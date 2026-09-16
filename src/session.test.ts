@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, rm, rename, chmod } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, rename, chmod } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { changesFor, withSession } from './test/helpers.ts';
+import { startCapture } from './session.ts';
+import { changesFor, waitForRecords, withSession } from './test/helpers.ts';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -20,6 +22,29 @@ describe('session', () => {
           await writeFile(join(root, 'trigger.ts'), 'new');
           const recs = await waitFor((r) => changesFor(r, 'trigger.ts').length >= 1);
           assert.equal(changesFor(recs, 'existing.ts').length, 0);
+        },
+      );
+    });
+
+    it('records a baseline-unreadable gap for a directory it cannot enumerate', async () => {
+      await withSession(
+        async (root) => {
+          const locked = join(root, 'locked');
+          await mkdir(locked);
+          await chmod(locked, 0o000); // unreadable when the baseline scan reaches it
+        },
+        async ({ root, waitFor }) => {
+          try {
+            const recs = await waitFor((r) =>
+              r.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
+            );
+            assert.ok(
+              recs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
+              'expected a baseline-unreadable gap for the locked directory',
+            );
+          } finally {
+            await chmod(join(root, 'locked'), 0o755); // restore so cleanup can remove it
+          }
         },
       );
     });
@@ -181,6 +206,17 @@ describe('session', () => {
       );
     });
 
+    it('captures a file whose name merely starts with ".." rather than dropping it as an escape', async () => {
+      await withSession(
+        async () => {},
+        async ({ root, waitFor }) => {
+          await writeFile(join(root, '..notes.ts'), 'kept');
+          const recs = await waitFor((r) => changesFor(r, '..notes.ts').length >= 1);
+          assert.ok(changesFor(recs, '..notes.ts').length >= 1, 'a "..notes.ts" file must still be captured');
+        },
+      );
+    });
+
     it('emits an unavailable/unreadable snapshot when a file becomes unreadable', async () => {
       await withSession(
         async (root) => {
@@ -208,15 +244,27 @@ describe('session', () => {
   });
 
   describe('exclusions', () => {
-    it('never captures the capture store itself', async () => {
-      await withSession(
-        async () => {},
-        async ({ root, waitFor }) => {
-          await writeFile(join(root, 'x.ts'), 'data');
-          const recs = await waitFor((r) => changesFor(r, 'x.ts').length >= 1);
-          assert.ok(recs.every((r) => !r.path.includes('events.jsonl') && !r.path.includes('sha256')));
-        },
-      );
+    it('never captures the capture store even when it lives inside the watched root', async () => {
+      // Store *inside* root is the case that matters: the exclusion is what
+      // stops the watcher from observing its own log and blob writes. A store
+      // outside root would pass trivially.
+      const root = await mkdtemp(join(tmpdir(), 'slip-wt-'));
+      const store = join(root, '.slipstream');
+      const session = await startCapture({ root, storeDir: store });
+      try {
+        await writeFile(join(root, 'x.ts'), 'data');
+        const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'x.ts').length >= 1);
+        // The real edit is captured...
+        assert.ok(changesFor(recs, 'x.ts').length >= 1, 'a real edit inside root must be captured');
+        // ...and the store's own writes (log + blobs) never appear as changes.
+        assert.ok(
+          recs.every((r) => !r.path.startsWith('.slipstream')),
+          'no record may reference a path inside the capture store',
+        );
+      } finally {
+        await session.stop();
+        await rm(root, { recursive: true, force: true });
+      }
     });
   });
 });

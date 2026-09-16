@@ -84,9 +84,15 @@ describe('reader', () => {
 
   describe('isStableAcross', () => {
     it('flags a size or mtime change during the read as unstable', () => {
-      assert.equal(isStableAcross({ size: 10, mtimeMs: 5 }, { size: 12, mtimeMs: 5 }), false);
-      assert.equal(isStableAcross({ size: 10, mtimeMs: 5 }, { size: 10, mtimeMs: 9 }), false);
-      assert.equal(isStableAcross({ size: 10, mtimeMs: 5 }, { size: 10, mtimeMs: 5 }), true);
+      assert.equal(isStableAcross({ size: 10, mtimeMs: 5, ctimeMs: 5 }, { size: 12, mtimeMs: 5, ctimeMs: 5 }), false);
+      assert.equal(isStableAcross({ size: 10, mtimeMs: 5, ctimeMs: 5 }, { size: 10, mtimeMs: 9, ctimeMs: 9 }), false);
+      assert.equal(isStableAcross({ size: 10, mtimeMs: 5, ctimeMs: 5 }, { size: 10, mtimeMs: 5, ctimeMs: 5 }), true);
+    });
+
+    it('flags a ctime-only change as unstable (restored mtime cannot hide a mid-read write)', () => {
+      // A writer that restores the original mtime via utimes still bumps ctime,
+      // so a matching size+mtime with a moved ctime must still read as torn.
+      assert.equal(isStableAcross({ size: 10, mtimeMs: 5, ctimeMs: 5 }, { size: 10, mtimeMs: 5, ctimeMs: 8 }), false);
     });
   });
 });

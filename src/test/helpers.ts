@@ -15,9 +15,8 @@ import { createEngine, type Engine } from '../engine.ts';
 import { startCapture, type CaptureSession } from '../session.ts';
 import type { Snapshot } from '../snapshot.ts';
 
-/** Build a content snapshot for a given hash (size is incidental unless set). */
-export const content = (sha256: string, size = 1): Snapshot => ({ kind: 'content', sha256, size });
-export const absent: Snapshot = { kind: 'absent' };
+/** Build a content snapshot for a given hash (size is incidental to these tests). */
+export const content = (sha256: string): Snapshot => ({ kind: 'content', sha256, size: 1 });
 
 /** Create a fresh temp directory that is removed when `fn` settles. */
 export async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -91,7 +90,6 @@ export async function withSession(
   fn: (ctx: {
     root: string;
     session: CaptureSession;
-    records: () => Promise<LoggedRecord[]>;
     waitFor: (predicate: (recs: LoggedRecord[]) => boolean) => Promise<LoggedRecord[]>;
   }) => Promise<void>,
   opts: { maxBytes?: number } = {},
@@ -106,7 +104,6 @@ export async function withSession(
     await fn({
       root,
       session: s,
-      records: () => readRecords(s.logPath),
       waitFor: (predicate) => waitForRecords(s.logPath, predicate),
     });
   } finally {
@@ -137,12 +134,13 @@ export async function readRecords(logPath: string): Promise<LoggedRecord[]> {
  * fixed sleep. Returns whatever records exist at the deadline so callers get a
  * meaningful assertion failure instead of a bare timeout.
  */
+const WAIT_TIMEOUT_MS = 8000;
+
 export async function waitForRecords(
   logPath: string,
   predicate: (recs: LoggedRecord[]) => boolean,
-  timeoutMs = 8000,
 ): Promise<LoggedRecord[]> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
   for (;;) {
     const recs = await readRecords(logPath);
     if (predicate(recs)) return recs;

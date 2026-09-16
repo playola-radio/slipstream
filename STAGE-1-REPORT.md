@@ -1,11 +1,11 @@
 # Stage 1 verdict — is watcher-primary capture good enough to watch live?
 
-**Short answer: yes.** Across repeated runs, capture commits changes in well
-under ~150 ms at p99, and the *only* loss is mild burst-within-file (intermediate
-states dropped during rapid bursts, with the correct endpoint always captured).
-There were **zero** endpoint-wrong, zero phantom, zero whole-change-lost, and
-zero ordering-wrong events — the two correctness-fatal categories and the two
-severe categories were empty on every run.
+**Short answer: yes.** Across repeated runs, capture commits changes at a p99
+that is almost always under ~150 ms, and the *only* loss is mild burst-within-file
+(intermediate states dropped during rapid bursts, with the correct endpoint
+always captured). There were **zero** endpoint-wrong, zero phantom, zero
+whole-change-lost, and zero ordering-wrong events — the two correctness-fatal
+categories and the two severe categories were empty on every run.
 
 Numbers below are from `npm run bench` on macOS (FSEvents via `@parcel/watcher`),
 Node 24. Latency varies run to run because it is dominated by FSEvents delivery,
@@ -15,9 +15,14 @@ not by our hashing or logging; three representative runs are summarized.
 
 | Scenario | p50 | p99 |
 |---|---|---|
-| single small file (64 B, n=50) | ~62–69 | ~71–111 |
-| 1 MiB file (n=30) | ~65–72 | ~82–108 |
-| burst of 100 files (n=100) | ~94–147 | ~100–153 |
+| single small file (64 B, n=50) | ~62–64 | ~73–82 |
+| 1 MiB file (n=30) | ~64–68 | ~74–176 |
+| burst of 100 files (n=100) | ~90–99 | ~99–106 |
+
+The 1 MiB p99 is usually ~75 ms but spiked to ~176 ms once in three runs — a
+single tail sample (nearest-rank p99 over n=30 *is* one observation), not a size
+effect: the median is flat across sizes. Treat "~150 ms p99" as the common case,
+not a hard ceiling; the tail is FSEvents delivery jitter, not our processing.
 
 Notes:
 - **The 1 MiB file is no slower than the small file.** Hashing and CAS write are
@@ -28,6 +33,19 @@ Notes:
   creates plus serialized per-path processing; even so, the whole burst commits
   within ~150 ms.
 
+### What "committed" means for these numbers
+
+Latency is measured from the `writeFile` call to a record's `committed_at_ms`.
+`committed_at_ms` is stamped at the **serialized commit point** in the log — the
+instant just before the record's line is appended, inside the per-log append
+chain that guarantees ordering. That append is a single un-fsynced `write` and
+takes sub-millisecond time, so the measured latency is essentially "write →
+observed → hashed → line queued for the OS," not "write → durably on disk."
+**Durability (`fsync` of the file and its directory) is deliberately deferred to
+Stage 2**, per the plan's durability-ordering invariant; these Stage 1 numbers
+would gain the cost of two `fsync`s per commit once that lands, which is why the
+figure is reported honestly as commit-point latency, not durable-write latency.
+
 ## 2. Loss by category (against a known write trace)
 
 Trace: 60 scripted writes across rapid-writes, an A→B→A→B→A cycle, an atomic
@@ -36,11 +54,20 @@ across three runs:
 
 | Category | Count | Severity |
 |---|---|---|
-| Burst-within-file | 31–33 | Mild — endpoint captured, which is what a reviewer reads |
+| Burst-within-file | 32–33 | Mild — endpoint captured, which is what a reviewer reads |
 | Whole-change-lost | **0** | Severe |
 | Endpoint-wrong | **0** | Fatal |
 | Ordering-wrong | **0** | Severe |
 | Phantom | **0** | Severe |
+
+**Loss-harness caveat.** These counts are only trustworthy if the trace records
+*every* state the filesystem actually passed through — an unlisted real state
+would be miscounted as a phantom or an endpoint-wrong. The atomic-save scenario
+is the case that matters: it writes `.atomic.ts.tmp` and renames it over
+`atomic.ts`, so the temp file is a genuine on-disk state. The trace now includes
+those temp-file steps, so observing the temp write is scored correctly rather
+than as a false phantom. The harness also reads the log **after** `session.stop()`
+drains the engine, so a still-in-flight commit is never miscounted as lost.
 
 All ~32 lost states come from the 30-write rapid burst to a single file:
 FSEvents coalesces the burst and delivers essentially one event, so the
@@ -83,7 +110,34 @@ saves, creates/deletes from a real editor) are covered above. Running the live
 cross-check is a worthwhile confirmation and can be done on request; it is a
 validation-method gap, not a measured capture loss.
 
-## 4. Verdict
+## 4. Reported issues (not fixed here — product / Stage-2 decisions)
+
+The adversarial review surfaced two items that are deliberately *reported and
+left*, because fixing them is a call I do not own in Stage 1 (see CLAUDE.md,
+"Decisions that are not yours to make").
+
+- **Durability is not implemented yet (Stage 2 owns it).** Blobs and log lines
+  are written but not `fsync`'d, and the durability-ordering invariant (blobs
+  durably published *before* the events referencing them) is not enforced in
+  Stage 1. A crash between the CAS write and the log append, or after either but
+  before the OS flushes, can lose or dangle a record. This is consistent with the
+  plan, which places durability in Stage 2; the latency numbers above are
+  reported as commit-point, not durable-write, latency precisely so Stage 2's
+  `fsync` cost is not silently hidden. **No fix applied** — implementing fsync
+  now would pre-empt a staged decision and change the measured baseline.
+
+- **Ancestor-symlink TOCTOU is possible.** We refuse to *follow* symlinks we
+  enumerate, and we `realpath` the root once at startup, but we do not re-verify
+  on every read that no ancestor directory of a watched path was swapped for a
+  symlink after startup. A sufficiently motivated local writer could redirect a
+  path between observation and read. Closing this fully (per-read ancestor
+  verification, or `O_NOFOLLOW`-style open semantics) has a real per-event cost
+  and is a security/fidelity trade-off. **Reported, not fixed** — whether Stage 1
+  should pay that cost is a product/security call for Brian, not a silent local
+  change (it would also trade CPU for fidelity, which the project rules reserve
+  as a non-local decision).
+
+## 5. Verdict
 
 **Watcher-primary capture is good enough to watch live.** Commit latency is
 low enough for live review (p99 under ~150 ms), independent of file size, and

@@ -8,16 +8,20 @@ export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 interface StatShape {
   size: number;
   mtimeMs: number;
+  ctimeMs: number;
 }
 
 /**
  * A read is trustworthy only if the file did not change while we were reading
- * it. If size or mtime moved between the pre-read and post-read stat, the bytes
- * we hold may be a torn mix of two states — which we must never record as a
- * real endpoint. Callers retry, then fall back to `unavailable/unstable`.
+ * it. If size, mtime, or ctime moved between the pre-read and post-read stat,
+ * the bytes we hold may be a torn mix of two states — which we must never
+ * record as a real endpoint. ctime is included because it cannot be set
+ * backward via `utimes`, so it still moves when a writer restores the original
+ * mtime to hide a mid-read change. Callers retry, then fall back to
+ * `unavailable/unstable`.
  */
 export function isStableAcross(before: StatShape, after: StatShape): boolean {
-  return before.size === after.size && before.mtimeMs === after.mtimeMs;
+  return before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
 }
 
 export interface Reader {
@@ -28,13 +32,13 @@ export interface ReaderOptions {
   root: string;
   cas: Cas;
   maxBytes?: number;
-  /** Retries when a read is observed torn before giving up as `unstable`. */
-  stabilityRetries?: number;
 }
+
+const STABILITY_RETRIES = 3;
 
 export function createReader(opts: ReaderOptions): Reader {
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  const retries = opts.stabilityRetries ?? 3;
+  const retries = STABILITY_RETRIES;
 
   const read = async (relPath: string): Promise<Snapshot> => {
     const abs = join(opts.root, relPath);
@@ -44,7 +48,7 @@ export function createReader(opts: ReaderOptions): Reader {
       try {
         const st = await lstat(abs);
         if (st.isSymbolicLink() || !st.isFile()) return { kind: 'absent' };
-        before = { size: st.size, mtimeMs: st.mtimeMs };
+        before = { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
         return { kind: 'unavailable', reason: 'io-error' };
@@ -65,7 +69,7 @@ export function createReader(opts: ReaderOptions): Reader {
       try {
         const bytes = await handle.readFile();
         const st = await handle.stat();
-        if (!isStableAcross(before, { size: st.size, mtimeMs: st.mtimeMs })) {
+        if (!isStableAcross(before, { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs })) {
           continue; // torn read; re-observe from a fresh stat
         }
         const ref = await opts.cas.put(bytes);

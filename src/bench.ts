@@ -6,8 +6,8 @@
  *   2. Loss by category against a known write trace, via src/loss.ts.
  *
  * This is not a unit test — filesystem timing is nondeterministic, so the
- * scenarios are run and reported, never asserted. The pure pieces (percentile,
- * snapshot mapping) are unit-tested in bench.test.ts. Run with `npm run bench`.
+ * scenarios are run and reported, never asserted. The pure piece (percentile)
+ * is unit-tested in bench.test.ts. Run with `npm run bench`.
  */
 import { mkdtemp, readFile, rm, writeFile, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,8 +15,9 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, type CaptureSession } from './session.ts';
 import type { LoggedRecord } from './log.ts';
-import type { Snapshot } from './snapshot.ts';
 import { categorize, type ObservedState, type RecordState, type TraceStep } from './loss.ts';
+
+const BENCH_WAIT_TIMEOUT_MS = 15000;
 
 /** Nearest-rank percentile over an ascending-sorted sample. NaN if empty. */
 export function percentile(sorted: number[], p: number): number {
@@ -24,13 +25,6 @@ export function percentile(sorted: number[], p: number): number {
   const rank = Math.ceil((p / 100) * sorted.length);
   const idx = Math.min(sorted.length, Math.max(1, rank)) - 1;
   return sorted[idx]!;
-}
-
-/** Collapse a Snapshot to the size-independent state the loss trace compares. */
-export function snapshotToObserved(snap: Snapshot): ObservedState {
-  if (snap.kind === 'content') return { kind: 'content', sha256: snap.sha256 };
-  if (snap.kind === 'unavailable') return { kind: 'unavailable', reason: snap.reason };
-  return { kind: 'absent' };
 }
 
 const sha = (b: Buffer | string) => createHash('sha256').update(b).digest('hex');
@@ -47,9 +41,8 @@ async function readRecords(logPath: string): Promise<LoggedRecord[]> {
 async function waitFor(
   logPath: string,
   predicate: (recs: LoggedRecord[]) => boolean,
-  timeoutMs = 15000,
 ): Promise<LoggedRecord[]> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + BENCH_WAIT_TIMEOUT_MS;
   for (;;) {
     const recs = await readRecords(logPath);
     if (predicate(recs)) return recs;
@@ -222,16 +215,18 @@ const lossScenarios: LossScenario[] = [
 
 async function runLoss(): Promise<void> {
   const trace: TraceStep[] = [];
-  let records: RecordState[] = [];
   let raw: LoggedRecord[] = [];
 
-  await withSession(async ({ root, session }) => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-bench-wt-'));
+  const store = await mkdtemp(join(tmpdir(), 'slip-bench-st-'));
+  const session = await startCapture({ root, storeDir: store });
+  try {
     for (const scenario of lossScenarios) {
       const steps = await scenario.run(root);
       trace.push(...steps);
       await sleep(150); // let the watcher settle between scenarios
     }
-    // Drain: wait until the log stops growing, then stop the session.
+    // Let FSEvents finish delivering: wait until the log stops growing.
     let prev = -1;
     for (let i = 0; i < 50; i++) {
       const recs = await readRecords(session.logPath);
@@ -239,12 +234,20 @@ async function runLoss(): Promise<void> {
       prev = recs.length;
       await sleep(100);
     }
+    // stop() unsubscribes the watcher and drains in-flight engine work before
+    // the log closes, so the log read afterward reflects every committed record.
+    await session.stop();
     raw = await readRecords(session.logPath);
-  });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(store, { recursive: true, force: true });
+  }
 
-  records = raw
+  // Snapshot is structurally an ObservedState (its extra `size` is ignored by
+  // categorize), so the committed `after` maps straight onto the trace's state.
+  const records: RecordState[] = raw
     .filter((r): r is Extract<LoggedRecord, { type: 'file.changed' }> => r.type === 'file.changed')
-    .map((r) => ({ path: r.path, after: snapshotToObserved(r.after) }));
+    .map((r) => ({ path: r.path, after: r.after }));
 
   const report = categorize(trace, records);
   const gaps = raw.filter((r) => r.type === 'capture.gap').length;

@@ -12,40 +12,54 @@ export interface FileChangedInput {
   coalesced?: boolean;
 }
 
+export type CaptureGapReason = 'coalesced' | 'baseline-unreadable' | 'watcher-error';
+
 export interface CaptureGapInput {
   type: 'capture.gap';
   path: string;
-  reason: 'coalesced';
+  reason: CaptureGapReason;
   observed_at_ms: number;
 }
 
 export type RecordInput = FileChangedInput | CaptureGapInput;
 
 export type LoggedRecord = RecordInput & {
-  seq: number;
   committed_at_ms: number;
 };
 
 export interface Log {
-  append(input: RecordInput): Promise<LoggedRecord>;
+  append(input: RecordInput): Promise<void>;
   close(): Promise<void>;
+}
+
+/**
+ * Write the whole buffer, looping on short writes. A single `handle.write` may
+ * commit fewer bytes than requested under storage pressure; the log is the
+ * source of truth, so a truncated line would corrupt every record after it.
+ */
+export async function writeAll(
+  handle: Pick<FileHandle, 'write'>,
+  buf: Buffer,
+): Promise<void> {
+  let offset = 0;
+  while (offset < buf.length) {
+    const { bytesWritten } = await handle.write(buf, offset, buf.length - offset);
+    if (bytesWritten <= 0) throw new Error('log write made no progress');
+    offset += bytesWritten;
+  }
 }
 
 export async function createLog(filePath: string): Promise<Log> {
   const handle: FileHandle = await open(filePath, 'a');
-  let seq = 0;
   let tail: Promise<unknown> = Promise.resolve();
 
-  const append = (input: RecordInput): Promise<LoggedRecord> => {
-    // Chain onto the tail so appends never interleave and seq stays contiguous.
+  const append = (input: RecordInput): Promise<void> => {
+    // Chain onto the tail so appends never interleave or lose lines.
     const result = tail.then(async () => {
-      const record: LoggedRecord = {
-        ...input,
-        seq: ++seq,
-        committed_at_ms: Date.now(),
-      };
-      await handle.write(`${JSON.stringify(record)}\n`);
-      return record;
+      // committed_at_ms is the serialized commit instant, stamped immediately
+      // before the (un-fsynced, sub-ms) append. Durable publication is Stage 2.
+      const record: LoggedRecord = { ...input, committed_at_ms: Date.now() };
+      await writeAll(handle, Buffer.from(`${JSON.stringify(record)}\n`));
     });
     tail = result.catch(() => undefined);
     return result;
