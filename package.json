@@ -12,6 +12,7 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
+    "bench": "node src/bench.ts",
     "slipstream": "node src/cli.ts"
   },
   "dependencies": {
