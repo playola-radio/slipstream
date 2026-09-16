@@ -98,6 +98,58 @@ unreadable, and binary.
 Then report, in plain terms, whether watcher-primary capture is good enough to
 watch live — and if not, exactly where it loses.
 
+## Required report format
+
+Stage 1 ends with a written verdict in this shape. "It seemed fine" is not an
+available answer, and neither is a single aggregate percentage — loss is only
+interpretable by category.
+
+**1. Latency.** p50 and p99 milliseconds from write to committed record.
+Separately for: single small file, a 1 MiB file, and a burst of 100 files.
+
+**2. Loss, broken down by category.** A raw percentage flattens cases that mean
+very different things, so report counts per category against the known write
+trace:
+
+| Category | What it means | How bad |
+|---|---|---|
+| Burst-within-file | Intermediate states lost, correct endpoint captured | Mild — the endpoint is what a reviewer reads anyway |
+| Whole-change-lost | A file changed and no event was emitted at all | Severe — the feed is silently incomplete |
+| Endpoint-wrong | An event was emitted with content that never existed on disk | Fatal — worse than no event |
+| Ordering-wrong | Events committed in an order contradicting the trace | Severe |
+| Phantom | An event emitted for a change that did not happen | Severe |
+
+`endpoint-wrong` and `phantom` are correctness bugs, not acceptable loss. Any
+nonzero count there is a defect to fix within Stage 1, not a gap to report.
+
+**3. Per-scenario results** for each awkward case listed above — rapid writes,
+atomic save, delete, create, empty file, human save mid-turn, oversize,
+unreadable, binary — pass, or fail with the category and count.
+
+**4. A one-paragraph verdict**: is this good enough to watch live, and where
+does it lose?
+
+## What you must not decide alone
+
+If capture turns out lossy, **stop and report. Do not remedy it.** Specifically,
+do not without checking with Brian first:
+
+- Change the capture architecture, or add a second capture source.
+- Add a harness hook (`PostToolUse` or otherwise) to backfill misses.
+- Emit events from Claude Code's `file-history/` or any harness log.
+- Add polling, shorten the debounce, or otherwise trade CPU for fidelity.
+- Relax, reword, or drop any Stage 1 success criterion.
+- Declare Stage 1 complete with a known-lossy result.
+
+The reason is that "too lossy" is a product decision, not an engineering one.
+Supplementing capture with harness hooks, accepting the loss and disclosing it,
+and narrowing what Slipstream promises are three different products. That call is
+Brian's, and it needs the numbers above to be made well.
+
+A high `burst-within-file` count with clean endpoints is very likely **fine** and
+should be reported as such rather than treated as failure — the whole design
+already assumes observed states, not every write.
+
 ## Working agreement
 
 - Follow the repo's `CLAUDE.md`: TDD, small commits that compile and pass, no

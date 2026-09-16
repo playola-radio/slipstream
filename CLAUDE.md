@@ -40,6 +40,26 @@ tool lie to its user, which is worse than missing a feature.
 - **Slipstream does not launch agents.** Conductor stays the launcher. Slipstream
   arrives through user-level MCP and skill config.
 
+## Decisions that are not yours to make
+
+Report and stop; do not remedy. These are product decisions, and each was
+settled deliberately — a plausible-looking local fix quietly reverses a call made
+with evidence you do not have in context.
+
+- **Adding a second capture source**, or emitting change events from any harness
+  log or `file-history/`. Harness data may refine attribution only.
+- **Adding a hook to backfill missed changes.**
+- **Trading CPU for fidelity** — polling, shortened debounce — to raise capture
+  rates.
+- **Relaxing, rewording, or dropping a success criterion** in
+  `IMPLEMENTATION_PLAN.md`.
+- **Weakening an honesty constraint above**, including inferring authorship more
+  confidently than the evidence supports.
+- **Declaring a stage complete with a known-failing gate.**
+
+If measurements say the current design is insufficient, that is a useful result.
+Write it up with numbers and stop.
+
 ## Stack
 
 TypeScript on Node 24 LTS throughout — daemon, MCP forwarder, UI.
