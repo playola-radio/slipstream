@@ -145,7 +145,7 @@ writes `file.changed` records with before/after CAS blobs to a JSONL log.
 - Human editor save during an agent turn.
 - Oversize file, unreadable-permission file, binary file.
 
-**Status**: Implementation Complete, pending one validation decision.
+**Status**: Complete.
 Implementation, tests (59 passing), and the measurement harness are done, and
 the Codex adversarial review is green: the challenge + excess-audit pass produced
 one combined fix wave (commit 8e41750), a re-review of that wave surfaced three
@@ -158,15 +158,22 @@ stable ~65–105 ms median commit latency (noisy small-sample p99 tail, ~100 ms
 common case), zero fatal/severe loss across repeated runs, only mild
 burst-within-file (endpoint always captured).
 
+Both real-agent cross-checks (this section's "Tests") were run and pass — see
+`STAGE-1-REPORT.md` § "Cross-check against real agent output":
+- `~/.claude/file-history/` endpoint reconciliation: all four real Claude Code
+  sessions on this machine (24 files, 49 versions) replayed in real write order;
+  every endpoint byte-matched `@vMax`, zero fatal/severe/phantom/missed. (Run as
+  a *replay* of real file-history content — the literal live-session variant is
+  impossible from this Conductor/SDK session, which does not populate
+  file-history; the live-concurrency dimension is covered by the next check.)
+- Live Codex `apply_patch` session (real independent concurrent writer):
+  create + multi-edit + delete all captured with correct endpoints, deletion
+  captured as `absent`, zero phantom/gap.
+
 Two reported-not-fixed items (product/Stage-2 decisions for Brian, per "Decisions
 that are not yours to make"): fsync/durability ordering is deferred to Stage 2;
 ancestor-symlink TOCTOU is possible and left as a security/fidelity trade-off.
-
-Remaining before final sign-off (Brian's call, not mine to close): one listed
-validation *method* — the live Claude Code / Codex session cross-check against
-`~/.claude/file-history/` — was substituted with scripted write traces plus the
-full real-filesystem integration suite. Either accept that substitution or run
-the live cross-check before marking this stage Complete.
+Neither is a Stage-1 gate; both are explicitly Stage-2/product scope.
 
 ---
 

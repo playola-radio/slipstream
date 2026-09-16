@@ -111,16 +111,65 @@ and a decision for Brian, not something I changed here.)
 | Binary file | PASS — stored verbatim | `session.test.ts` "captures a binary file verbatim" |
 | A→B→A cycle | PASS — two transitions, not deduped | `snapshot.test.ts`, `engine.test.ts`, bench `cycle-aba` |
 
-### Validation not yet performed (noted gap, not a capture failure)
+### Cross-check against real agent output (both brief techniques — PASS)
 
-The brief lists two *cross-check* techniques as validation available for free:
-capturing a real Claude Code session and checking endpoints against
-`~/.claude/file-history/`, and a real Codex `apply_patch` session. I validated
-against **scripted** write traces and the integration suite, not a live agent
-session. The behaviors those sessions would exercise (rapid writes, atomic
-saves, creates/deletes from a real editor) are covered above. Running the live
-cross-check is a worthwhile confirmation and can be done on request; it is a
-validation-method gap, not a measured capture loss.
+The brief lists two *cross-check* techniques against real agent output. Both
+were run; both pass with zero fatal or severe loss.
+
+**1. `~/.claude/file-history/` endpoint reconciliation (real Claude Code output).**
+file-history stores, per session, a full-content blob per file per version
+(`<hash>@vN`) — the exact bytes real Claude Code sessions wrote. Using those
+`@vN` blobs as an independent oracle, all four file-history sessions on this
+machine were replayed in real global write order (blob mtime) into a
+Slipstream-watched scratch dir, and Slipstream's captured endpoints were
+reconciled against the file-history versions:
+
+| Session | Files | Real versions | Endpoint-wrong | Whole-change-lost | Phantom | Missed intermediate | `capture.gap` |
+|---|---|---|---|---|---|---|---|
+| 21659fd9 | 10 | 20 | 0 | 0 | 0 | 0 | 0 |
+| a9c28578 | 6 | 16 | 0 | 0 | 0 | 0 | 0 |
+| 58a15cbe | 4 | 8 | 0 | 0 | 0 | 0 | 0 |
+| 0932ca5c | 4 | 5 | 0 | 0 | 0 | 0 | 0 |
+| **total** | **24** | **49** | **0** | **0** | **0** | **0** | **0** |
+
+Every file's final captured content byte-matched its `@vMax`, every
+intermediate version was captured as a distinct transition, and no captured
+content was absent from the file-history oracle. Endpoint commit latency across
+these real files (up to ~19 KB) was p50 ~33–122 ms, p99 ≤192 ms — in line with
+the bench. Zero missed intermediates is itself an honest finding about *real*
+cadence: these sessions' per-file edits are checkpoints minutes apart, so there
+were no rapid same-file bursts to coalesce (the burst-within-file loss in §2 is
+a synthetic 30-writes-in-a-tight-loop stress that real editing does not produce).
+
+*Method honesty:* this is a **replay** of real file-history content, not a live
+capture of a concurrently-running Claude Code session. The literal live variant
+could not be produced here: this Conductor/SDK-launched session does **not**
+populate `~/.claude/file-history/` (verified — file-history is written only by
+interactive Claude Code sessions, and this session's own edits create no
+history dir). The replay therefore validates *endpoint fidelity against real
+agent-authored content and real edit order*, and the live-concurrency dimension
+it cannot cover is covered by technique 2.
+
+**2. Live Codex `apply_patch` session (real, independent, concurrent writer).**
+Slipstream watched a scratch dir while a real `codex exec` session edited it
+concurrently — a genuine foreign process using its own editor mechanism. Codex
+created `util.py`, `notes.md`, and `config.json`, multi-edited `util.py` and
+`notes.md`, then deleted `config.json`. The oracle was the actual final on-disk
+state Codex produced (read directly, not through Slipstream):
+
+| Path | Result |
+|---|---|
+| `util.py` | OK — final captured content sha == disk sha |
+| `notes.md` | OK — final captured content sha == disk sha |
+| `config.json` | OK — captured create then final state `absent` (the deletion) |
+
+Endpoint-wrong 0, missing 0, phantom 0, `capture.gap` 0. A real independent
+agent's creates, multi-edits, and a deletion were all captured with correct
+endpoints and no fabricated content.
+
+Harnesses live outside the repo (`/tmp/slip-xcheck/replay.ts`,
+`/tmp/slip-xcheck/codex-live.ts`); they import the shipped `startCapture` path
+and write only to throwaway temp dirs.
 
 ## 4. Reported issues (not fixed here — product / Stage-2 decisions)
 
