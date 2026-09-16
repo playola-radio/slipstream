@@ -34,6 +34,39 @@ the front-end and replace it. Every stage below is gated on this: if a stage's
 capability is not reachable through the published schema + reader API, it is not
 done.
 
+## Stack — settled
+
+**TypeScript on Node 24 LTS throughout**: daemon, MCP forwarder, and UI.
+
+The capture path is syscall- and disk-bound, not CPU-bound. Per change it does a
+stat, a read, a SHA-256 (OpenSSL — the same C library Go or Rust would call), a
+blob write, a byte diff, and an append. A 100 KB file hashes in ~0.1 ms against a
+human-perception budget of ~50 ms. Language choice is not the constraint.
+
+The decisive argument is the hard rule above: one language means the daemon and
+every bundled client share a single TypeScript type generated from the JSON
+Schema, so the compiler enforces the contract. A split stack would hand-maintain
+that contract in two places, which is where drift lives. The MCP forwarder is
+~200 lines of stdio JSON-RPC with a first-party TypeScript SDK; the UI is React +
+Monaco regardless; tree-sitter ships as wasm and loads identically in both.
+
+Known Node-specific risks, each already answered by the design:
+- Single event loop — hashing and parsing run in `worker_threads`, which the
+  async-enrichment decision (Q1) already requires.
+- FSEvents coalescing at scale (`npm install`, branch switch) — a platform limit,
+  not a language one; `@parcel/watcher` is a native binding to the same API. The
+  answer in any language is debounce, coalesce, and emit `capture.gap`.
+- Durability — `fs.fsync` on both file and containing directory is exposed and
+  required by the Stage 2 ordering rule.
+
+Rejected: Swift (macOS-only, contradicts a replaceable front-end), C++ (no gain
+over Rust here), Go/Rust daemon with a TS client (loses the shared schema type
+for a path already far faster than needed).
+
+**Revisit only with Stage 1 numbers.** If measured capture latency is the
+bottleneck, the fix is moving one hot loop to a native addon or sidecar, not a
+rewrite — and Stage 1's required p50/p99 measurements will name the function.
+
 ## Settled decisions
 
 | # | Decision | Choice |
