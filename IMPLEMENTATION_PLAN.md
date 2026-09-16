@@ -145,12 +145,28 @@ writes `file.changed` records with before/after CAS blobs to a JSONL log.
 - Human editor save during an agent turn.
 - Oversize file, unreadable-permission file, binary file.
 
-**Status**: In Progress — implementation, tests (56 passing), and the
-measurement harness are done; verdict written in `STAGE-1-REPORT.md`
-(watcher-primary capture PASSES: p99 < ~150 ms, zero fatal/severe loss, only
-mild burst-within-file). Awaiting Codex adversarial review before marking
-Complete. Noted validation gap: live Claude Code / Codex session cross-check
-against `~/.claude/file-history/` not yet run (scripted traces used instead).
+**Status**: Implementation Complete, pending one validation decision.
+Implementation, tests (59 passing), and the measurement harness are done, and
+the Codex adversarial review is green: the challenge + excess-audit pass produced
+one combined fix wave (commit 8e41750), a re-review of that wave surfaced three
+more issues (log-corruption-on-write-failure, a fabricated `absent` before-state
+for files under an unreadable baseline dir, and a bench scoring gap), those were
+fixed in commit fce5189, and the final re-review confirmed no new defects.
+
+Verdict (`STAGE-1-REPORT.md`): watcher-primary capture **PASSES the gate** —
+stable ~65–105 ms median commit latency (noisy small-sample p99 tail, ~100 ms
+common case), zero fatal/severe loss across repeated runs, only mild
+burst-within-file (endpoint always captured).
+
+Two reported-not-fixed items (product/Stage-2 decisions for Brian, per "Decisions
+that are not yours to make"): fsync/durability ordering is deferred to Stage 2;
+ancestor-symlink TOCTOU is possible and left as a security/fidelity trade-off.
+
+Remaining before final sign-off (Brian's call, not mine to close): one listed
+validation *method* — the live Claude Code / Codex session cross-check against
+`~/.claude/file-history/` — was substituted with scripted write traces plus the
+full real-filesystem integration suite. Either accept that substitution or run
+the live cross-check before marking this stage Complete.
 
 ---
 
