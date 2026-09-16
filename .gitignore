@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Test & coverage
+coverage/
+.nyc_output/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Captured sessions — event logs and content-addressed blobs.
+# Real source bytes from watched worktrees land here. Never commit.
+.slipstream/
+sessions/
+blobs/
+*.jsonl
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# tree-sitter grammars fetched at runtime
+grammars/*.wasm
+
+# Editor / OS
+.vscode/
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.swp
+
+# Claude Code local settings (shared settings.json stays tracked)
+.claude/settings.local.json

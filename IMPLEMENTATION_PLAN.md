@@ -1,0 +1,319 @@
+# Slipstream — MVP Implementation Plan
+
+Date: 2026-09-16
+Status: approved to build (Brian, after Codex adversarial review)
+
+## What the MVP is
+
+A **live feed of code changes as an agent makes them**, watched alongside the
+agent in a browser. Conductor stays the launcher. Slipstream rides in via user-level
+MCP + skill config.
+
+## What the MVP promises — and does not
+
+The single most important framing decision, per Codex's Q14 amendment:
+
+> Slipstream streams **a live history of observed filesystem states, with explicit
+> coverage gaps.** It does not claim to be a complete record of every write.
+
+A watcher observes states, not writes. If a file goes `A → B → C` before Slipstream
+reads it, Slipstream reports `A → C`. An `A → B → A` cycle can be entirely invisible.
+This is disclosed in the schema via `slipstream.capture.gap.v1` and surfaced in the
+UI — never papered over.
+
+Likewise, `session_id` means **capture scope** (which worktree is being watched),
+never proof of authorship. Attribution is revisable inference with an explicit
+status, not a verified claim.
+
+## The hard rule
+
+**The event schema is the product's public interface.** The on-disk JSONL log +
+CAS blobs are the source of truth; the HTTP/SSE reader is a thin view over them;
+the bundled UI is one client among possible many. Anyone must be able to delete
+the front-end and replace it. Every stage below is gated on this: if a stage's
+capability is not reachable through the published schema + reader API, it is not
+done.
+
+## Settled decisions
+
+| # | Decision | Choice |
+|---|---|---|
+| Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
+| Q2 | Question/comment loop | Not in MVP; schema must make it purely additive |
+| Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
+| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree |
+| Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
+| Q6 | MCP topology | stdio thin forwarder → one long-running daemon (verified necessary) |
+| Q7 | Event envelope | CloudEvents structured JSON; minimal effort spent on it |
+| Q8 | Skill packaging | Portable core `SKILL.md` + optional per-harness enrichment |
+| Q9 | Install | Manual/documented for MVP |
+| Q10 | stdio spawn model | Verified: one server process per session |
+| Q11 | Task grouping | In MVP, via agent-declared `slipstream_begin_task` |
+| Q12 | Large/binary/unreadable files | Explicit `unavailable` snapshots with reasons; never a fake empty blob |
+| Q13 | Attribution | Revisable inference: `pending` / `heuristic` / `ambiguous` / `unknown` |
+| Q14 | Definition of done | Live demo **plus** measured latency, crash/replay tests, and independent-client parity |
+
+### Three amendments accepted from Codex review
+
+1. **Q14 narrowed** — promise observed states with explicit gaps, not complete
+   edit history. Done requires measurement, not just a convincing demo.
+2. **Q13 restructured** — separate capture scope / declared grouping /
+   attribution into three distinct fields. Attribution carries a status and is
+   revisable by later append-only events.
+3. **Q1 moved off the capture path** — publish bytes and byte ranges
+   immediately; append clips asynchronously. Clips are an array of paired spans
+   (one change can touch several functions), never a single span.
+
+### Rejected
+
+- **Harness content as a second event stream.** Claude Code's `file-history/`
+  is used only to *validate* capture fidelity in Stage 1. Emitting from it too
+  would require reconciling two timelines with different coverage and version
+  identities. A transcript record may *update attribution*; it may never
+  *create* a filesystem-change event. This avoids double-capture structurally.
+
+---
+
+## Stage 1: Prove byte capture
+
+**Goal**: Determine whether watcher-primary capture is accurate and fast enough
+to watch live. This is the gate — if it fails, everything downstream is wasted.
+
+**Deliverable**: A CLI that attaches to a worktree, baselines it, watches it, and
+writes `file.changed` records with before/after CAS blobs to a JSONL log.
+
+**Scope discipline**: no MCP, no task grouping, no parser, no SSE, no UI.
+
+**Success Criteria**
+- Baseline enumerates the worktree with watching installed *before* enumeration
+  begins, reconciling during the scan. Baseline is current bytes, not git HEAD —
+  a dirty worktree's existing changes are not presented as new edits.
+- Per-path serialized processing; each read compares against the **last committed
+  snapshot**, not whatever is on disk when the diff worker runs.
+- Byte-identical observations emit nothing. Content-hash dedup is **not** applied
+  globally — `A → B → A` is two legitimate transitions.
+- Capture limits enforced: regular files ≤ 10 MiB. Oversize, unreadable,
+  unstable, and io-error paths emit explicit `unavailable` snapshots.
+- Renames represented as delete + create. Symlinks excluded, never followed
+  outside the root.
+- Measured p50/p99 latency from write to committed record.
+
+**Tests**
+- Known-write-trace comparison: a script performs a scripted sequence of writes;
+  captured transitions are diffed against the trace. Missed intermediates are
+  *counted and reported*, not treated as failures.
+- Real Claude Code session editing files; captured endpoints cross-checked
+  against `~/.claude/file-history/<session>/` versions.
+- Real Codex session editing files via `apply_patch`.
+- Rapid successive writes to one path.
+- Atomic save (write-temp + rename) resolves to a change at the original path.
+- File deletion; file creation; empty file (stored zero-byte blob, **not**
+  absent).
+- Human editor save during an agent turn.
+- Oversize file, unreadable-permission file, binary file.
+
+**Status**: Not Started
+
+---
+
+## Stage 2: Prove the durable interface
+
+**Goal**: Freeze the v1 public contract and prove it survives a crash. After this
+stage the schema is a published interface, not an implementation detail.
+
+**Deliverable**: Finalized JSON Schemas, sequencing, durable blob publication,
+restart reconciliation, the cursor-based replay/follow reader, and a minimal
+disk-reading TUI client that consumes only public artifacts.
+
+**Success Criteria**
+- Storage layout published and stable:
+  `sessions/<session_id>/events.jsonl`, `blobs/sha256/<ab>/<hex>`,
+  `schemas/<event-type>.json`.
+- Single writer assigns contiguous per-session sequence numbers as decimal
+  strings. Sequence expresses commit order, not exact cross-file write
+  chronology. `time` is never used for ordering.
+- **Durability rule**: referenced blobs are written and durably published
+  *before* the events referencing them are appended. The event log is flushed
+  before anything is acknowledged or published over HTTP.
+- Reader API: `GET /v1/sessions`, `GET /v1/sessions/{id}/events?after={seq}` with
+  `follow=false` (finite NDJSON, durable high-water sequence in a response
+  header) and `follow=true` (SSE), `GET /v1/blobs/sha256/{hex}`,
+  `GET /v1/schemas/{type}`.
+- Replay-then-follow uses **one cursor in one log position** — never a history
+  query plus a separately registered live callback. No gap, no duplicate.
+- SSE: `id` is the session-local sequence, `event` is `slipstream`, `Last-Event-ID`
+  overrides `after`, heartbeats are SSE comments (not persisted events). A slow
+  client is disconnected and resumes from its cursor; it never blocks capture.
+- Error codes: `400` invalid cursor, `404` unknown session, `410` removed
+  session, `409` cursor beyond durable high-water. Never silently reset a cursor.
+- Loopback-only HTTP with authentication and explicit origin policy; owner-only
+  storage permissions.
+
+**Tests**
+- Kill the daemon mid-capture; restart. Session identity and sequence are
+  preserved, an incomplete trailing record is removed, a `session.resumed` event
+  is appended at `recovered_through_seq + 1`, and a restart gap plus
+  reconciliation events follow.
+- Corruption in the *middle* of the log is an error, not a skipped event.
+- Two independent readers (HTTP reader and direct disk reader) converge on
+  identical recorded state.
+- Reconnect from a stale cursor mid-stream: no gap, no duplicate.
+- Disk-full: capture stops acknowledging, health state goes failing, and the gap
+  is recorded once storage recovers.
+- Schema-evolution guard: a client ignoring unknown event types and unknown
+  object fields still renders a complete feed.
+
+**Status**: Not Started
+
+---
+
+## Stage 3: Prove riding alongside Conductor, with tasks
+
+**Goal**: Slipstream attaches to exactly one Conductor-launched session among several
+and receives declared task boundaries from the agent — without owning launch.
+
+**Deliverable**: Daemon IPC over an owner-only local socket, stdio forwarders for
+both harnesses, explicit CLI attach/detach, the portable skill, and the single
+MCP tool `slipstream_begin_task`.
+
+**Success Criteria**
+- One active capture session daemon-wide, bound to one exact harness session ID
+  and one canonical worktree. Retained sessions remain readable.
+- Explicit CLI attachment selects the session. Forwarders in non-selected
+  sessions return `SESSION_NOT_SELECTED` and **never steal ownership**. Switching
+  requires detach then attach.
+- Identity binding uses verified harness session context; CWD alone is
+  insufficient. Ambiguous identity **fails attachment rather than guessing**.
+- Two agents writing in the selected worktree are both captured, with attribution
+  marked ambiguous or unknown. Single capture scope ≠ single writer.
+- `slipstream_begin_task(title)` → `{session_id, task_id, event_id, seq}`, acknowledged
+  only after the event is committed. Forwarder-supplied request UUID gives
+  idempotency on retry.
+- Error surface: `DAEMON_UNAVAILABLE`, `SESSION_NOT_SELECTED`,
+  `IDENTITY_UNRESOLVED`, `CAPTURE_NOT_READY`, `INVALID_TITLE`,
+  `STORAGE_UNAVAILABLE`.
+- Task boundary is the declaration event's sequence. Late declarations are
+  **never silently backdated**. No declaration means an ungrouped bucket. There
+  is no task-completed claim in this MVP.
+- Manually started daemon; forwarders fail fast if it is unavailable. No
+  competing auto-start.
+- CLI documented for start, attach, status, detach, session deletion, GC.
+
+**Tests**
+- Three Conductor worktrees open; only the attached session can declare tasks;
+  the other two forwarders return `SESSION_NOT_SELECTED`.
+- Skill loaded from user-level config into a session Slipstream did not launch
+  (both harnesses) — verifying the inheritance already confirmed for this session.
+- Retried `slipstream_begin_task` with the same request UUID commits once.
+- Agent never calls `slipstream_begin_task`: changes land in the ungrouped bucket and
+  the feed stays correct.
+- Daemon down: forwarder returns `DAEMON_UNAVAILABLE` without hanging the agent.
+
+**Status**: Not Started
+
+---
+
+## Stage 4: Prove honest attribution and enrichment
+
+**Goal**: Add the two things that must never block or corrupt capture — harness
+attribution and function clips — as append-only enrichment.
+
+**Deliverable**: Claude Code and Codex transcript adapters emitting
+`change.attribution` events; async tree-sitter workers emitting `change.clips`
+events.
+
+**Success Criteria — attribution**
+- Starting policy (configurable, calibrated not guaranteed): each timestamped
+  harness tool-use record contributes a ±2s window matched against the change's
+  observation interval. Exactly one candidate → `heuristic`; multiple →
+  `ambiguous`; none after a 5s grace → `unknown`.
+- Late evidence revises any result via a new `change.attribution` event. The
+  highest-sequence attribution targeting a change wins; original events stay
+  immutable.
+- `task_hint_id` never changes. Clients may regroup on revised attribution but
+  must retain original chronology.
+- Evidence identity survives transcript rereads and daemon restarts.
+- No status claims verified authorship. UI language is "possibly agent", never
+  "attributed".
+
+**Success Criteria — clips**
+- Parsing runs in isolated workers against immutable before/after blobs, never on
+  the capture path. Enrichment is debounced; the capture queue is not.
+- Budgets: parse only UTF-8 ≤ 1 MiB, 100 ms wall-clock per change; clips capped
+  at 300 lines and 64 KiB per side; fallback is changed ranges ± 20 lines.
+- Clips are an **array** of paired spans. A deleted function exists only on the
+  before side; a created one only on the after side.
+- A parse error *elsewhere* in the file does not void a usable enclosing
+  function. Fall back only when the relevant enclosing structure is unreliable.
+- Explicit `fallback_reason` on every non-`ready` clip event.
+- Under overload, enrichment is skipped with a stated reason and raw capture
+  continues.
+
+**Tests**
+- Two overlapping parallel tool calls → `ambiguous`.
+- Human save during an agent turn → not silently credited to the agent.
+- Transcript arriving late → an initially `unknown` change gains evidence and is
+  revised.
+- Edits occurring before their task is declared → grouped by declaration
+  sequence, not backdated.
+- A change touching several functions, deleting one, and editing imports → one
+  event, multiple clips, top-level fallback where appropriate.
+- Half-written unparseable file mid-edit → falls back, event still published.
+- Parser workers saturated → raw capture latency unchanged (measured).
+
+**Status**: Not Started
+
+---
+
+## Stage 5: Build the watching UI and run acceptance
+
+**Goal**: The three-column workspace from the canvas, consuming only public APIs,
+plus the Q14 acceptance run.
+
+**Deliverable**: React client — explorer (segmented `Changed · N` | `All files`,
+Changed active by default) → change stream (sticky non-stacking task headings,
+whole-function clips with gutter markers) → editor panes (Monaco diff,
+Diff/Plain toggle, collapsed unchanged ranges).
+
+**Success Criteria**
+- The client consumes **only** the published reader API and schemas. It holds no
+  privileged access to the daemon's internals.
+- Uncertainty is visible: ambiguous and unknown attribution render as such;
+  coverage gaps render as gaps.
+- Change stream uses lightweight rendered diffs; Monaco is instantiated for the
+  focused pane only, never per card.
+- Design tokens pulled from the canvas `GetVariables()`, not re-derived.
+- **Acceptance run (this is Q14's bar):** live Conductor sessions for both
+  harnesses; task grouping visible; daemon killed and readers reconnected
+  mid-session; measured capture latency reported; known coverage gaps documented;
+  then the bundled UI is **stopped entirely** and the Stage 2 TUI reproduces the
+  same session state.
+
+**Explicitly not in this MVP**: question/answer loop, review or approval
+workflow, automatic installer, launcher replacement, historical content import.
+
+**Status**: Not Started
+
+---
+
+## Vocabulary — settled
+
+**Product name: Slipstream.** Decided 2026-09-16 (working name "Differ" retired).
+A slipstream is the low-pressure pocket behind a fast-moving object — riding in
+it makes following dramatically cheaper than leading. That is the product thesis:
+stay in the agent's wake and review as it works, instead of facing a pile of
+files at the end. The metaphor also encodes the constraint honestly — the effect
+falls off with distance, so you have to keep up. Binding on the public interface:
+`slipstream.*` event types, `urn:slipstream:session:<id>`, `slipstream_begin_task`,
+`.slipstream/` storage.
+
+**"Task", not "story."** Decided 2026-09-16, ahead of Stage 3's schema freeze.
+This is binding on the public interface: `slipstream.task.started.v1`, `task_id`,
+`task_hint_id`, `slipstream_begin_task`, subject `task/<task_id>`. The canvas uses
+"story" in several frame names; the UI copy follows the schema, so those read as
+tasks. Changing this after Stage 3 is a breaking event-type version bump.
+
+## Open questions deferred past MVP
+
+1. Should an agent's answer be allowed to edit code, when Q&A arrives?
+2. Automatic install/registration of the MCP server, skill, and hooks.
