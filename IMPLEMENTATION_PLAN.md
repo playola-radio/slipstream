@@ -145,7 +145,12 @@ writes `file.changed` records with before/after CAS blobs to a JSONL log.
 - Human editor save during an agent turn.
 - Oversize file, unreadable-permission file, binary file.
 
-**Status**: Not Started
+**Status**: In Progress — implementation, tests (56 passing), and the
+measurement harness are done; verdict written in `STAGE-1-REPORT.md`
+(watcher-primary capture PASSES: p99 < ~150 ms, zero fatal/severe loss, only
+mild burst-within-file). Awaiting Codex adversarial review before marking
+Complete. Noted validation gap: live Claude Code / Codex session cross-check
+against `~/.claude/file-history/` not yet run (scripted traces used instead).
 
 ---
 
