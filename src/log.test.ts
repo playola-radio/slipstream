@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeAll } from './log.ts';
-import { withLog } from './test/helpers.ts';
+import { join } from 'node:path';
+import { createLog, writeAll } from './log.ts';
+import { withLog, withTempDir } from './test/helpers.ts';
 
 const gap = (path: string, observed_at_ms: number) =>
   ({ type: 'capture.gap', path, reason: 'coalesced', observed_at_ms }) as const;
@@ -37,6 +38,18 @@ describe('log', () => {
           new Set(records.map((r) => r.path)),
           new Set(Array.from({ length: 50 }, (_, i) => `p${i}`)),
         );
+      });
+    });
+
+    it('stops accepting appends once a write fails, rather than corrupting the log', async () => {
+      await withTempDir(async (dir) => {
+        const log = await createLog(join(dir, 'events.jsonl'));
+        // Closing the handle makes the next write fail on a closed fd — a stand-in
+        // for a mid-line write failure. A poisoned log must reject rather than
+        // append onto a partial line.
+        await log.close();
+        await assert.rejects(log.append(gap('a', 1)));
+        await assert.rejects(log.append(gap('b', 2))); // stays poisoned
       });
     });
   });

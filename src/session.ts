@@ -80,9 +80,12 @@ export async function startCapture(opts: CaptureOptions): Promise<CaptureSession
     onFile: async (rel) => engine.setBaseline(rel, await reader.read(rel)),
     // A directory we could not read means its baseline is unknown; a later
     // change there must not masquerade as a brand-new file (invariant 5), so
+    // tell the engine to treat its descendants' prior state as unknown and
     // record the incomplete-baseline gap honestly.
-    onDirError: async (relDir) =>
-      log.append({ type: 'capture.gap', path: relDir, reason: 'baseline-unreadable', observed_at_ms: Date.now() }),
+    onDirError: async (relDir) => {
+      engine.markBaselineUnknown(relDir);
+      await log.append({ type: 'capture.gap', path: relDir, reason: 'baseline-unreadable', observed_at_ms: Date.now() });
+    },
   });
 
   // Go live and reconcile: replay everything observed during the scan. This

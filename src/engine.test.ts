@@ -71,6 +71,35 @@ describe('engine', () => {
         }
       });
     });
+
+    it('uses an unknown before-state, not absent, for a path under an unreadable baseline dir', async () => {
+      await withEngine(scriptedReader([content('after')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('locked');
+        engine.notify('locked/existing.ts', 1); // never baselined; dir was unreadable
+        await engine.drain();
+        const [rec] = await read();
+        if (rec?.type === 'file.changed') {
+          assert.deepEqual(rec.before, { kind: 'unavailable', reason: 'baseline-unknown' });
+          assert.deepEqual(rec.after, content('after'));
+        } else {
+          assert.fail('expected a file.changed record');
+        }
+      });
+    });
+
+    it('does not treat a sibling outside the unreadable dir as baseline-unknown', async () => {
+      await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('locked');
+        engine.notify('elsewhere.ts', 1); // not under the unreadable prefix
+        await engine.drain();
+        const [rec] = await read();
+        if (rec?.type === 'file.changed') {
+          assert.deepEqual(rec.before, { kind: 'absent' });
+        } else {
+          assert.fail('expected a file.changed record');
+        }
+      });
+    });
   });
 
   describe('coalescing and serialization', () => {

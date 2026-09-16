@@ -52,14 +52,25 @@ export async function writeAll(
 export async function createLog(filePath: string): Promise<Log> {
   const handle: FileHandle = await open(filePath, 'a');
   let tail: Promise<unknown> = Promise.resolve();
+  // A write that fails mid-line leaves the file at an unknown offset. Appending
+  // further records would concatenate onto that partial line and corrupt the
+  // log — which is the source of truth. Once poisoned, every append rejects
+  // rather than risk writing onto a half-written line.
+  let poison: Error | null = null;
 
   const append = (input: RecordInput): Promise<void> => {
     // Chain onto the tail so appends never interleave or lose lines.
     const result = tail.then(async () => {
+      if (poison) throw poison;
       // committed_at_ms is the serialized commit instant, stamped immediately
       // before the (un-fsynced, sub-ms) append. Durable publication is Stage 2.
       const record: LoggedRecord = { ...input, committed_at_ms: Date.now() };
-      await writeAll(handle, Buffer.from(`${JSON.stringify(record)}\n`));
+      try {
+        await writeAll(handle, Buffer.from(`${JSON.stringify(record)}\n`));
+      } catch (err) {
+        poison = err instanceof Error ? err : new Error(String(err));
+        throw poison;
+      }
     });
     tail = result.catch(() => undefined);
     return result;

@@ -1,11 +1,12 @@
 # Stage 1 verdict — is watcher-primary capture good enough to watch live?
 
-**Short answer: yes.** Across repeated runs, capture commits changes at a p99
-that is almost always under ~150 ms, and the *only* loss is mild burst-within-file
-(intermediate states dropped during rapid bursts, with the correct endpoint
-always captured). There were **zero** endpoint-wrong, zero phantom, zero
-whole-change-lost, and zero ordering-wrong events — the two correctness-fatal
-categories and the two severe categories were empty on every run.
+**Short answer: yes.** Across repeated runs, capture commits changes with a
+stable median of ~65–105 ms (noisy p99 tail discussed below), and the *only* loss
+is mild burst-within-file (intermediate states dropped during rapid bursts, with
+the correct endpoint always captured). There were **zero** endpoint-wrong, zero
+phantom, zero whole-change-lost, and zero ordering-wrong events — the two
+correctness-fatal categories and the two severe categories were empty on every
+run.
 
 Numbers below are from `npm run bench` on macOS (FSEvents via `@parcel/watcher`),
 Node 24. Latency varies run to run because it is dominated by FSEvents delivery,
@@ -15,14 +16,19 @@ not by our hashing or logging; three representative runs are summarized.
 
 | Scenario | p50 | p99 |
 |---|---|---|
-| single small file (64 B, n=50) | ~62–64 | ~73–82 |
-| 1 MiB file (n=30) | ~64–68 | ~74–176 |
-| burst of 100 files (n=100) | ~90–99 | ~99–106 |
+| single small file (64 B, n=50) | ~62–68 | ~73–236 |
+| 1 MiB file (n=30) | ~64–70 | ~74–176 |
+| burst of 100 files (n=100) | ~86–104 | ~93–112 |
 
-The 1 MiB p99 is usually ~75 ms but spiked to ~176 ms once in three runs — a
-single tail sample (nearest-rank p99 over n=30 *is* one observation), not a size
-effect: the median is flat across sizes. Treat "~150 ms p99" as the common case,
-not a hard ceiling; the tail is FSEvents delivery jitter, not our processing.
+The **p50 is the stable, representative number** — ~65 ms for isolated files,
+~90–105 ms for a 100-file burst, and essentially flat across file size. The p99
+on the isolated-file scenarios is noisy: with n=30–50, nearest-rank p99 *is* a
+single tail observation, and it spiked to ~176 ms (1 MiB) and ~236 ms (small
+file) once each across several runs. Those tails are FSEvents delivery jitter on
+a loaded machine, not our hashing or logging — the flat medians and the tight,
+larger-sample burst p99 (~100 ms) confirm the processing cost is low and
+size-independent. Treat "~100 ms" as the honest live-review latency and the
+occasional ~200 ms tail as delivery jitter, not a processing ceiling.
 
 Notes:
 - **The 1 MiB file is no slower than the small file.** Hashing and CAS write are
@@ -60,13 +66,18 @@ across three runs:
 | Ordering-wrong | **0** | Severe |
 | Phantom | **0** | Severe |
 
-**Loss-harness caveat.** These counts are only trustworthy if the trace records
-*every* state the filesystem actually passed through — an unlisted real state
-would be miscounted as a phantom or an endpoint-wrong. The atomic-save scenario
-is the case that matters: it writes `.atomic.ts.tmp` and renames it over
-`atomic.ts`, so the temp file is a genuine on-disk state. The trace now includes
-those temp-file steps, so observing the temp write is scored correctly rather
-than as a false phantom. The harness also reads the log **after** `session.stop()`
+**Loss-harness caveat.** These counts are only trustworthy if the trace accounts
+for every state the harness itself creates — an observed state with no matching
+trace entry would be miscounted as a phantom or endpoint-wrong. The atomic-save
+scenario is the case that matters: it writes `.atomic.ts.tmp` and renames it over
+`atomic.ts`, so the temp file is a genuine transient on-disk state. That temp
+path is a filesystem artifact of the write-temp+rename technique, not a
+user-intended change, so the scenario **excludes it from scoring** and grades
+fidelity at the final path (which is the atomic-save contract). If capture
+happens to observe the temp write, it is neither counted as a phantom nor left
+ungraded by accident — it is deliberately out of the graded set. (The atomic-save
+integration test in `session.test.ts` independently proves the final path is
+captured correctly.) The harness also reads the log **after** `session.stop()`
 drains the engine, so a still-in-flight commit is never miscounted as lost.
 
 All ~32 lost states come from the 30-write rapid burst to a single file:
@@ -96,6 +107,7 @@ and a decision for Brian, not something I changed here.)
 | Human save during an agent turn | PASS (structural) — capture is source-agnostic; it observes states per path, serialized, regardless of which process wrote. Concurrent independent writers are exercised by the `many-files` + burst scenarios. No live dual-writer test was scripted. | design + bench `many-files` |
 | Oversize (>limit) | PASS — explicit `unavailable/oversize`, never a fake blob | `session.test.ts` "emits an unavailable/oversize snapshot…" |
 | Unreadable permissions | PASS — explicit `unavailable/unreadable` | `session.test.ts` "emits an unavailable/unreadable snapshot…" |
+| Unreadable directory at baseline | PASS — coverage gap recorded; a later change to a file under it reports an honest `unavailable/baseline-unknown` before-state, never a fabricated `absent` | `session.test.ts` "records a baseline-unreadable gap and never fabricates absent…"; `engine.test.ts` baseline-unknown cases |
 | Binary file | PASS — stored verbatim | `session.test.ts` "captures a binary file verbatim" |
 | A→B→A cycle | PASS — two transitions, not deduped | `snapshot.test.ts`, `engine.test.ts`, bench `cycle-aba` |
 

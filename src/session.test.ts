@@ -26,24 +26,40 @@ describe('session', () => {
       );
     });
 
-    it('records a baseline-unreadable gap for a directory it cannot enumerate', async () => {
+    it('records a baseline-unreadable gap and never fabricates absent for a file under it', async () => {
       await withSession(
         async (root) => {
           const locked = join(root, 'locked');
           await mkdir(locked);
+          await writeFile(join(locked, 'existing.ts'), 'pre-existing'); // baselined? no — dir is locked
           await chmod(locked, 0o000); // unreadable when the baseline scan reaches it
         },
         async ({ root, waitFor }) => {
+          const locked = join(root, 'locked');
           try {
-            const recs = await waitFor((r) =>
+            // The scan discloses the incomplete baseline as a gap...
+            const gapRecs = await waitFor((r) =>
               r.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
             );
             assert.ok(
-              recs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
+              gapRecs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
               'expected a baseline-unreadable gap for the locked directory',
             );
+            // ...and once the file becomes observable and changes, its prior
+            // state is honestly unknown, never a fabricated "absent" that would
+            // imply the pre-existing file was newly created.
+            await chmod(locked, 0o755);
+            await writeFile(join(locked, 'existing.ts'), 'changed after restore');
+            const recs = await waitFor((r) => changesFor(r, join('locked', 'existing.ts')).length >= 1);
+            const [c] = changesFor(recs, join('locked', 'existing.ts'));
+            assert.equal(c?.type, 'file.changed');
+            if (c?.type === 'file.changed') {
+              assert.equal(c.before.kind, 'unavailable');
+              if (c.before.kind === 'unavailable') assert.equal(c.before.reason, 'baseline-unknown');
+              assert.equal(c.after.kind, 'content');
+            }
           } finally {
-            await chmod(join(root, 'locked'), 0o755); // restore so cleanup can remove it
+            await chmod(locked, 0o755); // restore so cleanup can remove it
           }
         },
       );

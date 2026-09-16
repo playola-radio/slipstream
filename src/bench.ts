@@ -131,6 +131,13 @@ interface LossScenario {
   name: string;
   awkward: string;
   run: (root: string) => Promise<TraceStep[]>;
+  /**
+   * Paths this scenario creates as filesystem artifacts of the technique under
+   * test (e.g. an atomic save's write-temp file) rather than as user-intended
+   * changes. Records for these paths are excluded from loss scoring: the
+   * scenario grades fidelity at the real target path, per its contract.
+   */
+  ignore?: string[];
 }
 
 const content = (body: Buffer | string): ObservedState => ({ kind: 'content', sha256: sha(body) });
@@ -168,6 +175,9 @@ const lossScenarios: LossScenario[] = [
   {
     name: 'atomic-save',
     awkward: 'atomic save (write-temp + rename) resolves at the final path',
+    // The temp file is an artifact of the write-temp+rename technique, not a
+    // user-intended change; grade only the final path.
+    ignore: ['.atomic.ts.tmp'],
     run: async (root) => {
       const rel = 'atomic.ts';
       await writeFile(join(root, rel), 'original');
@@ -243,10 +253,17 @@ async function runLoss(): Promise<void> {
     await rm(store, { recursive: true, force: true });
   }
 
+  // Records for scenario artifact paths (e.g. atomic-save temp files) are not
+  // graded: they are real observed states, but not user-intended changes the
+  // trace claims to track. Excluding them keeps an observed temp write from
+  // being miscounted as a phantom.
+  const ignored = new Set(lossScenarios.flatMap((s) => s.ignore ?? []));
+
   // Snapshot is structurally an ObservedState (its extra `size` is ignored by
   // categorize), so the committed `after` maps straight onto the trace's state.
   const records: RecordState[] = raw
     .filter((r): r is Extract<LoggedRecord, { type: 'file.changed' }> => r.type === 'file.changed')
+    .filter((r) => !ignored.has(r.path))
     .map((r) => ({ path: r.path, after: r.after }));
 
   const report = categorize(trace, records);

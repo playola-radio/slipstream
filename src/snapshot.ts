@@ -4,8 +4,13 @@
  * exist; unavailable means the path exists but its bytes were not captured,
  * with an explicit reason. An empty file is `content` with size 0, never
  * `absent`.
+ *
+ * `baseline-unknown` is the one reason that describes a *prior* state rather
+ * than a read failure: it marks a `before` whose baseline was never observed
+ * (its directory was unreadable during the initial scan), so the tool must not
+ * pretend the path was `absent` before the change.
  */
-export type UnavailableReason = 'oversize' | 'unreadable' | 'unstable' | 'io-error';
+export type UnavailableReason = 'oversize' | 'unreadable' | 'unstable' | 'io-error' | 'baseline-unknown';
 
 export type Snapshot =
   | { kind: 'content'; sha256: string; size: number }

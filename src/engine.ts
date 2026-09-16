@@ -1,3 +1,4 @@
+import { sep } from 'node:path';
 import type { Log } from './log.ts';
 import type { Reader } from './reader.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
@@ -10,6 +11,12 @@ export interface EngineOptions {
 export interface Engine {
   /** Record a path's starting state without emitting a change (baseline). */
   setBaseline(path: string, snapshot: Snapshot): void;
+  /**
+   * Mark a directory whose baseline could not be enumerated. Descendants with
+   * no observed baseline get an honest `unavailable/baseline-unknown` before
+   * state instead of a fabricated `absent`.
+   */
+  markBaselineUnknown(relDir: string): void;
   /** Signal that a path may have changed, observed at `observedAtMs`. */
   notify(path: string, observedAtMs: number): void;
   /** Resolve once all queued processing (and its appends) have settled. */
@@ -29,9 +36,26 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
   const coalesced = new Set<string>();
   const processing = new Set<string>();
   const inflight = new Set<Promise<void>>();
+  const baselineUnknown = new Set<string>(); // dirs whose baseline scan failed
 
   const setBaseline = (path: string, snapshot: Snapshot): void => {
     committed.set(path, snapshot);
+  };
+
+  const markBaselineUnknown = (relDir: string): void => {
+    baselineUnknown.add(relDir);
+  };
+
+  // The prior state of a path we never baselined is honestly unknown when its
+  // directory could not be scanned; elsewhere, no baseline means it did not
+  // exist yet.
+  const priorFor = (path: string): Snapshot => {
+    for (const prefix of baselineUnknown) {
+      if (prefix === '' || path === prefix || path.startsWith(prefix + sep)) {
+        return { kind: 'unavailable', reason: 'baseline-unknown' };
+      }
+    }
+    return { kind: 'absent' };
   };
 
   const notify = (path: string, observedAtMs: number): void => {
@@ -42,13 +66,20 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
       return;
     }
     processing.add(path);
-    const task = processLoop(path).finally(() => inflight.delete(task));
+    // A processing failure (e.g. the log poisoned itself after a write error)
+    // must be surfaced, never left as an unhandled rejection that crashes the
+    // watcher. The log's own failure is the durable signal; this is the console.
+    const task = processLoop(path)
+      .catch((err: unknown) => {
+        console.error(`slipstream: capture processing error for ${path}: ${(err as Error).message}`);
+      })
+      .finally(() => inflight.delete(task));
     inflight.add(task);
   };
 
   const handleOnce = async (path: string, observedAtMs: number, wasCoalesced: boolean): Promise<void> => {
     const after = await reader.read(path);
-    const before = committed.get(path) ?? { kind: 'absent' };
+    const before = committed.get(path) ?? priorFor(path);
     if (snapshotsEqual(before, after)) {
       // Nothing to record — but if we coalesced, an intermediate state may have
       // existed and been lost. Surface that honestly rather than silently.
@@ -83,5 +114,5 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
     }
   };
 
-  return { setBaseline, notify, drain };
+  return { setBaseline, markBaselineUnknown, notify, drain };
 }
