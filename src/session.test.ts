@@ -178,6 +178,79 @@ test('an oversize file emits an unavailable/oversize snapshot, never a fake blob
   }
 });
 
+test('rapid successive writes capture the correct endpoint and never a state that never existed', async () => {
+  await withSession(
+    async (root) => {
+      await writeFile(join(root, 'hot.ts'), 'v0');
+    },
+    async ({ root, waitFor }) => {
+      const { createHash } = await import('node:crypto');
+      const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+      const writtenShas = new Set<string>([sha('v0')]);
+      for (let i = 1; i <= 25; i++) {
+        const body = `version-${i}`;
+        writtenShas.add(sha(body));
+        await writeFile(join(root, 'hot.ts'), body);
+      }
+      const endpointSha = sha('version-25');
+      const recs = await waitFor((r) =>
+        changesFor(r, 'hot.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha),
+      );
+      const changes = changesFor(recs, 'hot.ts');
+      // The endpoint must be captured (intermediate loss is acceptable burst).
+      assert.ok(changes.some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha));
+      // Every recorded content must be a version we actually wrote — a torn
+      // read fabricating a state that never existed would be a fatal defect.
+      for (const c of changes) {
+        if (c.type === 'file.changed' && c.after.kind === 'content') {
+          assert.ok(writtenShas.has(c.after.sha256), `recorded a state that was never written: ${c.after.sha256}`);
+        }
+      }
+    },
+  );
+});
+
+test('a binary file is captured verbatim', async () => {
+  const bytes = Buffer.from([0, 1, 2, 253, 254, 255, 0, 128]);
+  await withSession(
+    async () => {},
+    async ({ root, session, waitFor }) => {
+      await writeFile(join(root, 'blob.bin'), bytes);
+      const recs = await waitFor((r) => changesFor(r, 'blob.bin').length >= 1);
+      const [c] = changesFor(recs, 'blob.bin');
+      if (c?.type === 'file.changed' && c.after.kind === 'content') {
+        const stored = await readFile(join(session.blobsDir, 'sha256', c.after.sha256.slice(0, 2), c.after.sha256));
+        assert.deepEqual(stored, bytes);
+      } else {
+        assert.fail('expected binary content');
+      }
+    },
+  );
+});
+
+test('a file that becomes unreadable emits an unavailable/unreadable snapshot', async () => {
+  await withSession(
+    async (root) => {
+      await writeFile(join(root, 'secret.ts'), 'readable');
+    },
+    async ({ root, waitFor }) => {
+      const p = join(root, 'secret.ts');
+      await writeFile(p, 'about to lock');
+      await chmod(p, 0o000);
+      try {
+        const recs = await waitFor((r) =>
+          changesFor(r, 'secret.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'unavailable'),
+        );
+        assert.ok(
+          changesFor(recs, 'secret.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'unavailable' && c.after.reason === 'unreadable'),
+        );
+      } finally {
+        await chmod(p, 0o644);
+      }
+    },
+  );
+});
+
 test('the capture store is never itself captured', async () => {
   // storeDir lives outside root here, but assert no record ever references the
   // store path even if a nested layout is used.
