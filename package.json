@@ -10,7 +10,7 @@
     "slipstream": "./src/cli.ts"
   },
   "scripts": {
-    "test": "node --test 'src/**/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "slipstream": "node src/cli.ts"
   },
