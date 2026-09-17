@@ -96,3 +96,13 @@ it('reports a stale reader connection without throwing', async () => {
     assert.match(lines.join(''), /unavailable.*--disk/);
   } finally { fetchMock.mock.restore(); }
 });
+
+it('disk replay consumes every bounded batch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), Array.from({ length: 700 }, (_, i) =>
+    JSON.stringify({ seq: String(i + 1), type: 'test', data: {} }) + '\n').join(''));
+  const lines = await replayFromDisk(dir, UUID);
+  assert.equal(lines.length, 700);
+  assert.match(lines[699]!, /^700 · /);
+});

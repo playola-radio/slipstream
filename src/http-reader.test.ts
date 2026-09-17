@@ -1,6 +1,7 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, appendFile, symlink, access } from 'node:fs/promises';
+import { ServerResponse } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -361,4 +362,83 @@ it('flushes caught-up SSE headers before any event or heartbeat', async () => {
     assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8');
     assert.equal(res.headers.get('cache-control'), 'no-store');
   } finally { clearTimeout(timer); ac.abort(); await srv.close(); }
+});
+
+it('replays many batches over finite and SSE, then follows exactly once up to H', async () => {
+  const count = 1600;
+  const dir = await storeWithSession();
+  const path = join(dir, 'sessions', UUID, 'events.jsonl');
+  const line = (n: number) => JSON.stringify({ seq: String(n), type: 'test', data: { text: 'x'.repeat(1024) } }) + '\n';
+  await writeFile(path, Array.from({ length: count + 1 }, (_, i) => line(i + 1)).join(''));
+  const health = createHealth(BigInt(count));
+  const srv = await startReaderServer({ storeDir: dir, active: { id: UUID, health, logPath: path } });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 10000);
+  try {
+    const finite = await GET(srv, `/v1/sessions/${UUID}/events`);
+    assert.equal(finite.headers.get('slipstream-durable-seq'), String(count));
+    const expected = Array.from({ length: count }, (_, i) => String(i + 1));
+    assert.deepEqual((await finite.text()).trimEnd().split('\n').map(l => JSON.parse(l).seq), expected);
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}` }, signal: ac.signal,
+    });
+    const reader = res.body!.getReader();
+    let text = '';
+    const decoder = new TextDecoder();
+    while (sseEvents(text).length < count) {
+      const part = await reader.read(); assert.equal(part.done, false);
+      text += decoder.decode(part.value, { stream: true });
+    }
+    assert.deepEqual(sseEvents(text).map(e => e.id), expected);
+    health.setDurableSeq(BigInt(count + 1));
+    while (sseEvents(text).length < count + 1) {
+      const part = await reader.read(); assert.equal(part.done, false);
+      text += decoder.decode(part.value, { stream: true });
+    }
+    assert.deepEqual(sseEvents(text).map(e => e.id), [...expected, String(count + 1)]);
+  } finally { clearTimeout(timer); ac.abort(); await srv.close(); }
+});
+
+it('finite replay waits for drain before writing the next record', async () => {
+  const srv = await startReaderServer({ storeDir: await storeWithSession() });
+  const original = ServerResponse.prototype.write;
+  let waiting = false; let ignored = false; let writes = 0;
+  const patched = mock.method(ServerResponse.prototype, 'write', function (this: ServerResponse, chunk: string) {
+    if (waiting) ignored = true;
+    writes++;
+    original.call(this, chunk, 'utf8');
+    waiting = true;
+    setTimeout(() => { waiting = false; this.emit('drain'); }, 30);
+    return false;
+  });
+  try {
+    const res = await GET(srv, `/v1/sessions/${UUID}/events`);
+    assert.equal((await res.text()).trimEnd().split('\n').length, 2);
+    assert.equal(writes, 2);
+    assert.equal(ignored, false, 'wrote while waiting for drain');
+  } finally { patched.mock.restore(); await srv.close(); }
+});
+
+it('returns 500 for corruption after the first replay batch', async () => {
+  const dir = await storeWithSession();
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'),
+    Array.from({ length: 700 }, (_, i) =>
+      JSON.stringify({ seq: String(i + 1), type: 'test', data: {} }) + '\n').join('')
+      + 'broken\n{"seq":"702","type":"test","data":{}}\n');
+  const srv = await startReaderServer({ storeDir: dir });
+  try { assert.equal((await GET(srv, `/v1/sessions/${UUID}/events`)).status, 500); }
+  finally { await srv.close(); }
+});
+
+it('keeps history readable when tombstone contents are malformed', async () => {
+  const dir = await storeWithSession();
+  const srv = await startReaderServer({ storeDir: dir });
+  try {
+    for (const raw of ['{}', '{"version":2}', '[]', 'true', 'not JSON']) {
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), raw);
+      const res = await GET(srv, `/v1/sessions/${UUID}/events`);
+      assert.equal(res.status, 200, raw);
+      assert.equal((await res.text()).trimEnd().split('\n').length, 2);
+    }
+  } finally { await srv.close(); }
 });

@@ -206,3 +206,19 @@ it('rejects accessible descriptors, directories and symlinks', async () => {
   await symlink(join(dir, 'missing'), join(dir, 'runtime', 'stale.json'));
   assert.equal(await readRuntimeDescriptor(dir), null);
 });
+
+it('finds a large log high-water without a whole-file read', async () => {
+  const { mock } = await import('node:test');
+  const fs = (await import('node:fs/promises')).default;
+  const dir = await store();
+  const log = sessionLogPath(dir, UUID);
+  await writeFile(log, Array.from({ length: 4000 }, (_, i) =>
+    JSON.stringify({ seq: String(i + 1), padding: 'x'.repeat(100) }) + '\n').join('') + 'torn'.repeat(20000));
+  const { syncBuiltinESMExports } = await import('node:module');
+  const spy = mock.method(fs, 'readFile');
+  syncBuiltinESMExports();
+  try {
+    assert.equal(await onDiskHighWater(log), 4000n);
+    assert.equal(spy.mock.callCount(), 0, 'high-water must not buffer the whole log');
+  } finally { spy.mock.restore(); syncBuiltinESMExports(); }
+});

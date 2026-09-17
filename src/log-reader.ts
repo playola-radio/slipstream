@@ -31,65 +31,67 @@ export interface LogCursor {
   close(): Promise<void>;
 }
 
+// Each batch retains at most 256 records / 256 KiB, plus one oversized record.
+// A single record cannot be split on the wire; memory also depends on its size.
+export const LOG_BATCH_RECORDS = 256;
+const BATCH_BYTES = 256 * 1024;
+const READ_BYTES = 64 * 1024;
+
 export async function openLogCursor(logPath: string, after: bigint): Promise<LogCursor> {
   const handle: FileHandle = await open(logPath, 'r');
-  let offset = 0;          // byte offset of the next unread byte on disk
-  let positioned = after === 0n; // have we skipped past `after` yet?
-  let lastSeq = after;     // highest emitted seq; enforces strict contiguity
+  let offset = 0; // sole committed byte position, advanced only over complete lines
+  let lastSeq = after;
+  let positioned = after === 0n;
+  let window = Buffer.alloc(0);
+  let windowStart = 0;
+  const decoder = new TextDecoder('utf-8', { fatal: true });
 
-  // Byte-exact: split the complete region on the newline byte and return each
-  // line's ORIGINAL byte slice, so offsets never depend on a re-encoded string.
-  async function readNewComplete(): Promise<{ slices: Buffer[] }> {
-    const chunkSize = 64 * 1024;
-    const buf = Buffer.alloc(chunkSize);
-    const chunks: Buffer[] = [];
-    let read = offset;
+  async function nextLine(): Promise<Buffer | null> {
+    let pos = offset;
+    const pieces: Buffer[] = [];
     for (;;) {
-      const { bytesRead } = await handle.read(buf, 0, chunkSize, read);
-      if (bytesRead === 0) break;
-      chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
-      read += bytesRead;
-      if (bytesRead < chunkSize) break;
+      if (pos < windowStart || pos >= windowStart + window.length) {
+        const buffer = Buffer.allocUnsafe(READ_BYTES);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, pos);
+        window = buffer.subarray(0, bytesRead);
+        windowStart = pos;
+        if (!bytesRead) return null; // torn tail: offset stays at the line start
+      }
+      const start = pos - windowStart;
+      const nl = window.indexOf(0x0a, start);
+      if (nl >= 0) {
+        pieces.push(window.subarray(start, nl));
+        return Buffer.concat(pieces);
+      }
+      pieces.push(window.subarray(start));
+      pos = windowStart + window.length;
     }
-    const all = Buffer.concat(chunks);
-    const lastNl = all.lastIndexOf(0x0a);
-    if (lastNl < 0) return { slices: [] };
-    const complete = all.subarray(0, lastNl); // bytes before the final newline
-    const slices: Buffer[] = [];
-    let start = 0;
-    for (let i = 0; i < complete.length; i++) {
-      if (complete[i] === 0x0a) { slices.push(complete.subarray(start, i)); start = i + 1; }
-    }
-    slices.push(complete.subarray(start));
-    return { slices };
   }
 
   return {
     async readThrough(boundary: bigint): Promise<ReaderEvent[]> {
-      if (boundary <= after) return [];
-      const { slices } = await readNewComplete();
-      const decoder = new TextDecoder('utf-8', { fatal: true });
       const out: ReaderEvent[] = [];
-      let advance = offset;
-      for (const slice of slices) {
+      let bytes = 0;
+      while (lastSeq < boundary && out.length < LOG_BATCH_RECORDS && bytes < BATCH_BYTES) {
+        const slice = await nextLine();
+        if (slice === null) break;
         let line: string;
         try { line = decoder.decode(slice); }
         catch { throw new LogCorruptError('invalid UTF-8 in log record'); }
         const ev = parseLine(line);
-        const lineBytes = slice.length + 1; // original bytes + the newline
+        const lineBytes = slice.length + 1;
         if (!positioned) {
-          if (ev.seq <= after) { advance += lineBytes; continue; }
+          if (ev.seq <= after) { offset += lineBytes; continue; }
           positioned = true;
         }
         if (ev.seq !== lastSeq + 1n) {
           throw new LogCorruptError(`non-contiguous seq: expected ${lastSeq + 1n} got ${ev.seq}`);
         }
-        if (ev.seq > boundary) break;      // stop; do not advance or update lastSeq
         out.push(ev);
         lastSeq = ev.seq;
-        advance += lineBytes;
+        offset += lineBytes;
+        bytes += lineBytes;
       }
-      offset = advance;
       return out;
     },
     async close() { await handle.close(); },

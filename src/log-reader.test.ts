@@ -149,3 +149,34 @@ describe('log-reader', () => {
     });
   });
 });
+
+it('bounds batches across a large replay, H, and the follow seam', async () => {
+  const count = 1600;
+  const p = await logWith(...Array.from({ length: count }, (_, i) => line(i + 1)));
+  const cur = await openLogCursor(p, 0n);
+  const seen: bigint[] = [];
+  let peak = 0;
+  try {
+    for (;;) {
+      const batch = await cur.readThrough(BigInt(count - 1));
+      peak = Math.max(peak, batch.length);
+      assert.ok(batch.length <= 256, `buffered ${batch.length} records`);
+      if (!batch.length) break;
+      seen.push(...batch.map(e => e.seq));
+    }
+    assert.deepEqual(seen, Array.from({ length: count - 1 }, (_, i) => BigInt(i + 1)));
+    assert.ok(peak > 0);
+    assert.deepEqual((await cur.readThrough(BigInt(count))).map(e => e.seq), [BigInt(count)]);
+    await appendFile(p, line(count + 1).trimEnd());
+    assert.deepEqual(await cur.readThrough(BigInt(count + 1)), []);
+    await appendFile(p, '\n');
+    assert.deepEqual((await cur.readThrough(BigInt(count + 1))).map(e => e.seq), [BigInt(count + 1)]);
+  } finally { await cur.close(); }
+});
+
+it('does not parse a complete uncommitted record after H', async () => {
+  const p = await logWith(line(1), 'not committed JSON\n');
+  const cur = await openLogCursor(p, 0n);
+  try { assert.deepEqual((await cur.readThrough(1n)).map(e => e.seq), [1n]); }
+  finally { await cur.close(); }
+});

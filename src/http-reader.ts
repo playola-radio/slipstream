@@ -20,7 +20,7 @@ export interface ReaderServer {
 const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
 
 const SSE_HEARTBEAT_MS = 15000;
-const SSE_DRAIN_DEADLINE_MS = 10000;
+const DRAIN_DEADLINE_MS = 10000;
 
 function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {}) {
   res.writeHead(status, { 'cache-control': 'no-store', ...headers });
@@ -39,7 +39,7 @@ async function writeBackpressured(res: ServerResponse, chunk: string, signal: Ab
   if (signal.aborted) throw new Error('aborted');
   if (res.write(chunk)) return;
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { cleanup(); reject(new Error('drain timeout')); }, SSE_DRAIN_DEADLINE_MS);
+    const timer = setTimeout(() => { cleanup(); reject(new Error('drain timeout')); }, DRAIN_DEADLINE_MS);
     const onDrain = () => { cleanup(); resolve(); };
     const onAbort = () => { cleanup(); reject(new Error('aborted')); };
     const cleanup = () => { clearTimeout(timer); res.off('drain', onDrain); signal.removeEventListener('abort', onAbort); };
@@ -188,25 +188,51 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     }
 
     if (!follow) {
-      // Read (and detect corruption) BEFORE the 200 so a LogCorruptError becomes
-      // a clean 500 via the top-level handler, never a 200 with a truncated body.
-      const cursor = await openLogCursor(logPath, effectiveAfter);
-      let events: Awaited<ReturnType<typeof cursor.readThrough>>;
-      try { events = await cursor.readThrough(H); }
-      finally { await cursor.close(); }
-      res.writeHead(200, {
-        'cache-control': 'no-store',
-        'content-type': 'application/x-ndjson; charset=utf-8',
-        [DURABLE_SEQ_HEADER]: H.toString(),
-      });
-      for (const ev of events) res.write(ev.raw + '\n');
-      res.end();
+      const ac = new AbortController();
+      const onDisconnect = () => ac.abort();
+      res.on('close', onDisconnect);
+      res.on('error', onDisconnect);
+      followers.add(ac);
+      let cursor: LogCursor | undefined;
+      try {
+        if (closing || res.destroyed) return;
+        // Validate in bounded batches before headers to preserve a clean 500 on
+        // corruption anywhere in (after, H]. Append-only history is then replayed
+        // in a second bounded pass; no whole-log array is retained.
+        cursor = await openLogCursor(logPath, effectiveAfter);
+        for (let seq = effectiveAfter; seq < H;) {
+          if (ac.signal.aborted) return;
+          const batch = await cursor.readThrough(H);
+          if (!batch.length) throw new LogCorruptError('disk short of durable boundary');
+          seq = batch[batch.length - 1]!.seq;
+        }
+        await cursor.close();
+        cursor = undefined;
+        cursor = await openLogCursor(logPath, effectiveAfter);
+        if (ac.signal.aborted) return;
+        res.writeHead(200, {
+          'cache-control': 'no-store',
+          'content-type': 'application/x-ndjson; charset=utf-8',
+          [DURABLE_SEQ_HEADER]: H.toString(),
+        });
+        for (let seq = effectiveAfter; seq < H;) {
+          if (ac.signal.aborted) return;
+          const batch = await cursor.readThrough(H);
+          if (!batch.length) throw new LogCorruptError('disk short of durable boundary');
+          for (const ev of batch) await writeBackpressured(res, ev.raw + '\n', ac.signal);
+          seq = batch[batch.length - 1]!.seq;
+        }
+        res.end();
+      } finally {
+        await cursor?.close();
+        followers.delete(ac);
+        res.off('close', onDisconnect);
+        res.off('error', onDisconnect);
+        if (ac.signal.aborted && !res.writableEnded) res.destroy();
+      }
       return;
     }
 
-    // follow=true: SSE, one cursor over disk bounded by the advancing durable boundary.
-    // Register cancellation BEFORE acquiring any resource so a disconnect during
-    // setup drives teardown; keep the cursor and heartbeat inside one try/finally.
     const ac = new AbortController();
     const onDisconnect = () => ac.abort();
     res.on('close', onDisconnect);
@@ -216,7 +242,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     res.flushHeaders();
 
     // Serialize every write (events and heartbeats) through the bounded path so
-    // an idle client that stops reading eventually hits SSE_DRAIN_DEADLINE_MS and
+    // an idle client that stops reading eventually hits DRAIN_DEADLINE_MS and
     // is aborted, and so heartbeats never interleave with an in-flight event write.
     let tail: Promise<void> = Promise.resolve();
     const write = (chunk: string): Promise<void> => {
@@ -239,14 +265,16 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       for (;;) {
         const target = boundary.current();
         if (target > cur) {
-          for (const ev of await cursor.readThrough(target)) {
-            await write(`id: ${ev.seq}\nevent: slipstream\ndata: ${ev.raw}\n\n`);
-            cur = ev.seq;
+          while (cur < target) {
+            if (ac.signal.aborted) return;
+            const batch = await cursor.readThrough(target);
+            // A nonempty short batch is normal; an empty batch below H is not.
+            if (!batch.length) throw new LogCorruptError('disk short of durable boundary');
+            for (const ev of batch) {
+              await write(`id: ${ev.seq}\nevent: slipstream\ndata: ${ev.raw}\n\n`);
+              cur = ev.seq;
+            }
           }
-          // Durability ordering guarantees records ≤ H are fsync'd before H is
-          // published, so falling short of an advertised target is real
-          // truncation/corruption — surface it rather than busy-looping.
-          if (cur < target) throw new LogCorruptError('disk short of durable boundary');
         }
         await boundary.waitForAdvance(cur, ac.signal); // rejects on abort → exits loop
       }

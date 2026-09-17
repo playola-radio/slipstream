@@ -29,19 +29,38 @@ export function blobPath(storeDir: string, hex: string): string {
 }
 
 export async function onDiskHighWater(logPath: string): Promise<bigint> {
-  let text: string;
-  try { text = await readFile(logPath, 'utf8'); }
+  let handle;
+  try { handle = await open(logPath, 'r'); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0n;
     throw err;
   }
-  // Split into segments; the final segment is either '' (the log ended with the
-  // '\n' the writer appends) or a torn incomplete tail (no terminating '\n').
-  // Discard it either way and read the last COMPLETE (newline-terminated) line.
-  const segments = text.split('\n');
-  segments.pop();
-  if (segments.length === 0) return 0n; // genuinely empty complete history
-  const lastLine = segments[segments.length - 1]!;
+  let lastLine: string;
+  try {
+    // Scan backwards in fixed-size windows, discarding a torn tail without
+    // retaining it. Only the final complete record needs to be assembled.
+    let pos = (await handle.stat()).size;
+    let foundEnd = false;
+    const pieces: Buffer[] = [];
+    while (pos > 0) {
+      const size = Math.min(pos, 64 * 1024);
+      pos -= size;
+      const buffer = Buffer.allocUnsafe(size);
+      const { bytesRead } = await handle.read(buffer, 0, size, pos);
+      if (bytesRead !== size) throw new LogCorruptError('high-water: log truncated during read');
+      let end = size;
+      if (!foundEnd) {
+        end = buffer.lastIndexOf(0x0a);
+        if (end < 0) continue;
+        foundEnd = true;
+      }
+      const start = end > 0 ? buffer.lastIndexOf(0x0a, end - 1) : -1;
+      pieces.push(buffer.subarray(start + 1, end));
+      if (start >= 0) break;
+    }
+    if (!foundEnd) return 0n;
+    lastLine = Buffer.concat(pieces.reverse()).toString('utf8');
+  } finally { await handle.close(); }
   if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
   let seq: unknown;
   try { seq = (JSON.parse(lastLine) as { seq?: unknown }).seq; }

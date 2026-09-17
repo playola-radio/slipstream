@@ -247,7 +247,10 @@ all three required failure paths pass. PR 2b delivered the `/v1` reader API
 (finite NDJSON and SSE follow with one-cursor replay-then-follow, HTTP error
 codes, and loopback bearer auth with host/origin checks), the two-reader
 convergence and stale-cursor reconnect tests, the schema-evolution guard, and
-the disk-reading TUI client (plus the `serve`/`view` CLI). The recovery
+the disk-reading TUI client (plus the `serve`/`view` CLI). PR #6 review fixes
+add bounded replay with backpressure, failed-startup capture cleanup, validated
+tombstones and runtime descriptors, correct schema error statuses, and immediate
+SSE headers. All 247 deterministic tests and typecheck pass. The recovery
 durable-sync gap remains tracked as separate work.
 
 ---

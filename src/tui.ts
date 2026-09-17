@@ -27,7 +27,14 @@ export async function replayFromDisk(storeDir: string, id: string): Promise<stri
   const logPath = sessionLogPath(storeDir, id);
   const H = await onDiskHighWater(logPath);
   const cursor = await openLogCursor(logPath, 0n);
-  try { return (await cursor.readThrough(H)).map(renderEvent); }
+  try {
+    const lines: string[] = [];
+    for (;;) {
+      const batch = await cursor.readThrough(H);
+      if (!batch.length) return lines;
+      lines.push(...batch.map(renderEvent));
+    }
+  }
   finally { await cursor.close(); }
 }
 
