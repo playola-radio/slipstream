@@ -1,8 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { access } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import type { Health } from './health.ts';
-import { listSessions, readTombstone, isValidSessionId, sessionLogPath, onDiskHighWater } from './store-reader.ts';
+import {
+  listSessions, readTombstone, isValidSessionId, sessionLogPath, onDiskHighWater,
+  blobPath, isValidHex, schemaBytes,
+} from './store-reader.ts';
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
 import { parseCursor, openLogCursor } from './log-reader.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
@@ -56,7 +60,37 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       await handleEvents(req, res, decodeURIComponent(eventsMatch[1]!), searchParams);
       return;
     }
-    // blobs / schemas routes added in later tasks
+    const blobMatch = pathname.match(/^\/v1\/blobs\/sha256\/([^/]+)$/);
+    if (blobMatch) {
+      const hex = blobMatch[1]!;
+      if (!isValidHex(hex)) { send(res, 400, 'invalid hash'); return; }
+      const path = blobPath(opts.storeDir, hex);
+      let size: number;
+      try { size = (await stat(path)).size; }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') { send(res, 404, 'not found'); return; }
+        throw err;
+      }
+      res.writeHead(200, {
+        'cache-control': 'no-store',
+        'content-type': 'application/octet-stream',
+        'content-length': String(size),
+      });
+      const stream = createReadStream(path);
+      stream.on('error', () => res.destroy());
+      res.on('close', () => stream.destroy());
+      stream.pipe(res);
+      return;
+    }
+
+    const schemaMatch = pathname.match(/^\/v1\/schemas\/([^/]+)$/);
+    if (schemaMatch) {
+      const bytes = await schemaBytes(decodeURIComponent(schemaMatch[1]!));
+      if (!bytes) { send(res, 404, 'not found'); return; }
+      send(res, 200, bytes, { 'content-type': 'application/json; charset=utf-8' });
+      return;
+    }
+
     send(res, 404, 'not found');
   }
 

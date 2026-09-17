@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
+import { createCas } from './cas.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
 
@@ -102,5 +103,43 @@ describe('http-reader events (finite)', () => {
     await mkdir(join(dir, 'sessions', removed), { recursive: true });
     await writeFile(join(dir, 'sessions', removed, 'removed.json'), '{"version":1}', 'utf8');
     assert.equal((await GET(srv, `/v1/sessions/${removed}/events?after=0`)).status, 410);
+  });
+});
+
+describe('http-reader blobs + schemas', () => {
+  let dir: string; let srv: ReaderServer; let hex: string; let empty: string;
+  before(async () => {
+    dir = await storeWithSession();
+    const cas = await createCas(join(dir, 'blobs'));
+    hex = (await cas.put(Buffer.from('hello'))).sha256;
+    empty = (await cas.put(Buffer.alloc(0))).sha256;
+    srv = await startReaderServer({ storeDir: dir });
+  });
+  after(async () => { await srv.close(); });
+
+  it('serves blob bytes as octet-stream', async () => {
+    const res = await GET(srv, `/v1/blobs/sha256/${hex}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(await res.text(), 'hello');
+  });
+
+  it('serves a genuine zero-byte blob as an empty 200', async () => {
+    const res = await GET(srv, `/v1/blobs/sha256/${empty}`);
+    assert.equal(res.status, 200);
+    assert.equal((await res.arrayBuffer()).byteLength, 0);
+  });
+
+  it('400 on malformed hex, 404 on a missing blob', async () => {
+    assert.equal((await GET(srv, '/v1/blobs/sha256/ZZZ')).status, 400);
+    assert.equal((await GET(srv, `/v1/blobs/sha256/${'a'.repeat(64)}`)).status, 404);
+  });
+
+  it('serves a known schema verbatim and 404 on an unknown type', async () => {
+    const res = await GET(srv, '/v1/schemas/slipstream.file.changed.v1');
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { properties: { type: { const: string } } };
+    assert.equal(body.properties.type.const, 'slipstream.file.changed.v1');
+    assert.equal((await GET(srv, '/v1/schemas/nope.v1')).status, 404);
   });
 });
