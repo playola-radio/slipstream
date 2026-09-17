@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { renderEvent, replayFromDisk } from './tui.ts';
+import { renderEvent, replayFromDisk, sseDataLine } from './tui.ts';
 import { parseLine } from './log-reader.ts';
 
 const UUID = '55555555-5555-4555-8555-555555555555';
@@ -25,6 +25,31 @@ describe('tui', () => {
     it('renders an unknown type without throwing', () => {
       const ev = parseLine(JSON.stringify({ seq: '8', type: 'future.v9', data: {} }));
       assert.match(renderEvent(ev), /^8 · future\.v9 · -/);
+    });
+    it('sanitizes control chars in the event type', () => {
+      const ev = parseLine(JSON.stringify({ seq: '9', type: 'evil\x1b[2Jtype', data: {} }));
+      const line = renderEvent(ev);
+      assert.ok(!line.includes('\x1b'), 'escape must not reach the terminal');
+      assert.match(line, /^9 · evil�\[2Jtype/);
+    });
+    it('sanitizes control chars in an unavailable snapshot reason', () => {
+      const ev = parseLine(JSON.stringify({
+        seq: '10', type: 'slipstream.file.changed.v1',
+        data: { path: 'f', after: { kind: 'unavailable', reason: 'bad\x1breason' } },
+      }));
+      assert.ok(!renderEvent(ev).includes('\x1b'));
+    });
+  });
+
+  describe('sseDataLine', () => {
+    it('extracts a data: line whose payload contains a literal U+2028', () => {
+      const json = JSON.stringify({
+        seq: '3', type: 'slipstream.file.changed.v1', data: { path: 'a b', after: { kind: 'absent' } },
+      });
+      const frame = `id: 3\nevent: slipstream\ndata: ${json}`;
+      const data = sseDataLine(frame);
+      assert.equal(data, json); // not truncated/dropped at the U+2028
+      assert.match(renderEvent(parseLine(data!)), /^3 · /);
     });
   });
 

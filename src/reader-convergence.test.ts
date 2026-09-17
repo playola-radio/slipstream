@@ -7,10 +7,9 @@ import { startReaderServer } from './http-reader.ts';
 import { withFakeSession } from './test/helpers.ts';
 
 // INDEPENDENT direct-disk reader — deliberately not the production log-reader.
-function directDiskEvents(logText: string): { seq: string; type: string; obj: any }[] {
+function directDiskEvents(logText: string): { seq: string }[] {
   return logText.split('\n').filter((l) => l.length > 0).map((l) => {
-    const obj = JSON.parse(l);
-    return { seq: obj.seq, type: obj.type, obj };
+    return { seq: (JSON.parse(l) as { seq: string }).seq };
   });
 }
 
