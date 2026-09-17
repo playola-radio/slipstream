@@ -2,6 +2,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, appendFile } from 'node:fs/promises';
+import { Buffer } from 'node:buffer';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCursor, parseLine, openLogCursor, LogCorruptError } from './log-reader.ts';
@@ -92,6 +93,56 @@ describe('log-reader', () => {
 
     it('throws LogCorruptError on a genuine blank terminated line between valid records', async () => {
       const p = await logWith(line(1), '\n', line(2));
+      const cur = await openLogCursor(p, 0n);
+      await assert.rejects(() => cur.readThrough(2n), LogCorruptError);
+      await cur.close();
+    });
+
+    it('throws on a duplicate seq (1,1,2)', async () => {
+      const p = await logWith(line(1), line(1), line(2));
+      const cur = await openLogCursor(p, 0n);
+      await assert.rejects(() => cur.readThrough(2n), LogCorruptError);
+      await cur.close();
+    });
+
+    it('throws on a gap in seq (1,3)', async () => {
+      const p = await logWith(line(1), line(3));
+      const cur = await openLogCursor(p, 0n);
+      await assert.rejects(() => cur.readThrough(3n), LogCorruptError);
+      await cur.close();
+    });
+
+    it('throws on a reordered seq (1,3,2)', async () => {
+      const p = await logWith(line(1), line(3), line(2));
+      const cur = await openLogCursor(p, 0n);
+      await assert.rejects(() => cur.readThrough(3n), LogCorruptError);
+      await cur.close();
+    });
+
+    it('replays the correct contiguous suffix when after lands mid-log', async () => {
+      const p = await logWith(line(1), line(2), line(3));
+      const cur = await openLogCursor(p, 1n);
+      assert.deepEqual((await cur.readThrough(3n)).map((e) => e.seq), [2n, 3n]);
+      await cur.close();
+    });
+
+    it('returns the boundary record exactly once when stopping at it then resuming', async () => {
+      const p = await logWith(line(1), line(2), line(3));
+      const cur = await openLogCursor(p, 0n);
+      assert.deepEqual((await cur.readThrough(2n)).map((e) => e.seq), [1n, 2n]);
+      assert.deepEqual((await cur.readThrough(3n)).map((e) => e.seq), [3n]); // no false corruption
+      await cur.close();
+    });
+
+    it('throws LogCorruptError on invalid UTF-8 and does not mis-parse the next record', async () => {
+      const p = join(await mkdtemp(join(tmpdir(), 'slip-utf8-')), 'events.jsonl');
+      const corrupt = Buffer.concat([
+        Buffer.from('{"seq":"1","type":"t","data":{"path":"a'),
+        Buffer.from([0xff]),                       // raw invalid UTF-8 byte
+        Buffer.from('b"}}\n'),
+        Buffer.from('{"seq":"2","type":"t","data":{}}\n'),
+      ]);
+      await writeFile(p, corrupt);
       const cur = await openLogCursor(p, 0n);
       await assert.rejects(() => cur.readThrough(2n), LogCorruptError);
       await cur.close();

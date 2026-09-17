@@ -35,8 +35,11 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   const handle: FileHandle = await open(logPath, 'r');
   let offset = 0;          // byte offset of the next unread byte on disk
   let positioned = after === 0n; // have we skipped past `after` yet?
+  let lastSeq = after;     // highest emitted seq; enforces strict contiguity
 
-  async function readNewComplete(): Promise<{ lines: string[] }> {
+  // Byte-exact: split the complete region on the newline byte and return each
+  // line's ORIGINAL byte slice, so offsets never depend on a re-encoded string.
+  async function readNewComplete(): Promise<{ slices: Buffer[] }> {
     const chunkSize = 64 * 1024;
     const buf = Buffer.alloc(chunkSize);
     const chunks: Buffer[] = [];
@@ -50,26 +53,40 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
     }
     const all = Buffer.concat(chunks);
     const lastNl = all.lastIndexOf(0x0a);
-    if (lastNl < 0) return { lines: [] };
-    const complete = all.subarray(0, lastNl).toString('utf8');
-    return { lines: complete.split('\n') };
+    if (lastNl < 0) return { slices: [] };
+    const complete = all.subarray(0, lastNl); // bytes before the final newline
+    const slices: Buffer[] = [];
+    let start = 0;
+    for (let i = 0; i < complete.length; i++) {
+      if (complete[i] === 0x0a) { slices.push(complete.subarray(start, i)); start = i + 1; }
+    }
+    slices.push(complete.subarray(start));
+    return { slices };
   }
 
   return {
     async readThrough(boundary: bigint): Promise<ReaderEvent[]> {
       if (boundary <= after) return [];
-      const { lines } = await readNewComplete();
+      const { slices } = await readNewComplete();
+      const decoder = new TextDecoder('utf-8', { fatal: true });
       const out: ReaderEvent[] = [];
       let advance = offset;
-      for (const line of lines) {
+      for (const slice of slices) {
+        let line: string;
+        try { line = decoder.decode(slice); }
+        catch { throw new LogCorruptError('invalid UTF-8 in log record'); }
         const ev = parseLine(line);
-        const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
+        const lineBytes = slice.length + 1; // original bytes + the newline
         if (!positioned) {
           if (ev.seq <= after) { advance += lineBytes; continue; }
           positioned = true;
         }
-        if (ev.seq > boundary) break;      // stop; do not advance past boundary
+        if (ev.seq !== lastSeq + 1n) {
+          throw new LogCorruptError(`non-contiguous seq: expected ${lastSeq + 1n} got ${ev.seq}`);
+        }
+        if (ev.seq > boundary) break;      // stop; do not advance or update lastSeq
         out.push(ev);
+        lastSeq = ev.seq;
         advance += lineBytes;
       }
       offset = advance;
