@@ -201,7 +201,8 @@ left*, because fixing them is a call I do not own in Stage 1 (see CLAUDE.md,
 ## 5. Verdict
 
 **Watcher-primary capture is good enough to watch live.** Commit latency is
-low enough for live review (p99 under ~150 ms), independent of file size, and
+low enough for live review — a stable ~65–105 ms median independent of file
+size, with an occasional FSEvents-jitter tail to ~200 ms (see §1) — and
 capture is correct where it must be: no fabricated content, no phantom events,
 no lost whole changes, no reordering. Where it loses is exactly and only the
 place the design already accepts — intermediate states inside a rapid burst to a
