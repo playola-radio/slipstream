@@ -50,6 +50,7 @@ async function writeBackpressured(res: ServerResponse, chunk: string, signal: Ab
 export async function startReaderServer(opts: ReaderServerOptions): Promise<ReaderServer> {
   const token = generateToken();
   const followers = new Set<AbortController>();
+  let closing = false;
 
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);
@@ -219,7 +220,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     let cursor: LogCursor | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     try {
-      if (ac.signal.aborted || res.destroyed) return;
+      // `closing` guards the connect-during-shutdown race: the add→guard span
+      // below has no await, so a `closing` flag set in close() before its abort
+      // loop is always visible here, and this request tears down via finally
+      // instead of blocking server.close() forever in waitForAdvance.
+      if (closing || ac.signal.aborted || res.destroyed) return;
       cursor = await openLogCursor(logPath, effectiveAfter);
       if (ac.signal.aborted || res.destroyed) return;
       heartbeat = setInterval(() => { write(': heartbeat\n\n').catch(() => ac.abort()); }, SSE_HEARTBEAT_MS);
@@ -252,6 +257,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   return {
     url, port, token, descriptorPath,
     close: async () => {
+      closing = true;
       for (const ac of followers) ac.abort();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // Remove the descriptor this server published; a dead reader must not leave
