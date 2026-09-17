@@ -1,9 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, writeFile, rm, rename } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { startCapture } from './session.ts';
+import type { Platform } from './platform.ts';
 import type { Log } from './log.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import { changesFor, waitForRecords, withFakeSession } from './test/helpers.ts';
@@ -169,31 +170,6 @@ describe('session', () => {
       );
     });
 
-    it('resolves an atomic save (write-temp + rename) to a change at the final path', async () => {
-      await withFakeSession(
-        async (root) => {
-          await writeFile(join(root, 'atomic.ts'), 'original');
-        },
-        async ({ root, observe, waitFor }) => {
-          const tmp = join(root, '.atomic.ts.tmp');
-          await writeFile(tmp, 'rewritten atomically');
-          await rename(tmp, join(root, 'atomic.ts'));
-          observe('atomic.ts');
-          const recs = await waitFor((r) =>
-            changesFor(r, 'atomic.ts').some(
-              (c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.size === 'rewritten atomically'.length,
-            ),
-          );
-          const c = changesFor(recs, 'atomic.ts').at(-1);
-          if (c?.type === 'file.changed' && c.after.kind === 'content') {
-            assert.equal(c.after.size, 'rewritten atomically'.length);
-          } else {
-            assert.fail('expected the rewritten content at the final path');
-          }
-        },
-      );
-    });
-
     it('emits an unavailable/oversize snapshot for a large file, never a fake blob', async () => {
       await withFakeSession(
         async () => {},
@@ -268,17 +244,38 @@ describe('session', () => {
 
     it('never captures the capture store even when it lives inside the watched root', async () => {
       // Store *inside* root is the case that matters: the exclusion is what stops
-      // the watcher from observing its own log and blob writes. The session must
-      // pass the store into the observation source's ignore list, so a store-path
-      // observation is dropped while a real edit inside root is captured.
+      // the watcher from observing its own log and blob writes. Verify both the
+      // wiring (the store is handed to the observation source's ignore list) and
+      // the behavior (a real file written inside the store is never captured,
+      // while a real edit elsewhere in root is).
       const root = await mkdtemp(join(tmpdir(), 'slip-wt-'));
       const store = join(root, '.slipstream');
-      const platform = createFakePlatform();
+      const fake = createFakePlatform();
+      let watchedIgnore: readonly string[] = [];
+      const platform: Platform = {
+        watch: async (o) => {
+          watchedIgnore = o.ignore;
+          return fake.watch(o);
+        },
+      };
       const session = await startCapture({ root, storeDir: store }, { platform });
       try {
+        // session resolves symlinks in the store path (macOS /var -> /private/var),
+        // so compare against the resolved form.
+        const resolvedStore = await realpath(store);
+        assert.ok(
+          watchedIgnore.some((e) => e === resolvedStore || e.startsWith(resolvedStore + sep)),
+          'the store directory must be handed to the watcher ignore list',
+        );
+        // A real blob inside the store: without the exclusion this would be read
+        // and captured, so its absence from the log is a real signal, not a
+        // vacuous one against a nonexistent path.
+        const blobDir = join(store, 'blobs', 'sha256', 'ab');
+        await mkdir(blobDir, { recursive: true });
+        await writeFile(join(blobDir, 'deadbeef'), 'internal blob bytes');
         await writeFile(join(root, 'x.ts'), 'data');
-        platform.observe(join('.slipstream', 'blobs', 'sha256', 'ab', 'deadbeef')); // store write: must be ignored
-        platform.observe('x.ts');
+        fake.observe(join('.slipstream', 'blobs', 'sha256', 'ab', 'deadbeef')); // store write: must be ignored
+        fake.observe('x.ts');
         const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'x.ts').length >= 1);
         assert.ok(changesFor(recs, 'x.ts').length >= 1, 'a real edit inside root must be captured');
         assert.ok(

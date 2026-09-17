@@ -114,13 +114,9 @@ export async function withSession(
   }
 }
 
-/** The `enumerate` seam's signature, for tests that inject a scripted baseline. */
-type EnumerateFn = (
-  root: string,
-  dir: string,
-  isExcluded: (abs: string) => boolean,
-  handlers: { onFile: (rel: string) => Promise<void>; onDirError: (relDir: string) => Promise<void> },
-) => Promise<void>;
+/** The `enumerate` seam's signature, for tests that inject a scripted baseline.
+ * Derived from `startCapture` so it tracks the production dependency exactly. */
+type EnumerateFn = NonNullable<NonNullable<Parameters<typeof startCapture>[1]>['enumerate']>;
 
 /**
  * A capture session driven by the centralized {@link createFakePlatform} instead
@@ -135,7 +131,7 @@ export async function withFakeSession(
   fn: (ctx: {
     root: string;
     session: CaptureSession;
-    observe: (path: string, observedAtMs?: number) => void;
+    observe: (path: string) => void;
     waitFor: (predicate: (recs: LoggedRecord[]) => boolean) => Promise<LoggedRecord[]>;
   }) => Promise<void>,
   opts: { maxBytes?: number; enumerate?: EnumerateFn } = {},
@@ -154,7 +150,7 @@ export async function withFakeSession(
     await fn({
       root,
       session: s,
-      observe: (p, at) => platform.observe(p, at),
+      observe: (p) => platform.observe(p),
       waitFor: (predicate) => waitForRecords(s.logPath, predicate),
     });
   } finally {

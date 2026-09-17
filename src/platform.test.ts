@@ -1,32 +1,29 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFakePlatform } from './test/fake-platform.ts';
 import { describePlatformContract, type ObservationHarness } from './test/platform-contract.ts';
 
-// The fake never touches disk, but a real temp root keeps absolute-path math
-// identical to the real driver in platform.os.test.ts.
+// The fake does pure path arithmetic and synchronous delivery — no disk — so a
+// fixed absolute root is enough. The real driver in platform.os.test.ts is what
+// exercises real filesystem resources against the same contract.
+const FAKE_ROOT = join('/', 'slip-fake-root');
+
 const fakeHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<ObservationHarness> => {
-  const root = await mkdtemp(join(tmpdir(), 'slip-fake-'));
   const observations: string[] = [];
   const platform = createFakePlatform();
   const sub = await platform.watch({
-    root,
-    ignore: ignore.map((d) => join(root, d)),
+    root: FAKE_ROOT,
+    ignore: ignore.map((d) => join(FAKE_ROOT, d)),
     onObservation: (abs) => observations.push(abs),
     onError: () => {},
   });
   return {
-    root,
+    root: FAKE_ROOT,
     observations,
     mutate: async (rel) => platform.observe(rel),
     settle: async () => {},
-    close: async () => {
-      await sub.close();
-      await rm(root, { recursive: true, force: true });
-    },
+    close: async () => sub.close(),
   };
 };
 
@@ -39,6 +36,22 @@ describe('FakePlatform', () => {
     await platform.watch({ root: '/root', ignore: [], onObservation: (p, at) => observations.push([p, at]), onError: () => {} });
     platform.observe('src/a.ts', 123);
     assert.deepEqual(observations, [['/root/src/a.ts', 123]]);
+  });
+
+  it('drops an observation that resolves outside the watched root', async () => {
+    const platform = createFakePlatform();
+    const observations: string[] = [];
+    await platform.watch({ root: '/root', ignore: [], onObservation: (p) => observations.push(p), onError: () => {} });
+    platform.observe('../outside.ts');
+    assert.deepEqual(observations, [], 'the real watcher never reports a path outside root');
+  });
+
+  it('drops a "..name" file inside an ignored subtree (not just its plain children)', async () => {
+    const platform = createFakePlatform();
+    const observations: string[] = [];
+    await platform.watch({ root: '/root', ignore: ['/root/ignored'], onObservation: (p) => observations.push(p), onError: () => {} });
+    platform.observe('ignored/..notes.ts');
+    assert.deepEqual(observations, [], 'a "..notes.ts" under an ignored dir is still ignored');
   });
 
   it('routes failWith to onError as an honest coverage-gap signal', async () => {
@@ -57,8 +70,6 @@ describe('FakePlatform', () => {
     await sub.close();
     platform.observe('a.ts');
     assert.deepEqual(observations, []);
-    assert.equal(platform.closed, true);
-    assert.equal(platform.watching, false);
   });
 
   it('throws if driven before watch() so misuse is caught, not silently dropped', async () => {

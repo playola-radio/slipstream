@@ -1,4 +1,4 @@
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import type { Platform, Subscription, WatchOptions } from '../platform.ts';
 
 /**
@@ -13,23 +13,36 @@ import type { Platform, Subscription, WatchOptions } from '../platform.ts';
  * notification per write" — the exact fidelity the real watcher cannot promise
  * (FSEvents coalesces; a metadata-only change may be suppressed) — and would let
  * a test certify a capture the OS would never deliver.
+ *
+ * It mirrors two properties of the real boundary so a test cannot rely on an
+ * observation the OS would never deliver: a path resolving outside the watched
+ * root is dropped, and a path inside an ignored subtree is dropped. `ignore`
+ * entries are matched as literal directory paths, which is all `session.ts` ever
+ * passes (the store dir and `.git`); the real adapter also accepts globs, but
+ * none are used, so the fake does not model them.
  */
 export interface FakePlatform extends Platform {
-  /** Deliver an observation for `path` (relative to the watched root, or
-   *  absolute). Dropped if it falls inside an ignored subtree, matching the real
-   *  boundary. No-op after `close()`. */
+  /** Deliver an observation for `path` (relative to the watched root). Resolved
+   *  to an absolute path under root, matching the real boundary's output.
+   *  Dropped if it resolves outside root or inside an ignored subtree. No-op
+   *  after `close()`. */
   observe(path: string, observedAtMs?: number): void;
   /** Deliver an observation-source error; the session surfaces it as a gap. */
   failWith(err: Error): void;
-  readonly watching: boolean;
-  readonly closed: boolean;
+}
+
+/** A relative path escapes its base only via a leading `..` segment (or when it
+ * comes back absolute); a filename that merely starts with `..`, like
+ * `..notes.ts`, stays inside. Mirrors `escapesBase` in session.ts. */
+function escapesBase(rel: string): boolean {
+  return isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`);
 }
 
 /** `abs` is ignored when it equals or sits under any (absolute, directory) ignore entry. */
 function isIgnored(abs: string, ignore: readonly string[]): boolean {
   return ignore.some((entry) => {
     const rel = relative(entry, abs);
-    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+    return rel === '' || !escapesBase(rel);
   });
 }
 
@@ -50,7 +63,9 @@ export function createFakePlatform(): FakePlatform {
   const observe = (path: string, observedAtMs: number = Date.now()): void => {
     if (!opts) throw new Error('FakePlatform.observe called before watch()');
     if (closed) return;
-    const abs = isAbsolute(path) ? path : join(opts.root, path);
+    const abs = join(opts.root, path);
+    const rel = relative(opts.root, abs);
+    if (rel === '' || escapesBase(rel)) return; // the real watcher never reports outside root
     if (isIgnored(abs, opts.ignore)) return;
     opts.onObservation(abs, observedAtMs);
   };
@@ -61,15 +76,5 @@ export function createFakePlatform(): FakePlatform {
     opts.onError(err);
   };
 
-  return {
-    watch,
-    observe,
-    failWith,
-    get watching() {
-      return opts !== undefined && !closed;
-    },
-    get closed() {
-      return closed;
-    },
-  };
+  return { watch, observe, failWith };
 }

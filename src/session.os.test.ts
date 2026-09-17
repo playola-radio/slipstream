@@ -76,8 +76,7 @@ describe('session (real OS)', () => {
         const recs = await waitFor((r) =>
           changesFor(r, 'hot.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha),
         );
-        const changes = changesFor(recs, 'hot.ts');
-        assert.ok(changes.some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha));
+        const changes = changesFor(recs, 'hot.ts'); // waitFor already proved the endpoint landed
         // A torn read fabricating a state that was never written would be fatal.
         for (const c of changes) {
           if (c.type === 'file.changed' && c.after.kind === 'content') {
@@ -99,12 +98,9 @@ describe('session (real OS)', () => {
       async ({ root, waitFor }) => {
         const locked = join(root, 'locked');
         try {
-          const gapRecs = await waitFor((r) =>
+          // waitFor throws unless the baseline-unreadable gap for 'locked' appears.
+          await waitFor((r) =>
             r.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
-          );
-          assert.ok(
-            gapRecs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
-            'expected a baseline-unreadable gap for the locked directory',
           );
           await chmod(locked, 0o755);
           await writeFile(join(locked, 'existing.ts'), 'changed after restore');
@@ -133,13 +129,9 @@ describe('session (real OS)', () => {
         await writeFile(p, 'about to lock');
         await chmod(p, 0o000);
         try {
-          const recs = await waitFor((r) =>
+          // waitFor throws unless the unreadable snapshot is recorded.
+          await waitFor((r) =>
             changesFor(r, 'secret.ts').some(
-              (c) => c.type === 'file.changed' && c.after.kind === 'unavailable' && c.after.reason === 'unreadable',
-            ),
-          );
-          assert.ok(
-            changesFor(recs, 'secret.ts').some(
               (c) => c.type === 'file.changed' && c.after.kind === 'unavailable' && c.after.reason === 'unreadable',
             ),
           );

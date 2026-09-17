@@ -25,7 +25,7 @@ export interface ObservationHarness {
   close(): Promise<void>;
 }
 
-export type HarnessFactory = (opts: { ignore?: string[] }) => Promise<ObservationHarness>;
+type HarnessFactory = (opts: { ignore?: string[] }) => Promise<ObservationHarness>;
 
 const CONTRACT_TIMEOUT_MS = 8000;
 
@@ -49,8 +49,7 @@ export function describePlatformContract(label: string, make: HarnessFactory): v
       const h = await make({});
       try {
         await h.mutate('a.ts');
-        await waitObserved(h, 'a.ts');
-        assert.ok(isObserved(h, 'a.ts'), 'expected an absolute-path observation for a.ts');
+        await waitObserved(h, 'a.ts'); // throws if the change never surfaces under root
       } finally {
         await h.close();
       }

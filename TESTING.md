@@ -111,7 +111,9 @@ deterministic at a negligible wall-clock cost for this size.
 Boundary fixtures:
 
 - `createFakePlatform()` (`src/test/fake-platform.ts`) — the centralized fake of
-  the observation boundary: `observe(path)`, `failWith(err)`, `watching`,
-  `closed`.
+  the observation boundary: `observe(path)` delivers a notification, `failWith(err)`
+  drives an observation-source error. It resolves paths and applies the ignore
+  list the way the real watcher does, so a test cannot rely on an observation the
+  OS would never deliver.
 - `describePlatformContract(label, makeHarness)` (`src/test/platform-contract.ts`)
   — the shared contract, run against both real and fake drivers.
