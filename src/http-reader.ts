@@ -19,12 +19,31 @@ export interface ReaderServer {
 
 export const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
 
+const SSE_HEARTBEAT_MS = 15000;
+const SSE_DRAIN_DEADLINE_MS = 10000;
+
 function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {}) {
   res.writeHead(status, { 'cache-control': 'no-store', ...headers });
   res.end(body);
 }
 function sendJson(res: ServerResponse, status: number, value: unknown) {
   send(res, status, JSON.stringify(value), { 'content-type': 'application/json; charset=utf-8' });
+}
+
+function isFollow(params: URLSearchParams): boolean {
+  const v = params.get('follow');
+  return v === 'true' || v === '1';
+}
+
+async function writeBackpressured(res: ServerResponse, chunk: string, signal: AbortSignal): Promise<void> {
+  if (res.write(chunk)) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error('drain timeout')); }, SSE_DRAIN_DEADLINE_MS);
+    const onDrain = () => { cleanup(); resolve(); };
+    const onAbort = () => { cleanup(); reject(new Error('aborted')); };
+    const cleanup = () => { clearTimeout(timer); res.off('drain', onDrain); signal.removeEventListener('abort', onAbort); };
+    res.once('drain', onDrain); signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export async function startReaderServer(opts: ReaderServerOptions): Promise<ReaderServer> {
@@ -110,25 +129,61 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     const after = parseCursor(params.get('after') ?? undefined);
     if (after === null) { send(res, 400, 'invalid cursor'); return; }
 
+    // Last-Event-ID overrides after (follow only), validated the same way
+    let effectiveAfter = after;
+    const follow = isFollow(params);
+    if (follow) {
+      const leiRaw = req.headers['last-event-id'];
+      if (typeof leiRaw === 'string') {
+        const lei = parseCursor(leiRaw);
+        if (lei === null) { send(res, 400, 'invalid cursor'); return; }
+        effectiveAfter = lei;
+      }
+    }
+
     const boundary = await boundaryFor(id);
     const H = boundary.current();
-    if (after > H) {
+    if (effectiveAfter > H) {
       send(res, 409, 'cursor beyond durable high-water', { [DURABLE_SEQ_HEADER]: H.toString() });
       return;
     }
 
-    // follow handled in Task 9; this task is finite only
-    res.writeHead(200, {
-      'cache-control': 'no-store',
-      'content-type': 'application/x-ndjson; charset=utf-8',
-      [DURABLE_SEQ_HEADER]: H.toString(),
-    });
-    const cursor = await openLogCursor(logPath, after);
+    if (!follow) {
+      res.writeHead(200, {
+        'cache-control': 'no-store',
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        [DURABLE_SEQ_HEADER]: H.toString(),
+      });
+      const cursor = await openLogCursor(logPath, effectiveAfter);
+      try { for (const ev of await cursor.readThrough(H)) res.write(ev.raw + '\n'); }
+      finally { await cursor.close(); }
+      res.end();
+      return;
+    }
+
+    // follow=true: SSE, one cursor over disk bounded by the advancing durable boundary
+    res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
+    const ac = new AbortController();
+    res.on('close', () => ac.abort());
+    res.on('error', () => ac.abort());
+    const heartbeat = setInterval(() => {
+      if (!res.write(':' + ' heartbeat\n\n')) { /* let backpressure path handle */ }
+    }, SSE_HEARTBEAT_MS);
+    const cursor = await openLogCursor(logPath, effectiveAfter);
     try {
-      const events = await cursor.readThrough(H);
-      for (const ev of events) res.write(ev.raw + '\n');
-    } finally { await cursor.close(); }
-    res.end();
+      let cur = effectiveAfter;
+      for (;;) {
+        const target = boundary.current();
+        if (target > cur) {
+          for (const ev of await cursor.readThrough(target)) {
+            await writeBackpressured(res, `id: ${ev.seq}\nevent: slipstream\ndata: ${ev.raw}\n\n`, ac.signal);
+            cur = ev.seq;
+          }
+        }
+        await boundary.waitForAdvance(cur, ac.signal); // rejects on abort → exits loop
+      }
+    } catch { /* aborted or drain timeout */ }
+    finally { clearInterval(heartbeat); await cursor.close(); if (!res.writableEnded) res.destroy(); }
   }
 
   return {

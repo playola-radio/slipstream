@@ -1,10 +1,11 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
 import { createCas } from './cas.ts';
+import { createHealth } from './health.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
 
@@ -141,5 +142,74 @@ describe('http-reader blobs + schemas', () => {
     const body = (await res.json()) as { properties: { type: { const: string } } };
     assert.equal(body.properties.type.const, 'slipstream.file.changed.v1');
     assert.equal((await GET(srv, '/v1/schemas/nope.v1')).status, 404);
+  });
+});
+
+function sseEvents(text: string): { id: string; data: string }[] {
+  return text.split('\n\n').filter((f) => f.includes('data:')).map((frame) => {
+    const id = /(^|\n)id: (.*)/.exec(frame)?.[2] ?? '';
+    const data = /(^|\n)data: (.*)/.exec(frame)?.[2] ?? '';
+    return { id, data };
+  });
+}
+
+describe('http-reader SSE follow', () => {
+  it('replays then follows with one cursor: no gap, no duplicate across the seam', async () => {
+    const dir = await storeWithSession();               // has seq 1,2 on disk
+    const health = createHealth(2n);
+    const srv = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    const ac = new AbortController();
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=0&follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}` },
+      signal: ac.signal,
+    });
+    assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let acc = ''; const seen: string[] = [];
+    async function pump(until: number) {
+      while (seen.length < until) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        for (const e of sseEvents(acc)) if (e.data && !seen.includes(e.id)) seen.push(e.id);
+      }
+    }
+    await pump(2);                                       // replayed 1,2
+    // live append 3 and advance the durable boundary
+    await appendFile(join(dir, 'sessions', UUID, 'events.jsonl'),
+      JSON.stringify({ specversion:'1.0', id:'3', source:'urn:slipstream:session:'+UUID,
+        type:'slipstream.file.changed.v1', datacontenttype:'application/json', seq:'3',
+        time:'2026-01-01T00:00:00.000Z', data:{ session_id: UUID } }) + '\n');
+    health.setDurableSeq(3n);
+    await pump(3);
+    assert.deepEqual(seen, ['1', '2', '3']);            // no gap, no dup
+    ac.abort();
+    await srv.close();
+  });
+
+  it('Last-Event-ID overrides after and yields exactly the suffix', async () => {
+    const dir = await storeWithSession();
+    const health = createHealth(2n);
+    const srv = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    const ac = new AbortController();
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=0&follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}`, 'last-event-id': '1' },
+      signal: ac.signal,
+    });
+    const reader = res.body!.getReader(); const decoder = new TextDecoder();
+    let acc = ''; let firstId = '';
+    while (!firstId) {
+      const { value, done } = await reader.read(); if (done) break;
+      acc += decoder.decode(value, { stream: true });
+      firstId = sseEvents(acc)[0]?.id ?? '';
+    }
+    assert.equal(firstId, '2');                          // 1 skipped
+    ac.abort(); await srv.close();
   });
 });
