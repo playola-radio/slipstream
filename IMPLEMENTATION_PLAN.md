@@ -234,7 +234,11 @@ session identity and seq, discarding only a torn trailing record, appending
 `session.resumed` at `recovered_through_seq + 1` followed by a restart gap and
 reconciliation changes; mid-log corruption a hard error; disk-full stops
 acknowledging, health goes failing, and a single storage gap is recorded on
-recovery. Single writer is enforced by an mtime-heartbeat session lock
+recovery. Recovery establishes a durability barrier (fsync retained log +
+containing directory) over the recovered prefix before `recovered_through_seq`
+is published as durable, on the clean path as well as when truncating a torn
+tail, so a recovered seq can never advertise bytes storage did not persist.
+Single writer is enforced by an mtime-heartbeat session lock
 (`src/lock.ts`): a live owner is refused, a crash-stale lock is reclaimed, and a
 dispossessed owner detects the takeover via a per-acquisition nonce and stops
 acknowledging (health `ELOCKLOST`). A strict single-writer guarantee against

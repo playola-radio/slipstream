@@ -1,7 +1,8 @@
 import { open, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { isAbsolute } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
+import { fsyncDir } from './storage.ts';
 import { EVENT_TYPES, sourceFor, type AnyEvent, type EventType } from './event.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
@@ -238,14 +239,22 @@ export async function recoverSession(
     baselineUnknownDirs.add('');
   }
 
-  if (discardedTailBytes > 0) {
+  // A recovered seq must be a durable seq. The writer commits bytes to the page
+  // cache (writeAll) and only then fsyncs, so a crash mid-outage — exactly when
+  // recovery runs — can leave complete, valid, CAS-verified records that never
+  // reached the platter. Before recoveredThroughSeq is published as the durable
+  // high-water, force the retained prefix to disk (and truncate a torn tail in
+  // the same barrier). Without this, a clean recovery would advertise a boundary
+  // storage may not hold, and a later crash could move the sequence backwards.
+  if (keptLen > 0 || discardedTailBytes > 0) {
     const handle = await open(logPath, 'r+');
     try {
-      await handle.truncate(keptLen);
+      if (discardedTailBytes > 0) await handle.truncate(keptLen);
       await handle.sync();
     } finally {
       await handle.close();
     }
+    await fsyncDir(dirname(logPath));
   }
 
   return {
