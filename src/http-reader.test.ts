@@ -339,3 +339,26 @@ describe('http-reader SSE follow', () => {
     ac.abort(); await srv.close();
   });
 });
+
+it('returns 400 for malformed schema tokens and encoding', async () => {
+  const srv = await startReaderServer({ storeDir: await storeWithSession() });
+  try {
+    for (const type of ['%ZZ', '%E0%A4%A', 'bad%20type', '..%2Fsecret', 'bad%00type']) {
+      assert.equal((await GET(srv, `/v1/schemas/${type}`)).status, 400, type);
+    }
+  } finally { await srv.close(); }
+});
+
+it('flushes caught-up SSE headers before any event or heartbeat', async () => {
+  const srv = await startReaderServer({ storeDir: await storeWithSession() });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 1000);
+  try {
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=2&follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}` }, signal: ac.signal,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+  } finally { clearTimeout(timer); ac.abort(); await srv.close(); }
+});

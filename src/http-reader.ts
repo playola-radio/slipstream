@@ -140,7 +140,13 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     const schemaMatch = pathname.match(/^\/v1\/schemas\/([^/]+)$/);
     if (schemaMatch) {
-      const bytes = await schemaBytes(decodeURIComponent(schemaMatch[1]!));
+      let type: string;
+      try { type = decodeURIComponent(schemaMatch[1]!); }
+      catch { send(res, 400, 'invalid type'); return; }
+      if (!/^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/.test(type)) {
+        send(res, 400, 'invalid type'); return;
+      }
+      const bytes = await schemaBytes(type);
       if (!bytes) { send(res, 404, 'not found'); return; }
       send(res, 200, bytes, { 'content-type': 'application/json; charset=utf-8' });
       return;
@@ -207,6 +213,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     res.on('error', onDisconnect);
     followers.add(ac);
     res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
+    res.flushHeaders();
 
     // Serialize every write (events and heartbeats) through the bounded path so
     // an idle client that stops reading eventually hits SSE_DRAIN_DEADLINE_MS and
