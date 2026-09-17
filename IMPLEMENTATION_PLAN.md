@@ -400,3 +400,64 @@ tasks. Changing this after Stage 3 is a breaking event-type version bump.
 
 1. Should an agent's answer be allowed to edit code, when Q&A arrives?
 2. Automatic install/registration of the MCP server, skill, and hooks.
+
+---
+
+# Test-architecture refactor: the filesystem-observation boundary
+
+Date: 2026-09-17
+Status: approved to build (Brian; boundary line settled via Codex consult)
+
+## Why
+
+`session.test.ts` drives real FSEvents, so its results depend on the host OS.
+Two tests pass only on a real developer Mac: a baseline-unreadable + post-restore
+observation (fails on Linux — inotify does not re-add a watch after chmod) and an
+unavailable/unreadable transition (flaky on hosted macOS — suspected FSEvents
+mtime-suppression on chmod). No hosted CI runner faithfully reproduces a real Mac
+for permission/timing-dependent watcher behavior.
+
+## The decision (locked)
+
+Introduce ONE centralized, owner-maintained boundary — `Platform` — for
+**filesystem observation only** (the watcher seam, the sole truly
+platform-divergent surface). Everywhere else, non-boundary tests drive a single
+`FakePlatform`. Reader / enumerate / CAS / log stay **real over temp dirs** —
+they are already portable and deterministic; a whole in-memory filesystem would
+be a second filesystem to maintain just to test a filesystem observer.
+
+Honesty constraint made structural: `FakePlatform` **never auto-translates a
+filesystem mutation into an observation.** Tests deliver observations explicitly
+(`observe(path)`), because "one notification per write" is exactly the fidelity
+the real watcher cannot promise. Encoding it in the fake would make the fake more
+honest than production and let CI certify a capture the OS won't deliver.
+
+Contract discipline: shared watcher-contract assertions run against BOTH the real
+`Platform` (real-fs driver) and `FakePlatform` (controlled-observation driver).
+We share the *assertions*, not an assumption that their notification sequences
+match. Platform-capability probes ("does real FSEvents emit on chmod?") stay
+real-OS-only; fake conformance can never rescue a failing real probe.
+
+## Stage R1: Introduce the `Platform` observation boundary
+**Goal**: Extract the watcher into a documented `Platform` seam with no behavior change.
+**Success Criteria**: `src/platform.ts` exports `Platform` (`watch({root, ignore, onObservation, onError}) => Promise<{close}>`) and `createPlatform()` wrapping `@parcel/watcher`; `session.ts` depends on a `Platform` in place of the `createWatcher` seam; full suite green locally against the real Platform.
+**Tests**: existing `session.test.ts` unchanged, still green (proves the extraction is behavior-preserving).
+**Status**: Complete. `src/platform.ts` added, `src/watcher.ts` deleted, `session.ts` depends on `Platform`; typecheck clean, 71/71 green.
+
+## Stage R2: Centralized `FakePlatform` + contract tests
+**Goal**: One reusable fake of the boundary, pinned to the real one by a shared contract.
+**Success Criteria**: `src/test/fake-platform.ts` implements `Platform`, fresh per test, with controls `observe(path, atMs?)` and `failWith(err)`, and does NOT auto-observe fs mutations; a shared contract asserts subscription readiness, ignore/exclusion behavior, out-of-root filtering, and shutdown, and passes against both real (real-fs driver, `.os` tier) and fake (CI tier).
+**Tests**: `src/test/platform-contract.ts` (shared assertions); `src/platform.os.test.ts` (real driver); fake driver runs in CI tier.
+**Status**: Complete. `FakePlatform` + `platform-contract.ts` added; the shared contract asserts in-root delivery (readiness), ignore/exclusion (including `..name` children), out-of-root filtering, and post-close shutdown, and runs against both real (`platform.os.test.ts`) and fake (`platform.test.ts`) drivers, plus a few fake-only unit tests (exact path/timestamp resolution, `failWith`, before-`watch()` misuse). Typecheck clean.
+
+## Stage R3: Move deterministic session tests onto the fake; quarantine OS probes
+**Goal**: The CI tier is deterministic; every real-OS claim is isolated and honest.
+**Success Criteria**: `session.test.ts` drives observations via `FakePlatform` (deterministic, CI-safe) for the 14 logic tests (baseline dedup, create/modify/delete, empty/binary/oversize, rapid-endpoint, `..notes` path-keep, exclusion filtering, baseline-unknown before-state, unavailable propagation); the genuinely platform-dependent probes (real chmod→observation, real FSEvents delivery/coalescing/ignore-respect/rename-to-final-path, real readdir EACCES→baseline-unreadable gap) move to `session.os.test.ts`; `waitForRecords` throws on timeout instead of returning stale records at the deadline.
+**Tests**: reclassified as above; the two previously-failing tests become deterministic (fake) for their logic and honest real-OS probes for their OS claim.
+**Status**: Complete. `session.test.ts` is fake-driven; `session.os.test.ts` holds the real chmod/FSEvents/rapid-write probes; `reader.test.ts` unreadable mapping moved to the `openFile` seam; `waitForRecords` throws on timeout. 75 CI-tier + 7 OS-tier green locally.
+
+## Stage R4: Test tiering + workflow + docs
+**Goal**: CI runs the deterministic tier cross-platform; the real-OS tier is opt-in/local.
+**Success Criteria**: `npm test` runs the deterministic tier (`src/**/*.test.ts` excluding `*.os.test.ts`); `npm run test:os` runs `src/**/*.os.test.ts`; `.github/workflows/tests.yml` runs the deterministic tier on ubuntu AND macos (portability proof, resolves the red macos-only workaround); `TESTING.md` documents the two tiers, the fake, and the contract discipline.
+**Tests**: CI green on both OSes; `test:os` green locally on the Mac.
+**Status**: Complete. `package.json` scripts split the tiers via the `!(*.os)` extglob; `tests.yml` runs `npm test` on an ubuntu+macos matrix with a type-check step; `TESTING.md` documents the boundary, the fake, the contract, and the two tiers. `npm test` = 75 green, `npm run test:os` = 7 green, typecheck clean locally.

@@ -10,7 +10,7 @@ import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
 import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
-import { createWatcher, type Watcher } from './watcher.ts';
+import { createPlatform, type Platform, type Subscription } from './platform.ts';
 import type { AnyEvent, EventInput } from './event.ts';
 
 export interface CaptureOptions {
@@ -31,11 +31,11 @@ export interface CaptureSession {
 
 interface CaptureDependencies {
   createLog: typeof createLog;
-  createWatcher: typeof createWatcher;
+  platform: Platform;
   enumerate: typeof enumerate;
 }
 
-const defaultDependencies: CaptureDependencies = { createLog, createWatcher, enumerate };
+const defaultDependencies: CaptureDependencies = { createLog, platform: createPlatform(), enumerate };
 
 /** A relative path escapes its base only via a leading `..` segment (or when it
  * comes back absolute); a filename that merely starts with `..`, like
@@ -204,7 +204,7 @@ export async function startCapture(
 
   let live = false;
   const buffer: Array<[string, number]> = [];
-  const onEvent = (abs: string, observedAtMs: number): void => {
+  const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
     if (rel === '' || escapesBase(rel)) return;
@@ -361,9 +361,9 @@ export async function startCapture(
 
   // Install the watcher BEFORE enumerating so nothing that happens during the
   // scan is missed; buffered events reconcile against the baseline afterward.
-  let watcher: Watcher | undefined;
+  let subscription: Subscription | undefined;
   try {
-    watcher = await deps.createWatcher({ root, ignore: excluded, onEvent, onError });
+    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError });
 
     if (resuming) {
       await appendEvent({
@@ -427,7 +427,7 @@ export async function startCapture(
     // releasing the lock, or its next reopen could write to a log a second owner
     // has since acquired — the same ordering `stop()` relies on.
     stopped = true;
-    await watcher?.close().catch(() => {});
+    await subscription?.close().catch(() => {});
     await supervisorLoop.catch(() => {});
     await engine.drain().catch(() => {});
     await underlying.close().catch(() => {});
@@ -445,7 +445,7 @@ export async function startCapture(
     health,
     stop: async () => {
       stopped = true;
-      await watcher?.close();
+      await subscription?.close();
       // Await any in-flight recovery: it may be mid-reopen, and appending after
       // we release the lock would let a second owner's writes interleave. The
       // loop stops starting new attempts once `stopped` is set.
