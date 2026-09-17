@@ -191,6 +191,27 @@ describe('http-reader SSE follow', () => {
     await srv.close();
   });
 
+  it('close() resolves promptly even with a live SSE follower connected', async () => {
+    const dir = await storeWithSession();
+    const health = createHealth(2n);
+    const srv = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    const ac = new AbortController();
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=0&follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}` },
+      signal: ac.signal,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+    // Leave the follower open; a broken close() would hang here forever.
+    const closed = srv.close();
+    const guard = new Promise<never>((_r, reject) =>
+      setTimeout(() => reject(new Error('srv.close() hung with a live SSE follower')), 4000).unref());
+    await Promise.race([closed, guard]);
+    ac.abort();
+  });
+
   it('Last-Event-ID overrides after and yields exactly the suffix', async () => {
     const dir = await storeWithSession();
     const health = createHealth(2n);

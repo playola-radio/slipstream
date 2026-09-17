@@ -71,23 +71,28 @@ async function main(): Promise<void> {
   console.error(`slipstream: session ${session.sessionId}`);
   console.error(`slipstream: log ${session.logPath}`);
 
-  if (args.command === 'watch') {
-    console.error('slipstream: press Ctrl-C to stop');
-
-    // The active watcher subscription keeps the process alive; nothing else to do
-    // until a signal. Stop cleanly so the log's tail append and drain complete.
+  // Shared clean-shutdown wiring for both watch and serve. `teardown` runs any
+  // subsystem stop (e.g. the reader server) BEFORE capture stops, so both report
+  // cleanly and the log's tail append and drain complete.
+  const onSignal = (teardown: () => Promise<void>): void => {
     let stopping = false;
     const stop = async (): Promise<void> => {
       if (stopping) return;
       stopping = true;
+      await teardown();
       await session.stop();
       const n = await countRecords(session.logPath);
       console.error(`slipstream: stopped; ${n} record(s) committed to ${session.logPath}`);
       process.exit(0);
     };
-
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
+  };
+
+  if (args.command === 'watch') {
+    console.error('slipstream: press Ctrl-C to stop');
+    // The active watcher subscription keeps the process alive until a signal.
+    onSignal(async () => {});
     return;
   }
 
@@ -100,21 +105,8 @@ async function main(): Promise<void> {
   console.error(`slipstream: reader descriptor ${server.descriptorPath}`);
   console.error('slipstream: press Ctrl-C to stop');
 
-  // Stop accepting readers before tearing down capture, then let watch's own
-  // stop message land last so both subsystems report cleanly.
-  let stopping = false;
-  const stop = async (): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    await server.close();
-    await session.stop();
-    const n = await countRecords(session.logPath);
-    console.error(`slipstream: stopped; ${n} record(s) committed to ${session.logPath}`);
-    process.exit(0);
-  };
-
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
+  // Stop accepting readers (aborting live SSE followers) before tearing down capture.
+  onSignal(async () => { await server.close(); });
 }
 
 if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {

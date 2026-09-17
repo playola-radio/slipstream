@@ -8,7 +8,7 @@ import {
   blobPath, isValidHex, schemaBytes,
 } from './store-reader.ts';
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
-import { parseCursor, openLogCursor } from './log-reader.ts';
+import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
@@ -50,8 +50,10 @@ async function writeBackpressured(res: ServerResponse, chunk: string, signal: Ab
 export async function startReaderServer(opts: ReaderServerOptions): Promise<ReaderServer> {
   const host = opts.host ?? '127.0.0.1';
   const token = generateToken();
+  const followers = new Set<AbortController>();
 
-  const server = createServer((req, res) => { void handle(req, res).catch(() => {
+  const server = createServer((req, res) => { void handle(req, res).catch((err) => {
+    console.error('slipstream reader: request failed', err);
     if (!res.headersSent) send(res, 500, 'internal error'); else res.destroy();
   }); });
 
@@ -162,33 +164,63 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       return;
     }
 
-    // follow=true: SSE, one cursor over disk bounded by the advancing durable boundary
-    res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
+    // follow=true: SSE, one cursor over disk bounded by the advancing durable boundary.
+    // Register cancellation BEFORE acquiring any resource so a disconnect during
+    // setup drives teardown; keep the cursor and heartbeat inside one try/finally.
     const ac = new AbortController();
-    res.on('close', () => ac.abort());
-    res.on('error', () => ac.abort());
-    const heartbeat = setInterval(() => {
-      if (!res.write(':' + ' heartbeat\n\n')) { /* let backpressure path handle */ }
-    }, SSE_HEARTBEAT_MS);
-    const cursor = await openLogCursor(logPath, effectiveAfter);
+    const onDisconnect = () => ac.abort();
+    res.on('close', onDisconnect);
+    res.on('error', onDisconnect);
+    followers.add(ac);
+    res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
+
+    // Serialize every write (events and heartbeats) through the bounded path so
+    // an idle client that stops reading eventually hits SSE_DRAIN_DEADLINE_MS and
+    // is aborted, and so heartbeats never interleave with an in-flight event write.
+    let tail: Promise<void> = Promise.resolve();
+    const write = (chunk: string): Promise<void> => {
+      tail = tail.then(() => writeBackpressured(res, chunk, ac.signal));
+      return tail;
+    };
+
+    let cursor: LogCursor | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
     try {
+      if (ac.signal.aborted || res.destroyed) return;
+      cursor = await openLogCursor(logPath, effectiveAfter);
+      if (ac.signal.aborted || res.destroyed) return;
+      heartbeat = setInterval(() => { write(': heartbeat\n\n').catch(() => ac.abort()); }, SSE_HEARTBEAT_MS);
       let cur = effectiveAfter;
       for (;;) {
         const target = boundary.current();
         if (target > cur) {
           for (const ev of await cursor.readThrough(target)) {
-            await writeBackpressured(res, `id: ${ev.seq}\nevent: slipstream\ndata: ${ev.raw}\n\n`, ac.signal);
+            await write(`id: ${ev.seq}\nevent: slipstream\ndata: ${ev.raw}\n\n`);
             cur = ev.seq;
           }
+          // Durability ordering guarantees records ≤ H are fsync'd before H is
+          // published, so falling short of an advertised target is real
+          // truncation/corruption — surface it rather than busy-looping.
+          if (cur < target) throw new LogCorruptError('disk short of durable boundary');
         }
         await boundary.waitForAdvance(cur, ac.signal); // rejects on abort → exits loop
       }
-    } catch { /* aborted or drain timeout */ }
-    finally { clearInterval(heartbeat); await cursor.close(); if (!res.writableEnded) res.destroy(); }
+    } catch (err) {
+      // Corruption must not be silent (honesty). An abort/drain-timeout stays silent.
+      if (err instanceof LogCorruptError) console.error('slipstream reader: corruption in SSE follow', err);
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      if (cursor) await cursor.close();
+      followers.delete(ac);
+      if (!res.writableEnded) res.destroy();
+    }
   }
 
   return {
     url, port, token, descriptorPath,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: async () => {
+      for (const ac of followers) ac.abort();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
   };
 }
