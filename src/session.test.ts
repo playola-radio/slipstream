@@ -26,7 +26,7 @@ describe('session', () => {
           { root, storeDir: store },
           {
             createLog: async () => fakeLog,
-            createWatcher: async () => ({ close: async () => { watcherClosed = true; } }),
+            platform: { watch: async () => ({ close: async () => { watcherClosed = true; } }) },
             enumerate: async () => { throw new Error('baseline failed'); },
           },
         ),

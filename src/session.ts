@@ -5,7 +5,7 @@ import { createCas } from './cas.ts';
 import { createReader } from './reader.ts';
 import { createLog } from './log.ts';
 import { createEngine } from './engine.ts';
-import { createWatcher, type Watcher } from './watcher.ts';
+import { createPlatform, type Platform, type Subscription } from './platform.ts';
 
 export interface CaptureOptions {
   root: string;
@@ -22,11 +22,11 @@ export interface CaptureSession {
 
 interface CaptureDependencies {
   createLog: typeof createLog;
-  createWatcher: typeof createWatcher;
+  platform: Platform;
   enumerate: typeof enumerate;
 }
 
-const defaultDependencies: CaptureDependencies = { createLog, createWatcher, enumerate };
+const defaultDependencies: CaptureDependencies = { createLog, platform: createPlatform(), enumerate };
 
 /** A relative path escapes its base only via a leading `..` segment (or when it
  * comes back absolute); a filename that merely starts with `..`, like
@@ -72,7 +72,7 @@ export async function startCapture(
 
   let live = false;
   const buffer: Array<[string, number]> = [];
-  const onEvent = (abs: string, observedAtMs: number): void => {
+  const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
     if (rel === '' || escapesBase(rel)) return;
@@ -89,9 +89,9 @@ export async function startCapture(
 
   // Install the watcher BEFORE enumerating so nothing that happens during the
   // scan is missed; buffered events reconcile against the baseline afterward.
-  let watcher: Watcher | undefined;
+  let subscription: Subscription | undefined;
   try {
-    watcher = await deps.createWatcher({ root, ignore: excluded, onEvent, onError });
+    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError });
 
     await deps.enumerate(root, root, isExcluded, {
       onFile: async (rel) => engine.setBaseline(rel, await reader.read(rel)),
@@ -105,7 +105,7 @@ export async function startCapture(
       },
     });
   } catch (err) {
-    await Promise.allSettled([watcher?.close(), log.close()]);
+    await Promise.allSettled([subscription?.close(), log.close()]);
     throw err;
   }
 
@@ -121,7 +121,7 @@ export async function startCapture(
     logPath,
     blobsDir,
     stop: async () => {
-      await watcher.close();
+      await subscription.close();
       await engine.drain();
       await log.close();
     },
