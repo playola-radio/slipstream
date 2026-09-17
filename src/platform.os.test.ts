@@ -13,8 +13,12 @@ import { describePlatformContract, type ObservationHarness } from './test/platfo
 
 const realHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<ObservationHarness> => {
   // The native watcher reports realpaths; resolve the root the same way the
-  // session does so relative-path math lines up.
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'slip-os-')));
+  // session does so relative-path math lines up. `root` sits inside a scratch
+  // dir, so a `../` mutation lands outside the watched root but inside scratch
+  // and is still cleaned up.
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), 'slip-os-')));
+  const root = join(scratch, 'root');
+  await mkdir(root);
   const observations: string[] = [];
   const platform = createPlatform();
   const sub = await platform.watch({
@@ -23,6 +27,13 @@ const realHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
     onObservation: (abs) => observations.push(abs),
     onError: () => {},
   });
+  let stopped = false;
+  const stopObserving = async () => {
+    if (!stopped) {
+      stopped = true;
+      await sub.close();
+    }
+  };
   return {
     root,
     observations,
@@ -32,9 +43,10 @@ const realHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
       await writeFile(abs, `content-${Math.random()}`);
     },
     settle: async () => new Promise((r) => setTimeout(r, 250)),
+    stopObserving,
     close: async () => {
-      await sub.close();
-      await rm(root, { recursive: true, force: true });
+      await stopObserving();
+      await rm(scratch, { recursive: true, force: true });
     },
   };
 };

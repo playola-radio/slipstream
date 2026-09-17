@@ -426,7 +426,7 @@ real-OS-only; fake conformance can never rescue a failing real probe.
 **Goal**: One reusable fake of the boundary, pinned to the real one by a shared contract.
 **Success Criteria**: `src/test/fake-platform.ts` implements `Platform`, fresh per test, with controls `observe(path, atMs?)` and `failWith(err)`, and does NOT auto-observe fs mutations; a shared contract asserts subscription readiness, ignore/exclusion behavior, out-of-root filtering, and shutdown, and passes against both real (real-fs driver, `.os` tier) and fake (CI tier).
 **Tests**: `src/test/platform-contract.ts` (shared assertions); `src/platform.os.test.ts` (real driver); fake driver runs in CI tier.
-**Status**: Complete. `FakePlatform` + `platform-contract.ts` added; contract green against both real (`platform.os.test.ts`) and fake (`platform.test.ts`), plus fake unit tests. Typecheck clean.
+**Status**: Complete. `FakePlatform` + `platform-contract.ts` added; the shared contract asserts in-root delivery (readiness), ignore/exclusion (including `..name` children), out-of-root filtering, and post-close shutdown, and runs against both real (`platform.os.test.ts`) and fake (`platform.test.ts`) drivers, plus a few fake-only unit tests (exact path/timestamp resolution, `failWith`, before-`watch()` misuse). Typecheck clean.
 
 ## Stage R3: Move deterministic session tests onto the fake; quarantine OS probes
 **Goal**: The CI tier is deterministic; every real-OS claim is isolated and honest.

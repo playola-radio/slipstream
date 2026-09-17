@@ -23,6 +23,7 @@ const fakeHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
     observations,
     mutate: async (rel) => platform.observe(rel),
     settle: async () => {},
+    stopObserving: async () => sub.close(),
     close: async () => sub.close(),
   };
 };
@@ -38,22 +39,6 @@ describe('FakePlatform', () => {
     assert.deepEqual(observations, [['/root/src/a.ts', 123]]);
   });
 
-  it('drops an observation that resolves outside the watched root', async () => {
-    const platform = createFakePlatform();
-    const observations: string[] = [];
-    await platform.watch({ root: '/root', ignore: [], onObservation: (p) => observations.push(p), onError: () => {} });
-    platform.observe('../outside.ts');
-    assert.deepEqual(observations, [], 'the real watcher never reports a path outside root');
-  });
-
-  it('drops a "..name" file inside an ignored subtree (not just its plain children)', async () => {
-    const platform = createFakePlatform();
-    const observations: string[] = [];
-    await platform.watch({ root: '/root', ignore: ['/root/ignored'], onObservation: (p) => observations.push(p), onError: () => {} });
-    platform.observe('ignored/..notes.ts');
-    assert.deepEqual(observations, [], 'a "..notes.ts" under an ignored dir is still ignored');
-  });
-
   it('routes failWith to onError as an honest coverage-gap signal', async () => {
     const platform = createFakePlatform();
     const errors: Error[] = [];
@@ -61,15 +46,6 @@ describe('FakePlatform', () => {
     platform.failWith(new Error('watch lapsed'));
     assert.equal(errors.length, 1);
     assert.match(errors[0]!.message, /watch lapsed/);
-  });
-
-  it('stops delivering observations after close', async () => {
-    const platform = createFakePlatform();
-    const observations: string[] = [];
-    const sub = await platform.watch({ root: '/root', ignore: [], onObservation: (p) => observations.push(p), onError: () => {} });
-    await sub.close();
-    platform.observe('a.ts');
-    assert.deepEqual(observations, []);
   });
 
   it('throws if driven before watch() so misuse is caught, not silently dropped', async () => {
