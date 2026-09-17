@@ -36,6 +36,7 @@ function isFollow(params: URLSearchParams): boolean {
 }
 
 async function writeBackpressured(res: ServerResponse, chunk: string, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw new Error('aborted');
   if (res.write(chunk)) return;
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => { cleanup(); reject(new Error('drain timeout')); }, SSE_DRAIN_DEADLINE_MS);
