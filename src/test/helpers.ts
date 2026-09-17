@@ -13,6 +13,7 @@ import { createReader, type Reader } from '../reader.ts';
 import { createLog, type Log, type LoggedRecord } from '../log.ts';
 import { createEngine, type Engine } from '../engine.ts';
 import { startCapture, type CaptureSession } from '../session.ts';
+import { createFakePlatform } from './fake-platform.ts';
 import type { Snapshot } from '../snapshot.ts';
 
 /** Build a content snapshot for a given hash (size is incidental to these tests). */
@@ -113,6 +114,56 @@ export async function withSession(
   }
 }
 
+/** The `enumerate` seam's signature, for tests that inject a scripted baseline. */
+type EnumerateFn = (
+  root: string,
+  dir: string,
+  isExcluded: (abs: string) => boolean,
+  handlers: { onFile: (rel: string) => Promise<void>; onDirError: (relDir: string) => Promise<void> },
+) => Promise<void>;
+
+/**
+ * A capture session driven by the centralized {@link createFakePlatform} instead
+ * of real FSEvents. `setup` seeds the worktree before capture attaches (real
+ * enumerate baselines it); the test then mutates real files and calls `observe`
+ * to deliver the notification explicitly — deterministic, CI-safe, and never
+ * dependent on watcher timing. Pass `enumerate` to script the baseline scan
+ * (e.g. to simulate an unreadable directory without a real chmod).
+ */
+export async function withFakeSession(
+  setup: (root: string) => Promise<void>,
+  fn: (ctx: {
+    root: string;
+    session: CaptureSession;
+    observe: (path: string, observedAtMs?: number) => void;
+    waitFor: (predicate: (recs: LoggedRecord[]) => boolean) => Promise<LoggedRecord[]>;
+  }) => Promise<void>,
+  opts: { maxBytes?: number; enumerate?: EnumerateFn } = {},
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fwt-'));
+  const store = await mkdtemp(join(tmpdir(), 'slip-fst-'));
+  const platform = createFakePlatform();
+  let session: CaptureSession | undefined;
+  try {
+    await setup(root);
+    session = await startCapture(
+      { root, storeDir: store, maxBytes: opts.maxBytes },
+      opts.enumerate ? { platform, enumerate: opts.enumerate } : { platform },
+    );
+    const s = session;
+    await fn({
+      root,
+      session: s,
+      observe: (p, at) => platform.observe(p, at),
+      waitFor: (predicate) => waitForRecords(s.logPath, predicate),
+    });
+  } finally {
+    await session?.stop();
+    await rm(root, { recursive: true, force: true });
+    await rm(store, { recursive: true, force: true });
+  }
+}
+
 /** Returns each queued snapshot in order, one per `read()` call. */
 export function scriptedReader(snapshots: Snapshot[]): Reader {
   const queue = [...snapshots];
@@ -130,10 +181,10 @@ export async function readRecords(logPath: string): Promise<LoggedRecord[]> {
 }
 
 /**
- * Poll the log until `predicate` holds or the timeout elapses. FSEvents is
- * asynchronous, so integration tests wait on observed records rather than a
- * fixed sleep. Returns whatever records exist at the deadline so callers get a
- * meaningful assertion failure instead of a bare timeout.
+ * Poll the log until `predicate` holds, then return the matching records. If the
+ * timeout elapses first this THROWS with the records last seen — a predicate that
+ * never holds is a real failure, and returning stale records at the deadline
+ * would let it masquerade as a pass.
  */
 const WAIT_TIMEOUT_MS = 8000;
 
@@ -145,7 +196,11 @@ export async function waitForRecords(
   for (;;) {
     const recs = await readRecords(logPath);
     if (predicate(recs)) return recs;
-    if (Date.now() > deadline) return recs;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `waitForRecords timed out after ${WAIT_TIMEOUT_MS}ms; last saw ${recs.length} record(s): ${JSON.stringify(recs)}`,
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }

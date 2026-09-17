@@ -1,14 +1,17 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile, rm, rename, chmod } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startCapture } from './session.ts';
 import type { Log } from './log.ts';
-import { changesFor, waitForRecords, withSession } from './test/helpers.ts';
+import { createFakePlatform } from './test/fake-platform.ts';
+import { changesFor, waitForRecords, withFakeSession } from './test/helpers.ts';
 
-const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+// The deterministic tier: capture logic driven by the centralized FakePlatform.
+// Every observation is delivered explicitly via `observe`, so nothing here
+// depends on real FSEvents timing or permission enforcement. The genuinely
+// platform-dependent claims live in session.os.test.ts (the real-OS tier).
 
 describe('session', () => {
   it('closes the watcher and log when baseline startup throws', async () => {
@@ -42,55 +45,53 @@ describe('session', () => {
 
   describe('baseline', () => {
     it('does not report pre-existing content in a dirty worktree as a new edit', async () => {
-      await withSession(
+      await withFakeSession(
         async (root) => {
           await writeFile(join(root, 'existing.ts'), 'already here before attach');
         },
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           // Touch a different file to get a definite event, then assert the
           // pre-existing file produced no change record.
           await writeFile(join(root, 'trigger.ts'), 'new');
+          observe('trigger.ts');
           const recs = await waitFor((r) => changesFor(r, 'trigger.ts').length >= 1);
           assert.equal(changesFor(recs, 'existing.ts').length, 0);
         },
       );
     });
 
-    it('records a baseline-unreadable gap and never fabricates absent for a file under it', async () => {
-      await withSession(
+    it('never fabricates absent for a file whose baseline directory was unreadable', async () => {
+      await withFakeSession(
         async (root) => {
-          const locked = join(root, 'locked');
-          await mkdir(locked);
-          await writeFile(join(locked, 'existing.ts'), 'pre-existing'); // baselined? no — dir is locked
-          await chmod(locked, 0o000); // unreadable when the baseline scan reaches it
+          await mkdir(join(root, 'locked'));
+          await writeFile(join(root, 'locked', 'existing.ts'), 'pre-existing');
         },
-        async ({ root, waitFor }) => {
-          const locked = join(root, 'locked');
-          try {
-            // The scan discloses the incomplete baseline as a gap...
-            const gapRecs = await waitFor((r) =>
-              r.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
-            );
-            assert.ok(
-              gapRecs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
-              'expected a baseline-unreadable gap for the locked directory',
-            );
-            // ...and once the file becomes observable and changes, its prior
-            // state is honestly unknown, never a fabricated "absent" that would
-            // imply the pre-existing file was newly created.
-            await chmod(locked, 0o755);
-            await writeFile(join(locked, 'existing.ts'), 'changed after restore');
-            const recs = await waitFor((r) => changesFor(r, join('locked', 'existing.ts')).length >= 1);
-            const [c] = changesFor(recs, join('locked', 'existing.ts'));
-            assert.equal(c?.type, 'file.changed');
-            if (c?.type === 'file.changed') {
-              assert.equal(c.before.kind, 'unavailable');
-              if (c.before.kind === 'unavailable') assert.equal(c.before.reason, 'baseline-unknown');
-              assert.equal(c.after.kind, 'content');
-            }
-          } finally {
-            await chmod(locked, 0o755); // restore so cleanup can remove it
+        async ({ root, observe, waitFor }) => {
+          const rel = join('locked', 'existing.ts');
+          await writeFile(join(root, 'locked', 'existing.ts'), 'changed after restore');
+          observe(rel);
+          const recs = await waitFor((r) => changesFor(r, rel).length >= 1);
+          // The incomplete baseline is disclosed as a gap...
+          assert.ok(
+            recs.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
+            'expected a baseline-unreadable gap for the locked directory',
+          );
+          // ...and the later change carries an honest unavailable/baseline-unknown
+          // before-state, never a fabricated absent implying a brand-new file.
+          const [c] = changesFor(recs, rel);
+          assert.equal(c?.type, 'file.changed');
+          if (c?.type === 'file.changed') {
+            assert.equal(c.before.kind, 'unavailable');
+            if (c.before.kind === 'unavailable') assert.equal(c.before.reason, 'baseline-unknown');
+            assert.equal(c.after.kind, 'content');
           }
+        },
+        {
+          // Simulate an unreadable 'locked' dir deterministically — no chmod, so
+          // this holds even when the suite runs as root.
+          enumerate: async (_root, _dir, _isExcluded, handlers) => {
+            await handlers.onDirError('locked');
+          },
         },
       );
     });
@@ -98,10 +99,11 @@ describe('session', () => {
 
   describe('capture', () => {
     it('emits absent -> content when a file is created', async () => {
-      await withSession(
+      await withFakeSession(
         async () => {},
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           await writeFile(join(root, 'created.ts'), 'hello world');
+          observe('created.ts');
           const recs = await waitFor((r) => changesFor(r, 'created.ts').length >= 1);
           const [c] = changesFor(recs, 'created.ts');
           assert.equal(c?.type, 'file.changed');
@@ -114,12 +116,13 @@ describe('session', () => {
     });
 
     it('emits content -> content with the new bytes when a baselined file is modified', async () => {
-      await withSession(
+      await withFakeSession(
         async (root) => {
           await writeFile(join(root, 'f.ts'), 'v1');
         },
-        async ({ root, session, waitFor }) => {
+        async ({ root, session, observe, waitFor }) => {
           await writeFile(join(root, 'f.ts'), 'v2-changed');
+          observe('f.ts');
           const recs = await waitFor((r) => changesFor(r, 'f.ts').length >= 1);
           const [c] = changesFor(recs, 'f.ts');
           if (c?.type === 'file.changed' && c.after.kind === 'content') {
@@ -133,12 +136,13 @@ describe('session', () => {
     });
 
     it('emits content -> absent when a file is deleted', async () => {
-      await withSession(
+      await withFakeSession(
         async (root) => {
           await writeFile(join(root, 'doomed.ts'), 'bye');
         },
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           await rm(join(root, 'doomed.ts'));
+          observe('doomed.ts');
           const recs = await waitFor((r) =>
             changesFor(r, 'doomed.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'absent'),
           );
@@ -150,10 +154,11 @@ describe('session', () => {
     });
 
     it('captures an empty file as a zero-byte content snapshot, not absent', async () => {
-      await withSession(
+      await withFakeSession(
         async () => {},
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           await writeFile(join(root, 'empty.ts'), '');
+          observe('empty.ts');
           const recs = await waitFor((r) => changesFor(r, 'empty.ts').length >= 1);
           const [c] = changesFor(recs, 'empty.ts');
           if (c?.type === 'file.changed') {
@@ -165,14 +170,15 @@ describe('session', () => {
     });
 
     it('resolves an atomic save (write-temp + rename) to a change at the final path', async () => {
-      await withSession(
+      await withFakeSession(
         async (root) => {
           await writeFile(join(root, 'atomic.ts'), 'original');
         },
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           const tmp = join(root, '.atomic.ts.tmp');
           await writeFile(tmp, 'rewritten atomically');
           await rename(tmp, join(root, 'atomic.ts'));
+          observe('atomic.ts');
           const recs = await waitFor((r) =>
             changesFor(r, 'atomic.ts').some(
               (c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.size === 'rewritten atomically'.length,
@@ -189,10 +195,11 @@ describe('session', () => {
     });
 
     it('emits an unavailable/oversize snapshot for a large file, never a fake blob', async () => {
-      await withSession(
+      await withFakeSession(
         async () => {},
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           await writeFile(join(root, 'big.ts'), Buffer.alloc(64, 1));
+          observe('big.ts');
           const recs = await waitFor((r) => changesFor(r, 'big.ts').length >= 1);
           const [c] = changesFor(recs, 'big.ts');
           if (c?.type === 'file.changed') {
@@ -206,40 +213,13 @@ describe('session', () => {
       );
     });
 
-    it('captures the correct endpoint under rapid writes and never a state that never existed', async () => {
-      await withSession(
-        async (root) => {
-          await writeFile(join(root, 'hot.ts'), 'v0');
-        },
-        async ({ root, waitFor }) => {
-          const writtenShas = new Set<string>([sha('v0')]);
-          for (let i = 1; i <= 25; i++) {
-            const body = `version-${i}`;
-            writtenShas.add(sha(body));
-            await writeFile(join(root, 'hot.ts'), body);
-          }
-          const endpointSha = sha('version-25');
-          const recs = await waitFor((r) =>
-            changesFor(r, 'hot.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha),
-          );
-          const changes = changesFor(recs, 'hot.ts');
-          assert.ok(changes.some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha));
-          // A torn read fabricating a state that was never written would be fatal.
-          for (const c of changes) {
-            if (c.type === 'file.changed' && c.after.kind === 'content') {
-              assert.ok(writtenShas.has(c.after.sha256), `recorded a state that was never written: ${c.after.sha256}`);
-            }
-          }
-        },
-      );
-    });
-
     it('captures a binary file verbatim', async () => {
       const bytes = Buffer.from([0, 1, 2, 253, 254, 255, 0, 128]);
-      await withSession(
+      await withFakeSession(
         async () => {},
-        async ({ root, session, waitFor }) => {
+        async ({ root, session, observe, waitFor }) => {
           await writeFile(join(root, 'blob.bin'), bytes);
+          observe('blob.bin');
           const recs = await waitFor((r) => changesFor(r, 'blob.bin').length >= 1);
           const [c] = changesFor(recs, 'blob.bin');
           if (c?.type === 'file.changed' && c.after.kind === 'content') {
@@ -253,37 +233,13 @@ describe('session', () => {
     });
 
     it('captures a file whose name merely starts with ".." rather than dropping it as an escape', async () => {
-      await withSession(
+      await withFakeSession(
         async () => {},
-        async ({ root, waitFor }) => {
+        async ({ root, observe, waitFor }) => {
           await writeFile(join(root, '..notes.ts'), 'kept');
+          observe('..notes.ts');
           const recs = await waitFor((r) => changesFor(r, '..notes.ts').length >= 1);
           assert.ok(changesFor(recs, '..notes.ts').length >= 1, 'a "..notes.ts" file must still be captured');
-        },
-      );
-    });
-
-    it('emits an unavailable/unreadable snapshot when a file becomes unreadable', async () => {
-      await withSession(
-        async (root) => {
-          await writeFile(join(root, 'secret.ts'), 'readable');
-        },
-        async ({ root, waitFor }) => {
-          const p = join(root, 'secret.ts');
-          await writeFile(p, 'about to lock');
-          await chmod(p, 0o000);
-          try {
-            const recs = await waitFor((r) =>
-              changesFor(r, 'secret.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'unavailable'),
-            );
-            assert.ok(
-              changesFor(recs, 'secret.ts').some(
-                (c) => c.type === 'file.changed' && c.after.kind === 'unavailable' && c.after.reason === 'unreadable',
-              ),
-            );
-          } finally {
-            await chmod(p, 0o644);
-          }
         },
       );
     });
@@ -311,18 +267,20 @@ describe('session', () => {
     });
 
     it('never captures the capture store even when it lives inside the watched root', async () => {
-      // Store *inside* root is the case that matters: the exclusion is what
-      // stops the watcher from observing its own log and blob writes. A store
-      // outside root would pass trivially.
+      // Store *inside* root is the case that matters: the exclusion is what stops
+      // the watcher from observing its own log and blob writes. The session must
+      // pass the store into the observation source's ignore list, so a store-path
+      // observation is dropped while a real edit inside root is captured.
       const root = await mkdtemp(join(tmpdir(), 'slip-wt-'));
       const store = join(root, '.slipstream');
-      const session = await startCapture({ root, storeDir: store });
+      const platform = createFakePlatform();
+      const session = await startCapture({ root, storeDir: store }, { platform });
       try {
         await writeFile(join(root, 'x.ts'), 'data');
+        platform.observe(join('.slipstream', 'blobs', 'sha256', 'ab', 'deadbeef')); // store write: must be ignored
+        platform.observe('x.ts');
         const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'x.ts').length >= 1);
-        // The real edit is captured...
         assert.ok(changesFor(recs, 'x.ts').length >= 1, 'a real edit inside root must be captured');
-        // ...and the store's own writes (log + blobs) never appear as changes.
         assert.ok(
           recs.every((r) => !r.path.startsWith('.slipstream')),
           'no record may reference a path inside the capture store',

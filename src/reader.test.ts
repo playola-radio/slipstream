@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, open, writeFile, symlink, chmod } from 'node:fs/promises';
+import { mkdir, open, writeFile, symlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { isStableAcross } from './reader.ts';
@@ -103,17 +103,23 @@ describe('reader', () => {
       );
     });
 
-    it('reads an unreadable file as unavailable/unreadable', async () => {
-      await withReader(async ({ root, read }) => {
-        const p = join(root, 'locked.txt');
-        await writeFile(p, 'nope');
-        await chmod(p, 0o000);
-        try {
+    it('maps an EACCES open to unavailable/unreadable', async () => {
+      // Deterministic at the openFile seam — no real chmod, so this holds even
+      // when the suite runs as root. Real permission enforcement is proven by the
+      // real-OS tier (session.os.test.ts).
+      await withReader(
+        async ({ root, read }) => {
+          await writeFile(join(root, 'locked.txt'), 'nope');
           assert.deepEqual(await read('locked.txt'), { kind: 'unavailable', reason: 'unreadable' });
-        } finally {
-          await chmod(p, 0o644);
-        }
-      });
+        },
+        {
+          openFile: async () => {
+            const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+            err.code = 'EACCES';
+            throw err;
+          },
+        },
+      );
     });
   });
 
