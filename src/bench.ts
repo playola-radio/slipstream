@@ -12,7 +12,8 @@
 import { mkdtemp, readFile, rm, writeFile, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { startCapture, type CaptureSession } from './session.ts';
 import type { LoggedRecord } from './log.ts';
 import { categorize, type ObservedState, type RecordState, type TraceStep } from './loss.ts';
@@ -28,11 +29,12 @@ export function percentile(sorted: number[], p: number): number {
 }
 
 const sha = (b: Buffer | string) => createHash('sha256').update(b).digest('hex');
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-async function readRecords(logPath: string): Promise<LoggedRecord[]> {
+export async function readBenchRecords(logPath: string): Promise<LoggedRecord[]> {
   const text = await readFile(logPath, 'utf8').catch(() => '');
-  return text
+  const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+  return complete
     .split('\n')
     .filter((l) => l.length > 0)
     .map((l) => JSON.parse(l) as LoggedRecord);
@@ -44,7 +46,7 @@ async function waitFor(
 ): Promise<LoggedRecord[]> {
   const deadline = Date.now() + BENCH_WAIT_TIMEOUT_MS;
   for (;;) {
-    const recs = await readRecords(logPath);
+    const recs = await readBenchRecords(logPath);
     if (predicate(recs)) return recs;
     if (Date.now() > deadline) return recs;
     await sleep(10);
@@ -236,18 +238,13 @@ async function runLoss(): Promise<void> {
       trace.push(...steps);
       await sleep(150); // let the watcher settle between scenarios
     }
-    // Let FSEvents finish delivering: wait until the log stops growing.
-    let prev = -1;
-    for (let i = 0; i < 50; i++) {
-      const recs = await readRecords(session.logPath);
-      if (recs.length === prev) break;
-      prev = recs.length;
-      await sleep(100);
-    }
+    // Let FSEvents finish delivering: require a sustained quiet window before
+    // unsubscribing so a valid trailing event is not cut off.
+    await waitForSettled(() => readBenchRecords(session.logPath));
     // stop() unsubscribes the watcher and drains in-flight engine work before
     // the log closes, so the log read afterward reflects every committed record.
     await session.stop();
-    raw = await readRecords(session.logPath);
+    raw = await readBenchRecords(session.logPath);
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(store, { recursive: true, force: true });
@@ -302,4 +299,30 @@ async function main(): Promise<void> {
   console.log('');
 }
 
-await main();
+const SETTLE_QUIET_MS = 500;
+const SETTLE_POLL_MS = 100;
+
+export async function waitForSettled(
+  read: () => Promise<unknown[]>,
+  wait: (ms: number) => Promise<void> = sleep,
+  now: () => number = Date.now,
+): Promise<void> {
+  let previousLength = -1;
+  let lastChange = now();
+  while (now() - lastChange < SETTLE_QUIET_MS) {
+    const records = await read();
+    if (records.length !== previousLength) {
+      previousLength = records.length;
+      lastChange = now();
+    }
+    await wait(SETTLE_POLL_MS);
+  }
+}
+
+export function isExecutedEntrypoint(moduleUrl: string, argvPath: string): boolean {
+  return moduleUrl === pathToFileURL(resolve(argvPath)).href;
+}
+
+if (process.argv[1] && isExecutedEntrypoint(import.meta.url, process.argv[1])) {
+  await main();
+}

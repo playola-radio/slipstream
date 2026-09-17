@@ -78,12 +78,11 @@ export function categorize(trace: TraceStep[], records: RecordState[]): LossRepo
     const recAll = (recordsByPath.get(path) ?? []).map((r) => key(r.after));
     const recValid = recAll.filter((k) => validKeys.has(k));
 
-    report.endpointWrong += recAll.length - recValid.length;
-
     if (traceStates.length === 0) {
       report.phantom += recAll.length;
       continue;
     }
+    report.endpointWrong += recAll.length - recValid.length;
     if (recValid.length === 0) {
       report.wholeChangeLost += 1;
       continue;

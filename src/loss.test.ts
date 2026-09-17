@@ -46,6 +46,7 @@ describe('loss', () => {
     it('counts a record for a path that never changed as a phantom', () => {
       const r = categorize([], [{ path: 'never', after: c('x') }]);
       assert.equal(r.phantom, 1);
+      assert.equal(r.endpointWrong, 0);
     });
 
     it('counts records in an order the trace never produced as ordering-wrong', () => {

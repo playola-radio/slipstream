@@ -1,4 +1,5 @@
-import { lstat, open } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Cas } from './cas.ts';
 import type { Snapshot } from './snapshot.ts';
@@ -32,6 +33,7 @@ export interface ReaderOptions {
   root: string;
   cas: Cas;
   maxBytes?: number;
+  openFile?: (path: string, flags: number) => Promise<FileHandle>;
 }
 
 const STABILITY_RETRIES = 3;
@@ -39,6 +41,7 @@ const STABILITY_RETRIES = 3;
 export function createReader(opts: ReaderOptions): Reader {
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const retries = STABILITY_RETRIES;
+  const openFile = opts.openFile ?? open;
 
   const read = async (relPath: string): Promise<Snapshot> => {
     const abs = join(opts.root, relPath);
@@ -58,7 +61,7 @@ export function createReader(opts: ReaderOptions): Reader {
 
       let handle;
       try {
-        handle = await open(abs, 'r');
+        handle = await openFile(abs, constants.O_RDONLY | constants.O_NONBLOCK);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'ENOENT') return { kind: 'absent' };
@@ -67,12 +70,23 @@ export function createReader(opts: ReaderOptions): Reader {
       }
 
       try {
-        const bytes = await handle.readFile();
+        const opened = await handle.stat();
+        if (!opened.isFile()) return { kind: 'absent' };
+        if (opened.size > maxBytes) return { kind: 'unavailable', reason: 'oversize' };
+
+        const bytes = Buffer.alloc(opened.size);
+        let offset = 0;
+        while (offset < bytes.length) {
+          const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
         const st = await handle.stat();
+        if (st.size > maxBytes) return { kind: 'unavailable', reason: 'oversize' };
         if (!isStableAcross(before, { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs })) {
           continue; // torn read; re-observe from a fresh stat
         }
-        const ref = await opts.cas.put(bytes);
+        const ref = await opts.cas.put(bytes.subarray(0, offset));
         return { kind: 'content', sha256: ref.sha256, size: ref.size };
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;

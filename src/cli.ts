@@ -8,6 +8,7 @@
  */
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { startCapture } from './session.ts';
 
 interface Args {
@@ -15,14 +16,18 @@ interface Args {
   store: string;
 }
 
-function parseArgs(argv: string[]): Args | null {
+export function parseArgs(argv: string[]): Args | null {
   if (argv[0] !== 'watch') return null;
   let dir = process.cwd();
   let store: string | undefined;
   const rest = argv.slice(1);
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
-    if (arg === '--store') store = resolve(rest[++i] ?? '');
+    if (arg === '--store') {
+      const value = rest[++i];
+      if (value === undefined || value.startsWith('--')) return null;
+      store = resolve(value);
+    }
     else if (!arg.startsWith('--')) dir = resolve(arg);
   }
   return { dir, store: store ?? resolve(dir, '.slipstream') };
@@ -63,4 +68,6 @@ async function main(): Promise<void> {
   process.on('SIGTERM', stop);
 }
 
-await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await main();
+}

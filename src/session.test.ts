@@ -5,11 +5,41 @@ import { mkdir, mkdtemp, readFile, writeFile, rm, rename, chmod } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startCapture } from './session.ts';
+import type { Log } from './log.ts';
 import { changesFor, waitForRecords, withSession } from './test/helpers.ts';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 describe('session', () => {
+  it('closes the watcher and log when baseline startup throws', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'slip-wt-'));
+    const store = await mkdtemp(join(tmpdir(), 'slip-st-'));
+    let watcherClosed = false;
+    let logClosed = false;
+    const fakeLog: Log = {
+      append: async () => {},
+      close: async () => { logClosed = true; },
+    };
+    try {
+      await assert.rejects(
+        startCapture(
+          { root, storeDir: store },
+          {
+            createLog: async () => fakeLog,
+            createWatcher: async () => ({ close: async () => { watcherClosed = true; } }),
+            enumerate: async () => { throw new Error('baseline failed'); },
+          },
+        ),
+        /baseline failed/,
+      );
+      assert.equal(watcherClosed, true);
+      assert.equal(logClosed, true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(store, { recursive: true, force: true });
+    }
+  });
+
   describe('baseline', () => {
     it('does not report pre-existing content in a dirty worktree as a new edit', async () => {
       await withSession(
@@ -260,6 +290,26 @@ describe('session', () => {
   });
 
   describe('exclusions', () => {
+    it('rejects a store directory that equals the watched root', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'slip-wt-'));
+      try {
+        await assert.rejects(startCapture({ root, storeDir: root }), /store directory.*watched root/i);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a store directory that contains the watched root', async () => {
+      const store = await mkdtemp(join(tmpdir(), 'slip-st-'));
+      const root = join(store, 'worktree');
+      await mkdir(root);
+      try {
+        await assert.rejects(startCapture({ root, storeDir: store }), /store directory.*watched root/i);
+      } finally {
+        await rm(store, { recursive: true, force: true });
+      }
+    });
+
     it('never captures the capture store even when it lives inside the watched root', async () => {
       // Store *inside* root is the case that matters: the exclusion is what
       // stops the watcher from observing its own log and blob writes. A store

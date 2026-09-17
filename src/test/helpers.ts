@@ -5,7 +5,7 @@
  * injected seam — the engine's `Reader` — for deterministic unit tests. See
  * TESTING.md for the full policy on where we do and do not mock.
  */
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCas, type Cas } from '../cas.ts';
@@ -36,13 +36,13 @@ export async function withCas(fn: (cas: Cas) => Promise<void>): Promise<void> {
 /** A reader over a throwaway worktree with its own throwaway blob store. */
 export async function withReader(
   fn: (ctx: { root: string; cas: Cas; read: Reader['read'] }) => Promise<void>,
-  opts: { maxBytes?: number } = {},
+  opts: { maxBytes?: number; openFile?: (path: string, flags: number) => Promise<FileHandle> } = {},
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'slip-root-'));
   const store = await mkdtemp(join(tmpdir(), 'slip-store-'));
   try {
     const cas = await createCas(store);
-    const reader = createReader({ root, cas, maxBytes: opts.maxBytes });
+    const reader = createReader({ root, cas, maxBytes: opts.maxBytes, openFile: opts.openFile ?? open });
     await fn({ root, cas, read: (p) => reader.read(p) });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -122,7 +122,8 @@ export function scriptedReader(snapshots: Snapshot[]): Reader {
 /** Parse a JSONL event log into records (empty if the file does not exist). */
 export async function readRecords(logPath: string): Promise<LoggedRecord[]> {
   const text = await readFile(logPath, 'utf8').catch(() => '');
-  return text
+  const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+  return complete
     .split('\n')
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as LoggedRecord);

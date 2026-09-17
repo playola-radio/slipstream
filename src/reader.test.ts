@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, symlink, chmod } from 'node:fs/promises';
+import { mkdir, open, writeFile, symlink, chmod } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { isStableAcross } from './reader.ts';
 import { withReader } from './test/helpers.ts';
@@ -65,6 +66,40 @@ describe('reader', () => {
           assert.deepEqual(await read('big.txt'), { kind: 'unavailable', reason: 'oversize' });
         },
         { maxBytes: 10 },
+      );
+    });
+
+    it('rejects a file that grows over the limit after the path lstat', async () => {
+      await withReader(
+        async ({ root, read }) => {
+          const path = join(root, 'growing.txt');
+          await writeFile(path, 'small');
+          assert.deepEqual(await read('growing.txt'), { kind: 'unavailable', reason: 'oversize' });
+        },
+        {
+          maxBytes: 5,
+          openFile: async (path, flags) => {
+            await writeFile(path, 'now too large');
+            return open(path, flags);
+          },
+        },
+      );
+    });
+
+    it('opens nonblocking and rejects a non-file swapped in after lstat', async () => {
+      await withReader(
+        async ({ root, read }) => {
+          const path = join(root, 'swapped');
+          await writeFile(path, 'file');
+          assert.deepEqual(await read('swapped'), { kind: 'absent' });
+        },
+        {
+          openFile: async (path, flags) => {
+            assert.notEqual(flags & constants.O_NONBLOCK, 0);
+            await mkdir(`${path}-directory`);
+            return open(`${path}-directory`, flags);
+          },
+        },
       );
     });
 

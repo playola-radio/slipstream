@@ -1,13 +1,23 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { createLog, writeAll } from './log.ts';
-import { withLog, withTempDir } from './test/helpers.ts';
+import { readRecords, withLog, withTempDir } from './test/helpers.ts';
 
 const gap = (path: string, observed_at_ms: number) =>
   ({ type: 'capture.gap', path, reason: 'coalesced', observed_at_ms }) as const;
 
 describe('log', () => {
+  it('ignores an incomplete trailing JSONL record while it is being appended', async () => {
+    await withTempDir(async (dir) => {
+      const path = join(dir, 'events.jsonl');
+      const complete = { type: 'capture.gap', path: '', reason: 'watcher-error', observed_at_ms: 1, committed_at_ms: 2 };
+      await writeFile(path, `${JSON.stringify(complete)}\n{"type":"file.changed"`);
+      assert.deepEqual(await readRecords(path), [complete]);
+    });
+  });
+
   describe('append', () => {
     it('writes one JSON object per line', async () => {
       await withLog(async ({ log, read }) => {
