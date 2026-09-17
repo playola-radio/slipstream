@@ -8,10 +8,15 @@ on:
 
 jobs:
   test:
-    # Slipstream's capture path is FSEvents (@parcel/watcher) and it runs on the
-    # developer's Mac via Conductor, so CI validates on macOS. inotify has
-    # different watch semantics that Stage 1 does not yet target.
-    runs-on: macos-latest
+    # The deterministic tier (`npm test`) drives capture through FakePlatform, so
+    # it does not depend on FSEvents timing or permission enforcement and runs
+    # honestly on both platforms. Running both proves portability. The real-OS
+    # tier (`npm run test:os`) needs real FSEvents and runs on a developer Mac.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out repository
@@ -25,6 +30,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
 
       - name: Run tests
         run: npm test

@@ -432,10 +432,10 @@ real-OS-only; fake conformance can never rescue a failing real probe.
 **Goal**: The CI tier is deterministic; every real-OS claim is isolated and honest.
 **Success Criteria**: `session.test.ts` drives observations via `FakePlatform` (deterministic, CI-safe) for the 14 logic tests (baseline dedup, create/modify/delete, empty/binary/oversize, rapid-endpoint, `..notes` path-keep, exclusion filtering, baseline-unknown before-state, unavailable propagation); the genuinely platform-dependent probes (real chmod→observation, real FSEvents delivery/coalescing/ignore-respect/rename-to-final-path, real readdir EACCES→baseline-unreadable gap) move to `session.os.test.ts`; `waitForRecords` throws on timeout instead of returning stale records at the deadline.
 **Tests**: reclassified as above; the two previously-failing tests become deterministic (fake) for their logic and honest real-OS probes for their OS claim.
-**Status**: Not Started
+**Status**: Complete. `session.test.ts` is fake-driven; `session.os.test.ts` holds the real chmod/FSEvents/rapid-write probes; `reader.test.ts` unreadable mapping moved to the `openFile` seam; `waitForRecords` throws on timeout. 75 CI-tier + 7 OS-tier green locally.
 
 ## Stage R4: Test tiering + workflow + docs
 **Goal**: CI runs the deterministic tier cross-platform; the real-OS tier is opt-in/local.
 **Success Criteria**: `npm test` runs the deterministic tier (`src/**/*.test.ts` excluding `*.os.test.ts`); `npm run test:os` runs `src/**/*.os.test.ts`; `.github/workflows/tests.yml` runs the deterministic tier on ubuntu AND macos (portability proof, resolves the red macos-only workaround); `TESTING.md` documents the two tiers, the fake, and the contract discipline.
 **Tests**: CI green on both OSes; `test:os` green locally on the Mac.
-**Status**: Not Started
+**Status**: Complete. `package.json` scripts split the tiers via the `!(*.os)` extglob; `tests.yml` runs `npm test` on an ubuntu+macos matrix with a type-check step; `TESTING.md` documents the boundary, the fake, the contract, and the two tiers. `npm test` = 75 green, `npm run test:os` = 7 green, typecheck clean locally.
