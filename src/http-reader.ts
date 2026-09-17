@@ -74,7 +74,16 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     if (pathname === '/v1/sessions') {
       const sessions = await listSessions(opts.storeDir);
-      sendJson(res, 200, sessions.map((s) => ({ id: s.id, durable_seq: s.durableSeq.toString(), removed: s.removed })));
+      const activeId = opts.active?.id;
+      // The active session's authoritative durable high-water is its health
+      // boundary, not the disk-derived value (a written-but-not-yet-committed
+      // record would otherwise advertise H+1 while /events still uses H).
+      const activeH = opts.active ? liveBoundary(opts.active.health).current() : 0n;
+      sendJson(res, 200, sessions.map((s) => ({
+        id: s.id,
+        durable_seq: (s.id === activeId ? activeH : s.durableSeq).toString(),
+        removed: s.removed,
+      })));
       return;
     }
     const eventsMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/events$/);
@@ -152,14 +161,18 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     }
 
     if (!follow) {
+      // Read (and detect corruption) BEFORE the 200 so a LogCorruptError becomes
+      // a clean 500 via the top-level handler, never a 200 with a truncated body.
+      const cursor = await openLogCursor(logPath, effectiveAfter);
+      let events: Awaited<ReturnType<typeof cursor.readThrough>>;
+      try { events = await cursor.readThrough(H); }
+      finally { await cursor.close(); }
       res.writeHead(200, {
         'cache-control': 'no-store',
         'content-type': 'application/x-ndjson; charset=utf-8',
         [DURABLE_SEQ_HEADER]: H.toString(),
       });
-      const cursor = await openLogCursor(logPath, effectiveAfter);
-      try { for (const ev of await cursor.readThrough(H)) res.write(ev.raw + '\n'); }
-      finally { await cursor.close(); }
+      for (const ev of events) res.write(ev.raw + '\n');
       res.end();
       return;
     }

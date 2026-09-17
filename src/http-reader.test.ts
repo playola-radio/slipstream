@@ -107,6 +107,37 @@ describe('http-reader events (finite)', () => {
   });
 });
 
+describe('http-reader corruption honesty', () => {
+  it('/v1/sessions reports the active session durable_seq from health, not disk', async () => {
+    const dir = await storeWithSession();               // disk log has seq 1,2
+    const health = createHealth(1n);                    // health H behind the disk
+    const srv = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    try {
+      const body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false }]);
+    } finally { await srv.close(); }
+  });
+
+  it('finite events endpoint returns 500 (not a truncated 200) on mid-log corruption', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'slip-http-corrupt-'));
+    const id = '66666666-6666-4666-8666-666666666666';
+    await mkdir(join(dir, 'sessions', id), { recursive: true });
+    await writeFile(
+      join(dir, 'sessions', id, 'events.jsonl'),
+      '{"seq":"1","type":"t","data":{}}\n{oops\n{"seq":"3","type":"t","data":{}}\n',
+      'utf8',
+    );
+    const srv = await startReaderServer({ storeDir: dir });
+    try {
+      const res = await GET(srv, `/v1/sessions/${id}/events?after=0`);
+      assert.equal(res.status, 500);
+      await res.text();
+    } finally { await srv.close(); }
+  });
+});
+
 describe('http-reader blobs + schemas', () => {
   let dir: string; let srv: ReaderServer; let hex: string; let empty: string;
   before(async () => {

@@ -2,6 +2,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENT_TYPES } from './event.ts';
+import { LogCorruptError } from './log-reader.ts';
 
 export interface SessionInfo { id: string; durableSeq: bigint; removed: boolean }
 export interface Tombstone { version: number }
@@ -9,6 +10,7 @@ export interface RuntimeDescriptor { url: string; token: string }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX_RE = /^[0-9a-f]{64}$/;
+const SEQ_RE = /^[1-9][0-9]*$/;
 const SCHEMAS_DIR = fileURLToPath(new URL('../schemas/', import.meta.url));
 
 export function isValidSessionId(id: string): boolean { return UUID_RE.test(id); }
@@ -32,14 +34,21 @@ export async function onDiskHighWater(logPath: string): Promise<bigint> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0n;
     throw err;
   }
-  const lastNl = text.lastIndexOf('\n');
-  if (lastNl < 0) return 0n;
-  const complete = text.slice(0, lastNl);
-  const nl = complete.lastIndexOf('\n');
-  const lastLine = complete.slice(nl + 1);
-  if (!lastLine) return 0n;
-  const seq = (JSON.parse(lastLine) as { seq?: string }).seq;
-  return seq ? BigInt(seq) : 0n;
+  // Split into segments; the final segment is either '' (the log ended with the
+  // '\n' the writer appends) or a torn incomplete tail (no terminating '\n').
+  // Discard it either way and read the last COMPLETE (newline-terminated) line.
+  const segments = text.split('\n');
+  segments.pop();
+  if (segments.length === 0) return 0n; // genuinely empty complete history
+  const lastLine = segments[segments.length - 1]!;
+  if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
+  let seq: unknown;
+  try { seq = (JSON.parse(lastLine) as { seq?: unknown }).seq; }
+  catch { throw new LogCorruptError('high-water: invalid JSON in final record'); }
+  if (typeof seq !== 'string' || !SEQ_RE.test(seq)) {
+    throw new LogCorruptError('high-water: final record has no valid decimal-string seq');
+  }
+  return BigInt(seq);
 }
 
 export async function readTombstone(storeDir: string, id: string): Promise<Tombstone | null> {

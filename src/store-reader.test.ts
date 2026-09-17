@@ -7,6 +7,7 @@ import {
   listSessions, readTombstone, isValidSessionId, isValidHex,
   schemaBytes, onDiskHighWater, blobPath, sessionLogPath, readRuntimeDescriptor,
 } from './store-reader.ts';
+import { LogCorruptError } from './log-reader.ts';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
 
@@ -43,6 +44,42 @@ describe('store-reader', () => {
     it('returns 0n for an empty or missing log', async () => {
       const dir = await store();
       assert.equal(await onDiskHighWater(sessionLogPath(dir, UUID)), 0n);
+    });
+    it('returns the true high-water for a clean seq-only log', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":"1"}\n{"seq":"2"}\n', 'utf8');
+      assert.equal(await onDiskHighWater(log), 2n);
+    });
+    it('returns 0n for a genuinely empty (zero-byte) log', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '', 'utf8');
+      assert.equal(await onDiskHighWater(log), 0n);
+    });
+    it('throws on an extra trailing newline (blank final line)', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":"1"}\n\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
+    });
+    it('throws on a bare-newline-only log', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
+    });
+    it('throws on a final {} record with no seq', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":"1"}\n{}\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
+    });
+    it('throws on a numeric (non-string) seq', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":9007199254740993}\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
     });
   });
 
