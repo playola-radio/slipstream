@@ -120,4 +120,16 @@ describe('followLog', () => {
 
     assert.deepEqual(seen, ['café']);
   });
+
+  it('emits nothing when started with an already-aborted signal', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'lf-'));
+    const log = join(dir, 'events.jsonl');
+    await writeFile(log, 'one\ntwo\nthree\n');
+
+    const seen: string[] = [];
+    await followLog(log, (line) => seen.push(line), { signal: AbortSignal.abort(), intervalMs: 20 });
+    await new Promise((r) => setTimeout(r, 60));
+
+    assert.deepEqual(seen, []);
+  });
 });

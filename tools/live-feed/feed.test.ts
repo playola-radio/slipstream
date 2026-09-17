@@ -177,6 +177,19 @@ describe('formatEvent', () => {
     assert.ok(line!.includes('\\x1b'));
   });
 
+  it('neutralizes control characters in an unavailable reason too', () => {
+    const evil: FeedEvent = {
+      kind: 'change',
+      atMs: 0,
+      path: 'a.txt',
+      before: { kind: 'content', size: 1 },
+      after: { kind: 'unavailable', reason: '\x1b[2J\nFORGED' },
+    };
+    const line = formatEvent(evil, { color: false });
+    assert.ok(!line!.includes('\x1b['));
+    assert.ok(!line!.includes('\n'));
+  });
+
   it('skips "other" events by returning null', () => {
     assert.equal(formatEvent({ kind: 'other' }, { color: false }), null);
   });

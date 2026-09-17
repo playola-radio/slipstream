@@ -119,10 +119,12 @@ export async function followLog(
   let carry = Buffer.alloc(0);
   let pumping = false;
   let dirty = false;
+  let stopped = false;
 
   const emitCompleteLines = (): void => {
     let nl: number;
     while ((nl = carry.indexOf(0x0a)) >= 0) {
+      if (stopped) return;
       const line = carry.subarray(0, nl).toString('utf8');
       carry = carry.subarray(nl + 1);
       if (line.trim().length > 0) onLine(line);
@@ -138,6 +140,7 @@ export async function followLog(
     try {
       do {
         dirty = false;
+        if (stopped) break;
         let handle;
         try {
           handle = await open(path, 'r');
@@ -156,6 +159,7 @@ export async function followLog(
             carry = Buffer.alloc(0);
           }
           while (position < info.size) {
+            if (stopped) break;
             const want = Math.min(READ_CHUNK, info.size - position);
             const buffer = Buffer.alloc(want);
             const { bytesRead } = await handle.read(buffer, 0, want, position);
@@ -168,7 +172,7 @@ export async function followLog(
         } finally {
           await handle.close();
         }
-      } while (dirty);
+      } while (dirty && !stopped);
     } finally {
       pumping = false;
     }
@@ -177,16 +181,16 @@ export async function followLog(
   return new Promise<void>((resolvePromise) => {
     const interval = opts.intervalMs ?? 250;
     const listener = (): void => void pump();
-    watchFile(path, { interval }, listener);
-    void pump();
     const stop = (): void => {
+      if (stopped) return;
+      stopped = true;
       unwatchFile(path, listener);
       resolvePromise();
     };
-    if (opts.signal) {
-      if (opts.signal.aborted) return stop();
-      opts.signal.addEventListener('abort', stop, { once: true });
-    }
+    if (opts.signal?.aborted) return stop();
+    watchFile(path, { interval }, listener);
+    if (opts.signal) opts.signal.addEventListener('abort', stop, { once: true });
+    void pump();
   });
 }
 

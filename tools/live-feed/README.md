@@ -54,6 +54,15 @@ then new records as they arrive.
   size. A state whose prior baseline was never observed is reported as
   `modified`, never upgraded to a confident `new`.
 
+## Known limitation
+
+The viewer follows the log by polling its size. If a capture restart truncates
+the log and regrows it past the follower's read offset **within a single poll
+interval** (so the shrink is never observed), the viewer can splice a stale
+partial line onto new bytes and print a `⚠ unparseable log line` — it never
+silently drops the gap, but that one boundary record may show as malformed.
+After restarting a capture, restart the viewer for a clean view.
+
 ## Tests
 
 ```bash

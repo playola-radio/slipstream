@@ -127,8 +127,11 @@ export function parseLine(line: string): FeedEvent {
 
 /**
  * Neutralize terminal control characters in text read from the log. Filenames
- * can legally contain ESC and other C0 controls; printing them verbatim would
- * let a watched path rewrite the terminal or forge feed lines.
+ * and unavailable-reason strings can legally contain ESC and other C0 controls;
+ * printing them verbatim would let a watched path rewrite the terminal or forge
+ * feed lines. Applied to the whole assembled line, so every log-derived field
+ * (path, sizes, reason) is covered uniformly. The arrow and box glyphs the
+ * viewer itself adds are non-control code points and pass through untouched.
  */
 function sanitize(text: string): string {
   return text.replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
@@ -162,11 +165,11 @@ export function formatEvent(ev: FeedEvent, opts: FormatOptions): string | null {
   switch (ev.kind) {
     case 'change': {
       const cls = classifyChange(ev.before, ev.after);
-      const line = `${formatClock(ev.atMs)} ${sanitize(ev.path)} ${sizeLabel(ev.before)} → ${sizeLabel(ev.after)} [${cls}]`;
-      return paint(line, CLASS_COLOR[cls], color);
+      const line = `${formatClock(ev.atMs)} ${ev.path} ${sizeLabel(ev.before)} → ${sizeLabel(ev.after)} [${cls}]`;
+      return paint(sanitize(line), CLASS_COLOR[cls], color);
     }
     case 'gap':
-      return paint(`${formatClock(ev.atMs)} ⚠ gap: ${sanitize(ev.reason)}`, ANSI.dim, color);
+      return paint(sanitize(`${formatClock(ev.atMs)} ⚠ gap: ${ev.reason}`), ANSI.dim, color);
     case 'malformed':
       return paint(`--:--:-- ⚠ unparseable log line`, ANSI.dim, color);
     case 'other':
