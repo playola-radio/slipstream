@@ -28,6 +28,12 @@ export interface Health {
   /** Enter the failing state, recording the storage failure that triggered it. */
   markFailing(failure: HealthFailure): void;
   markRecovering(): void;
+  /**
+   * Register a listener called synchronously, after the value is set, on
+   * every `setDurableSeq`. Returns an unsubscribe function. Listeners must
+   * be cheap; they must not perform I/O or await inside the callback.
+   */
+  subscribe(listener: () => void): () => void;
 }
 
 export function createHealth(durableSeq: bigint = 0n): Health {
@@ -35,6 +41,7 @@ export function createHealth(durableSeq: bigint = 0n): Health {
   let seq = durableSeq;
   let failure: HealthFailure | undefined;
   let gapPending = false;
+  const listeners = new Set<() => void>();
 
   return {
     snapshot: () => ({
@@ -45,6 +52,7 @@ export function createHealth(durableSeq: bigint = 0n): Health {
     }),
     setDurableSeq: (next) => {
       seq = next;
+      for (const l of listeners) l();
     },
     markHealthy: () => {
       state = 'healthy';
@@ -63,6 +71,12 @@ export function createHealth(durableSeq: bigint = 0n): Health {
     },
     markRecovering: () => {
       state = 'recovering';
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
     },
   };
 }
