@@ -1,88 +1,121 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { writeFile } from 'node:fs/promises';
-import { createLog, writeAll } from './log.ts';
+import { stat, writeFile } from 'node:fs/promises';
+import { createLog } from './log.ts';
+import type { EventInput } from './event.ts';
 import { readRecords, withLog, withTempDir } from './test/helpers.ts';
 
-const gap = (path: string, observed_at_ms: number) =>
-  ({ type: 'capture.gap', path, reason: 'coalesced', observed_at_ms }) as const;
+const SESSION = '00000000-0000-4000-8000-000000000000';
+
+const change = (path: string, occurred_at_ms = 1): EventInput => ({
+  type: 'slipstream.file.changed.v1',
+  occurred_at_ms,
+  data: { path, before: { kind: 'absent' }, after: { kind: 'absent' }, observation: 'watcher' },
+});
 
 describe('log', () => {
-  it('ignores an incomplete trailing JSONL record while it is being appended', async () => {
-    await withTempDir(async (dir) => {
-      const path = join(dir, 'events.jsonl');
-      const complete = { type: 'capture.gap', path: '', reason: 'watcher-error', observed_at_ms: 1, committed_at_ms: 2 };
-      await writeFile(path, `${JSON.stringify(complete)}\n{"type":"file.changed"`);
-      assert.deepEqual(await readRecords(path), [complete]);
-    });
-  });
-
   describe('append', () => {
-    it('writes one JSON object per line', async () => {
+    it('writes one CloudEvents object per line', async () => {
       await withLog(async ({ log, read }) => {
-        await log.append(gap('a', 1));
-        await log.append(gap('b', 2));
+        await log.append(change('a'));
+        await log.append(change('b'));
         const records = await read();
         assert.equal(records.length, 2);
-        assert.equal(records[0]?.path, 'a');
-        assert.equal(records[1]?.path, 'b');
+        assert.equal(records[0]?.type, 'slipstream.file.changed.v1');
       });
     });
 
-    it('stamps a commit time on every record', async () => {
+    it('assigns contiguous decimal seq numbers starting at 1', async () => {
       await withLog(async ({ log, read }) => {
-        const before = Date.now();
-        await log.append(gap('a', 1));
-        const [rec] = await read();
-        assert.ok(rec && rec.committed_at_ms >= before && rec.committed_at_ms <= Date.now());
+        await log.append(change('a'));
+        await log.append(change('b'));
+        await log.append(change('c'));
+        assert.deepEqual((await read()).map((r) => r.seq), ['1', '2', '3']);
       });
     });
 
-    it('serializes concurrent appends without interleaving or lost lines', async () => {
+    it('returns the built envelope with source, seq, and injected session_id', async () => {
+      await withLog(async ({ log }) => {
+        const event = await log.append(change('a'));
+        assert.equal(event.seq, '1');
+        assert.equal(event.id, '1');
+        assert.equal(event.source, `urn:slipstream:session:${SESSION}`);
+        assert.equal(event.data.session_id, SESSION);
+      });
+    });
+
+    it('advances durableSeq only after a record is committed', async () => {
+      await withLog(async ({ log }) => {
+        assert.equal(log.durableSeq(), 0n);
+        await log.append(change('a'));
+        assert.equal(log.durableSeq(), 1n);
+      });
+    });
+
+    it('continues numbering from startSeq when resuming a log', async () => {
+      await withTempDir(async (dir) => {
+        const path = join(dir, 'events.jsonl');
+        await writeFile(path, ''); // pre-existing (recovered) log
+        const log = await createLog({ filePath: path, sessionId: SESSION, startSeq: 41n });
+        try {
+          const event = await log.append(change('a'));
+          assert.equal(event.seq, '42');
+          assert.equal(log.durableSeq(), 42n);
+        } finally {
+          await log.close();
+        }
+      });
+    });
+
+    it('serializes concurrent appends into a contiguous, non-interleaved seq run', async () => {
       await withLog(async ({ log, read }) => {
-        await Promise.all(Array.from({ length: 50 }, (_, i) => log.append(gap(`p${i}`, i))));
+        await Promise.all(Array.from({ length: 50 }, (_, i) => log.append(change(`p${i}`, i))));
         const records = await read();
-        assert.equal(records.length, 50);
         assert.deepEqual(
-          new Set(records.map((r) => r.path)),
-          new Set(Array.from({ length: 50 }, (_, i) => `p${i}`)),
+          records.map((r) => Number(r.seq)).sort((a, b) => a - b),
+          Array.from({ length: 50 }, (_, i) => i + 1),
         );
       });
     });
 
     it('stops accepting appends once a write fails, rather than corrupting the log', async () => {
       await withTempDir(async (dir) => {
-        const log = await createLog(join(dir, 'events.jsonl'));
-        // Closing the handle makes the next write fail on a closed fd — a stand-in
-        // for a mid-line write failure. A poisoned log must reject rather than
-        // append onto a partial line.
-        await log.close();
-        await assert.rejects(log.append(gap('a', 1)));
-        await assert.rejects(log.append(gap('b', 2))); // stays poisoned
+        const log = await createLog({ filePath: join(dir, 'events.jsonl'), sessionId: SESSION });
+        await log.close(); // next write hits a closed fd — stand-in for a mid-line failure
+        await assert.rejects(log.append(change('a')));
+        await assert.rejects(log.append(change('b'))); // stays poisoned
       });
     });
   });
 
-  describe('writeAll', () => {
-    it('loops until the whole buffer is written when writes are short', async () => {
-      const chunks: Buffer[] = [];
-      // A handle that commits at most 3 bytes per call, exercising the loop.
-      const handle = {
-        write: async (buf: Buffer, offset: number, length: number) => {
-          const bytesWritten = Math.min(3, length);
-          chunks.push(Buffer.from(buf.subarray(offset, offset + bytesWritten)));
-          return { bytesWritten, buffer: buf };
-        },
-      };
-      await writeAll(handle as never, Buffer.from('abcdefghij'));
-      assert.equal(Buffer.concat(chunks).toString(), 'abcdefghij');
-      assert.ok(chunks.length >= 4); // 10 bytes at <=3 per call
+  describe('durability', () => {
+    it('creates the log file owner-only (0600)', async () => {
+      await withTempDir(async (dir) => {
+        const path = join(dir, 'events.jsonl');
+        const log = await createLog({ filePath: path, sessionId: SESSION });
+        try {
+          assert.equal((await stat(path)).mode & 0o777, 0o600);
+        } finally {
+          await log.close();
+        }
+      });
     });
 
-    it('throws rather than spin when a write makes no progress', async () => {
-      const handle = { write: async () => ({ bytesWritten: 0, buffer: Buffer.alloc(0) }) };
-      await assert.rejects(writeAll(handle as never, Buffer.from('x')), /no progress/);
+    it('leaves a fully-terminated record on disk once append resolves', async () => {
+      await withTempDir(async (dir) => {
+        const path = join(dir, 'events.jsonl');
+        const log = await createLog({ filePath: path, sessionId: SESSION });
+        try {
+          await log.append(change('a'));
+          const { readFile } = await import('node:fs/promises');
+          const text = await readFile(path, 'utf8');
+          assert.ok(text.endsWith('\n'));
+          assert.equal(text.trimEnd().split('\n').length, 1);
+        } finally {
+          await log.close();
+        }
+      });
     });
   });
 });

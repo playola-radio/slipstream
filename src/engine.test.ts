@@ -4,6 +4,9 @@ import type { Reader } from './reader.ts';
 import type { Snapshot } from './snapshot.ts';
 import { content, scriptedReader, withEngine } from './test/helpers.ts';
 
+const CHANGED = 'slipstream.file.changed.v1';
+const GAP = 'slipstream.capture.gap.v1';
+
 describe('engine', () => {
   describe('change detection', () => {
     it('emits one file.changed with the correct before/after for a change from the baseline', async () => {
@@ -13,11 +16,12 @@ describe('engine', () => {
         await engine.drain();
         const recs = await read();
         assert.equal(recs.length, 1);
-        assert.equal(recs[0]?.type, 'file.changed');
-        if (recs[0]?.type === 'file.changed') {
-          assert.deepEqual(recs[0].before, content('aaa'));
-          assert.deepEqual(recs[0].after, content('bbb'));
-          assert.equal(recs[0].observed_at_ms, 100);
+        assert.equal(recs[0]?.type, CHANGED);
+        if (recs[0]?.type === CHANGED) {
+          assert.deepEqual(recs[0].data.before, content('aaa'));
+          assert.deepEqual(recs[0].data.after, content('bbb'));
+          assert.equal(recs[0].data.observation, 'watcher');
+          assert.equal(recs[0].time, new Date(100).toISOString());
         }
       });
     });
@@ -40,9 +44,9 @@ describe('engine', () => {
         await engine.drain();
         const recs = await read();
         assert.equal(recs.length, 2);
-        if (recs[0]?.type === 'file.changed' && recs[1]?.type === 'file.changed') {
-          assert.deepEqual([recs[0].before, recs[0].after], [content('aaa'), content('bbb')]);
-          assert.deepEqual([recs[1].before, recs[1].after], [content('bbb'), content('aaa')]);
+        if (recs[0]?.type === CHANGED && recs[1]?.type === CHANGED) {
+          assert.deepEqual([recs[0].data.before, recs[0].data.after], [content('aaa'), content('bbb')]);
+          assert.deepEqual([recs[1].data.before, recs[1].data.after], [content('bbb'), content('aaa')]);
         }
       });
     });
@@ -53,9 +57,9 @@ describe('engine', () => {
         engine.notify('f.ts', 1);
         await engine.drain();
         const [rec] = await read();
-        if (rec?.type === 'file.changed') {
-          assert.deepEqual(rec.before, content('aaa'));
-          assert.deepEqual(rec.after, { kind: 'absent' });
+        if (rec?.type === CHANGED) {
+          assert.deepEqual(rec.data.before, content('aaa'));
+          assert.deepEqual(rec.data.after, { kind: 'absent' });
         }
       });
     });
@@ -65,9 +69,9 @@ describe('engine', () => {
         engine.notify('created.ts', 1);
         await engine.drain();
         const [rec] = await read();
-        if (rec?.type === 'file.changed') {
-          assert.deepEqual(rec.before, { kind: 'absent' });
-          assert.deepEqual(rec.after, content('new'));
+        if (rec?.type === CHANGED) {
+          assert.deepEqual(rec.data.before, { kind: 'absent' });
+          assert.deepEqual(rec.data.after, content('new'));
         }
       });
     });
@@ -78,9 +82,9 @@ describe('engine', () => {
         engine.notify('locked/existing.ts', 1); // never baselined; dir was unreadable
         await engine.drain();
         const [rec] = await read();
-        if (rec?.type === 'file.changed') {
-          assert.deepEqual(rec.before, { kind: 'unavailable', reason: 'baseline-unknown' });
-          assert.deepEqual(rec.after, content('after'));
+        if (rec?.type === CHANGED) {
+          assert.deepEqual(rec.data.before, { kind: 'unavailable', reason: 'baseline-unknown' });
+          assert.deepEqual(rec.data.after, content('after'));
         } else {
           assert.fail('expected a file.changed record');
         }
@@ -93,8 +97,8 @@ describe('engine', () => {
         engine.notify('elsewhere.ts', 1); // not under the unreadable prefix
         await engine.drain();
         const [rec] = await read();
-        if (rec?.type === 'file.changed') {
-          assert.deepEqual(rec.before, { kind: 'absent' });
+        if (rec?.type === CHANGED) {
+          assert.deepEqual(rec.data.before, { kind: 'absent' });
         } else {
           assert.fail('expected a file.changed record');
         }
@@ -130,15 +134,18 @@ describe('engine', () => {
         // not disk). The notify that landed during cycle 1 folds into cycle 2,
         // which re-reads, finds bbb unchanged, and records a capture.gap because
         // a transient state may have been skipped.
-        const changed = recs.filter((r) => r.type === 'file.changed');
-        const gaps = recs.filter((r) => r.type === 'capture.gap');
+        const changed = recs.filter((r) => r.type === CHANGED);
+        const gaps = recs.filter((r) => r.type === GAP);
         assert.equal(changed.length, 1);
-        if (changed[0]?.type === 'file.changed') {
-          assert.deepEqual(changed[0].before, content('aaa'));
-          assert.deepEqual(changed[0].after, content('bbb'));
+        if (changed[0]?.type === CHANGED) {
+          assert.deepEqual(changed[0].data.before, content('aaa'));
+          assert.deepEqual(changed[0].data.after, content('bbb'));
         }
         assert.equal(gaps.length, 1);
-        assert.equal(gaps[0]?.path, 'f.ts');
+        if (gaps[0]?.type === GAP) {
+          assert.deepEqual(gaps[0].data.scope, { kind: 'path', path: 'f.ts' });
+          assert.equal(gaps[0].data.reason, 'coalesced');
+        }
       });
     });
 

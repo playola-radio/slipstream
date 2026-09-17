@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Cas } from './cas.ts';
+import { StorageError } from './storage.ts';
 import type { Snapshot } from './snapshot.ts';
 
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
@@ -89,6 +90,10 @@ export function createReader(opts: ReaderOptions): Reader {
         const ref = await opts.cas.put(bytes.subarray(0, offset));
         return { kind: 'content', sha256: ref.sha256, size: ref.size };
       } catch (err) {
+        // A failure to durably publish the blob is a *storage* fault, not an
+        // unreadable source file. Never launder it into an `unavailable`
+        // snapshot — propagate so capture can suspend and disclose a gap.
+        if (err instanceof StorageError) throw err;
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'EACCES' || code === 'EPERM') return { kind: 'unavailable', reason: 'unreadable' };
         return { kind: 'unavailable', reason: 'io-error' };

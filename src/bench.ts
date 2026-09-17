@@ -1,7 +1,7 @@
 /**
  * Stage 1 measurement harness. Produces the two numbers the gate requires:
  *
- *   1. Latency (p50/p99, write -> committed record) for a single small file, a
+ *   1. Latency (p50/p99, write -> observed record time) for a single small file, a
  *      1 MiB file, and a burst of 100 files.
  *   2. Loss by category against a known write trace, via src/loss.ts.
  *
@@ -15,8 +15,12 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, type CaptureSession } from './session.ts';
 import { isMainModule } from './entrypoint.ts';
-import type { LoggedRecord } from './log.ts';
+import type { AnyEvent, CloudEvent } from './event.ts';
 import { categorize, type ObservedState, type RecordState, type TraceStep } from './loss.ts';
+
+type LoggedRecord = AnyEvent;
+type ChangedRecord = CloudEvent<'slipstream.file.changed.v1'>;
+const isChanged = (r: AnyEvent): r is ChangedRecord => r.type === 'slipstream.file.changed.v1';
 
 const BENCH_WAIT_TIMEOUT_MS = 15000;
 
@@ -88,10 +92,10 @@ async function latencySingleFile(bytesPer: number, iterations: number): Promise<
       const t0 = Date.now();
       await writeFile(path, body);
       const recs = await waitFor(session.logPath, (r) =>
-        r.some((x) => x.type === 'file.changed' && x.after.kind === 'content' && x.after.sha256 === digest),
+        r.some((x) => isChanged(x) && x.data.after.kind === 'content' && x.data.after.sha256 === digest),
       );
-      const rec = recs.find((x) => x.type === 'file.changed' && x.after.kind === 'content' && x.after.sha256 === digest);
-      if (rec) latencies.push(rec.committed_at_ms - t0);
+      const rec = recs.find((x) => isChanged(x) && x.data.after.kind === 'content' && x.data.after.sha256 === digest);
+      if (rec) latencies.push(Date.parse(rec.time) - t0);
     }
   });
   return latencies;
@@ -113,17 +117,17 @@ async function latencyBurst(count: number): Promise<number[]> {
     const recs = await waitFor(session.logPath, (r) => {
       const seen = new Set(
         r
-          .filter((x) => x.type === 'file.changed' && x.after.kind === 'content')
-          .map((x) => x.path),
+          .filter((x) => isChanged(x) && x.data.after.kind === 'content')
+          .map((x) => (x as ChangedRecord).data.path),
       );
       return [...expected.keys()].every((p) => seen.has(p));
     });
     for (const [rel, digest] of expected) {
       const rec = recs.find(
-        (x) => x.type === 'file.changed' && x.path === rel && x.after.kind === 'content' && x.after.sha256 === digest,
+        (x) => isChanged(x) && x.data.path === rel && x.data.after.kind === 'content' && x.data.after.sha256 === digest,
       );
       const start = t0.get(rel);
-      if (rec && start !== undefined) latencies.push(rec.committed_at_ms - start);
+      if (rec && start !== undefined) latencies.push(Date.parse(rec.time) - start);
     }
   });
   return latencies;
@@ -259,12 +263,12 @@ async function runLoss(): Promise<void> {
   // Snapshot is structurally an ObservedState (its extra `size` is ignored by
   // categorize), so the committed `after` maps straight onto the trace's state.
   const records: RecordState[] = raw
-    .filter((r): r is Extract<LoggedRecord, { type: 'file.changed' }> => r.type === 'file.changed')
-    .filter((r) => !ignored.has(r.path))
-    .map((r) => ({ path: r.path, after: r.after }));
+    .filter(isChanged)
+    .filter((r) => !ignored.has(r.data.path))
+    .map((r) => ({ path: r.data.path, after: r.data.after }));
 
   const report = categorize(trace, records);
-  const gaps = raw.filter((r) => r.type === 'capture.gap').length;
+  const gaps = raw.filter((r) => r.type === 'slipstream.capture.gap.v1').length;
 
   console.log('\n## 2. Loss by category (against a known write trace)\n');
   console.log(`Trace steps written: ${trace.length}   file.changed committed: ${records.length}   capture.gap: ${gaps}\n`);
@@ -282,7 +286,7 @@ async function runLoss(): Promise<void> {
 
 async function runLatency(): Promise<void> {
   console.log('# Stage 1 measurements\n');
-  console.log('## 1. Latency (write -> committed record), milliseconds\n');
+  console.log('## 1. Latency (write -> observed record time), milliseconds\n');
   console.log('| Scenario | n | p50 | p99 |');
   console.log('|---|---|---|---|');
   const single = stats(await latencySingleFile(64, 50));

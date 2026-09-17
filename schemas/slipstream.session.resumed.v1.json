@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.session.resumed.v1.json",
+  "title": "slipstream.session.resumed.v1",
+  "$comment": "Recorded on restart at recovered_through_seq + 1. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.session.resumed.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "recovered_through_seq",
+        "discarded_tail_bytes",
+        "resumed_at_ms"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "recovered_through_seq": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "discarded_tail_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resumed_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

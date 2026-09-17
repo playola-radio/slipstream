@@ -5,7 +5,8 @@ import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
 export interface EngineOptions {
   reader: Reader;
-  log: Log;
+  /** The engine only appends; it neither tracks durability nor closes the log. */
+  log: Pick<Log, 'append'>;
 }
 
 export interface Engine {
@@ -84,11 +85,19 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
       // Nothing to record — but if we coalesced, an intermediate state may have
       // existed and been lost. Surface that honestly rather than silently.
       if (wasCoalesced) {
-        await log.append({ type: 'capture.gap', path, reason: 'coalesced', observed_at_ms: observedAtMs });
+        await log.append({
+          type: 'slipstream.capture.gap.v1',
+          occurred_at_ms: observedAtMs,
+          data: { scope: { kind: 'path', path }, reason: 'coalesced' },
+        });
       }
       return;
     }
-    await log.append({ type: 'file.changed', path, before, after, observed_at_ms: observedAtMs, coalesced: wasCoalesced });
+    await log.append({
+      type: 'slipstream.file.changed.v1',
+      occurred_at_ms: observedAtMs,
+      data: { path, before, after, observation: 'watcher', coalesced: wasCoalesced },
+    });
     committed.set(path, after);
   };
 
