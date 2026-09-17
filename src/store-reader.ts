@@ -54,8 +54,10 @@ export async function onDiskHighWater(logPath: string): Promise<bigint> {
 export async function readTombstone(storeDir: string, id: string): Promise<Tombstone | null> {
   try {
     const raw = await readFile(tombstonePath(storeDir, id), 'utf8');
-    const parsed = JSON.parse(raw) as Tombstone;
-    return parsed;
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { return null; }
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      && (parsed as Tombstone).version === 1 ? { version: 1 } : null;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;

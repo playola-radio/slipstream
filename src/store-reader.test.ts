@@ -165,3 +165,13 @@ describe('store-reader', () => {
     });
   });
 });
+
+for (const raw of ['{}', '{"version":2}', '[]', 'true', 'not JSON']) {
+  it(`does not hide history for malformed tombstone ${raw}`, async () => {
+    const dir = await store();
+    await writeFile(sessionLogPath(dir, UUID), '{"seq":"1"}\n');
+    await writeFile(join(dir, 'sessions', UUID, 'removed.json'), raw);
+    assert.equal(await readTombstone(dir, UUID), null);
+    assert.deepEqual(await listSessions(dir), [{ id: UUID, durableSeq: 1n, removed: false }]);
+  });
+}
