@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, open, readFile, writeFile } from 'node:fs/promises';
+import { fstatSync } from 'node:fs';
+import { appendFile, open, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createCas } from './cas.ts';
 import { createLog } from './log.ts';
@@ -191,26 +192,61 @@ describe('recovery', () => {
       const cas = await createCas(join(dir, 'blobs'));
       const path = await seedLog(dir, [started, baselineAbsent('a.ts')]);
 
-      // Spy on the real fsync syscall through the FileHandle prototype — no
-      // production seam is added, and the mock still calls through to the real
-      // sync. A clean log referencing only `absent` snapshots drives no blob
-      // syncs, so any sync observed here is the retained log's durability
-      // barrier. Without the barrier a clean recovery re-publishes
-      // recoveredThroughSeq as durable without ever forcing the retained bytes
-      // to the platter.
+      // Identify each synced handle by inode so the assertion guards the LOG
+      // FILE's own fsync specifically, not merely "some handle synced" — a
+      // count-only spy also counts the directory sync and would still pass if
+      // the load-bearing `handle.sync()` were deleted. A clean log referencing
+      // only `absent` snapshots drives no blob syncs, so the only syncs here are
+      // recovery's own barrier. Spy on the real fsync through the FileHandle
+      // prototype (no production seam); the mock still calls the real sync.
+      const logIno = (await stat(path)).ino;
+      const dirIno = (await stat(dir)).ino;
+      const syncedInos: number[] = [];
       const probe = await open(path, 'r');
       const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
       await probe.close();
-      const sync = t.mock.method(proto, 'sync');
+      const realSync = proto.sync;
+      t.mock.method(proto, 'sync', function (this: { fd: number }) {
+        syncedInos.push(fstatSync(this.fd).ino);
+        return realSync.call(this);
+      });
 
       const rec = await recoverSession(path, SESSION, cas);
 
       assert.equal(rec.discardedTailBytes, 0, 'precondition: clean recovery, no torn tail');
       assert.equal(rec.recoveredThroughSeq, 2n);
       assert.ok(
-        sync.mock.callCount() >= 1,
-        'retained log must be fsynced before recoveredThroughSeq is returned as durable',
+        syncedInos.includes(logIno),
+        'the retained log file itself must be fsynced before recoveredThroughSeq is durable',
       );
+      assert.ok(
+        syncedInos.includes(dirIno),
+        'the containing directory must be fsynced as part of the barrier',
+      );
+    });
+  });
+
+  it('rejects recovery when the retained-prefix fsync fails, never returning a non-durable seq', async (t) => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, baselineAbsent('a.ts')]);
+
+      // Fail only the log file's fsync (by inode); the directory sync still runs
+      // for real. A recovered seq must be a durable seq, so a failed barrier must
+      // reject rather than return recoveredThroughSeq for republication.
+      const logIno = (await stat(path)).ino;
+      const probe = await open(path, 'r');
+      const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+      await probe.close();
+      const realSync = proto.sync;
+      t.mock.method(proto, 'sync', function (this: { fd: number }) {
+        if (fstatSync(this.fd).ino === logIno) {
+          return Promise.reject(Object.assign(new Error('injected fsync failure'), { code: 'EIO' }));
+        }
+        return realSync.call(this);
+      });
+
+      await assert.rejects(recoverSession(path, SESSION, cas), /injected fsync failure/);
     });
   });
 
