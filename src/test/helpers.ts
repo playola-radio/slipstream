@@ -10,11 +10,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCas, type Cas } from '../cas.ts';
 import { createReader, type Reader } from '../reader.ts';
-import { createLog, type Log, type LoggedRecord } from '../log.ts';
+import { createLog, type Log } from '../log.ts';
+import type { AnyEvent, CloudEvent } from '../event.ts';
 import { createEngine, type Engine } from '../engine.ts';
 import { startCapture, type CaptureSession } from '../session.ts';
 import { createFakePlatform } from './fake-platform.ts';
 import type { Snapshot } from '../snapshot.ts';
+
+/** Every record on disk is a full CloudEvents envelope. */
+export type LoggedRecord = AnyEvent;
+export type FileChangedEvent = CloudEvent<'slipstream.file.changed.v1'>;
+
+const TEST_SESSION_ID = '00000000-0000-4000-8000-000000000000';
 
 /** Build a content snapshot for a given hash (size is incidental to these tests). */
 export const content = (sha256: string): Snapshot => ({ kind: 'content', sha256, size: 1 });
@@ -57,7 +64,7 @@ export async function withLog(
 ): Promise<void> {
   await withTempDir(async (dir) => {
     const path = join(dir, 'events.jsonl');
-    const log = await createLog(path);
+    const log = await createLog({ filePath: path, sessionId: TEST_SESSION_ID });
     try {
       await fn({ log, read: () => readRecords(path) });
     } finally {
@@ -73,7 +80,7 @@ export async function withEngine(
 ): Promise<void> {
   await withTempDir(async (dir) => {
     const path = join(dir, 'events.jsonl');
-    const log = await createLog(path);
+    const log = await createLog({ filePath: path, sessionId: TEST_SESSION_ID });
     try {
       await fn({ engine: createEngine({ reader, log }), read: () => readRecords(path) });
     } finally {
@@ -166,7 +173,12 @@ export function scriptedReader(snapshots: Snapshot[]): Reader {
   return { read: async () => queue.shift() ?? { kind: 'absent' } };
 }
 
-/** Parse a JSONL event log into records (empty if the file does not exist). */
+/**
+ * Parse a JSONL event log into records (empty if the file does not exist).
+ * Tolerant on purpose — it drops an unterminated trailing line so a test can
+ * poll a log mid-append. NEVER use this for recovery; startup validation
+ * (recovery.ts) must treat a torn or malformed record strictly, not swallow it.
+ */
 export async function readRecords(logPath: string): Promise<LoggedRecord[]> {
   const text = await readFile(logPath, 'utf8').catch(() => '');
   const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
@@ -202,6 +214,8 @@ export async function waitForRecords(
 }
 
 /** All `file.changed` records for a single path, in commit order. */
-export function changesFor(recs: LoggedRecord[], path: string): LoggedRecord[] {
-  return recs.filter((r) => r.type === 'file.changed' && r.path === path);
+export function changesFor(recs: LoggedRecord[], path: string): FileChangedEvent[] {
+  return recs.filter(
+    (r): r is FileChangedEvent => r.type === 'slipstream.file.changed.v1' && r.data.path === path,
+  );
 }

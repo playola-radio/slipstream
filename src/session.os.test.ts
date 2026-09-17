@@ -27,11 +27,9 @@ describe('session (real OS)', () => {
         await writeFile(join(root, 'created.ts'), 'hello world');
         const recs = await waitFor((r) => changesFor(r, 'created.ts').length >= 1);
         const [c] = changesFor(recs, 'created.ts');
-        assert.equal(c?.type, 'file.changed');
-        if (c?.type === 'file.changed') {
-          assert.equal(c.before.kind, 'absent');
-          assert.equal(c.after.kind, 'content');
-        }
+        assert.ok(c);
+        assert.equal(c.data.before.kind, 'absent');
+        assert.equal(c.data.after.kind, 'content');
       },
     );
   });
@@ -47,12 +45,12 @@ describe('session (real OS)', () => {
         await rename(tmp, join(root, 'atomic.ts'));
         const recs = await waitFor((r) =>
           changesFor(r, 'atomic.ts').some(
-            (c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.size === 'rewritten atomically'.length,
+            (c) => c.data.after.kind === 'content' && c.data.after.size === 'rewritten atomically'.length,
           ),
         );
         const c = changesFor(recs, 'atomic.ts').at(-1);
-        if (c?.type === 'file.changed' && c.after.kind === 'content') {
-          assert.equal(c.after.size, 'rewritten atomically'.length);
+        if (c && c.data.after.kind === 'content') {
+          assert.equal(c.data.after.size, 'rewritten atomically'.length);
         } else {
           assert.fail('expected the rewritten content at the final path');
         }
@@ -74,13 +72,13 @@ describe('session (real OS)', () => {
         }
         const endpointSha = sha('version-25');
         const recs = await waitFor((r) =>
-          changesFor(r, 'hot.ts').some((c) => c.type === 'file.changed' && c.after.kind === 'content' && c.after.sha256 === endpointSha),
+          changesFor(r, 'hot.ts').some((c) => c.data.after.kind === 'content' && c.data.after.sha256 === endpointSha),
         );
         const changes = changesFor(recs, 'hot.ts'); // waitFor already proved the endpoint landed
         // A torn read fabricating a state that was never written would be fatal.
         for (const c of changes) {
-          if (c.type === 'file.changed' && c.after.kind === 'content') {
-            assert.ok(writtenShas.has(c.after.sha256), `recorded a state that was never written: ${c.after.sha256}`);
+          if (c.data.after.kind === 'content') {
+            assert.ok(writtenShas.has(c.data.after.sha256), `recorded a state that was never written: ${c.data.after.sha256}`);
           }
         }
       },
@@ -100,18 +98,22 @@ describe('session (real OS)', () => {
         try {
           // waitFor throws unless the baseline-unreadable gap for 'locked' appears.
           await waitFor((r) =>
-            r.some((x) => x.type === 'capture.gap' && x.reason === 'baseline-unreadable' && x.path === 'locked'),
+            r.some(
+              (x) =>
+                x.type === 'slipstream.capture.gap.v1' &&
+                x.data.reason === 'baseline-unreadable' &&
+                'path' in x.data.scope &&
+                x.data.scope.path === 'locked',
+            ),
           );
           await chmod(locked, 0o755);
           await writeFile(join(locked, 'existing.ts'), 'changed after restore');
           const recs = await waitFor((r) => changesFor(r, join('locked', 'existing.ts')).length >= 1);
           const [c] = changesFor(recs, join('locked', 'existing.ts'));
-          assert.equal(c?.type, 'file.changed');
-          if (c?.type === 'file.changed') {
-            assert.equal(c.before.kind, 'unavailable');
-            if (c.before.kind === 'unavailable') assert.equal(c.before.reason, 'baseline-unknown');
-            assert.equal(c.after.kind, 'content');
-          }
+          assert.ok(c);
+          assert.equal(c.data.before.kind, 'unavailable');
+          if (c.data.before.kind === 'unavailable') assert.equal(c.data.before.reason, 'baseline-unknown');
+          assert.equal(c.data.after.kind, 'content');
         } finally {
           await chmod(locked, 0o755); // restore so cleanup can remove it
         }
@@ -132,7 +134,7 @@ describe('session (real OS)', () => {
           // waitFor throws unless the unreadable snapshot is recorded.
           await waitFor((r) =>
             changesFor(r, 'secret.ts').some(
-              (c) => c.type === 'file.changed' && c.after.kind === 'unavailable' && c.after.reason === 'unreadable',
+              (c) => c.data.after.kind === 'unavailable' && c.data.after.reason === 'unreadable',
             ),
           );
         } finally {

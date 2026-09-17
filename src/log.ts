@@ -1,76 +1,69 @@
-import { open, type FileHandle } from 'node:fs/promises';
-import type { Snapshot } from './snapshot.ts';
-
-export interface FileChangedInput {
-  type: 'file.changed';
-  path: string;
-  before: Snapshot;
-  after: Snapshot;
-  /** High-resolution wall clock (epoch ms) when the change was first observed. */
-  observed_at_ms: number;
-  /** True when intermediate states may have been coalesced before this commit. */
-  coalesced?: boolean;
-}
-
-export type CaptureGapReason = 'coalesced' | 'baseline-unreadable' | 'watcher-error';
-
-export interface CaptureGapInput {
-  type: 'capture.gap';
-  path: string;
-  reason: CaptureGapReason;
-  observed_at_ms: number;
-}
-
-export type RecordInput = FileChangedInput | CaptureGapInput;
-
-export type LoggedRecord = RecordInput & {
-  committed_at_ms: number;
-};
+import { open, stat, type FileHandle } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import { buildEnvelope, type AnyEvent, type EventInput } from './event.ts';
+import { FILE_MODE, StorageError, fsyncDir, writeAll } from './storage.ts';
 
 export interface Log {
-  append(input: RecordInput): Promise<void>;
+  /**
+   * Assign the next contiguous seq, build the CloudEvents envelope, append it,
+   * fsync the log, and only then resolve. Referenced blobs must already be
+   * durably published (the caller's responsibility). Returns the written event.
+   */
+  append(input: EventInput): Promise<AnyEvent>;
+  /** Highest seq whose record is durably on disk (0n before the first append). */
+  durableSeq(): bigint;
   close(): Promise<void>;
 }
 
-/**
- * Write the whole buffer, looping on short writes. A single `handle.write` may
- * commit fewer bytes than requested under storage pressure; the log is the
- * source of truth, so a truncated line would corrupt every record after it.
- */
-export async function writeAll(
-  handle: Pick<FileHandle, 'write'>,
-  buf: Buffer,
-): Promise<void> {
-  let offset = 0;
-  while (offset < buf.length) {
-    const { bytesWritten } = await handle.write(buf, offset, buf.length - offset);
-    if (bytesWritten <= 0) throw new Error('log write made no progress');
-    offset += bytesWritten;
-  }
+export interface CreateLogOptions {
+  filePath: string;
+  sessionId: string;
+  /** Last durable seq recovered from an existing log; the first append is startSeq+1. */
+  startSeq?: bigint;
 }
 
-export async function createLog(filePath: string): Promise<Log> {
-  const handle: FileHandle = await open(filePath, 'a');
+/**
+ * The single writer for a session's `events.jsonl`. Appends are serialized onto
+ * a tail promise so seq assignment and byte order never interleave. Each append
+ * is durable before it is acknowledged: writeAll then fsync, then the high-water
+ * seq advances. A write failure poisons the log — every later append rejects
+ * rather than concatenate onto a possibly half-written line (the log is the
+ * source of truth). Recovery repairs and reopens; it does not append through a
+ * poisoned handle.
+ */
+export async function createLog(opts: CreateLogOptions): Promise<Log> {
+  const { filePath, sessionId } = opts;
+  const isNew = !(await stat(filePath).then(() => true).catch(() => false));
+
+  const handle: FileHandle = await open(filePath, 'a', FILE_MODE);
+  if (isNew) {
+    try {
+      await handle.sync();
+      await fsyncDir(dirname(filePath));
+    } catch (err) {
+      await handle.close();
+      throw err instanceof StorageError ? err : new StorageError('create-log', err);
+    }
+  }
+
+  let durableSeq = opts.startSeq ?? 0n;
   let tail: Promise<unknown> = Promise.resolve();
-  // A write that fails mid-line leaves the file at an unknown offset. Appending
-  // further records would concatenate onto that partial line and corrupt the
-  // log — which is the source of truth. Once poisoned, every append rejects
-  // rather than risk writing onto a half-written line.
   let poison: Error | null = null;
 
-  const append = (input: RecordInput): Promise<void> => {
-    // Chain onto the tail so appends never interleave or lose lines.
+  const append = (input: EventInput): Promise<AnyEvent> => {
     const result = tail.then(async () => {
       if (poison) throw poison;
-      // committed_at_ms is the serialized commit instant, stamped immediately
-      // before the (un-fsynced, sub-ms) append. Durable publication is Stage 2.
-      const record: LoggedRecord = { ...input, committed_at_ms: Date.now() };
+      const seq = durableSeq + 1n;
+      const event = buildEnvelope(input, seq, sessionId);
       try {
-        await writeAll(handle, Buffer.from(`${JSON.stringify(record)}\n`));
+        await writeAll(handle, Buffer.from(`${JSON.stringify(event)}\n`));
+        await handle.sync();
       } catch (err) {
-        poison = err instanceof Error ? err : new Error(String(err));
+        poison = err instanceof StorageError ? err : new StorageError('append', err);
         throw poison;
       }
+      durableSeq = seq;
+      return event;
     });
     tail = result.catch(() => undefined);
     return result;
@@ -81,5 +74,5 @@ export async function createLog(filePath: string): Promise<Log> {
     await handle.close();
   };
 
-  return { append, close };
+  return { append, durableSeq: () => durableSeq, close };
 }

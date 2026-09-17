@@ -224,7 +224,29 @@ disk-reading TUI client that consumes only public artifacts.
 - Schema-evolution guard: a client ignoring unknown event types and unknown
   object fields still renders a complete feed.
 
-**Status**: Not Started
+**Status**: In Progress — durable write path + restart reconciliation (PR 2a)
+complete. Done: frozen v1 CloudEvents envelope and JSON Schemas under `schemas/`;
+single-writer contiguous decimal sequencing derived from the validated log
+(BigInt, `time` never used for ordering); durable blob publication (fsync file +
+containing directory) before the referencing event, log flushed before ack;
+owner-only storage permissions (0700/0600); restart reconciliation preserving
+session identity and seq, discarding only a torn trailing record, appending
+`session.resumed` at `recovered_through_seq + 1` followed by a restart gap and
+reconciliation changes; mid-log corruption a hard error; disk-full stops
+acknowledging, health goes failing, and a single storage gap is recorded on
+recovery. Single writer is enforced by an mtime-heartbeat session lock
+(`src/lock.ts`): a live owner is refused, a crash-stale lock is reclaimed, and a
+dispossessed owner detects the takeover via a per-acquisition nonce and stops
+acknowledging (health `ELOCKLOST`). A strict single-writer guarantee against
+*concurrent same-session daemon starts* is not achievable in pure Node — the
+takeover is detected asynchronously, so an append already awaiting its fsync
+cannot be un-written, and any pure-Node stale-break must briefly vacate the lock
+path. That residual is closed operationally: Conductor launches one daemon per
+worktree, so concurrent acquirers on one session do not occur. On-disk tests for
+all three required failure paths pass. Remaining for
+PR 2b: the `/v1` reader API (finite NDJSON + SSE follow, one-cursor
+replay-then-follow, error codes, loopback auth), the two-reader convergence and
+stale-cursor tests, and the disk-reading TUI client.
 
 ---
 
