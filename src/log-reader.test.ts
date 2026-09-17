@@ -58,5 +58,43 @@ describe('log-reader', () => {
       assert.deepEqual((await cur.readThrough(3n)).map((e) => e.seq), [2n, 3n]);
       await cur.close();
     });
+
+    it('round-trips a multibyte char whose bytes straddle a 64KB chunk boundary', async () => {
+      const emoji = '\u{1F600}'; // 4-byte UTF-8
+      const line1 = line(1);
+      // Find where the emoji lands in the JSON text when there is no padding,
+      // so we can compute exactly how much ASCII padding shifts its first
+      // byte to file offset 65535 (the last byte of the first 64KB chunk).
+      const zeroPadLine = line(2, undefined, { pad: emoji });
+      const emojiIndex = zeroPadLine.indexOf(emoji);
+      const fixedPrefixBytes = Buffer.byteLength(zeroPadLine.slice(0, emojiIndex), 'utf8');
+      const line1Bytes = Buffer.byteLength(line1, 'utf8');
+      const padLength = 65535 - line1Bytes - fixedPrefixBytes;
+      assert.ok(padLength >= 0, 'expected non-negative pad length');
+      const padStr = 'a'.repeat(padLength);
+      const expectedPad = padStr + emoji;
+      const line2 = line(2, undefined, { pad: expectedPad });
+      const line3 = line(3);
+      const p = await logWith(line1, line2, line3);
+
+      const straddleByte = line1Bytes + fixedPrefixBytes + padLength;
+      assert.equal(straddleByte, 65535, 'emoji must start at the last byte of the first 64KB chunk');
+
+      const cur = await openLogCursor(p, 0n);
+      const events = await cur.readThrough(3n);
+      await cur.close();
+
+      const ev2 = events.find((e) => e.seq === 2n);
+      assert.ok(ev2, 'expected seq 2 to be emitted');
+      assert.equal(ev2!.data.pad, expectedPad);
+      assert.ok(!ev2!.raw.includes('�'), 'raw line must not contain a replacement character');
+    });
+
+    it('throws LogCorruptError on a genuine blank terminated line between valid records', async () => {
+      const p = await logWith(line(1), '\n', line(2));
+      const cur = await openLogCursor(p, 0n);
+      await assert.rejects(() => cur.readThrough(2n), LogCorruptError);
+      await cur.close();
+    });
   });
 });

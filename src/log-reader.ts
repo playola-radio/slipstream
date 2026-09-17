@@ -36,23 +36,23 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   let offset = 0;          // byte offset of the next unread byte on disk
   let positioned = after === 0n; // have we skipped past `after` yet?
 
-  async function readNewComplete(): Promise<{ lines: string[]; consumed: number }> {
+  async function readNewComplete(): Promise<{ lines: string[] }> {
     const chunkSize = 64 * 1024;
     const buf = Buffer.alloc(chunkSize);
-    let acc = '';
+    const chunks: Buffer[] = [];
     let read = offset;
     for (;;) {
       const { bytesRead } = await handle.read(buf, 0, chunkSize, read);
       if (bytesRead === 0) break;
-      acc += buf.toString('utf8', 0, bytesRead);
+      chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
       read += bytesRead;
       if (bytesRead < chunkSize) break;
     }
-    const lastNl = acc.lastIndexOf('\n');
-    if (lastNl < 0) return { lines: [], consumed: 0 };
-    const complete = acc.slice(0, lastNl);
-    const consumed = Buffer.byteLength(complete + '\n', 'utf8');
-    return { lines: complete.split('\n'), consumed };
+    const all = Buffer.concat(chunks);
+    const lastNl = all.lastIndexOf(0x0a);
+    if (lastNl < 0) return { lines: [] };
+    const complete = all.subarray(0, lastNl).toString('utf8');
+    return { lines: complete.split('\n') };
   }
 
   return {
@@ -62,7 +62,6 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
       const out: ReaderEvent[] = [];
       let advance = offset;
       for (const line of lines) {
-        if (line === '') { advance += 1; continue; } // stray blank line's LF
         const ev = parseLine(line);
         const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
         if (!positioned) {
