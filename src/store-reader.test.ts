@@ -1,11 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   listSessions, readTombstone, isValidSessionId, isValidHex,
-  schemaBytes, onDiskHighWater, blobPath, sessionLogPath,
+  schemaBytes, onDiskHighWater, blobPath, sessionLogPath, readRuntimeDescriptor,
 } from './store-reader.ts';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
@@ -86,6 +86,45 @@ describe('store-reader', () => {
     it('builds the sharded CAS path under the store', () => {
       const hex = 'ab' + '0'.repeat(62);
       assert.equal(blobPath('/s', hex), join('/s', 'blobs', 'sha256', 'ab', hex));
+    });
+  });
+
+  describe('readRuntimeDescriptor', () => {
+    it('returns null when the runtime dir is missing', async () => {
+      const dir = await store();
+      assert.equal(await readRuntimeDescriptor(dir), null);
+    });
+
+    it('returns null when runtime/ has only non-.json files', async () => {
+      const dir = await store();
+      await mkdir(join(dir, 'runtime'), { recursive: true });
+      await writeFile(join(dir, 'runtime', 'notes.txt'), 'not json', 'utf8');
+      assert.equal(await readRuntimeDescriptor(dir), null);
+    });
+
+    it('returns the parsed descriptor for a single file', async () => {
+      const dir = await store();
+      await mkdir(join(dir, 'runtime'), { recursive: true });
+      await writeFile(
+        join(dir, 'runtime', 'a.json'),
+        JSON.stringify({ url: 'http://a', token: 'tok-a' }),
+        'utf8',
+      );
+      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://a', token: 'tok-a' });
+    });
+
+    it('picks the newest descriptor by mtime when two exist', async () => {
+      const dir = await store();
+      await mkdir(join(dir, 'runtime'), { recursive: true });
+      const older = join(dir, 'runtime', 'a.json');
+      const newer = join(dir, 'runtime', 'b.json');
+      await writeFile(older, JSON.stringify({ url: 'http://old', token: 'tok-old' }), 'utf8');
+      await writeFile(newer, JSON.stringify({ url: 'http://new', token: 'tok-new' }), 'utf8');
+      const past = new Date(Date.now() - 60_000);
+      const now = new Date();
+      await utimes(older, past, past);
+      await utimes(newer, now, now);
+      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://new', token: 'tok-new' });
     });
   });
 });
