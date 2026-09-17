@@ -34,4 +34,10 @@ describe('http-security', () => {
     assert.equal(checkHostOrigin({ host: [hp, hp] as unknown as string }, hp), false);
     assert.equal(checkHostOrigin({}, hp), false);
   });
+
+  it('rejects when more than one Host header was sent', () => {
+    const hp = '127.0.0.1:8787';
+    assert.equal(checkHostOrigin({ host: hp }, hp, 1), true);
+    assert.equal(checkHostOrigin({ host: hp }, hp, 2), false);
+  });
 });

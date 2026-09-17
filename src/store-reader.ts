@@ -16,11 +16,11 @@ const SCHEMAS_DIR = fileURLToPath(new URL('../schemas/', import.meta.url));
 export function isValidSessionId(id: string): boolean { return UUID_RE.test(id); }
 export function isValidHex(hex: string): boolean { return HEX_RE.test(hex); }
 
-export function sessionsDir(storeDir: string): string { return join(storeDir, 'sessions'); }
+function sessionsDir(storeDir: string): string { return join(storeDir, 'sessions'); }
 export function sessionLogPath(storeDir: string, id: string): string {
   return join(sessionsDir(storeDir), id, 'events.jsonl');
 }
-export function tombstonePath(storeDir: string, id: string): string {
+function tombstonePath(storeDir: string, id: string): string {
   return join(sessionsDir(storeDir), id, 'removed.json');
 }
 export function blobPath(storeDir: string, hex: string): string {

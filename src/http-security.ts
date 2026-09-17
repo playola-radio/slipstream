@@ -33,7 +33,11 @@ export function checkAuth(header: string | undefined, token: string): boolean {
 export function checkHostOrigin(
   headers: Record<string, string | string[] | undefined>,
   expectedHostPort: string,
+  hostCount = 1,
 ): boolean {
+  // Node collapses duplicate Host headers to the first in `headers.host`; reject
+  // if the client actually sent more than one (mirrors the Origin handling).
+  if (hostCount > 1) return false;
   const host = headers.host;
   if (typeof host !== 'string' || host !== expectedHostPort) return false;
   const origin = headers.origin;

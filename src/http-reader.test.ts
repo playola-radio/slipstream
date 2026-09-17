@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, appendFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, symlink, access } from 'node:fs/promises';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
@@ -23,6 +24,20 @@ async function storeWithSession(): Promise<string> {
 async function GET(srv: ReaderServer, path: string, headers: Record<string,string> = {}) {
   return fetch(`${srv.url}${path}`, {
     headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}`, ...headers },
+  });
+}
+
+// fetch() forbids setting a duplicate/custom Host, so drive the raw wire directly.
+function rawRequest(port: number, lines: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sock = connect(port, '127.0.0.1', () => {
+      sock.write(lines.join('\r\n') + '\r\n\r\n');
+    });
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (d) => { buf += d; });
+    sock.on('end', () => resolve(buf));
+    sock.on('error', reject);
   });
 }
 
@@ -59,6 +74,26 @@ describe('http-reader core', () => {
 
   it('returns 404 for an unknown route', async () => {
     assert.equal((await GET(srv, '/v1/nope')).status, 404);
+  });
+
+  it('rejects a request carrying two Host headers with 403', async () => {
+    const resp = await rawRequest(srv.port, [
+      'GET /v1/sessions HTTP/1.1',
+      `Host: 127.0.0.1:${srv.port}`,
+      `hOsT: 127.0.0.1:${srv.port}`,
+      `Authorization: Bearer ${srv.token}`,
+      'Connection: close',
+    ]);
+    assert.match(resp, /^HTTP\/1\.1 403/);
+  });
+
+  it('removes its runtime descriptor on close', async () => {
+    const d = await storeWithSession();
+    const s = await startReaderServer({ storeDir: d });
+    const dp = s.descriptorPath;
+    await access(dp); // present while running
+    await s.close();
+    await assert.rejects(() => access(dp), /ENOENT/);
   });
 });
 
@@ -167,6 +202,22 @@ describe('http-reader blobs + schemas', () => {
     assert.equal((await GET(srv, `/v1/blobs/sha256/${'a'.repeat(64)}`)).status, 404);
   });
 
+  it('returns 404 for a symlink planted at a valid blob path and never serves its target', async () => {
+    const d = await mkdtemp(join(tmpdir(), 'slip-symlink-'));
+    const planted = 'b'.repeat(64);
+    const shard = join(d, 'blobs', 'sha256', planted.slice(0, 2));
+    await mkdir(shard, { recursive: true });
+    const target = join(d, 'secret.txt');
+    await writeFile(target, 'SECRET-OUT-OF-STORE', 'utf8');
+    await symlink(target, join(shard, planted));
+    const s = await startReaderServer({ storeDir: d });
+    try {
+      const res = await GET(s, `/v1/blobs/sha256/${planted}`);
+      assert.equal(res.status, 404);
+      assert.notEqual(await res.text(), 'SECRET-OUT-OF-STORE');
+    } finally { await s.close(); }
+  });
+
   it('serves a known schema verbatim and 404 on an unknown type', async () => {
     const res = await GET(srv, '/v1/schemas/slipstream.file.changed.v1');
     assert.equal(res.status, 200);
@@ -262,6 +313,29 @@ describe('http-reader SSE follow', () => {
       firstId = sseEvents(acc)[0]?.id ?? '';
     }
     assert.equal(firstId, '2');                          // 1 skipped
+    ac.abort(); await srv.close();
+  });
+
+  it('Last-Event-ID overrides a malformed after param (follows from the LEI)', async () => {
+    const dir = await storeWithSession();
+    const health = createHealth(2n);
+    const srv = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    const ac = new AbortController();
+    const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=notanumber&follow=true`, {
+      headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}`, 'last-event-id': '1' },
+      signal: ac.signal,
+    });
+    assert.equal(res.status, 200);
+    const reader = res.body!.getReader(); const decoder = new TextDecoder();
+    let acc = ''; let firstId = '';
+    while (!firstId) {
+      const { value, done } = await reader.read(); if (done) break;
+      acc += decoder.decode(value, { stream: true });
+      firstId = sseEvents(acc)[0]?.id ?? '';
+    }
+    assert.equal(firstId, '2');                          // parsed LEI=1, not a 400
     ac.abort(); await srv.close();
   });
 });

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createReadStream } from 'node:fs';
-import { access, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, open, unlink, type FileHandle } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import type { Health } from './health.ts';
 import {
@@ -12,12 +12,12 @@ import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './l
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
-export interface ReaderServerOptions { storeDir: string; active?: ActiveSession; host?: string; port?: number }
+export interface ReaderServerOptions { storeDir: string; active?: ActiveSession }
 export interface ReaderServer {
   url: string; port: number; token: string; descriptorPath: string; close(): Promise<void>;
 }
 
-export const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
+const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
 
 const SSE_HEARTBEAT_MS = 15000;
 const SSE_DRAIN_DEADLINE_MS = 10000;
@@ -48,7 +48,6 @@ async function writeBackpressured(res: ServerResponse, chunk: string, signal: Ab
 }
 
 export async function startReaderServer(opts: ReaderServerOptions): Promise<ReaderServer> {
-  const host = opts.host ?? '127.0.0.1';
   const token = generateToken();
   const followers = new Set<AbortController>();
 
@@ -57,15 +56,31 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     if (!res.headersSent) send(res, 500, 'internal error'); else res.destroy();
   }); });
 
-  await new Promise<void>((resolve) => server.listen(opts.port ?? 0, host, resolve));
+  // Bind loopback only; a non-loopback bind must be impossible, not configurable.
+  // Reject the returned promise on a listen error (e.g. EADDRINUSE) rather than
+  // letting it crash the process with no handler.
+  await new Promise<void>((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+  });
   const port = (server.address() as AddressInfo).port;
-  const hostPort = `${host}:${port}`;
+  const hostPort = `127.0.0.1:${port}`;
   const url = `http://${hostPort}`;
-  const descriptorPath = await publishDescriptor(opts.storeDir, { url, token });
+  let descriptorPath: string;
+  try {
+    descriptorPath = await publishDescriptor(opts.storeDir, { url, token });
+  } catch (err) {
+    // Do not leak the listener if we cannot publish the descriptor.
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw err;
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'GET') { send(res, 405, 'method not allowed', { allow: 'GET' }); return; }
-    if (!checkHostOrigin(req.headers as Record<string,string|string[]|undefined>, hostPort)) {
+    if (!checkHostOrigin(
+      req.headers as Record<string,string|string[]|undefined>, hostPort,
+      req.headersDistinct.host?.length ?? 0,
+    )) {
       send(res, 403, 'forbidden'); return;
     }
     if (!checkAuth(req.headers.authorization, token)) { send(res, 401, 'unauthorized'); return; }
@@ -96,18 +111,26 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       const hex = blobMatch[1]!;
       if (!isValidHex(hex)) { send(res, 400, 'invalid hash'); return; }
       const path = blobPath(opts.storeDir, hex);
-      let size: number;
-      try { size = (await stat(path)).size; }
+      // O_NOFOLLOW: a symlink planted at a valid CAS path must not serve its
+      // (out-of-store) target. Size and bytes both come from the one opened fd,
+      // closing the stat/open TOCTOU. ELOOP (symlink) maps to 404, like ENOENT.
+      let handle: FileHandle;
+      try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
       catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') { send(res, 404, 'not found'); return; }
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ELOOP') { send(res, 404, 'not found'); return; }
         throw err;
       }
+      let size: number;
+      try { size = (await handle.stat()).size; }
+      catch (err) { await handle.close(); throw err; }
+      if (res.destroyed) { await handle.close(); return; }
       res.writeHead(200, {
         'cache-control': 'no-store',
         'content-type': 'application/octet-stream',
         'content-length': String(size),
       });
-      const stream = createReadStream(path);
+      const stream = handle.createReadStream(); // autoClose closes the fd
       stream.on('error', () => res.destroy());
       res.on('close', () => stream.destroy());
       stream.pipe(res);
@@ -138,20 +161,17 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     const logPath = sessionLogPath(opts.storeDir, id);
     try { await access(logPath); } catch { send(res, 404, 'not found'); return; }
 
-    const after = parseCursor(params.get('after') ?? undefined);
-    if (after === null) { send(res, 400, 'invalid cursor'); return; }
-
-    // Last-Event-ID overrides after (follow only), validated the same way
-    let effectiveAfter = after;
+    // Select the effective RAW cursor first — for follow, Last-Event-ID overrides
+    // the `after` param — THEN parse once, so a malformed `after` that a valid
+    // Last-Event-ID overrides does not spuriously 400.
     const follow = isFollow(params);
+    let rawCursor = params.get('after') ?? undefined;
     if (follow) {
       const leiRaw = req.headers['last-event-id'];
-      if (typeof leiRaw === 'string') {
-        const lei = parseCursor(leiRaw);
-        if (lei === null) { send(res, 400, 'invalid cursor'); return; }
-        effectiveAfter = lei;
-      }
+      if (typeof leiRaw === 'string') rawCursor = leiRaw;
     }
+    const effectiveAfter = parseCursor(rawCursor);
+    if (effectiveAfter === null) { send(res, 400, 'invalid cursor'); return; }
 
     const boundary = await boundaryFor(id);
     const H = boundary.current();
@@ -234,6 +254,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     close: async () => {
       for (const ac of followers) ac.abort();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      // Remove the descriptor this server published; a dead reader must not leave
+      // a stale pointer behind. ENOENT (already gone) is fine.
+      await unlink(descriptorPath).catch((err) => {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      });
     },
   };
 }
