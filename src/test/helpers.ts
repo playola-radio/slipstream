@@ -5,7 +5,7 @@
  * injected seam — the engine's `Reader` — for deterministic unit tests. See
  * TESTING.md for the full policy on where we do and do not mock.
  */
-import { mkdtemp, open, readFile, rm, type FileHandle } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCas, type Cas } from '../cas.ts';
@@ -42,7 +42,7 @@ export async function withReader(
   const store = await mkdtemp(join(tmpdir(), 'slip-store-'));
   try {
     const cas = await createCas(store);
-    const reader = createReader({ root, cas, maxBytes: opts.maxBytes, openFile: opts.openFile ?? open });
+    const reader = createReader({ root, cas, maxBytes: opts.maxBytes, openFile: opts.openFile });
     await fn({ root, cas, read: (p) => reader.read(p) });
   } finally {
     await rm(root, { recursive: true, force: true });

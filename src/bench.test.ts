@@ -2,15 +2,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
-import { isExecutedEntrypoint, percentile, readBenchRecords, waitForSettled } from './bench.ts';
+import { percentile, readBenchRecords, waitForSettled } from './bench.ts';
 import { withTempDir } from './test/helpers.ts';
 
 describe('bench', () => {
-  it('runs only when its module URL names the executed argv file', () => {
-    assert.equal(isExecutedEntrypoint('file:///tmp/bench.ts', '/tmp/bench.ts'), true);
-    assert.equal(isExecutedEntrypoint('file:///tmp/bench.ts', '/tmp/bench.test.ts'), false);
-  });
-
   it('requires at least 500 ms of quiet before delivery is settled', async () => {
     let now = 0;
     const lengths = [1, 1, 2, 2, 2, 2, 2, 2];

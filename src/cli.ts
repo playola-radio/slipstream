@@ -8,8 +8,8 @@
  */
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { startCapture } from './session.ts';
+import { isMainModule } from './entrypoint.ts';
 
 interface Args {
   dir: string;
@@ -68,6 +68,6 @@ async function main(): Promise<void> {
   process.on('SIGTERM', stop);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {
   await main();
 }

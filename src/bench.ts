@@ -12,9 +12,9 @@
 import { mkdtemp, readFile, rm, writeFile, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 import { startCapture, type CaptureSession } from './session.ts';
+import { isMainModule } from './entrypoint.ts';
 import type { LoggedRecord } from './log.ts';
 import { categorize, type ObservedState, type RecordState, type TraceStep } from './loss.ts';
 
@@ -319,10 +319,6 @@ export async function waitForSettled(
   }
 }
 
-export function isExecutedEntrypoint(moduleUrl: string, argvPath: string): boolean {
-  return moduleUrl === pathToFileURL(resolve(argvPath)).href;
-}
-
-if (process.argv[1] && isExecutedEntrypoint(import.meta.url, process.argv[1])) {
+if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {
   await main();
 }
