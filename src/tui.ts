@@ -60,9 +60,18 @@ function argFor(argv: string[], flag: string): string | undefined {
 
 async function followHttp(store: string, session: string, out: (l: string) => void): Promise<void> {
   const desc = await readRuntimeDescriptor(store);
-  if (!desc) { out('no running reader (runtime descriptor not found); try --disk'); return; }
+  if (!desc) { out('no usable reader (runtime descriptor missing or invalid); try --disk'); return; }
   const url = new URL(`v1/sessions/${session}/events?after=0&follow=true`, desc.url);
-  const res = await fetch(url, { headers: { authorization: `Bearer ${desc.token}` } });
+  let res: Response;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 5000);
+  try {
+    res = await fetch(url, {
+      headers: { authorization: `Bearer ${desc.token}` }, redirect: 'error',
+      signal: ac.signal,
+    });
+  } catch { out('reader unavailable (connection failed or stale descriptor); try --disk'); return; }
+  finally { clearTimeout(timer); }
   if (!res.ok || !res.body) { out(`reader responded ${res.status}`); return; }
   const reader = res.body.getReader(); const decoder = new TextDecoder(); let acc = '';
   for (;;) {

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, utimes, chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -144,10 +144,10 @@ describe('store-reader', () => {
       await mkdir(join(dir, 'runtime'), { recursive: true });
       await writeFile(
         join(dir, 'runtime', 'a.json'),
-        JSON.stringify({ url: 'http://a', token: 'tok-a' }),
-        'utf8',
+        JSON.stringify({ url: 'http://127.0.0.1:1234', token: 'tok-a' }),
+        { mode: 0o600 },
       );
-      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://a', token: 'tok-a' });
+      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://127.0.0.1:1234', token: 'tok-a' });
     });
 
     it('picks the newest descriptor by mtime when two exist', async () => {
@@ -155,13 +155,13 @@ describe('store-reader', () => {
       await mkdir(join(dir, 'runtime'), { recursive: true });
       const older = join(dir, 'runtime', 'a.json');
       const newer = join(dir, 'runtime', 'b.json');
-      await writeFile(older, JSON.stringify({ url: 'http://old', token: 'tok-old' }), 'utf8');
-      await writeFile(newer, JSON.stringify({ url: 'http://new', token: 'tok-new' }), 'utf8');
+      await writeFile(older, JSON.stringify({ url: 'http://localhost:1234', token: 'tok-old' }), { mode: 0o600 });
+      await writeFile(newer, JSON.stringify({ url: 'http://[::1]:1234', token: 'tok-new' }), { mode: 0o600 });
       const past = new Date(Date.now() - 60_000);
       const now = new Date();
       await utimes(older, past, past);
       await utimes(newer, now, now);
-      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://new', token: 'tok-new' });
+      assert.deepEqual(await readRuntimeDescriptor(dir), { url: 'http://[::1]:1234', token: 'tok-new' });
     });
   });
 });
@@ -175,3 +175,34 @@ for (const raw of ['{}', '{"version":2}', '[]', 'true', 'not JSON']) {
     assert.deepEqual(await listSessions(dir), [{ id: UUID, durableSeq: 1n, removed: false }]);
   });
 }
+
+for (const raw of ['{}', 'null', '[]', 'true', 'broken',
+  '{"url":3,"token":"secret"}', '{"url":"http://localhost","token":4}',
+  ...['https://localhost', 'http://example.com', 'http://localhost.evil.test',
+    'http://127.0.0.1/path', 'http://user:pass@localhost', 'http://localhost?x=1',
+    'http://localhost#x'].map(url => JSON.stringify({ url, token: 'secret' }))]) {
+  it(`skips unusable runtime descriptor ${raw}`, async () => {
+    const dir = await store();
+    await mkdir(join(dir, 'runtime'));
+    const good = { url: 'http://127.0.0.1:1234', token: 'good' };
+    const path = join(dir, 'runtime', 'good.json');
+    await writeFile(path, JSON.stringify(good), { mode: 0o600 });
+    await utimes(path, new Date(0), new Date(0));
+    await writeFile(join(dir, 'runtime', 'bad.json'), raw, { mode: 0o600 });
+    assert.deepEqual(await readRuntimeDescriptor(dir), good);
+  });
+}
+
+it('rejects accessible descriptors, directories and symlinks', async () => {
+  const dir = await store();
+  await mkdir(join(dir, 'runtime'));
+  const path = join(dir, 'runtime', 'a.json');
+  await writeFile(path, JSON.stringify({ url: 'http://localhost', token: 'secret' }));
+  await chmod(path, 0o640);
+  await mkdir(join(dir, 'runtime', 'directory.json'));
+  const target = join(dir, 'private');
+  await writeFile(target, JSON.stringify({ url: 'http://localhost', token: 'secret' }), { mode: 0o600 });
+  await symlink(target, join(dir, 'runtime', 'link.json'));
+  await symlink(join(dir, 'missing'), join(dir, 'runtime', 'stale.json'));
+  assert.equal(await readRuntimeDescriptor(dir), null);
+});

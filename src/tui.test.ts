@@ -1,9 +1,9 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { renderEvent, replayFromDisk, sseDataLine } from './tui.ts';
+import { renderEvent, replayFromDisk, sseDataLine, runTui } from './tui.ts';
 import { parseLine } from './log-reader.ts';
 
 const UUID = '55555555-5555-4555-8555-555555555555';
@@ -68,4 +68,31 @@ describe('tui', () => {
       assert.match(lines[0]!, /^1 · /);
     });
   });
+});
+
+it('does not send a token from a non-loopback descriptor', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'runtime'));
+  await writeFile(join(dir, 'runtime', 'bad.json'),
+    JSON.stringify({ url: 'http://example.com', token: 'secret' }), { mode: 0o600 });
+  const fetchMock = mock.method(globalThis, 'fetch', async () => new Response('', { status: 503 }));
+  const lines: string[] = [];
+  try {
+    await runTui(['--store', dir, '--session', UUID], l => lines.push(l));
+    assert.equal(fetchMock.mock.callCount(), 0);
+    assert.match(lines.join(''), /no .*reader/);
+  } finally { fetchMock.mock.restore(); }
+});
+
+it('reports a stale reader connection without throwing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'runtime'));
+  await writeFile(join(dir, 'runtime', 'a.json'),
+    JSON.stringify({ url: 'http://localhost:1234', token: 'secret' }), { mode: 0o600 });
+  const fetchMock = mock.method(globalThis, 'fetch', async () => { throw new Error('connection refused'); });
+  const lines: string[] = [];
+  try {
+    await runTui(['--store', dir, '--session', UUID], l => lines.push(l));
+    assert.match(lines.join(''), /unavailable.*--disk/);
+  } finally { fetchMock.mock.restore(); }
 });

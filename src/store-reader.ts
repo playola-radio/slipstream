@@ -1,4 +1,5 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { readdir, readFile, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENT_TYPES } from './event.ts';
@@ -95,11 +96,27 @@ export async function readRuntimeDescriptor(storeDir: string): Promise<RuntimeDe
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
-  if (files.length === 0) return null;
-  let newest = files[0]!; let newestMs = -1;
+  let newest: RuntimeDescriptor | null = null;
+  let newestMs = -1;
   for (const f of files) {
-    const s = await stat(join(dir, f));
-    if (s.mtimeMs > newestMs) { newestMs = s.mtimeMs; newest = f; }
+    // Validate the same fd we read; never follow symlinks or block on a FIFO.
+    let handle;
+    try {
+      handle = await open(join(dir, f), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const info = await handle.stat();
+      if (!info.isFile() || (info.mode & 0o077) !== 0
+        || (process.getuid && info.uid !== process.getuid())) continue;
+      const parsed: unknown = JSON.parse(await handle.readFile('utf8'));
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
+      const { url, token } = parsed as Record<string, unknown>;
+      if (typeof url !== 'string' || typeof token !== 'string') continue;
+      const origin = new URL(url);
+      if (origin.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(origin.hostname)
+        || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) continue;
+      if (info.mtimeMs > newestMs) { newestMs = info.mtimeMs; newest = { url, token }; }
+    } catch {
+      // A stale, inaccessible or malformed candidate must not hide a usable one.
+    } finally { await handle?.close(); }
   }
-  return JSON.parse(await readFile(join(dir, newest), 'utf8')) as RuntimeDescriptor;
+  return newest;
 }
