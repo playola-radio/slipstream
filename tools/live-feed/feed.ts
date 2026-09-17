@@ -134,7 +134,7 @@ export function parseLine(line: string): FeedEvent {
  * viewer itself adds are non-control code points and pass through untouched.
  */
 function sanitize(text: string): string {
-  return text.replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
 }
 
 const ANSI = {

@@ -38,3 +38,6 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Run tool tests
+        run: npm run test:tools

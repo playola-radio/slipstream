@@ -177,6 +177,19 @@ describe('formatEvent', () => {
     assert.ok(line!.includes('\\x1b'));
   });
 
+  it('neutralizes C1 control characters in a path', () => {
+    const evil: FeedEvent = {
+      kind: 'change',
+      atMs: 0,
+      path: '\x9bFORGED',
+      before: { kind: 'absent' },
+      after: { kind: 'content', size: 1 },
+    };
+    const line = formatEvent(evil, { color: false });
+    assert.ok(!line!.includes('\x9b'));
+    assert.ok(line!.includes('FORGED'));
+  });
+
   it('neutralizes control characters in an unavailable reason too', () => {
     const evil: FeedEvent = {
       kind: 'change',

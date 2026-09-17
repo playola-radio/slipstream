@@ -50,8 +50,9 @@ then new records as they arrive.
 - **deleted** (red): present before, absent after.
 - **modified** (yellow): content changed on both sides.
 - Sizes are bytes straight from the record. There is no line count in the log,
-  so only byte deltas are shown. Unavailable content shows `—`, never a fake
-  size. A state whose prior baseline was never observed is reported as
+  so only byte deltas are shown. Unavailable content shows its reason in angle
+  brackets (or `⟨unavailable⟩` when no reason is recorded), never a fake size.
+  A state whose prior baseline was never observed is reported as
   `modified`, never upgraded to a confident `new`.
 
 ## Known limitation

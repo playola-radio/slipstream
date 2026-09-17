@@ -19,6 +19,7 @@
 import { readdir, stat, open } from 'node:fs/promises';
 import { watchFile, unwatchFile } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseLine, formatEvent } from './feed.ts';
 
 export interface CliOptions {
@@ -141,36 +142,35 @@ export async function followLog(
       do {
         dirty = false;
         if (stopped) break;
-        let handle;
         try {
-          handle = await open(path, 'r');
+          const handle = await open(path, 'r');
+          try {
+            const info = await handle.stat();
+            if (inode !== null && info.ino !== inode) {
+              position = 0; // file was replaced
+              carry = Buffer.alloc(0);
+            }
+            inode = info.ino;
+            if (info.size < position) {
+              position = 0; // truncated
+              carry = Buffer.alloc(0);
+            }
+            while (position < info.size) {
+              if (stopped) break;
+              const want = Math.min(READ_CHUNK, info.size - position);
+              const buffer = Buffer.alloc(want);
+              const { bytesRead } = await handle.read(buffer, 0, want, position);
+              if (bytesRead <= 0) break;
+              position += bytesRead;
+              const chunk = buffer.subarray(0, bytesRead);
+              carry = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
+              emitCompleteLines();
+            }
+          } finally {
+            await handle.close();
+          }
         } catch {
-          break; // log not present yet; a later watch tick retries
-        }
-        try {
-          const info = await handle.stat();
-          if (inode !== null && info.ino !== inode) {
-            position = 0; // file was replaced
-            carry = Buffer.alloc(0);
-          }
-          inode = info.ino;
-          if (info.size < position) {
-            position = 0; // truncated
-            carry = Buffer.alloc(0);
-          }
-          while (position < info.size) {
-            if (stopped) break;
-            const want = Math.min(READ_CHUNK, info.size - position);
-            const buffer = Buffer.alloc(want);
-            const { bytesRead } = await handle.read(buffer, 0, want, position);
-            if (bytesRead <= 0) break;
-            position += bytesRead;
-            const chunk = buffer.subarray(0, bytesRead);
-            carry = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
-            emitCompleteLines();
-          }
-        } finally {
-          await handle.close();
+          // A transient stat/read/close failure is retried by the next watch tick.
         }
       } while (dirty && !stopped);
     } finally {
@@ -247,6 +247,6 @@ async function main(): Promise<void> {
   }, { signal: controller.signal });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main();
 }
