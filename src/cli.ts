@@ -97,10 +97,17 @@ async function main(): Promise<void> {
   }
 
   // args.command === 'serve'
-  const server = await startReaderServer({
-    storeDir: args.store,
-    active: { id: session.sessionId, health: session.health, logPath: session.logPath },
-  });
+  let server;
+  try {
+    server = await startReaderServer({
+      storeDir: args.store,
+      active: { id: session.sessionId, health: session.health, logPath: session.logPath },
+    });
+  } catch (err) {
+    try { await session.stop(); }
+    catch (stopError) { console.error('slipstream: capture cleanup failed', stopError); }
+    throw err;
+  }
   console.error(`slipstream: reader ${server.url}`);
   console.error(`slipstream: reader descriptor ${server.descriptorPath}`);
   console.error('slipstream: press Ctrl-C to stop');
