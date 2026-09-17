@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, open, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createCas } from './cas.ts';
 import { createLog } from './log.ts';
@@ -183,6 +183,34 @@ describe('recovery', () => {
         },
       ]);
       await assert.rejects(recoverSession(path, SESSION, cas), /size/);
+    });
+  });
+
+  it('establishes a durability barrier over the retained prefix on a clean recovery', async (t) => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, baselineAbsent('a.ts')]);
+
+      // Spy on the real fsync syscall through the FileHandle prototype — no
+      // production seam is added, and the mock still calls through to the real
+      // sync. A clean log referencing only `absent` snapshots drives no blob
+      // syncs, so any sync observed here is the retained log's durability
+      // barrier. Without the barrier a clean recovery re-publishes
+      // recoveredThroughSeq as durable without ever forcing the retained bytes
+      // to the platter.
+      const probe = await open(path, 'r');
+      const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+      await probe.close();
+      const sync = t.mock.method(proto, 'sync');
+
+      const rec = await recoverSession(path, SESSION, cas);
+
+      assert.equal(rec.discardedTailBytes, 0, 'precondition: clean recovery, no torn tail');
+      assert.equal(rec.recoveredThroughSeq, 2n);
+      assert.ok(
+        sync.mock.callCount() >= 1,
+        'retained log must be fsynced before recoveredThroughSeq is returned as durable',
+      );
     });
   });
 
