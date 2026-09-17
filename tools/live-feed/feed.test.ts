@@ -10,7 +10,7 @@ import {
 } from './feed.ts';
 
 /** A real CloudEvents `file.changed` record as written to events.jsonl. */
-function changedRecord(over: Record<string, unknown> = {}): string {
+function changedRecord(): string {
   return JSON.stringify({
     specversion: '1.0',
     id: '4',
@@ -26,7 +26,6 @@ function changedRecord(over: Record<string, unknown> = {}): string {
       observation: 'watcher',
       observed_at_ms: 1789667803962,
       coalesced: false,
-      ...over,
     },
   });
 }
@@ -58,8 +57,13 @@ describe('sizeLabel', () => {
     assert.equal(sizeLabel({ kind: 'absent' }), '0B');
   });
 
-  it('shows an em dash for unavailable content rather than a fake size', () => {
-    assert.equal(sizeLabel({ kind: 'unavailable' }), '—');
+  it('shows ?B for content with a missing size rather than a fabricated 0B', () => {
+    assert.equal(sizeLabel({ kind: 'content', size: null }), '?B');
+  });
+
+  it('exposes the reason for unavailable content instead of a fake size', () => {
+    assert.equal(sizeLabel({ kind: 'unavailable', reason: 'oversize' }), '⟨oversize⟩');
+    assert.equal(sizeLabel({ kind: 'unavailable', reason: null }), '⟨unavailable⟩');
   });
 });
 
@@ -68,8 +72,9 @@ describe('formatClock', () => {
     assert.match(formatClock(1789667803962), /^\d{2}:\d{2}:\d{2}$/);
   });
 
-  it('renders a placeholder when the timestamp is unknown', () => {
+  it('renders a placeholder when the timestamp is unknown or out of range', () => {
     assert.equal(formatClock(null), '--:--:--');
+    assert.equal(formatClock(1e20), '--:--:--');
   });
 });
 
@@ -99,6 +104,18 @@ describe('parseLine', () => {
     assert.equal(ev.atMs, 100);
   });
 
+  it('falls back to the envelope time when observed_at_ms is out of range', () => {
+    const line = JSON.stringify({
+      type: 'slipstream.file.changed.v1',
+      time: '2026-09-17T12:00:00.000Z',
+      data: { path: 'a', before: { kind: 'absent' }, after: { kind: 'content', size: 1 }, observed_at_ms: 1e20 },
+    });
+    const ev = parseLine(line);
+    assert.equal(ev.kind, 'change');
+    if (ev.kind !== 'change') return;
+    assert.equal(ev.atMs, Date.parse('2026-09-17T12:00:00.000Z'));
+  });
+
   it('normalizes a capture.gap record with its reason', () => {
     const line = JSON.stringify({
       type: 'slipstream.capture.gap.v1',
@@ -113,6 +130,11 @@ describe('parseLine', () => {
 
   it('classifies unrelated event types as "other" so they are skipped', () => {
     const line = JSON.stringify({ type: 'slipstream.session.started.v1', data: { session_id: 'abc' } });
+    assert.equal(parseLine(line).kind, 'other');
+  });
+
+  it('does not treat an unknown look-alike type as a change', () => {
+    const line = JSON.stringify({ type: 'slipstream.file.changed.audit.v1', data: {} });
     assert.equal(parseLine(line).kind, 'other');
   });
 
@@ -140,6 +162,19 @@ describe('formatEvent', () => {
     const gap: FeedEvent = { kind: 'gap', atMs: Date.UTC(2026, 0, 1, 0, 0, 0), reason: 'restart' };
     const clock = formatClock(gap.atMs);
     assert.equal(formatEvent(gap, { color: false }), `${clock} ⚠ gap: restart`);
+  });
+
+  it('neutralizes terminal control characters in a path', () => {
+    const evil: FeedEvent = {
+      kind: 'change',
+      atMs: 0,
+      path: '\x1b[2Jforged.txt',
+      before: { kind: 'absent' },
+      after: { kind: 'content', size: 1 },
+    };
+    const line = formatEvent(evil, { color: false });
+    assert.ok(!line!.includes('\x1b['));
+    assert.ok(line!.includes('\\x1b'));
   });
 
   it('skips "other" events by returning null', () => {

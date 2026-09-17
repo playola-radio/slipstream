@@ -95,11 +95,19 @@ export async function discoverLog(storeDir: string): Promise<string | null> {
   return newest?.path ?? null;
 }
 
+const READ_CHUNK = 1 << 20; // 1 MiB — bounds memory and dodges the max-string-length limit
+
 /**
  * Follow a JSONL file, invoking `onLine` for each complete line — existing
  * history first, then appended lines as they arrive. Thin by design: the
  * classification and formatting it feeds are the tested parts. Polls via
  * watchFile so it works uniformly across platforms.
+ *
+ * Bytes are accumulated in a Buffer and split on the newline byte, so a
+ * multibyte character straddling two reads is never decoded mid-sequence. The
+ * `watchFile` listener is installed before the initial read so appends landing
+ * during startup are not missed, and a `dirty` flag re-runs the pump when a
+ * change arrives while one is already in flight.
  */
 export async function followLog(
   path: string,
@@ -107,50 +115,72 @@ export async function followLog(
   opts: { signal?: AbortSignal; intervalMs?: number } = {},
 ): Promise<void> {
   let position = 0;
-  let carry = '';
+  let inode: number | null = null;
+  let carry = Buffer.alloc(0);
   let pumping = false;
+  let dirty = false;
+
+  const emitCompleteLines = (): void => {
+    let nl: number;
+    while ((nl = carry.indexOf(0x0a)) >= 0) {
+      const line = carry.subarray(0, nl).toString('utf8');
+      carry = carry.subarray(nl + 1);
+      if (line.trim().length > 0) onLine(line);
+    }
+  };
 
   const pump = async (): Promise<void> => {
-    if (pumping) return;
+    if (pumping) {
+      dirty = true; // a change arrived mid-pump; run again when this one finishes
+      return;
+    }
     pumping = true;
     try {
-      const handle = await open(path, 'r');
-      try {
-        const info = await handle.stat();
-        if (info.size < position) {
-          position = 0; // truncated or rotated
-          carry = '';
+      do {
+        dirty = false;
+        let handle;
+        try {
+          handle = await open(path, 'r');
+        } catch {
+          break; // log not present yet; a later watch tick retries
         }
-        if (info.size > position) {
-          const length = info.size - position;
-          const buffer = Buffer.alloc(length);
-          const { bytesRead } = await handle.read(buffer, 0, length, position);
-          position += bytesRead;
-          carry += buffer.subarray(0, bytesRead).toString('utf8');
-          let nl: number;
-          while ((nl = carry.indexOf('\n')) >= 0) {
-            const line = carry.slice(0, nl);
-            carry = carry.slice(nl + 1);
-            if (line.trim().length > 0) onLine(line);
+        try {
+          const info = await handle.stat();
+          if (inode !== null && info.ino !== inode) {
+            position = 0; // file was replaced
+            carry = Buffer.alloc(0);
           }
+          inode = info.ino;
+          if (info.size < position) {
+            position = 0; // truncated
+            carry = Buffer.alloc(0);
+          }
+          while (position < info.size) {
+            const want = Math.min(READ_CHUNK, info.size - position);
+            const buffer = Buffer.alloc(want);
+            const { bytesRead } = await handle.read(buffer, 0, want, position);
+            if (bytesRead <= 0) break;
+            position += bytesRead;
+            const chunk = buffer.subarray(0, bytesRead);
+            carry = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
+            emitCompleteLines();
+          }
+        } finally {
+          await handle.close();
         }
-      } finally {
-        await handle.close();
-      }
-    } catch {
-      // Log may not exist yet or momentarily be unreadable; retry on next tick.
+      } while (dirty);
     } finally {
       pumping = false;
     }
   };
 
-  await pump();
-
   return new Promise<void>((resolvePromise) => {
     const interval = opts.intervalMs ?? 250;
-    watchFile(path, { interval }, () => void pump());
+    const listener = (): void => void pump();
+    watchFile(path, { interval }, listener);
+    void pump();
     const stop = (): void => {
-      unwatchFile(path);
+      unwatchFile(path, listener);
       resolvePromise();
     };
     if (opts.signal) {

@@ -10,13 +10,14 @@
  * - A prior `unavailable` state is never upgraded to a confident "new".
  * - `capture.gap` records are rendered, never dropped, so coverage gaps stay
  *   visible.
- * - Unavailable content shows an explicit marker, never a fabricated size.
+ * - Unavailable content shows its explicit reason, never a fabricated size; a
+ *   missing/invalid size shows `?B`, never `0B`.
  */
 
 export type Snap =
-  | { kind: 'content'; size: number }
+  | { kind: 'content'; size: number | null }
   | { kind: 'absent' }
-  | { kind: 'unavailable'; reason?: string };
+  | { kind: 'unavailable'; reason: string | null };
 
 export type ChangeClass = 'new' | 'deleted' | 'modified';
 
@@ -24,7 +25,13 @@ export type FeedEvent =
   | { kind: 'change'; atMs: number | null; path: string; before: Snap; after: Snap }
   | { kind: 'gap'; atMs: number | null; reason: string }
   | { kind: 'other' }
-  | { kind: 'malformed'; raw: string };
+  | { kind: 'malformed' };
+
+// The real log uses these CloudEvents type names; the brief's flat example uses
+// the short aliases. Matching an exact set (not a substring) means an unknown or
+// future-versioned type is ignored rather than misread as a v1 change.
+const CHANGE_TYPES = new Set(['slipstream.file.changed.v1', 'file.changed']);
+const GAP_TYPES = new Set(['slipstream.capture.gap.v1', 'capture.gap']);
 
 export function classifyChange(before: { kind: string }, after: { kind: string }): ChangeClass {
   const beforeAbsent = before.kind === 'absent';
@@ -35,14 +42,21 @@ export function classifyChange(before: { kind: string }, after: { kind: string }
 }
 
 export function sizeLabel(snap: Snap): string {
-  if (snap.kind === 'content') return `${snap.size}B`;
+  if (snap.kind === 'content') return snap.size === null ? '?B' : `${snap.size}B`;
   if (snap.kind === 'absent') return '0B';
-  return '—';
+  return `⟨${snap.reason ?? 'unavailable'}⟩`;
+}
+
+/** True only for a value that maps to a real wall-clock instant. */
+function validMs(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Number.isNaN(new Date(value).getTime()) ? null : value;
 }
 
 export function formatClock(atMs: number | null): string {
-  if (atMs === null || !Number.isFinite(atMs)) return '--:--:--';
-  return new Date(atMs).toTimeString().slice(0, 8);
+  const ms = validMs(atMs);
+  if (ms === null) return '--:--:--';
+  return new Date(ms).toTimeString().slice(0, 8);
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -56,17 +70,19 @@ function toSnap(value: unknown): Snap {
   const obj = asObject(value);
   if (!obj) return { kind: 'unavailable', reason: 'missing' };
   if (obj.kind === 'content') {
-    return { kind: 'content', size: typeof obj.size === 'number' ? obj.size : 0 };
+    const size = typeof obj.size === 'number' && Number.isFinite(obj.size) && obj.size >= 0 ? obj.size : null;
+    return { kind: 'content', size };
   }
   if (obj.kind === 'absent') return { kind: 'absent' };
   if (obj.kind === 'unavailable') {
-    return { kind: 'unavailable', reason: typeof obj.reason === 'string' ? obj.reason : undefined };
+    return { kind: 'unavailable', reason: typeof obj.reason === 'string' ? obj.reason : null };
   }
   return { kind: 'unavailable', reason: 'unknown' };
 }
 
 function timestampFrom(data: Record<string, unknown>, envelope: Record<string, unknown>): number | null {
-  if (typeof data.observed_at_ms === 'number') return data.observed_at_ms;
+  const direct = validMs(data.observed_at_ms);
+  if (direct !== null) return direct;
   if (typeof envelope.time === 'string') {
     const parsed = Date.parse(envelope.time);
     if (Number.isFinite(parsed)) return parsed;
@@ -80,17 +96,17 @@ export function parseLine(line: string): FeedEvent {
   try {
     parsed = JSON.parse(line);
   } catch {
-    return { kind: 'malformed', raw: line };
+    return { kind: 'malformed' };
   }
   const envelope = asObject(parsed);
-  if (!envelope) return { kind: 'malformed', raw: line };
+  if (!envelope) return { kind: 'malformed' };
 
   const type = typeof envelope.type === 'string' ? envelope.type : '';
   // The flat brief shape carries fields at top level; the real log nests them
   // under `data`. Reading `data ?? envelope` handles both.
   const data = asObject(envelope.data) ?? envelope;
 
-  if (type.includes('file.changed')) {
+  if (CHANGE_TYPES.has(type)) {
     return {
       kind: 'change',
       atMs: timestampFrom(data, envelope),
@@ -99,7 +115,7 @@ export function parseLine(line: string): FeedEvent {
       after: toSnap(data.after),
     };
   }
-  if (type.includes('capture.gap')) {
+  if (GAP_TYPES.has(type)) {
     return {
       kind: 'gap',
       atMs: timestampFrom(data, envelope),
@@ -107,6 +123,15 @@ export function parseLine(line: string): FeedEvent {
     };
   }
   return { kind: 'other' };
+}
+
+/**
+ * Neutralize terminal control characters in text read from the log. Filenames
+ * can legally contain ESC and other C0 controls; printing them verbatim would
+ * let a watched path rewrite the terminal or forge feed lines.
+ */
+function sanitize(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
 }
 
 const ANSI = {
@@ -137,11 +162,11 @@ export function formatEvent(ev: FeedEvent, opts: FormatOptions): string | null {
   switch (ev.kind) {
     case 'change': {
       const cls = classifyChange(ev.before, ev.after);
-      const line = `${formatClock(ev.atMs)} ${ev.path} ${sizeLabel(ev.before)} → ${sizeLabel(ev.after)} [${cls}]`;
+      const line = `${formatClock(ev.atMs)} ${sanitize(ev.path)} ${sizeLabel(ev.before)} → ${sizeLabel(ev.after)} [${cls}]`;
       return paint(line, CLASS_COLOR[cls], color);
     }
     case 'gap':
-      return paint(`${formatClock(ev.atMs)} ⚠ gap: ${ev.reason}`, ANSI.dim, color);
+      return paint(`${formatClock(ev.atMs)} ⚠ gap: ${sanitize(ev.reason)}`, ANSI.dim, color);
     case 'malformed':
       return paint(`--:--:-- ⚠ unparseable log line`, ANSI.dim, color);
     case 'other':

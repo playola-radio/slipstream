@@ -95,4 +95,29 @@ describe('followLog', () => {
 
     assert.deepEqual(seen, ['one', 'two', 'three']);
   });
+
+  it('does not corrupt a multibyte character split across reads', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'lf-'));
+    const log = join(dir, 'events.jsonl');
+    await writeFile(log, '');
+
+    const seen: string[] = [];
+    const controller = new AbortController();
+    const done = followLog(log, (line) => seen.push(line), {
+      signal: controller.signal,
+      intervalMs: 20,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    // "café\n" with the two bytes of é (0xC3 0xA9) delivered in separate reads.
+    await appendFile(log, Buffer.from([0x63, 0x61, 0x66, 0xc3]));
+    await new Promise((r) => setTimeout(r, 60));
+    await appendFile(log, Buffer.from([0xa9, 0x0a]));
+    await new Promise((r) => setTimeout(r, 60));
+
+    controller.abort();
+    await done;
+
+    assert.deepEqual(seen, ['café']);
+  });
 });
