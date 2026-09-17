@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { access, open, mkdir, readFile, rename } from 'node:fs/promises';
+import { access, open, mkdir, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   DIR_MODE,
@@ -70,21 +70,25 @@ export async function createCas(rootDir: string): Promise<Cas> {
     const tmp = `${dest}.${randomUUID()}.tmp`;
     let handle;
     try {
-      handle = await open(tmp, 'wx', FILE_MODE);
-      await writeAll(handle, bytes);
-      await handle.sync();
-    } catch (err) {
-      throw new StorageError('write-blob', err);
-    } finally {
-      await handle?.close();
-    }
+      try {
+        handle = await open(tmp, 'wx', FILE_MODE);
+        await writeAll(handle, bytes);
+        await handle.sync();
+      } catch (err) {
+        throw new StorageError('write-blob', err);
+      } finally {
+        await handle?.close();
+      }
 
-    try {
-      await rename(tmp, dest);
-    } catch (err) {
-      throw new StorageError('rename-blob', err);
+      try {
+        await rename(tmp, dest);
+      } catch (err) {
+        throw new StorageError('rename-blob', err);
+      }
+      await fsyncDir(shard); // persist the rename into the shard directory
+    } finally {
+      await unlink(tmp).catch(() => {});
     }
-    await fsyncDir(shard); // persist the rename into the shard directory
 
     durable.add(sha256);
     return { sha256, size: bytes.length };

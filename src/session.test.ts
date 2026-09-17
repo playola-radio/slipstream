@@ -58,6 +58,59 @@ async function waitForHealth(health: Health, predicate: (s: ReturnType<Health['s
 }
 
 describe('session', () => {
+  it('releases the session lock when opening the log fails', async () => {
+    await withTempPair(async (root, store) => {
+      const seeded = await startCapture({ root, storeDir: store });
+      const sessionId = seeded.sessionId;
+      await seeded.stop();
+
+      await assert.rejects(
+        startCapture(
+          { root, storeDir: store, resumeSessionId: sessionId },
+          { createLog: async () => { throw new Error('open failed'); } },
+        ),
+        /open failed/,
+      );
+
+      const resumed = await startCapture({ root, storeDir: store, resumeSessionId: sessionId });
+      await resumed.stop();
+    });
+  });
+
+  it('installs the watcher before durably starting a new session', async () => {
+    await withTempPair(async (root, store) => {
+      const order: string[] = [];
+      const fakeLog: Log = {
+        append: async (input) => {
+          order.push(input.type);
+          return { seq: String(order.length) } as never;
+        },
+        durableSeq: () => BigInt(order.length),
+        close: async () => {},
+      };
+
+      const session = await startCapture(
+        { root, storeDir: store },
+        {
+          createLog: async () => fakeLog,
+          createWatcher: async () => {
+            order.push('watcher.subscribed');
+            return { close: async () => {} };
+          },
+          enumerate: async () => {},
+        },
+      );
+      try {
+        assert.deepEqual(order.slice(0, 2), [
+          'watcher.subscribed',
+          'slipstream.session.started.v1',
+        ]);
+      } finally {
+        await session.stop();
+      }
+    });
+  });
+
   it('closes the watcher and log when baseline startup throws', async () => {
     await withTempPair(async (root, store) => {
       let watcherClosed = false;

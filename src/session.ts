@@ -118,11 +118,17 @@ export async function startCapture(
   const health = createHealth(recovered?.recoveredThroughSeq ?? 0n);
   healthRef = health; // the compromise callback can now disclose a lost lock
 
-  let underlying: Log = await deps.createLog({
-    filePath: logPath,
-    sessionId,
-    startSeq: recovered?.recoveredThroughSeq,
-  });
+  let underlying: Log;
+  try {
+    underlying = await deps.createLog({
+      filePath: logPath,
+      sessionId,
+      startSeq: recovered?.recoveredThroughSeq,
+    });
+  } catch (err) {
+    await lock.release();
+    throw err;
+  }
 
   let stopped = false;
   let supervising = false;
@@ -294,6 +300,7 @@ export async function startCapture(
       // Let in-flight engine tasks settle before swapping the log out from under
       // them; otherwise one could append with a stale committed `before`.
       await engine.drain();
+      engine.resetNotifications();
       if (stopped || surrendered) return false; // shutting down / dispossessed: don't reopen
       await underlying.close().catch(() => {});
       const rec = await recoverSession(logPath, sessionId, cas);
@@ -356,6 +363,8 @@ export async function startCapture(
   // scan is missed; buffered events reconcile against the baseline afterward.
   let watcher: Watcher | undefined;
   try {
+    watcher = await deps.createWatcher({ root, ignore: excluded, onEvent, onError });
+
     if (resuming) {
       await appendEvent({
         type: 'slipstream.session.resumed.v1',
@@ -370,8 +379,6 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { scope: { kind: 'session' }, reason: 'restart' },
       });
-
-      watcher = await deps.createWatcher({ root, ignore: excluded, onEvent, onError });
       await reconcile(
         {
           committed: recovered!.committed,
@@ -386,8 +393,6 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { root, max_bytes: maxBytes },
       });
-
-      watcher = await deps.createWatcher({ root, ignore: excluded, onEvent, onError });
 
       const unknownScopes: string[] = [];
       await deps.enumerate(root, root, isExcluded, {

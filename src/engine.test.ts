@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createEngine } from './engine.ts';
 import type { Reader } from './reader.ts';
 import type { Snapshot } from './snapshot.ts';
 import { content, scriptedReader, withEngine } from './test/helpers.ts';
@@ -107,6 +108,46 @@ describe('engine', () => {
   });
 
   describe('coalescing and serialization', () => {
+    it('discards stale coalesced notifications when recovery resets bookkeeping', async () => {
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+      let reads = 0;
+      const reader: Reader = {
+        read: async () => {
+          reads++;
+          if (reads === 1) await firstGate;
+          return content('aaa');
+        },
+      };
+      const appended: Array<{ type: string }> = [];
+      let fail = true;
+      const engine = createEngine({
+        reader,
+        log: {
+          append: async (input) => {
+            if (fail) throw new Error('storage failed');
+            appended.push(input);
+            return {} as never;
+          },
+        },
+      });
+
+      engine.setBaseline('f.ts', content('bbb'));
+      engine.notify('f.ts', 1);
+      await Promise.resolve();
+      engine.notify('f.ts', 2);
+      releaseFirst();
+      await engine.drain();
+
+      engine.resetNotifications();
+      engine.setBaseline('f.ts', content('aaa'));
+      fail = false;
+      engine.notify('f.ts', 3);
+      await engine.drain();
+
+      assert.deepEqual(appended, [], 'a stale coalesced flag must not fabricate a gap');
+    });
+
     it('folds a notify that lands mid-read into a follow-up cycle and records an honest gap', async () => {
       // Gate the first read so a second notify arrives while the path is busy.
       let releaseFirst!: () => void;

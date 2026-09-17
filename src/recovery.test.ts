@@ -86,6 +86,36 @@ describe('recovery', () => {
     });
   });
 
+  it('rejects a second session.started record', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [
+        started,
+        {
+          type: 'slipstream.session.started.v1',
+          occurred_at_ms: 2,
+          data: { root: '/other-worktree', max_bytes: 2048 },
+        },
+      ]);
+      await assert.rejects(recoverSession(path, SESSION, cas), /duplicate session\.started/);
+    });
+  });
+
+  it('rejects unsafe baseline completed unknown scopes', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [
+        started,
+        {
+          type: 'slipstream.capture.baseline.completed.v1',
+          occurred_at_ms: 2,
+          data: { unknown_scopes: ['../outside'] },
+        },
+      ]);
+      await assert.rejects(recoverSession(path, SESSION, cas), /unsafe path/);
+    });
+  });
+
   it('accepts a baseline-unreadable gap scoped to the worktree root ("")', async () => {
     await withTempDir(async (dir) => {
       const cas = await createCas(join(dir, 'blobs'));

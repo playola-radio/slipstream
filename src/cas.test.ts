@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createCas, StorageError } from './cas.ts';
@@ -79,6 +79,22 @@ describe('cas', () => {
         const shard = dirname(cas.pathFor(ref.sha256));
         const entries = await readdir(shard);
         assert.deepEqual(entries, [ref.sha256]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('removes its temp file when publication fails', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'slip-cas-fail-'));
+      try {
+        const cas = await createCas(dir);
+        const bytes = Buffer.from('rename must fail');
+        const sha256 = '65441fb767011edf9b8bdfb5e39b3fdf42376a50bd2f46b0d259752f5b70e589';
+        const dest = cas.pathFor(sha256);
+        await mkdir(dest, { recursive: true });
+
+        await assert.rejects(() => cas.put(bytes), StorageError);
+        assert.deepEqual(await readdir(dirname(dest)), [sha256]);
       } finally {
         await rm(dir, { recursive: true, force: true });
       }

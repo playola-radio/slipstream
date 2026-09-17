@@ -185,6 +185,7 @@ export async function recoverSession(
 
     switch (event.type) {
       case 'slipstream.session.started.v1': {
+        if (i !== 0) throw new CorruptLogError(`${at}: duplicate session.started`);
         root = event.data.root;
         maxBytes = event.data.max_bytes;
         break;
@@ -196,7 +197,10 @@ export async function recoverSession(
         break;
       }
       case 'slipstream.capture.baseline.completed.v1': {
-        for (const dir of event.data.unknown_scopes) baselineUnknownDirs.add(dir);
+        for (const dir of event.data.unknown_scopes) {
+          assertSafeDir(dir, at);
+          baselineUnknownDirs.add(dir);
+        }
         baselineCompleted = true;
         break;
       }

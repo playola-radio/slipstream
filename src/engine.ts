@@ -22,6 +22,9 @@ export interface Engine {
   notify(path: string, observedAtMs: number): void;
   /** Resolve once all queued processing (and its appends) have settled. */
   drain(): Promise<void>;
+  /** Discard notification metadata after `drain()` when durable recovery will
+   * rebuild committed baselines from the log and filesystem. */
+  resetNotifications(): void;
 }
 
 /**
@@ -123,5 +126,10 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
     }
   };
 
-  return { setBaseline, markBaselineUnknown, notify, drain };
+  const resetNotifications = (): void => {
+    pending.clear();
+    coalesced.clear();
+  };
+
+  return { setBaseline, markBaselineUnknown, notify, drain, resetNotifications };
 }
