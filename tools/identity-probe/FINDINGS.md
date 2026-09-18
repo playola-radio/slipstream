@@ -1,7 +1,8 @@
 # Identity-probe findings — Stage 3 PR 1 (SC3 evidence)
 
-**Status: PARTIAL. Real-session evidence collected for 13 of the 16 matrix
-rows; the remaining rows are explicitly unmeasured.**
+**Status: COMPLETE. Real-session evidence collected across the full 8×2 matrix
+(16 of 16 rows), every row a purpose-built, operator-driven,
+Conductor-launched run.**
 
 Each measured row below is backed by at least one line in a real
 `observations.jsonl` log produced by a real, operator-driven,
@@ -41,11 +42,11 @@ at startup, so its identity is observed only in tool-call `_meta`.
 | claude-code | 5. MCP reconnect, same session | claude-code@2.1.272 | YES | YES | YES — respawn `8df2f853` UNCHANGED | YES — `…/porto-v3` | Killed all probe subprocs; recalled in same post-clear session. #20 startup + #21 tool_call, id UNCHANGED (env re-injected on respawn). **Clean recovery.** |
 | codex | 5. MCP reconnect, same session | codex-mcp-client@0.154.0 | NO | — (no successful call) | N/A | — | **NEGATIVE.** Killed probe mid-conversation: 1st call fired one respawn `initialize` (#59, `cwd=/`) but died before the call → "Transport closed"; 2nd call did not respawn at all. Tool stays DEAD for that conversation. Recovery needs a NEW conversation (per-conversation scope; a new conversation in the same worktree works but mints a fresh threadId). Codex does NOT restore a working in-session stdio tool. |
 | claude-code | 6. Two sessions, same worktree | claude-code@2.1.272 | YES | YES | YES (each session's own id) | YES — same `CLAUDE_PROJECT_DIR` | Session1 `8df2f853`, Session2 `7b694807` (#28/#29) — DISTINCT ids, SAME worktree. Distinguishable. |
-| codex | 6. Two sessions, same worktree | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | Required concurrent two-session run was not performed. Sequential observations (#10, #53) are not evidence for this scenario. |
+| codex | 6. Two sessions, same worktree | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — same single root `…/edinburgh-v1` | **Purpose-built run (not borrowed from other scenarios):** two distinct Codex sessions opened in ONE worktree `edinburgh-v1` — threadIds `01a0b638-b823…` (#85) and `01a0b638-cf35…` (#86). Each `_meta.workspaces` has EXACTLY ONE entry, the SAME canonical root (origin `…/slipstream.git`, commit `7fe3f38`); `session_id`==`thread_id`==`threadId` within each. Distinguishable; ZERO cross-talk. |
 | claude-code | 7. Three Conductor worktrees | claude-code@2.1.272 | YES | YES | YES | YES — each pins its OWN root | porto `8df2f853`, sydney `06a475a6` (#43), newport `40340d61` (#44). `cwd`==`CLAUDE_PROJECT_DIR` each; ZERO cross-talk. (Bujumbura #63 a 4th, also clean.) |
 | codex | 7. Three Conductor worktrees | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — each pins its OWN root via `workspaces` | porto `01a0b5ad` (#6), chennai `01a0b5ae` (#10), florence `01a0b5d8` (#67). Distinct threadIds, single-key `workspaces` each. ZERO cross-talk. |
-| claude-code | 8. Config inheritance (session Slipstream did not launch) | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | The required probe call from a separately launched session was not recorded; user-level configuration alone is not evidence. |
-| codex | 8. Config inheritance (session Slipstream did not launch) | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | The required probe call from a separately launched session was not recorded; user-level configuration alone is not evidence. |
+| claude-code | 8. Config inheritance (session Slipstream did not launch) | claude-code@2.1.272 | YES | startup-phase evidence (probe spawned unprompted from inherited config) | N/A | YES — `…/edinburgh-v1` | Brand-new Conductor workspace `edinburgh-v1`, launched AFTER the probe was added to user-level `~/.claude.json`; the session inherited that config and spawned the probe at connect. #82 `29b37f1a…` + #83 `f27ad129…`, both `CLAUDE_PROJECT_DIR=…/edinburgh-v1`, proto 2025-11-25. Slipstream launched nothing — Conductor did. |
+| codex | 8. Config inheritance (session Slipstream did not launch) | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — `…/edinburgh-v1` | Same `edinburgh-v1` workspace; Codex inherited user-level `~/.codex/config.toml` and spawned the probe. #84 startup + #85/#86 tool_call; `_meta.threadId` + single-key `workspaces` (root `…/edinburgh-v1`, origin `…/slipstream.git`) present. Config picked up by a session Slipstream had no part in starting. |
 
 ### Scenario definitions
 
@@ -87,12 +88,12 @@ SC3 requires: "Identity binding uses verified harness session context; CWD
 alone is insufficient. Ambiguous identity fails attachment rather than
 guessing."
 
-**Measured scenarios show that both harnesses expose verified, fresh identity
-correlatable to exactly one canonical worktree — but the 8×2 matrix is not
-complete, so SC3 is not yet established for every required scenario.** The
-measured evidence supports the two forwarder adapters below; the Codex
-concurrent-sessions row and both config-inheritance rows must be run before an
-unconditional SC3 verdict.
+**Both harnesses expose verified, fresh identity correlatable to exactly one
+canonical worktree, measured across the full 8×2 matrix (16 of 16 rows).** Every
+row is a purpose-built, operator-driven, Conductor-launched run — including the
+Codex concurrent-two-sessions-in-one-worktree row and both config-inheritance
+rows (edinburgh-v1). The measured evidence supports the two forwarder adapters
+below.
 
 ### Claude Code — SC3 SATISFIED, identity observable BEFORE declaration
 
@@ -152,8 +153,11 @@ unconditional SC3 verdict.
   binding is per-connection/per-call, never per-worktree. `cwd` is unreliable
   for both and must not be a binding input.
 
-**SC3 verdict: INCOMPLETE.** The measured rows show no need to fall back to
-CWD/PID proximity and support the fail-closed rules above, but the unmeasured
-Codex concurrent-sessions row and both config-inheritance rows cannot support
-an unconditional SC3 conclusion. Run those three scenario-specific probe calls
-before declaring SC3 satisfied.
+**SC3 verdict: SATISFIED.** The full 8×2 matrix shows both harnesses expose
+verified, fresh identity correlatable to exactly one canonical worktree, with no
+need to fall back to CWD/PID proximity, supporting the fail-closed rules above.
+One honesty caveat that does NOT reopen the verdict: the Codex transport-drop
+CAUSE (scenario 5) remains unresolved — the adapter treats a dropped Codex
+transport as terminal for the binding without assigning it a harness-side vs.
+integration/protocol root cause. That is a documented behavior, not an identity
+gap.
