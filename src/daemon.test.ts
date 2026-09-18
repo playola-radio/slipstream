@@ -427,35 +427,39 @@ for (const staleLock of [false, true]) {
   });
 }
 
-it('bounds shutdown when watcher startup never settles', async () => {
+it('holds the store lock until an in-flight attach settles before shutting down', async () => {
   const store = await mkdtemp(join(tmpdir(), 'slip-stall-'));
   const worktree = await mkdtemp(join(tmpdir(), 'slip-wt-'));
   let enterWatch!: () => void;
   const entered = new Promise<void>((resolve) => { enterWatch = resolve; });
-  let rejectWatch!: (error: Error) => void;
-  const watch = new Promise<Subscription>((_, reject) => { rejectWatch = reject; });
+  let resolveWatch!: (subscription: Subscription) => void;
+  const watch = new Promise<Subscription>((resolve) => { resolveWatch = resolve; });
+  let subClosed = false;
+  const subscription: Subscription = { close: async () => { subClosed = true; } };
   const d = await startDaemon({ storeDir: store, captureDependencies: {
     platform: { watch: () => { enterWatch(); return watch; } },
     enumerate: async () => {},
   } });
-  let timer: NodeJS.Timeout | undefined;
   try {
     const attach = sendControlRequest({ socketPath: d.socketPath,
       request: { v: 1, verb: 'attach', worktree, ...IDENTITY },
     }).catch(() => {});
     await entered;
-    await Promise.race([
-      d.stop(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('shutdown exceeded 7 seconds')), 7000);
-      }),
-    ]);
+    let stopped = false;
+    const stop = d.stop().then(() => { stopped = true; });
+    // Cross the former five-second teardown bound to catch early lock release.
+    await new Promise((resolve) => setTimeout(resolve, 5200));
+    assert.equal(stopped, false);
+    await stat(join(store, 'owner.lock'));
+    assert.equal(subClosed, false);
+    resolveWatch(subscription);
+    await stop;
     await attach;
+    assert.equal(subClosed, true);
     await assert.rejects(stat(join(store, 'owner.lock')), { code: 'ENOENT' });
   } finally {
-    if (timer) clearTimeout(timer);
-    // Only release the stalled startup during cleanup, after the bounded-stop assertion.
-    rejectWatch(new Error('test cleanup'));
+    // Always unblock startup so a failed assertion cannot wedge cleanup.
+    resolveWatch(subscription);
     await d.stop();
     await rm(store, { recursive: true, force: true });
     await rm(worktree, { recursive: true, force: true });

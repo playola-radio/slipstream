@@ -62,10 +62,6 @@ export const PROBE_TIMEOUT_MS = 1000;
 /** A connection must deliver one complete control request within this window;
  * otherwise it is dropped so it can never wedge shutdown. */
 const REQUEST_TIMEOUT_MS = 10_000;
-/** Teardown waits at most this long for an in-flight attach to settle. `torn` is
- * already set, so a late-resolving startAndActivate self-stops its half-built
- * session and freezes the boundary; proceeding after the bound is safe. */
-const ATTACH_TEARDOWN_MS = 5_000;
 
 function nonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0;
@@ -210,19 +206,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // An attach whose capture is still starting must not outlive shutdown: wait for
     // it to settle (it self-stops once it observes `torn`), then stop whatever it or
     // an active session left installed.
-    if (attachInFlight) {
-      const settled = attachInFlight.catch(() => {});
-      let timer: NodeJS.Timeout | undefined;
-      const bound = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, ATTACH_TEARDOWN_MS);
-        timer.unref();
-      });
-      try {
-        await Promise.race([settled, bound]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    }
+    if (attachInFlight) await attachInFlight.catch(() => {});
     // An attach aborted mid-startup may have failed to stop its half-built session
     // (it runs in startAndActivate, which sets abortStopError). Surface that too so
     // shutdown never reports success over a capture that could not be confirmed
