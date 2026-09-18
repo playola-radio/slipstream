@@ -80,7 +80,39 @@ Again, omit the `--store` arguments to use the default `~/.slipstream` store.
 ## Installing the skill
 
 The forwarder only exposes the tool; `SKILL.md` tells the agent *when* to call
-it. Install `SKILL.md` wherever your harness loads skills from (for Claude Code,
-a user- or project-level skills directory). The skill is portable — it contains
-no harness-specific identity mechanics — so the same `SKILL.md` works in any
-harness that has the forwarder configured.
+it. Without the skill installed the tool is present but never triggered, so
+install it for each harness you configured above. The skill is portable — it
+contains no harness-specific identity mechanics — so the same `SKILL.md` works
+in any harness that has the forwarder configured.
+
+The skill's name (from its front matter) is `slipstream-begin-task`; use that as
+the skill directory name where a harness expects one.
+
+### Claude Code
+
+Claude Code loads skills from a `skills/` directory, one folder per skill named
+after the skill, each containing a `SKILL.md`. Install it at the user level:
+
+```sh
+mkdir -p ~/.claude/skills/slipstream-begin-task
+cp /absolute/path/to/slipstream/SKILL.md ~/.claude/skills/slipstream-begin-task/SKILL.md
+```
+
+For a single project instead of every session, use that project's
+`.claude/skills/slipstream-begin-task/SKILL.md` in place of `~/.claude`.
+
+### Codex
+
+Codex does not use Claude Code's skill-directory convention; it reads standing
+instructions from `AGENTS.md` (the global `~/.codex/AGENTS.md`, or a project's
+root `AGENTS.md`). Install the skill by appending its guidance — the body of
+`SKILL.md` below the front matter — to whichever `AGENTS.md` Codex loads for the
+sessions you want it active in:
+
+```sh
+# global, active in every Codex session:
+cat /absolute/path/to/slipstream/SKILL.md >> ~/.codex/AGENTS.md
+```
+
+(The YAML front-matter block at the top of `SKILL.md` is Claude Code metadata;
+it is inert as plain text in `AGENTS.md`, but you may trim it for tidiness.)
