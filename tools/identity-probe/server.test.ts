@@ -57,6 +57,25 @@ test('a rejecting append on startup is reported, not fatal', async () => {
   assert.deepEqual(appendErrors, [failure]);
 });
 
+test('a rejecting append on tool_call is reported and answered with an error result, not thrown', async () => {
+  const appendErrors: unknown[] = [];
+  const failure = new Error('EACCES: permission denied');
+  const h = createProbeHandlers({
+    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => 4,
+    append: async () => { throw failure; },
+    onAppendError: (err) => { appendErrors.push(err); },
+  });
+  const res = await dispatch(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    h,
+  );
+  const result = res?.result as any;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /identity-probe failed to record snapshot/);
+  assert.deepEqual(appendErrors, [failure]);
+});
+
 test('the real server binary completes an MCP handshake over stdio', async () => {
   const child = spawn(process.execPath, [join(HERE, 'server.ts')], {
     stdio: ['pipe', 'pipe', 'inherit'],

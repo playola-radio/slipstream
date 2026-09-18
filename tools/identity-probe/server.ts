@@ -72,7 +72,13 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
       record('startup').catch(reportAppendError);
     },
     callTool: async (_name, params) => {
-      const obs = await record('tool_call', isObject(params) ? params : undefined);
+      let obs: Observation;
+      try {
+        obs = await record('tool_call', isObject(params) ? params : undefined);
+      } catch (err) {
+        reportAppendError(err);
+        return { text: `identity-probe failed to record snapshot: ${String(err)}`, isError: true };
+      }
       return {
         text:
           'identity-probe recorded a snapshot. ' +
