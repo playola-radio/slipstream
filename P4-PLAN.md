@@ -79,7 +79,22 @@ evidence + adapter rules are authoritative.
   SESSION_NOT_SELECTED; skill-from-config both harnesses; same-UUID commits once;
   never-declare → ungrouped; daemon-down no hang. Then Codex review + challenge +
   Excess Audit CONCURRENTLY, one combined fix wave, one re-review if non-trivial.
-  **Status: Not Started**
+  **Status: Complete** — adversarial review ran (review + challenge + Excess Audit
+  concurrently); one combined fix wave applied (commit `b60306b`); re-review run.
+  Findings B/C/D/E fixed; excess deletions applied. Finding A recorded below as a
+  known limitation (not mine to re-architect — it changes P3 idempotency scope).
+
+## Known limitations / follow-ups (surfaced by the adversarial review)
+- **A — cross-session duplicate under at-least-once auto-resend (design call, not
+  a bug fix).** The forwarder omits `session_id`, so `begin_task` idempotency is
+  scoped to the selected capture session. If the same identity triple is detached
+  and reattached between the first send and the honest resend, the resend commits
+  a second task in the NEW session. The reported success stays truthful (a task
+  was declared) and nothing is fabricated, but the intent is recorded twice. This
+  is the accepted cost of the LOCKED at-least-once auto-resend; closing it needs
+  store-level `request_id` dedup, which changes P3 idempotency scope — a product
+  decision, reported not remedied. Documented at `src/task-forwarder.ts` (module
+  docstring, rule 1).
 
 ## Gates (per CLAUDE.md)
 - Branch off `develop`, never `main`. Node built-ins only; no new deps (hand-roll,

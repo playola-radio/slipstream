@@ -9,10 +9,22 @@
  *     OutcomeUnknownError} when a request reached the wire but its outcome is
  *     unknowable. Because `session.beginTask` idempotency is durable and anchored
  *     on `request_id` (the daemon rebuilds `committedTasks` from the log), we can
- *     safely auto-resend the BYTE-IDENTICAL payload EXACTLY once — a same-UUID
- *     resend resolves idempotently, never double-committing. Only a begin_task
- *     with a nonempty request_id qualifies (see {@link shouldAutoResend}); a
- *     generic ambiguous request is never blindly retried.
+ *     safely auto-resend the BYTE-IDENTICAL payload EXACTLY once — within one
+ *     capture session a same-UUID resend resolves idempotently, never double-
+ *     committing. Only a begin_task with a nonempty request_id qualifies (see
+ *     {@link shouldAutoResend}); a generic ambiguous request is never blindly
+ *     retried.
+ *
+ *     KNOWN LIMIT (at-least-once): the forwarder omits session_id (it never
+ *     attaches, so it cannot know the capture UUID), so idempotency is scoped to
+ *     the selected capture session. If the SAME identity triple is detached and
+ *     reattached between the first send and the resend, the resend lands in a NEW
+ *     capture session whose `committedTasks` does not yet hold this request_id,
+ *     and the task is recorded a second time (in the new session). The success we
+ *     then report is truthful — a task WAS declared — but the intent is recorded
+ *     twice across the two sessions. This is the accepted cost of the locked
+ *     at-least-once auto-resend; closing it needs store-level request_id dedup
+ *     (P3 idempotency scope), which is a design decision, not a forwarder fix.
  *
  *  2. When the resend cannot definitively resolve the first send, we must not
  *     imply "nothing committed." A structurally-rejected resend (INVALID_TITLE /
