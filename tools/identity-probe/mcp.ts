@@ -61,38 +61,42 @@ const err = (id: string | number | null, code: number, message: string): JsonRpc
 });
 const ok = (id: string | number | null, result: unknown): JsonRpcResponse => ({ jsonrpc: '2.0', id, result });
 
-/** Dispatch one JSON-RPC request. Returns null for notifications (no `id`). */
+/** Dispatch one JSON-RPC request. Returns null for notifications (no `id`); JSON-RPC forbids responding to them. */
 export async function dispatch(req: JsonRpcRequest, h: McpHandlers): Promise<JsonRpcResponse | null> {
   const isNotification = req.id === undefined || req.id === null;
   const id = (req.id ?? null) as string | number | null;
 
-  switch (req.method) {
-    case 'initialize':
-      h.onInitialize(req.params);
-      return ok(id, {
-        protocolVersion: h.protocolVersion,
-        capabilities: { tools: {} },
-        serverInfo: h.serverInfo,
-      });
-    case 'notifications/initialized':
-    case 'notifications/cancelled':
-      return null;
-    case 'ping':
-      return ok(id, {});
-    case 'tools/list':
-      return ok(id, { tools: h.tools });
-    case 'tools/call': {
-      if (!isObject(req.params) || typeof req.params.name !== 'string') {
-        return err(id, -32602, 'invalid tools/call params');
+  const response = await (async (): Promise<JsonRpcResponse | null> => {
+    switch (req.method) {
+      case 'initialize':
+        h.onInitialize(req.params);
+        return ok(id, {
+          protocolVersion: h.protocolVersion,
+          capabilities: { tools: {} },
+          serverInfo: h.serverInfo,
+        });
+      case 'notifications/initialized':
+      case 'notifications/cancelled':
+        return null;
+      case 'ping':
+        return ok(id, {});
+      case 'tools/list':
+        return ok(id, { tools: h.tools });
+      case 'tools/call': {
+        if (!isObject(req.params) || typeof req.params.name !== 'string') {
+          return err(id, -32602, 'invalid tools/call params');
+        }
+        const name = req.params.name;
+        const found = h.tools.some((t) => t.name === name);
+        if (!found) return err(id, -32602, `unknown tool: ${name}`);
+        const out = await h.callTool(name, req.params);
+        return ok(id, { content: [{ type: 'text', text: out.text }], isError: out.isError ?? false });
       }
-      const name = req.params.name;
-      const found = h.tools.some((t) => t.name === name);
-      if (!found) return err(id, -32602, `unknown tool: ${name}`);
-      const out = await h.callTool(name, req.params);
-      return ok(id, { content: [{ type: 'text', text: out.text }], isError: out.isError ?? false });
+      default:
+        if (isNotification) return null; // unknown notifications are ignored
+        return err(id, -32601, `method not found: ${req.method}`);
     }
-    default:
-      if (isNotification) return null; // unknown notifications are ignored
-      return err(id, -32601, `method not found: ${req.method}`);
-  }
+  })();
+
+  return isNotification ? null : response;
 }

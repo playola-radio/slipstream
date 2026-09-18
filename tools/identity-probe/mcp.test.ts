@@ -87,3 +87,23 @@ test('unknown method returns -32601', async () => {
   const res = await dispatch({ jsonrpc: '2.0', id: 5, method: 'nope' }, handlers());
   assert.equal(res?.error?.code, -32601);
 });
+
+test('ping with no id is a notification and yields no response', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', method: 'ping' }, handlers());
+  assert.equal(res, null);
+});
+
+test('ping with an id still returns a response', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', id: 6, method: 'ping' }, handlers());
+  assert.deepEqual(res, { jsonrpc: '2.0', id: 6, result: {} });
+});
+
+test('tools/call with no id yields no response but still invokes callTool', async () => {
+  let called: string | undefined;
+  const res = await dispatch(
+    { jsonrpc: '2.0', method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    handlers({ callTool: async (name) => { called = name; return { text: 'ok' }; } }),
+  );
+  assert.equal(res, null);
+  assert.equal(called, 'identity_probe_snapshot');
+});
