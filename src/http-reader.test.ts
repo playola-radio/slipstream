@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
 import { createCas } from './cas.ts';
 import { createHealth } from './health.ts';
+import { createBoundaryRegistry } from './boundary-registry.ts';
+import { liveBoundary, staticBoundary } from './reader-runtime.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
 
@@ -441,4 +443,84 @@ it('keeps history readable when tombstone contents are malformed', async () => {
       assert.equal((await res.text()).trimEnd().split('\n').length, 2);
     }
   } finally { await srv.close(); }
+});
+
+describe('http-reader with a boundary registry', () => {
+  it('a reserved session lists durable_seq 0 despite disk records, then tracks health once active', async () => {
+    const dir = await storeWithSession();               // disk log has seq 1,2
+    const registry = createBoundaryRegistry();
+    registry.reserve(UUID);                              // reserved before capture commits
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      let body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: false }]);
+      const health = createHealth(2n);
+      registry.activate(UUID, liveBoundary(health));
+      body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false }]);
+    } finally { await srv.close(); }
+  });
+
+  it('falls back to disk high-water for a session the registry never knew', async () => {
+    const dir = await storeWithSession();               // disk log has seq 1,2
+    const registry = createBoundaryRegistry();          // empty: UUID is daemon-unknown
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      const body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false }]);
+      const res = await GET(srv, `/v1/sessions/${UUID}/events?after=0`);
+      assert.equal(res.status, 200);
+      assert.equal((await res.text()).trimEnd().split('\n').length, 2);
+    } finally { await srv.close(); }
+  });
+
+  it('aborts a live SSE follower when its session freezes (transition)', async () => {
+    const dir = await storeWithSession();               // disk log has seq 1,2
+    const registry = createBoundaryRegistry();
+    const health = createHealth(2n);
+    registry.reserve(UUID);
+    registry.activate(UUID, liveBoundary(health));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    const ac = new AbortController();
+    try {
+      const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=0&follow=true`, {
+        headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}` },
+        signal: ac.signal,
+      });
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let acc = ''; const seen: string[] = [];
+      while (seen.length < 2) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        for (const e of sseEvents(acc)) if (e.data && !seen.includes(e.id)) seen.push(e.id);
+      }
+      assert.deepEqual(seen, ['1', '2']);                // replayed up to the boundary
+      registry.freeze(UUID, 2n);                         // detach: transition aborts followers
+      // The server destroys the follower's response; the client stream must end
+      // (a clean done, or a socket error from the abrupt close — both are "ended").
+      const done = (async () => {
+        try { for (;;) { const r = await reader.read(); if (r.done) return true; } }
+        catch { return true; }
+      })();
+      const guard = new Promise<never>((_r, reject) =>
+        setTimeout(() => reject(new Error('follower was not aborted on freeze')), 4000).unref());
+      assert.equal(await Promise.race([done, guard]), true);
+    } finally { ac.abort(); await srv.close(); }
+  });
+
+  it('a registry entry shadows the active option when both are supplied', async () => {
+    const dir = await storeWithSession();
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, staticBoundary(1n)); // registry says 1
+    const health = createHealth(2n);                    // active says 2
+    const srv = await startReaderServer({
+      storeDir: dir, registry, active: { id: UUID, health, logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    try {
+      const body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false }]);
+    } finally { await srv.close(); }
+  });
 });

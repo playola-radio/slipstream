@@ -10,9 +10,19 @@ import {
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
 import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
+import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
-export interface ReaderServerOptions { storeDir: string; active?: ActiveSession }
+export interface ReaderServerOptions {
+  storeDir: string;
+  /** Standalone single-session view (`serve`). Ignored when {@link registry} is
+   * given; internally it becomes a one-entry registry. */
+  active?: ActiveSession;
+  /** The daemon's dynamic boundary registry (D3): authoritative per-session
+   * boundaries plus the SSE-follower set aborted on a session transition. When
+   * absent, boundaries come from `active` (if any) or from disk high-water. */
+  registry?: BoundaryRegistry;
+}
 export interface ReaderServer {
   url: string; port: number; token: string; descriptorPath: string; close(): Promise<void>;
 }
@@ -52,6 +62,14 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   const followers = new Set<AbortController>();
   let closing = false;
 
+  // One resolution path for boundaries. In standalone `serve` mode the caller's
+  // `active` session becomes a one-entry registry with a live boundary, so the
+  // rest of the server never special-cases it. The daemon passes its own registry.
+  const registry = opts.registry ?? createBoundaryRegistry();
+  if (opts.active && !opts.registry) {
+    registry.installIfAbsent(opts.active.id, liveBoundary(opts.active.health));
+  }
+
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);
     if (!res.headersSent) send(res, 500, 'internal error'); else res.destroy();
@@ -90,16 +108,18 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     if (pathname === '/v1/sessions') {
       const sessions = await listSessions(opts.storeDir);
-      const activeId = opts.active?.id;
-      // The active session's authoritative durable high-water is its health
+      // A registry-known session's authoritative durable high-water is its
       // boundary, not the disk-derived value (a written-but-not-yet-committed
-      // record would otherwise advertise H+1 while /events still uses H).
-      const activeH = opts.active ? liveBoundary(opts.active.health).current() : 0n;
-      sendJson(res, 200, sessions.map((s) => ({
-        id: s.id,
-        durable_seq: (s.id === activeId ? activeH : s.durableSeq).toString(),
-        removed: s.removed,
-      })));
+      // record would otherwise advertise H+1 while /events still uses H; a
+      // reserved-but-not-yet-active session reads 0 until capture commits).
+      sendJson(res, 200, sessions.map((s) => {
+        const runtime = registry.get(s.id);
+        return {
+          id: s.id,
+          durable_seq: (runtime ? runtime.boundary.current() : s.durableSeq).toString(),
+          removed: s.removed,
+        };
+      }));
       return;
     }
     const eventsMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/events$/);
@@ -156,7 +176,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   }
 
   async function boundaryFor(id: string): Promise<BoundarySource> {
-    if (opts.active?.id === id) return liveBoundary(opts.active.health);
+    // The registry is authoritative for every session the daemon has touched
+    // this run. Disk high-water is the fallback ONLY for daemon-unknown sessions
+    // (retained from a prior run, immutable now) — never for one mid-write.
+    const runtime = registry.get(id);
+    if (runtime) return runtime.boundary;
     return staticBoundary(await onDiskHighWater(sessionLogPath(opts.storeDir, id)));
   }
 
@@ -238,6 +262,13 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     res.on('close', onDisconnect);
     res.on('error', onDisconnect);
     followers.add(ac);
+    // Join the registry's per-session abort set and re-resolve the boundary from
+    // the SAME entry, synchronously with no await between: a session transition
+    // (activate/freeze) has therefore either already happened (so we read its new
+    // boundary here) or has not yet (so it will find us in the set and abort us).
+    // A follower is never left pinned to a stale boundary while unregistered.
+    registry.addFollower(id, ac);
+    const followBoundary = registry.get(id)?.boundary ?? boundary;
     res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
     res.flushHeaders();
 
@@ -263,7 +294,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       heartbeat = setInterval(() => { write(': heartbeat\n\n').catch(() => ac.abort()); }, SSE_HEARTBEAT_MS);
       let cur = effectiveAfter;
       for (;;) {
-        const target = boundary.current();
+        const target = followBoundary.current();
         if (target > cur) {
           while (cur < target) {
             if (ac.signal.aborted) return;
@@ -276,7 +307,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
             }
           }
         }
-        await boundary.waitForAdvance(cur, ac.signal); // rejects on abort → exits loop
+        await followBoundary.waitForAdvance(cur, ac.signal); // rejects on abort → exits loop
       }
     } catch (err) {
       // Corruption must not be silent (honesty). An abort/drain-timeout stays silent.
@@ -285,6 +316,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       if (heartbeat) clearInterval(heartbeat);
       if (cursor) await cursor.close();
       followers.delete(ac);
+      registry.removeFollower(id, ac);
       if (!res.writableEnded) res.destroy();
     }
   }
