@@ -71,6 +71,45 @@ test('parseMessage accepts an integer id', () => {
   assert.equal(res.ok, true);
 });
 
+test('parseMessage rejects a numeric params value', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping","params":42}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects a string params value on initialize', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"initialize","params":"invalid"}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects a null params value', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping","params":null}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects a boolean params value', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping","params":true}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage accepts an object params value', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}');
+  assert.equal(res.ok, true);
+});
+
+test('parseMessage accepts a request with no params', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping"}');
+  assert.equal(res.ok, true);
+});
+
+test('parseMessage accepts an array params value', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}');
+  assert.equal(res.ok, true);
+});
+
 test('initialize echoes protocol version, advertises tools, and fires onInitialize', async () => {
   let captured: unknown;
   const res = await dispatch(
