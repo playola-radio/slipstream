@@ -62,9 +62,17 @@ export function createHealth(durableSeq: bigint = 0n): Health {
         try {
           l();
         } catch (err) {
-          // String(err) never throws — a listener may throw a non-Error (even
-          // null), and re-accessing `.message` here would re-raise into the caller.
-          console.error(`slipstream: health listener threw: ${String(err)}`);
+          // Reporting must itself be crash-proof: String(err) can re-enter user
+          // code (a custom toString / Symbol.toPrimitive) that throws again, and
+          // that second exception would escape into the caller — re-opening the
+          // exact post-commit hole this catch exists to close.
+          let detail: string;
+          try {
+            detail = String(err);
+          } catch {
+            detail = '<unstringifiable listener error>';
+          }
+          console.error(`slipstream: health listener threw: ${detail}`);
         }
       }
     },
