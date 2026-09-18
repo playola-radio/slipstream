@@ -31,3 +31,35 @@ test('appendObservation tightens an existing log file to owner-only mode', { ski
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('appendObservation leaves a pre-existing loose log directory unchanged', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'identity-probe-report-'));
+  try {
+    await chmod(dir, 0o755);
+    const logPath = join(dir, 'observations.jsonl');
+
+    await appendObservation(logPath, SAMPLE_OBSERVATION);
+
+    const dirMode = (await stat(dir)).mode & 0o777;
+    const logMode = (await stat(logPath)).mode & 0o777;
+    assert.equal(dirMode, 0o755);
+    assert.equal(logMode, 0o600);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('appendObservation tightens a newly-created log directory to owner-only mode', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'identity-probe-report-'));
+  try {
+    const logDir = join(dir, 'logs');
+    const logPath = join(logDir, 'observations.jsonl');
+
+    await appendObservation(logPath, SAMPLE_OBSERVATION);
+
+    const dirMode = (await stat(logDir)).mode & 0o777;
+    assert.equal(dirMode, 0o700);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
