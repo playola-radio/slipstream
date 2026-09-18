@@ -10,6 +10,7 @@ import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
 import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
+import { isValidSessionId } from './store-reader.ts';
 import { createPlatform, type Platform, type Subscription } from './platform.ts';
 import type { AnyEvent, EventInput } from './event.ts';
 
@@ -19,6 +20,10 @@ export interface CaptureOptions {
   maxBytes?: number;
   /** Resume an existing session (restart reconciliation) instead of starting fresh. */
   resumeSessionId?: string;
+  /** Start a FRESH session under a caller-pre-generated id. The daemon uses this
+   * to reserve the reader boundary registry entry before the log dir exists on
+   * disk (D3). Mutually exclusive with {@link resumeSessionId}. */
+  sessionId?: string;
 }
 
 export interface BeginTaskInput {
@@ -90,6 +95,14 @@ export async function startCapture(
   dependencies: Partial<CaptureDependencies> = {},
 ): Promise<CaptureSession> {
   const deps = { ...defaultDependencies, ...dependencies };
+  if (opts.sessionId !== undefined) {
+    if (opts.resumeSessionId !== undefined) {
+      throw new Error('sessionId and resumeSessionId are mutually exclusive');
+    }
+    if (!isValidSessionId(opts.sessionId)) {
+      throw new Error(`sessionId is not a valid session UUID: ${opts.sessionId}`);
+    }
+  }
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
@@ -101,7 +114,7 @@ export async function startCapture(
   }
 
   const resuming = opts.resumeSessionId !== undefined;
-  const sessionId = opts.resumeSessionId ?? randomUUID();
+  const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
   const blobsDir = join(storeDir, 'blobs');
   const sessionDir = join(storeDir, 'sessions', sessionId);
   await mkdirpDurable(blobsDir);
