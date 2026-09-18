@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { createProbeHandlers } from './server.ts';
@@ -20,6 +21,31 @@ test('startup observation is recorded on initialize with client info', async () 
   assert.equal(records[0]!.phase, 'startup');
   assert.deepEqual(records[0]!.env.CLAUDE_CODE_SESSION_ID, { present: true, value: 's-1' });
   assert.equal(records[0]!.initialize.clientInfo?.name, 'claude-code');
+});
+
+test('startup append is serialized before a following tool_call append', async () => {
+  const records: Observation[] = [];
+  let releaseStartup!: () => void;
+  const startupReady = new Promise<void>((resolve) => { releaseStartup = resolve; });
+  const h = createProbeHandlers({
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => records.length + 1,
+    append: async (o) => {
+      if (o.phase === 'startup') await startupReady;
+      records.push(o);
+    },
+  });
+
+  await dispatch({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, h);
+  const toolResponse = dispatch(
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    h,
+  );
+  await new Promise((r) => setImmediate(r));
+  releaseStartup();
+  await toolResponse;
+
+  assert.deepEqual(records.map((r) => r.phase), ['startup', 'tool_call']);
 });
 
 test('tool call records a tool_call observation carrying _meta and returns text', async () => {
@@ -120,9 +146,11 @@ test('a rejecting append on tool_call is reported and answered with an error res
 });
 
 test('the real server binary completes an MCP handshake over stdio', async () => {
+  const logDir = join(process.env.TMPDIR ?? '/tmp', `probe-${process.pid}`);
+  await mkdir(logDir, { recursive: true, mode: 0o700 });
   const child = spawn(process.execPath, [join(HERE, 'server.ts')], {
     stdio: ['pipe', 'pipe', 'inherit'],
-    env: { ...process.env, SLIPSTREAM_IDENTITY_PROBE_LOG: join(process.env.TMPDIR ?? '/tmp', `probe-${process.pid}.jsonl`) },
+    env: { ...process.env, SLIPSTREAM_IDENTITY_PROBE_LOG: join(logDir, 'observations.jsonl') },
   });
   let out = '';
   child.stdout.setEncoding('utf8');

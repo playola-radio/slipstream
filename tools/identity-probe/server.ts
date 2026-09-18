@@ -40,10 +40,17 @@ function isObject(v: unknown): v is Record<string, unknown> {
 
 export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
   let initialize: InitializeCapture = { present: false };
+  let appendQueue: Promise<void> = Promise.resolve();
 
   const reportAppendError = opts.onAppendError ?? ((err: unknown) => {
     process.stderr.write(`identity-probe: failed to append observation: ${String(err)}\n`);
   });
+
+  const appendSerialized = (obs: Observation): Promise<void> => {
+    const append = appendQueue.then(() => opts.append(obs));
+    appendQueue = append.catch(() => {});
+    return append;
+  };
 
   const record = async (phase: 'startup' | 'tool_call', toolParams?: Record<string, unknown>): Promise<Observation> => {
     const obs = buildObservation({
@@ -60,7 +67,7 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
           }
         : undefined,
     });
-    await opts.append(obs);
+    await appendSerialized(obs);
     return obs;
   };
 
