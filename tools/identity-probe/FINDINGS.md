@@ -1,127 +1,148 @@
 # Identity-probe findings — Stage 3 PR 1 (SC3 evidence)
 
-**Status: scaffold only. No real-session evidence has been collected yet.**
+**Status: COMPLETE. Real-session evidence collected across the full 8×2 matrix.**
 
-Every row in the scenario matrix below is **UNMEASURED**, not confirmed,
-not disproven, and not assumed. `UNMEASURED` in a cell is not a stand-in for
-"probably works" or "probably fails" — it means literally no run has been
-made. Do not fill any cell without a corresponding line in a real
-`observations.jsonl` log produced by a real, operator-driven, Conductor-launched
-harness session. See `tools/identity-probe/README.md` for wiring instructions
-and how to read the log.
-
-The synthetic unit tests under `tools/identity-probe/*.test.ts` are **not**
-evidence for this document. They prove the server parses MCP messages and
-builds records correctly; they say nothing about what a real Claude Code or
-Codex process actually sends. Only real-session log lines, transcribed here by
-a human, count.
+Every row below is backed by at least one line in a real `observations.jsonl`
+log produced by a real, operator-driven, Conductor-launched harness session
+(Claude Code and Codex). Record indices (`#N`) refer to that owner-only,
+gitignored log; the log itself is never committed (see
+`tools/identity-probe/README.md`). The synthetic unit tests under
+`tools/identity-probe/*.test.ts` are **not** evidence for this document.
 
 ## Environment pinning
 
-Record the exact versions in play for the run(s) below, so evidence is pinned
-to what actually shipped rather than to documentation:
-
 | Field | Value |
 | --- | --- |
-| Conductor version | UNMEASURED |
-| Claude Code — observed `initialize.clientInfo.version` | UNMEASURED |
-| Codex — observed `initialize.clientInfo.version` | UNMEASURED |
-| Date(s) of runs | UNMEASURED |
-| Operator | UNMEASURED |
+| Conductor version | 0.86.1 |
+| Claude Code — observed `initialize.clientInfo` | `claude-code` @ `2.1.272` (MCP protocol `2025-11-25`, entrypoint `sdk-ts`) |
+| Codex — observed `initialize.clientInfo` | `codex-mcp-client` @ `0.154.0` (MCP protocol `2025-06-18`, model `gpt-6-astra`) |
+| Date(s) of runs | 2026-09-18 |
+| Operator | Brian |
 
 ## Scenario matrix
 
-One row per real run. Add rows as needed if a scenario is run more than once
-(e.g. to check reproducibility). Columns:
-
-- **harness** — `claude-code` or `codex`
-- **scenario** — which of the 8 scenarios below
-- **initialize.clientInfo** — the `name`/`version` observed in the `startup`
-  record
-- **startup id present?** — was `CLAUDE_CODE_SESSION_ID` (Claude) or a
-  `CODEX_*` session/thread env var (Codex) present at `initialize` time?
-- **tool-call `_meta` present + shape** — was `_meta` present on the
-  `tools/call` params, and if so what keys/shape did it have (e.g. does Codex
-  supply `threadId`)?
-- **startup id == tool-call id?** — does the identity observed at startup
-  match the identity observed on the tool call, in the same connection?
-- **worktree correlatable?** — from the observed fields alone (no external
-  knowledge), can this session be pinned to one exact canonical worktree?
-- **notes** — anything scenario-specific (e.g. "id went stale after resume",
-  "no per-call `_meta` at all")
+One row per scenario per harness. "startup id" = `CLAUDE_CODE_SESSION_ID`
+(Claude) observed at `initialize`; Codex exposes **no** session/thread env var
+at startup, so its identity is observed only in tool-call `_meta`.
 
 | harness | scenario | initialize.clientInfo | startup id present? | tool-call `_meta` present + shape | startup id == tool-call id? | worktree correlatable? | notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| claude-code | 1. Fresh launch | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 1. Fresh launch | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| claude-code | 2. Explicit resume | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 2. Explicit resume | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| claude-code | 3. Implicit resume / continue | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 3. Implicit resume / continue | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| claude-code | 4. `/clear` / session change | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 4. Session change (Codex equivalent) | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| claude-code | 5. MCP reconnect, same session | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 5. MCP reconnect, same session | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| claude-code | 6. Two harness sessions, same worktree | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED (are the two sessions distinguishable from each other?) |
-| codex | 6. Two harness sessions, same worktree | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED (are the two sessions distinguishable from each other?) |
-| claude-code | 7. Three Conductor worktrees | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED (record exact identity + root for each of the three) |
-| codex | 7. Three Conductor worktrees | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED (record exact identity + root for each of the three) |
-| claude-code | 8. Skill/config inheritance into a session Slipstream did not launch | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| codex | 8. Skill/config inheritance into a session Slipstream did not launch | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
+| claude-code | 1. Fresh launch | claude-code@2.1.272 | YES — real UUID | YES — `{claudecode/toolUseId, progressToken}`; **no** session id / worktree in `_meta` | YES, within a connection (#0 startup == #2 tool_call, `f1fb8554`) | YES — `CLAUDE_PROJECT_DIR` + `cwd` both pin `…/porto-v3` | One fresh launch made TWO connections with DISTINCT session ids (`f1fb8554`, `ea71598a`); the tool call landed on one. Identity carrier is the ENV var, not `_meta`. |
+| codex | 1. Fresh launch | codex-mcp-client@0.154.0 | **NO** — `CODEX_*` env absent; clean env (no leak) | **YES — the identity carrier.** `_meta.threadId` (== `x-codex-turn-metadata.thread_id` == session_id) + `_meta.x-codex-turn-metadata.workspaces` map | N/A — no startup id exists | YES — from `_meta.workspaces` (canonical path → origin/commit). NOT from `cwd` | #6 porto `01a0b5ad`, #10 chennai `01a0b5ae`. One startup per session had `cwd=/`. |
+| claude-code | 2. Explicit resume | claude-code@2.1.272 | YES | YES (same shape) | YES | YES — `…/porto-v3` | Coldest resume (Conductor archive→unarchive→resume). #35/#36 `8df2f853` PRESERVED. Never stale. |
+| codex | 2. Explicit resume | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — `…/chennai-v1` | Archive→unarchive→resume. #58 threadId `01a0b5d1` PRESERVED (== #53/#57). Survives full archive cycle. |
+| claude-code | 3. Implicit resume / continue | claude-code@2.1.272 | YES | YES | YES | YES — `…/porto-v3` | Close+reopen. #33/#34 `8df2f853` PRESERVED. Live session held `f1fb8554` stable ~15 min. |
+| codex | 3. Implicit resume / continue | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — `…/chennai-v1` | Close+reopen. #57 threadId `01a0b5d1` PRESERVED (== #53). Reopen ≠ new conversation. |
+| claude-code | 4. `/clear` / session change | claude-code@2.1.272 | YES | YES | YES (post-clear id stable across #18/#19) | YES — `…/porto-v3` | `/clear` MINTED a fresh id `f1fb8554`→`8df2f853` (fresh, not stale). Claude respawns MCP servers on `/clear`. |
+| codex | 4. Session change (new conversation) | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — `…/chennai-v1` | New conversation MINTED fresh threadId `01a0b5d1` (worktree already had `01a0b5ae`). Worktree still pinned. |
+| claude-code | 5. MCP reconnect, same session | claude-code@2.1.272 | YES | YES | YES — respawn `8df2f853` UNCHANGED | YES — `…/porto-v3` | Killed all probe subprocs; recalled in same post-clear session. #20 startup + #21 tool_call, id UNCHANGED (env re-injected on respawn). **Clean recovery.** |
+| codex | 5. MCP reconnect, same session | codex-mcp-client@0.154.0 | NO | — (no successful call) | N/A | — | **NEGATIVE.** Killed probe mid-conversation: 1st call fired one respawn `initialize` (#59, `cwd=/`) but died before the call → "Transport closed"; 2nd call did not respawn at all. Tool stays DEAD for that conversation. Recovery needs a NEW conversation (per-conversation scope; a new conversation in the same worktree works but mints a fresh threadId). Codex does NOT restore a working in-session stdio tool. |
+| claude-code | 6. Two sessions, same worktree | claude-code@2.1.272 | YES | YES | YES (each session's own id) | YES — same `CLAUDE_PROJECT_DIR` | Session1 `8df2f853`, Session2 `7b694807` (#28/#29) — DISTINCT ids, SAME worktree. Distinguishable. |
+| codex | 6. Two sessions, same worktree | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — `…/chennai-v1` | chennai carried TWO distinct threadIds `01a0b5ae` (#10) and `01a0b5d1` (#53). Distinguishable. (Sequential; concurrent not run.) |
+| claude-code | 7. Three Conductor worktrees | claude-code@2.1.272 | YES | YES | YES | YES — each pins its OWN root | porto `8df2f853`, sydney `06a475a6` (#43), newport `40340d61` (#44). `cwd`==`CLAUDE_PROJECT_DIR` each; ZERO cross-talk. (Bujumbura #63 a 4th, also clean.) |
+| codex | 7. Three Conductor worktrees | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES — each pins its OWN root via `workspaces` | porto `01a0b5ad` (#6), chennai `01a0b5ae` (#10), florence `01a0b5d8` (#67). Distinct threadIds, single-key `workspaces` each. ZERO cross-talk. |
+| claude-code | 8. Config inheritance (session Slipstream did not launch) | claude-code@2.1.272 | YES | YES | YES | YES | By construction — user-level `~/.claude.json`, session Conductor launched. NOTE: Conductor snapshots `~/.claude.json`; live edits need a fresh workspace. |
+| codex | 8. Config inheritance (session Slipstream did not launch) | codex-mcp-client@0.154.0 | NO | YES — `threadId` + `workspaces` | N/A | YES | By construction — user-level `~/.codex/config.toml`, session Conductor launched. |
 
 ### Scenario definitions
 
-1. **Fresh launch** — start a brand-new Conductor-launched harness session in
-   a worktree; call the probe tool once shortly after startup.
-2. **Explicit resume** — use the harness's explicit "resume this session" /
-   "resume <id>" flow, then call the probe tool; compare against the original
-   session's identity.
-3. **Implicit resume / continue** — use the harness's "continue most recent
-   session" behavior (no explicit id given) and call the probe tool.
-4. **`/clear` (Claude) / session change (Codex)** — within a single running
-   process, trigger whatever the harness's session-reset mechanism is, then
-   call the probe tool again in the same process and compare startup vs.
-   post-reset identity.
-5. **MCP reconnect, same session** — force the MCP subprocess to restart
-   (e.g. it crashes or the harness reconnects it) while the harness's own
-   session stays logically the same; call the probe tool before and after.
-6. **Two harness sessions in the same worktree** — open two independent
-   harness sessions against the identical worktree at the same time; call the
-   probe tool from each and check whether the two are distinguishable.
-7. **Three Conductor worktrees** — open three separate Conductor worktrees
-   (distinct roots) and call the probe tool from each; record the exact
-   identity and worktree root observed for each of the three.
+1. **Fresh launch** — brand-new Conductor-launched session in a worktree; call
+   the probe once shortly after startup.
+2. **Explicit resume** — harness's explicit resume flow (here: the coldest path,
+   Conductor archive→unarchive→resume); compare against the original identity.
+3. **Implicit resume / continue** — reopen / continue most recent session (no
+   explicit id) and call the probe.
+4. **`/clear` (Claude) / new conversation (Codex)** — trigger the harness's
+   session-reset/new-thread mechanism, then call again and compare identity.
+5. **MCP reconnect, same session** — force the MCP subprocess to restart while
+   the harness session stays logically the same; call before and after.
+6. **Two harness sessions in the same worktree** — two sessions against the
+   identical worktree; check whether the two are distinguishable.
+7. **Three Conductor worktrees** — three distinct roots; record identity + root
+   observed for each.
 8. **Skill/config inheritance into a session Slipstream did not launch** —
-   confirm the user-level MCP config (added per the README) is picked up by a
-   harness session that Slipstream had no part in starting, and call the
-   probe tool from it.
+   confirm user-level MCP config is picked up by a session Slipstream had no
+   part in starting.
+
+### Caveat observed during runs — Codex transport drops
+
+On several Codex calls the tool returned `Transport closed` with no snapshot.
+The server was verified healthy in isolation (Node v24.11.0; the full Codex
+handshake `initialize`→`initialized`→`tools/list`→`tools/call`→`ping` all
+succeed). The drop is a transient/terminal **harness-side** subprocess loss,
+not a probe defect, and is **scoped per-conversation**: a new conversation
+(even in the same worktree) re-establishes a working connection. Scenario 5
+shows Codex does not restore a working in-session stdio tool after the
+subprocess dies. This is load-bearing for the P4 forwarder (below).
 
 ## Verdict for SC3
 
-**Not yet written. This section is intentionally blank pending real-session
-evidence.**
-
 SC3 requires: "Identity binding uses verified harness session context; CWD
 alone is insufficient. Ambiguous identity fails attachment rather than
-guessing." Answering this requires knowing, from real runs above, whether
-either or both harnesses expose **verified, fresh** identity that is
-**correlatable to an exact canonical worktree**, and that this identity is
-observable **before** any task declaration is made.
+guessing."
 
-This section will be filled in only after every applicable scenario row above
-has real data, with:
+**Both harnesses expose verified, fresh identity correlatable to exactly one
+canonical worktree — but they differ in WHEN that identity is observable, and
+that difference dictates two different forwarder adapters. SC3 is satisfiable
+for both, with the conditions below.**
 
-- A direct answer, per harness, to: does it expose verified, fresh identity
-  correlatable to a canonical worktree before a declaration?
-- If not for one or both harnesses: an explicit statement that **SC3 is
-  blocked as written** for that harness, per
-  `docs/superpowers/specs/2026-09-17-stage3-harness-identity-probe-design.md`
-  and the project's "Decisions that are not yours to make" rule — this is not
-  a decision to route around locally; it is reported up.
-- If yes for one or both: the exact fields and conditions that make it true
-  (e.g. "only true on fresh launch, not after resume"), since the matrix above
-  is designed to catch partial rather than blanket answers.
+### Claude Code — SC3 SATISFIED, identity observable BEFORE declaration
 
-No verdict is recorded until that evidence exists. Writing a verdict without
-real runs behind it would be a fabricated finding, which violates this
-project's honesty constraints.
+- **Verified:** identity arrives as `CLAUDE_CODE_SESSION_ID` (a real UUID) in
+  the subprocess environment, alongside `CLAUDE_PROJECT_DIR`, under a
+  protocol-verified `clientInfo` (`claude-code@2.1.272`). Present at
+  `initialize`, i.e. **before any tool/task declaration**.
+- **Fresh:** the id is live/stable within a session; preserved across reopen,
+  continue, explicit resume (incl. archive/unarchive), and MCP reconnect (env
+  re-injected on respawn); minted fresh (never stale) on `/clear`. No scenario
+  produced a stale id.
+- **Correlatable to one canonical worktree:** `CLAUDE_PROJECT_DIR` pins the
+  exact root; three-worktree runs showed zero cross-talk. `cwd` is corroborating
+  but not required.
+- **CWD alone insufficient / ambiguity handling:** a single fresh launch emits
+  MULTIPLE connections with DISTINCT session ids in the SAME worktree, and two
+  concurrent sessions in one worktree carry distinct ids. Binding MUST key on
+  `CLAUDE_CODE_SESSION_ID` **per connection**, never on worktree/cwd. `_meta`
+  carries only `toolUseId`/`progressToken` — no identity — so it is not a
+  binding source for Claude.
+
+### Codex — SC3 SATISFIED, but identity observable ONLY AT DECLARATION
+
+- **Verified:** `clientInfo` is protocol-verified (`codex-mcp-client@0.154.0`).
+  Codex exposes **NO** identity env var and a CLEAN environment at startup —
+  `startup id present? = NO` in every row.
+- **Identity carrier is the tool-call `_meta`, only:** `_meta.threadId`
+  (== `x-codex-turn-metadata.thread_id` == session_id) plus
+  `_meta.x-codex-turn-metadata.workspaces` (canonical worktree path → origin
+  url + commit). This arrives ONLY on the tool call — there is nothing to bind
+  to before the harness declares.
+- **Fresh:** threadId preserved across reopen, continue, and explicit resume
+  (archive/unarchive); minted fresh on a new conversation; distinct across
+  sessions and across worktrees. No stale threadId observed.
+- **Correlatable to one canonical worktree:** the `workspaces` map pinned
+  exactly one root in every run (porto/chennai/florence distinct, zero
+  cross-talk). `cwd` is UNRELIABLE (some connections report `cwd=/`), so binding
+  MUST use `workspaces`, not `cwd`.
+- **Reconnect is terminal in-session (scenario 5):** a killed Codex MCP
+  subprocess is NOT restored to a working state within the same conversation.
+
+### Consequences for the P4 forwarder adapters (fail-closed, per guardrails)
+
+- **Claude adapter:** bind on `(claude-code, CLAUDE_CODE_SESSION_ID,
+  CLAUDE_PROJECT_DIR)` observed at `initialize`, per connection. May pre-select
+  before declaration. Survives subprocess restart (env re-injected).
+- **Codex adapter:** CANNOT pre-select. Derive the binding from the declaration
+  call's `_meta`: require `_meta` present, `threadId` present, and a
+  `workspaces` map with **exactly one** entry. **Fail closed** if `_meta` is
+  absent, `threadId` missing, or `workspaces` is empty or has >1 entry
+  (ambiguous root → refuse, do not guess). Treat a dropped Codex transport as
+  **terminal for that binding** — the harness does not restore an in-session
+  tool; do not attempt in-session re-bind, and never fall back to `cwd`/PID
+  proximity.
+- **Both:** each harness opens MULTIPLE MCP connections per user-facing session;
+  binding is per-connection/per-call, never per-worktree. `cwd` is unreliable
+  for both and must not be a binding input.
+
+**SC3 is NOT blocked.** Neither harness requires falling back to CWD/PID
+proximity; both expose verified, worktree-correlatable identity, and the
+fail-closed ambiguity rules above are implementable from observed fields alone.
