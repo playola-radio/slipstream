@@ -90,6 +90,12 @@ test('notifications/initialized yields no response', async () => {
   assert.equal(res, null);
 });
 
+test('an id-bearing request to notifications/initialized is not silently swallowed', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', id: 7, method: 'notifications/initialized' }, handlers());
+  assert.equal(res?.error?.code, -32601);
+  assert.equal(res?.id, 7);
+});
+
 test('ping returns empty result', async () => {
   const res = await dispatch({ jsonrpc: '2.0', id: 2, method: 'ping' }, handlers());
   assert.deepEqual(res, { jsonrpc: '2.0', id: 2, result: {} });

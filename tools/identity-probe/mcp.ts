@@ -76,9 +76,6 @@ export async function dispatch(req: JsonRpcRequest, h: McpHandlers): Promise<Jso
           capabilities: { tools: {} },
           serverInfo: h.serverInfo,
         });
-      case 'notifications/initialized':
-      case 'notifications/cancelled':
-        return null;
       case 'ping':
         return ok(id, {});
       case 'tools/list':
@@ -94,7 +91,6 @@ export async function dispatch(req: JsonRpcRequest, h: McpHandlers): Promise<Jso
         return ok(id, { content: [{ type: 'text', text: out.text }], isError: out.isError ?? false });
       }
       default:
-        if (isNotification) return null; // unknown notifications are ignored
         return err(id, -32601, `method not found: ${req.method}`);
     }
   })();
