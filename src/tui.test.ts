@@ -133,9 +133,10 @@ it('changes view renders a file with more lines than the spread-arg limit', asyn
     data: { path: 'big.txt', before: { kind: 'absent' }, after: { kind: 'content', sha256: A, size: N * 2 } },
   }) + '\n');
   const lines = await replayFromDisk(dir, UUID, { context: 3, full: true });
-  assert.equal(lines.length, N + 2); // header + N marked lines + trailing ''
+  assert.equal(lines.length, N + 3); // header + '(new file)' note + N marked lines + trailing ''
   assert.equal(lines[0], '#1 big.txt');
-  assert.match(lines[1]!, /^x +1 x$/);
+  assert.equal(lines[1], '  (new file)');
+  assert.match(lines[2]!, /^x +1 x$/);
 });
 
 it('disk replay consumes every bounded batch', async () => {

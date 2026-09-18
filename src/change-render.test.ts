@@ -28,10 +28,10 @@ test('renderChange: a modified line is marked against the before-content', async
   assert.deepEqual(out, ['#42 src/foo.ts', '  1 a', 'x 2 X', '  3 c']);
 });
 
-test('renderChange: a brand-new file marks every line', async () => {
+test('renderChange: a brand-new file marks every line under a "(new file)" note', async () => {
   const e = ev({ path: 'new.txt', before: { kind: 'absent' }, after: content('aaa', 6) });
   const out = await renderChange(e, source({ aaa: { kind: 'text', text: 'one\ntwo' } }), CTX);
-  assert.deepEqual(out, ['#42 new.txt', 'x 1 one', 'x 2 two']);
+  assert.deepEqual(out, ['#42 new.txt', '  (new file)', 'x 1 one', 'x 2 two']);
 });
 
 test('renderChange: a deleted file is reported, not diffed', async () => {
@@ -63,7 +63,7 @@ test('renderChange: an oversize after-side is summarized without fetching the bl
 test('renderChange: --full forces an oversize file to render', async () => {
   const e = ev({ path: 'huge.log', before: { kind: 'absent' }, after: content('aaa', 200000) });
   const out = await renderChange(e, source({ aaa: { kind: 'text', text: 'hello' } }), { context: 3, full: true });
-  assert.deepEqual(out, ['#42 huge.log', 'x 1 hello']);
+  assert.deepEqual(out, ['#42 huge.log', '  (new file)', 'x 1 hello']);
 });
 
 test('renderChange: an uncomparable before-side is a single note by default', async () => {

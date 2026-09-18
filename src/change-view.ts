@@ -187,6 +187,8 @@ export async function renderChange(
     if (opts.full) return [header, `  ${msg}`, ...renderUnmarked(afterLines)];
     return note(msg);
   }
+  // A new file has no baseline, so every line is marked; the note explains why.
+  if (beforeSnap.kind === 'absent') return [header, '  (new file)', ...body];
   return [header, ...body];
 }
 
