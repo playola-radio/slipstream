@@ -47,6 +47,24 @@ export function shouldAutoResend(envelope: RequestEnvelope): boolean {
   return envelope.verb === 'begin_task' && typeof envelope.request_id === 'string' && envelope.request_id.length > 0;
 }
 
+function nonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0;
+}
+
+/** A control ack proves a durable commit only if it carries all four task-commit
+ * identifiers. The control-client envelope validator accepts any `ok:true` shape,
+ * so an ack missing (or mistyping) these fields is NOT a confirmed commit — it is
+ * post-send ambiguity, handled exactly like an {@link OutcomeUnknownError}. */
+function isCommittedAck(res: ResponseEnvelope): res is ResponseEnvelope & { ok: true } {
+  return (
+    res.ok === true &&
+    nonEmptyString(res.session_id) &&
+    nonEmptyString(res.task_id) &&
+    nonEmptyString(res.event_id) &&
+    nonEmptyString(res.seq)
+  );
+}
+
 function successResult(res: ResponseEnvelope & { ok: true }): ToolResult {
   const structured = {
     session_id: res.session_id,
@@ -75,15 +93,9 @@ function outcomeUnknown(requestId: string): ToolResult {
   );
 }
 
-/** Map a definitive control response (from the FIRST send) to a tool result. */
-function mapFirstResponse(res: ResponseEnvelope, requestId: string): ToolResult {
-  if (res.ok) return successResult(res);
-  return errorResult(res.code, `${res.code}: ${res.message}`, requestId);
-}
-
 /** Map the RESEND response while resolving an earlier OutcomeUnknown. */
 function mapResendResponse(res: ResponseEnvelope, requestId: string): ToolResult {
-  if (res.ok) return successResult(res);
+  if (res.ok) return isCommittedAck(res) ? successResult(res) : outcomeUnknown(requestId);
   switch (res.code) {
     case 'INVALID_TITLE':
     case 'IDENTITY_UNRESOLVED':
@@ -128,7 +140,15 @@ export async function forwardBeginTask(deps: ForwardBeginTaskDeps): Promise<Tool
   };
 
   try {
-    return mapFirstResponse(await deps.send(envelope), requestId);
+    const res = await deps.send(envelope);
+    if (res.ok) {
+      // A well-formed commit ack is the only definitive success. A malformed
+      // `ok:true` proves nothing durable, so it falls through to the one resend
+      // exactly like a post-send OutcomeUnknown.
+      if (isCommittedAck(res)) return successResult(res);
+    } else {
+      return errorResult(res.code, `${res.code}: ${res.message}`, requestId);
+    }
   } catch (err) {
     if (!(err instanceof OutcomeUnknownError)) throw err;
     // fall through to the single byte-identical resend

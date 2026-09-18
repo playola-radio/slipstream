@@ -14,13 +14,11 @@
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
-import { createInterface } from 'node:readline';
 import { isMainModule } from './entrypoint.ts';
 import { dispatch, parseMessage, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
 import { sendControlRequest } from './control-client.ts';
-import type { RequestEnvelope, ResponseEnvelope } from './control-protocol.ts';
 import { controlSocketPath, resolveStoreDir } from './daemon-location.ts';
 
 export const BEGIN_TASK_TOOL: ToolDef = {
@@ -39,15 +37,12 @@ export const BEGIN_TASK_TOOL: ToolDef = {
 };
 
 type Env = Record<string, string | undefined>;
-type SendControl = (request: RequestEnvelope) => Promise<ResponseEnvelope>;
 
 export interface ForwarderHandlerOpts {
   /** Path to the daemon's control socket. */
   socketPath: string;
   /** The subprocess env, read once at initialize for the Claude identity triple. */
   env: Env;
-  /** Injectable control channel; production sends over the unix socket. */
-  send?: SendControl;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -65,8 +60,6 @@ function titleOf(params: unknown): string {
 
 export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers {
   const ctx = createHarnessContext();
-  const send: SendControl =
-    opts.send ?? ((request) => sendControlRequest({ socketPath: opts.socketPath, request }));
 
   return {
     serverInfo: { name: 'slipstream-forwarder', version: '0.0.0' },
@@ -80,8 +73,54 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
       forwardBeginTask({
         identity: ctx.identityForCall(params),
         title: titleOf(params),
-        send,
+        send: (request) => sendControlRequest({ socketPath: opts.socketPath, request }),
       }),
+  };
+}
+
+/** The largest single JSON-RPC line the forwarder will buffer from stdin. A well-
+ * formed request is a few hundred bytes; this cap is generous for a title yet far
+ * short of exhausting memory on an unterminated line. */
+export const MAX_STDIN_LINE_BYTES = 1024 * 1024;
+
+const NEWLINE = 0x0a;
+
+/** One decoded stdin event: a complete line to parse, or an over-cap line that was
+ * dropped (so the caller can answer a parse error instead of buffering forever). */
+export type StdinFrame = { line: string } | { overflow: true };
+
+/**
+ * Split raw stdin bytes into newline-delimited lines with a hard byte cap. A line
+ * (terminated or not) that exceeds `maxBytes` is dropped and reported as
+ * `{ overflow: true }`; the bytes up to its terminating newline are then discarded
+ * rather than accumulated, so a peer streaming an endless unterminated line can
+ * never grow the buffer without bound. Blank lines are skipped.
+ */
+export function createStdinFramer(maxBytes: number = MAX_STDIN_LINE_BYTES) {
+  let buf: Buffer = Buffer.alloc(0);
+  let discarding = false; // dropping the tail of an over-cap line until its newline
+  return {
+    push(chunk: Buffer): StdinFrame[] {
+      buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+      const out: StdinFrame[] = [];
+      for (;;) {
+        const nl = buf.indexOf(NEWLINE);
+        if (nl === -1) break;
+        const lineBuf = buf.subarray(0, nl);
+        buf = buf.subarray(nl + 1);
+        if (discarding) { discarding = false; continue; }
+        if (lineBuf.length > maxBytes) { out.push({ overflow: true }); continue; }
+        const line = lineBuf.toString('utf8');
+        if (line.trim().length === 0) continue;
+        out.push({ line });
+      }
+      if (buf.length > maxBytes) {
+        if (!discarding) out.push({ overflow: true });
+        buf = Buffer.alloc(0);
+        discarding = true;
+      }
+      return out;
+    },
   };
 }
 
@@ -96,17 +135,24 @@ export async function runForwarder(): Promise<void> {
   }
 
   const handlers = createForwarderHandlers({ socketPath, env: process.env });
-  const rl = createInterface({ input: process.stdin });
-  for await (const line of rl) {
-    if (line.trim().length === 0) continue;
-    const parsed = parseMessage(line);
-    if (!parsed.ok) {
-      const message = parsed.code === -32700 ? 'parse error' : 'invalid request';
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: parsed.code, message } }) + '\n');
-      continue;
+  const writeError = (code: number, message: string) =>
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code, message } }) + '\n');
+
+  const framer = createStdinFramer();
+  for await (const chunk of process.stdin) {
+    for (const frame of framer.push(chunk as Buffer)) {
+      if ('overflow' in frame) {
+        writeError(-32700, 'message exceeds byte cap');
+        continue;
+      }
+      const parsed = parseMessage(frame.line);
+      if (!parsed.ok) {
+        writeError(parsed.code, parsed.code === -32700 ? 'parse error' : 'invalid request');
+        continue;
+      }
+      const res = await dispatch(parsed.value, handlers);
+      if (res) process.stdout.write(JSON.stringify(res) + '\n');
     }
-    const res = await dispatch(parsed.value, handlers);
-    if (res) process.stdout.write(JSON.stringify(res) + '\n');
   }
 }
 

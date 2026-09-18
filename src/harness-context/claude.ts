@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import type { IdentityResult } from '../harness-context.ts';
 
 /**
@@ -24,6 +25,11 @@ export function claudeIdentity(env: Record<string, string | undefined>): Identit
   const projectDir = env.CLAUDE_PROJECT_DIR;
   if (typeof projectDir !== 'string' || projectDir.length === 0) {
     return { unresolved: 'CLAUDE_PROJECT_DIR is absent from the environment' };
+  }
+  // A relative project dir would be resolved against the forwarder's CWD, which is
+  // never a binding input; require an absolute path and fail closed otherwise.
+  if (!isAbsolute(projectDir)) {
+    return { unresolved: `CLAUDE_PROJECT_DIR ${projectDir} is not an absolute path` };
   }
   let worktree = projectDir;
   try {

@@ -52,6 +52,11 @@ test('claude adapter fails closed on an empty-string session id', () => {
   assert.match(unresolvedReason(r), /CLAUDE_CODE_SESSION_ID/);
 });
 
+test('claude adapter fails closed on a relative project dir (cwd is never a binding input)', () => {
+  const r = claudeIdentity({ CLAUDE_CODE_SESSION_ID: 'sid', CLAUDE_PROJECT_DIR: 'relative/project' });
+  assert.match(unresolvedReason(r), /absolute/);
+});
+
 // ---- Codex adapter ----------------------------------------------------------
 
 function codexParams(over: { threadId?: unknown; workspaces?: unknown } = {}): unknown {
@@ -94,6 +99,16 @@ test('codex adapter fails closed on an empty workspaces map (root ambiguous)', (
 test('codex adapter fails closed on more than one workspaces key (ambiguous root)', () => {
   const r = codexIdentity(codexParams({ workspaces: { '/a': {}, '/b': {} } }));
   assert.match(unresolvedReason(r), /2 roots|ambiguous/);
+});
+
+test('codex adapter fails closed on an array workspaces value (a numeric index is not a root)', () => {
+  const r = codexIdentity(codexParams({ workspaces: [{}] }));
+  assert.equal(isResolved(r), false);
+});
+
+test('codex adapter fails closed on a relative workspace key (cwd is never a binding input)', () => {
+  const r = codexIdentity(codexParams({ workspaces: { '.': {} } }));
+  assert.match(unresolvedReason(r), /absolute/);
 });
 
 // ---- Dispatch by clientInfo -------------------------------------------------

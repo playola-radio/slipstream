@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:net';
 import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createForwarderHandlers } from './mcp-forwarder.ts';
+import { createForwarderHandlers, createStdinFramer, type StdinFrame } from './mcp-forwarder.ts';
 import { dispatch, type JsonRpcRequest, type JsonRpcResponse } from './mcp-protocol.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
@@ -120,6 +120,39 @@ test('an unrecognized client fails closed as IDENTITY_UNRESOLVED without contact
   } finally {
     await daemon.close();
   }
+});
+
+// ---- stdin framing (bounded) -----------------------------------------------
+
+const linesOf = (frames: StdinFrame[]): string[] =>
+  frames.flatMap((f) => ('line' in f ? [f.line] : []));
+
+test('framer yields multiple newline-delimited messages from one chunk, skipping blanks', () => {
+  const framer = createStdinFramer(1024);
+  const frames = framer.push(Buffer.from('{"a":1}\n\n{"b":2}\n', 'utf8'));
+  assert.deepEqual(linesOf(frames), ['{"a":1}', '{"b":2}']);
+});
+
+test('framer reassembles a message split across chunks', () => {
+  const framer = createStdinFramer(1024);
+  assert.deepEqual(linesOf(framer.push(Buffer.from('{"a":', 'utf8'))), []);
+  assert.deepEqual(linesOf(framer.push(Buffer.from('1}\n', 'utf8'))), ['{"a":1}']);
+});
+
+test('framer drops an over-cap line as overflow and stays bounded, then recovers', () => {
+  const framer = createStdinFramer(8);
+  // A single unterminated line far past the cap arrives in pieces: exactly one
+  // overflow is reported and the buffer never accumulates it.
+  let overflows = 0;
+  for (let i = 0; i < 1000; i++) {
+    for (const f of framer.push(Buffer.from('x'.repeat(64), 'utf8'))) {
+      if ('overflow' in f) overflows++;
+    }
+  }
+  assert.equal(overflows, 1);
+  // The newline ends the discarded giant line; a following small message parses.
+  const frames = framer.push(Buffer.from('\n{"ok":1}\n', 'utf8'));
+  assert.deepEqual(linesOf(frames), ['{"ok":1}']);
 });
 
 test('a down daemon fails fast as DAEMON_UNAVAILABLE rather than hanging', async () => {

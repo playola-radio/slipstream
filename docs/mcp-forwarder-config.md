@@ -84,15 +84,3 @@ it. Install `SKILL.md` wherever your harness loads skills from (for Claude Code,
 a user- or project-level skills directory). The skill is portable — it contains
 no harness-specific identity mechanics — so the same `SKILL.md` works in any
 harness that has the forwarder configured.
-
-## Smoke test (optional)
-
-You can start the forwarder by hand to confirm it launches:
-
-```bash
-npm run forwarder
-```
-
-It then blocks, waiting for JSON-RPC on stdin (`Ctrl-C` to stop). Run this way
-with no harness attached it has no client identity and no session context, so it
-is only a "does it start" check — real behavior needs a harness to spawn it.

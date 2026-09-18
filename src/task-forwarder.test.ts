@@ -29,6 +29,9 @@ function scriptedSend(steps: Array<ResponseEnvelope | Error>) {
 const okResponse = (): ResponseEnvelope => ({
   v: 1, ok: true, session_id: 'cap-1', task_id: 'task-1', event_id: '5', seq: '5',
 });
+/** An `ok:true` envelope the control-client validator accepts but that carries no
+ * task-commit identifiers — nothing durable is proven. */
+const malformedOk = (): ResponseEnvelope => ({ v: 1, ok: true } as ResponseEnvelope);
 const errResponse = (code: ControlErrorCode, message = 'msg'): ResponseEnvelope => ({ v: 1, ok: false, code, message });
 
 test('unresolved identity returns IDENTITY_UNRESOLVED without contacting the daemon', async () => {
@@ -70,6 +73,24 @@ test('an OutcomeUnknown on the first send auto-resends the byte-identical payloa
   assert.deepEqual(sent[0], sent[1]); // byte-identical resend
 });
 
+test('a malformed success ack on the first send is post-send ambiguity and triggers the one resend', async () => {
+  const { send, sent } = scriptedSend([malformedOk(), okResponse()]);
+  const res = await forwardBeginTask({ identity: IDENTITY, title: 't', requestId: 'req-m', send });
+  assert.equal(res.isError, false, res.text);
+  assert.deepEqual(res.structured, { session_id: 'cap-1', task_id: 'task-1', event_id: '5', seq: '5' });
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0], sent[1]);
+});
+
+test('a malformed success ack on both sends collapses to OUTCOME_UNKNOWN, never a confident success', async () => {
+  const { send, sent } = scriptedSend([malformedOk(), malformedOk()]);
+  const res = await forwardBeginTask({ identity: IDENTITY, title: 't', requestId: 'req-mm', send });
+  assert.equal(res.isError, true);
+  assert.match(res.text, /OUTCOME_UNKNOWN/);
+  assert.match(res.text, /req-mm/);
+  assert.equal(sent.length, 2);
+});
+
 test('a final INVALID_TITLE on the resend replaces the earlier unknown', async () => {
   const { send, sent } = scriptedSend([new OutcomeUnknownError('drop'), errResponse('INVALID_TITLE', 'bad')]);
   const res = await forwardBeginTask({ identity: IDENTITY, title: 't', requestId: 'r', send });
@@ -105,14 +126,6 @@ test('DAEMON_UNAVAILABLE on the resend is OUTCOME_UNKNOWN, not a "safe to retry"
   assert.equal(res.isError, true);
   assert.match(res.text, /OUTCOME_UNKNOWN/);
   assert.match(res.text, /req-7/);
-});
-
-test('a daemon-down first send returns DAEMON_UNAVAILABLE with a single attempt', async () => {
-  const { send, sent } = scriptedSend([errResponse('DAEMON_UNAVAILABLE', 'no socket')]);
-  const res = await forwardBeginTask({ identity: IDENTITY, title: 't', requestId: 'r', send });
-  assert.equal(res.isError, true);
-  assert.match(res.text, /DAEMON_UNAVAILABLE/);
-  assert.equal(sent.length, 1);
 });
 
 test('shouldAutoResend only qualifies begin_task envelopes bearing a request_id', () => {

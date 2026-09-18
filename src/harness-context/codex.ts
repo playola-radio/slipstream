@@ -1,7 +1,8 @@
+import { isAbsolute } from 'node:path';
 import type { IdentityResult } from '../harness-context.ts';
 
 function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null;
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /**
@@ -35,5 +36,10 @@ export function codexIdentity(toolCallParams: unknown): IdentityResult {
   const keys = Object.keys(workspaces);
   if (keys.length === 0) return { unresolved: 'workspaces map is empty; worktree root is ambiguous' };
   if (keys.length > 1) return { unresolved: `workspaces map has ${keys.length} roots; ambiguous` };
-  return { harness: 'codex', harness_session_id: threadId, worktree: keys[0]! };
+  const worktree = keys[0]!;
+  // The worktree root must be an absolute path. A relative key (`.`, or an array's
+  // `0`) would be resolved against the daemon's own CWD, which is never a binding
+  // input — reject it before contacting the daemon.
+  if (!isAbsolute(worktree)) return { unresolved: `workspace root ${worktree} is not an absolute path` };
+  return { harness: 'codex', harness_session_id: threadId, worktree };
 }

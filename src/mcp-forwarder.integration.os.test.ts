@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createInterface, type Interface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -73,7 +73,7 @@ class ForwarderProcess {
 }
 
 async function withAttachedDaemon(
-  fn: (ctx: { store: string; worktree: string; otherWorktree: string; daemon: Daemon }) => Promise<void>,
+  fn: (ctx: { store: string; worktree: string; otherWorktree: string; daemon: Daemon; sessionId: string }) => Promise<void>,
 ): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-fwd-int-'));
   const worktree = await mkdtemp(join(tmpdir(), 'slip-fwd-int-wt-'));
@@ -90,7 +90,9 @@ async function withAttachedDaemon(
       responseTimeoutMs: 5000,
     });
     assert.equal(attach.ok, true);
-    await fn({ store, worktree, otherWorktree, daemon });
+    const sessionId = (attach as unknown as Record<string, string>).session_id;
+    assert.ok(typeof sessionId === 'string' && sessionId.length > 0);
+    await fn({ store, worktree, otherWorktree, daemon, sessionId });
   } finally {
     await daemon?.stop();
     await rm(store, { recursive: true, force: true });
@@ -120,7 +122,7 @@ describe('forwarder subprocess against a real daemon', () => {
   });
 
   it('a forwarder in a non-selected worktree gets SESSION_NOT_SELECTED and cannot steal ownership', async () => {
-    await withAttachedDaemon(async ({ store, otherWorktree, daemon }) => {
+    await withAttachedDaemon(async ({ store, worktree, otherWorktree, daemon, sessionId }) => {
       const fwd = new ForwarderProcess(store, {
         CLAUDE_CODE_SESSION_ID: HARNESS_SESSION_ID,
         CLAUDE_PROJECT_DIR: otherWorktree,
@@ -134,12 +136,16 @@ describe('forwarder subprocess against a real daemon', () => {
         await fwd.close();
       }
       // The selected session is untouched: the non-selected forwarder stole nothing.
-      const status = await sendControlRequest({
+      // Assert the exact selected identity, not merely that *some* session is active.
+      const status = (await sendControlRequest({
         socketPath: daemon.socketPath,
         request: { v: 1, verb: 'status' },
         responseTimeoutMs: 5000,
-      });
-      assert.equal((status as unknown as Record<string, string>).state, 'active');
+      })) as unknown as Record<string, string>;
+      assert.equal(status.state, 'active');
+      assert.equal(status.session_id, sessionId);
+      assert.equal(status.worktree, await realpath(worktree));
+      assert.equal(status.harness_session_id, HARNESS_SESSION_ID);
     });
   });
 });

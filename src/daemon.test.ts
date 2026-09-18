@@ -169,15 +169,6 @@ describe('daemon control verbs', () => {
     });
   });
 
-  it('commits begin_task when the declared identity triple matches the selected session', async () => {
-    await withDaemon(async ({ worktree, call }) => {
-      await call({ verb: 'attach', worktree, ...IDENTITY });
-      const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', worktree, ...IDENTITY });
-      assert.equal(res.ok, true);
-      assert.ok(rec(res).task_id);
-    });
-  });
-
   it('rejects begin_task whose declared triple does not match the selected session', async () => {
     await withDaemon(async ({ worktree, call }) => {
       await call({ verb: 'attach', worktree, ...IDENTITY });

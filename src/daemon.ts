@@ -460,6 +460,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (state !== 'active' || !current) {
       return errFields('SESSION_NOT_SELECTED', 'the selected session changed before the declaration committed');
     }
+    // Re-apply the optional session_id target guard after the await, exactly like
+    // the pre-await check: a concurrent detach+attach may have swapped in a session
+    // sharing the triple, and a request explicitly addressed to the prior session
+    // must not commit into its replacement.
+    if (req.session_id !== undefined && req.session_id !== current.id) {
+      return errFields('SESSION_NOT_SELECTED', `session_id ${String(req.session_id)} is not the selected session`);
+    }
     if (
       req.harness !== current.harness ||
       req.harness_session_id !== current.harnessSessionId ||
