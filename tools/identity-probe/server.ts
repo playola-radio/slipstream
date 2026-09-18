@@ -106,7 +106,8 @@ export async function runServer(): Promise<void> {
     if (line.trim().length === 0) continue;
     const parsed = parseMessage(line);
     if (!parsed.ok) {
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }) + '\n');
+      const message = parsed.code === -32700 ? 'parse error' : 'invalid request';
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: parsed.code, message } }) + '\n');
       continue;
     }
     const res = await dispatch(parsed.value, handlers);

@@ -13,8 +13,34 @@ function handlers(over: Partial<McpHandlers> = {}): McpHandlers {
   };
 }
 
-test('parseMessage rejects non-JSON', () => {
-  assert.equal(parseMessage('not json').ok, false);
+test('parseMessage classifies malformed JSON as a parse error', () => {
+  const res = parseMessage('not json');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32700);
+});
+
+test('parseMessage classifies valid JSON with no method as an invalid request', () => {
+  const res = parseMessage('{}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects the wrong jsonrpc version and an object-valued id as invalid request', () => {
+  const res = parseMessage('{"jsonrpc":"1.0","id":{},"method":"ping"}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects an object-valued id as invalid request', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":{},"method":"ping"}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage accepts a valid request', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","id":1,"method":"ping"}');
+  assert.equal(res.ok, true);
+  assert.equal((res as { ok: true; value: { method: string } }).value.method, 'ping');
 });
 
 test('initialize echoes protocol version, advertises tools, and fires onInitialize', async () => {

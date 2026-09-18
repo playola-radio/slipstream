@@ -26,18 +26,34 @@ export interface McpHandlers {
   callTool(name: string, params: unknown): Promise<{ text: string; isError?: boolean }>;
 }
 
-export function parseMessage(line: string): { ok: true; value: JsonRpcRequest } | { ok: false } {
-  try {
-    const value = JSON.parse(line) as JsonRpcRequest;
-    if (typeof value?.method !== 'string') return { ok: false };
-    return { ok: true, value };
-  } catch {
-    return { ok: false };
-  }
-}
+export type ParseResult =
+  | { ok: true; value: JsonRpcRequest }
+  | { ok: false; code: -32700 | -32600 };
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
+}
+
+function isValidRequest(value: unknown): value is JsonRpcRequest {
+  if (!isObject(value)) return false;
+  if (value.jsonrpc !== '2.0') return false;
+  if (typeof value.method !== 'string') return false;
+  if ('id' in value) {
+    const id = value.id;
+    if (typeof id !== 'string' && typeof id !== 'number' && id !== null) return false;
+  }
+  return true;
+}
+
+export function parseMessage(line: string): ParseResult {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return { ok: false, code: -32700 };
+  }
+  if (!isValidRequest(value)) return { ok: false, code: -32600 };
+  return { ok: true, value };
 }
 
 const err = (id: string | number | null, code: number, message: string): JsonRpcResponse => ({
