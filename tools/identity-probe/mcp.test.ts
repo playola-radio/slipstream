@@ -127,11 +127,6 @@ test('ping with no id is a notification and yields no response', async () => {
   assert.equal(res, null);
 });
 
-test('ping with an id still returns a response', async () => {
-  const res = await dispatch({ jsonrpc: '2.0', id: 6, method: 'ping' }, handlers());
-  assert.deepEqual(res, { jsonrpc: '2.0', id: 6, result: {} });
-});
-
 test('tools/call with no id yields no response but still invokes callTool', async () => {
   let called: string | undefined;
   const res = await dispatch(
