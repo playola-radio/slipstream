@@ -121,7 +121,7 @@ describe('daemon control verbs', () => {
     await withDaemon(async ({ worktree, call }) => {
       await call({ verb: 'attach', worktree, ...IDENTITY });
       const before = await call({ verb: 'status' });
-      const res = await call({ verb: 'begin_task', title: 'Fix login', request_id: 'req-1' });
+      const res = await call({ verb: 'begin_task', title: 'Fix login', request_id: 'req-1', worktree, ...IDENTITY });
       assert.equal(res.ok, true);
       assert.ok(rec(res).task_id);
       const after = await call({ verb: 'status' });
@@ -135,8 +135,8 @@ describe('daemon control verbs', () => {
   it('is idempotent per request_id (a retry replays the same task)', async () => {
     await withDaemon(async ({ worktree, call }) => {
       await call({ verb: 'attach', worktree, ...IDENTITY });
-      const first = await call({ verb: 'begin_task', title: 'T', request_id: 'req-dup' });
-      const second = await call({ verb: 'begin_task', title: 'T', request_id: 'req-dup' });
+      const first = await call({ verb: 'begin_task', title: 'T', request_id: 'req-dup', worktree, ...IDENTITY });
+      const second = await call({ verb: 'begin_task', title: 'T', request_id: 'req-dup', worktree, ...IDENTITY });
       assert.equal(rec(first).task_id, rec(second).task_id);
     });
   });
@@ -144,7 +144,7 @@ describe('daemon control verbs', () => {
   it('maps an empty title to INVALID_TITLE', async () => {
     await withDaemon(async ({ worktree, call }) => {
       await call({ verb: 'attach', worktree, ...IDENTITY });
-      const res = await call({ verb: 'begin_task', title: '', request_id: 'r' });
+      const res = await call({ verb: 'begin_task', title: '', request_id: 'r', worktree, ...IDENTITY });
       assert.equal(res.ok === false && res.code, 'INVALID_TITLE');
     });
   });
@@ -153,7 +153,7 @@ describe('daemon control verbs', () => {
     await withDaemon(async ({ worktree, call }) => {
       await call({ verb: 'attach', worktree, ...IDENTITY });
       const res = await call({
-        verb: 'begin_task', title: 'T', request_id: 'r',
+        verb: 'begin_task', title: 'T', request_id: 'r', worktree, ...IDENTITY,
         session_id: '00000000-0000-4000-8000-000000000000',
       });
       assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED');
@@ -164,8 +164,67 @@ describe('daemon control verbs', () => {
     await withDaemon(async ({ worktree, call }) => {
       const attach = await call({ verb: 'attach', worktree, ...IDENTITY });
       const id = rec(attach).session_id;
-      const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', session_id: id });
+      const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', session_id: id, worktree, ...IDENTITY });
       assert.equal(res.ok, true);
+    });
+  });
+
+  it('commits begin_task when the declared identity triple matches the selected session', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', worktree, ...IDENTITY });
+      assert.equal(res.ok, true);
+      assert.ok(rec(res).task_id);
+    });
+  });
+
+  it('rejects begin_task whose declared triple does not match the selected session', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const mismatches = [
+        { worktree, harness: 'codex', harness_session_id: 'abc123' }, // wrong harness
+        { worktree, harness: 'claude-code', harness_session_id: 'different' }, // wrong session id
+      ];
+      for (const triple of mismatches) {
+        const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', ...triple });
+        assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED');
+      }
+    });
+  });
+
+  it('rejects begin_task declared for a different worktree than the selected one', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      const other = await mkdtemp(join(tmpdir(), 'slip-daemon-other-'));
+      try {
+        await call({ verb: 'attach', worktree, ...IDENTITY });
+        const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', worktree: other, ...IDENTITY });
+        assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED');
+      } finally {
+        await rm(other, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('canonicalizes a symlinked declared worktree so it still matches the selected session', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      const linkParent = await mkdtemp(join(tmpdir(), 'slip-daemon-link-'));
+      const link = join(linkParent, 'wt');
+      await symlink(await realpath(worktree), link);
+      try {
+        await call({ verb: 'attach', worktree, ...IDENTITY });
+        const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r', worktree: link, ...IDENTITY });
+        assert.equal(res.ok, true);
+      } finally {
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('fails begin_task closed when the identity triple is absent', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const res = await call({ verb: 'begin_task', title: 'T', request_id: 'r' });
+      assert.equal(res.ok === false && res.code, 'IDENTITY_UNRESOLVED');
     });
   });
 
