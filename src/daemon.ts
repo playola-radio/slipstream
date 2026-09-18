@@ -213,6 +213,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // stopped.
     let stopErr: unknown = abortStopError;
     if (current) {
+      // Drain in-flight task declarations before stopping, exactly like detach:
+      // `torn` is already set, so beginTask admits no new work, and the append of
+      // any task that slipped in before shutdown must not race the session log
+      // closing under session.stop().
+      await Promise.allSettled([...inflightTasks]);
       // Do NOT swallow a failed stop: if capture could not be confirmed stopped,
       // shutdown must not report success. session.stop() still releases the session
       // lock and halts the engine even when it rethrows, so releasing the store
@@ -452,11 +457,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     } catch {
       declaredWorktree = req.worktree; // an unresolvable path cannot match the canonical root
     }
-    // Re-verify selection AFTER the realpath await: a concurrent detach or session
-    // compromise may have changed state or swapped the session while we
-    // canonicalized. From here through inflightTasks.add there is no await, so a
-    // detach cannot slip between this check and the append (it would either observe
-    // the task in flight and drain it, or find state no longer active).
+    // Re-verify selection AFTER the realpath await: a concurrent detach, teardown,
+    // or store-lock loss may have changed state or swapped the session while we
+    // canonicalized. From here through inflightTasks.add there is no await, so
+    // neither a detach nor a teardown can slip between these checks and the append
+    // (they either observe the task in flight and drain it, or are observed here).
+    // Teardown fails closed without touching `state`, so check `torn`/`compromised`
+    // explicitly — otherwise a request could append after the daemon has already
+    // begun shutting down or lost its store lock.
+    if (compromised || torn) {
+      return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    }
     if (state !== 'active' || !current) {
       return errFields('SESSION_NOT_SELECTED', 'the selected session changed before the declaration committed');
     }
