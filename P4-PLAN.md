@@ -74,7 +74,7 @@ evidence + adapter rules are authoritative.
   forwarder; `--store` socket resolution; daemon-down fast-fail; e2e vs fake daemon.
   **Status: Complete**
 - **F. `SKILL.md` + user-level config docs** — portable core; documented install for
-  Claude `~/.claude.json` and Codex `~/.codex/config.toml`. **Status: Not Started**
+  Claude `~/.claude.json` and Codex `~/.codex/config.toml`. **Status: Complete**
 - **G. Real-session acceptance + adversarial review** — three-worktree
   SESSION_NOT_SELECTED; skill-from-config both harnesses; same-UUID commits once;
   never-declare → ungrouped; daemon-down no hang. Then Codex review + challenge +
