@@ -265,6 +265,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // close — so close the listener explicitly here before awaiting the memoized
   // teardown, which would otherwise no-op and leak it.
   if (torn || compromised) {
+    // Destroy tracked connections before the explicit close: one accepted after
+    // teardown's own destruction sweep (e.g. during this retry's chmod window)
+    // could otherwise keep closeServer()'s promise from resolving if its peer
+    // holds the send side open, hanging startup rejection indefinitely.
+    for (const sock of connections) sock.destroy();
     await closeServer();
     await teardown();
     throw new Error('slipstream daemon lost its store lock during startup');
@@ -450,6 +455,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   function handleConnection(sock: Socket): void {
+    if (torn) {
+      // Shutting down: never take on a new connection that could linger and block
+      // server.close(); drop it so the client sees a closed connection and retries.
+      sock.destroy();
+      return;
+    }
     connections.add(sock);
     const decoder = createLineDecoder();
     let handled = false;
