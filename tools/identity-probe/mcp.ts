@@ -69,9 +69,10 @@ export async function dispatch(req: JsonRpcRequest, h: McpHandlers): Promise<Jso
       if (!isObject(req.params) || typeof req.params.name !== 'string') {
         return err(id, -32602, 'invalid tools/call params');
       }
-      const found = h.tools.some((t) => t.name === req.params!['name']);
-      if (!found) return err(id, -32602, `unknown tool: ${String(req.params.name)}`);
-      const out = await h.callTool(req.params.name, req.params);
+      const name = req.params.name;
+      const found = h.tools.some((t) => t.name === name);
+      if (!found) return err(id, -32602, `unknown tool: ${name}`);
+      const out = await h.callTool(name, req.params);
       return ok(id, { content: [{ type: 'text', text: out.text }], isError: out.isError ?? false });
     }
     default:
