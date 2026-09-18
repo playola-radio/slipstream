@@ -79,7 +79,7 @@ export interface LineDecoder {
 }
 
 export function createLineDecoder(maxBytes: number = MAX_MESSAGE_BYTES): LineDecoder {
-  let buf = Buffer.alloc(0);
+  let buf: Buffer = Buffer.alloc(0);
 
   return {
     push(chunk: Buffer): unknown[] {
