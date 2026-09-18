@@ -152,7 +152,7 @@ async function isDaemonOwned(store: string): Promise<boolean> {
 function reportControl(res: ResponseEnvelope): void {
   if (res.ok) {
     for (const [key, value] of Object.entries(res)) {
-      if (key === 'v' || key === 'ok' || key === 'id') continue;
+      if (key === 'v' || key === 'ok') continue;
       console.log(`${key}: ${String(value)}`);
     }
     return;

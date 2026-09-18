@@ -1,11 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, stat } from 'node:fs/promises';
+import { connect } from 'node:net';
+import { mkdtemp, rm, writeFile, stat, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
 import { sendControlRequest } from './control-client.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
+import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
 const IDENTITY = { harness: 'claude-code', harness_session_id: 'abc123' };
@@ -72,6 +74,11 @@ describe('daemon control verbs', () => {
       const status = await call({ verb: 'status' });
       assert.equal(rec(status).state, 'active');
       assert.equal(rec(status).session_id, id);
+      // The declared capture context is bound and reported (capture scope, never
+      // authorship); the forwarder relies on it in P4.
+      assert.equal(rec(status).worktree, worktree);
+      assert.equal(rec(status).harness, IDENTITY.harness);
+      assert.equal(rec(status).harness_session_id, IDENTITY.harness_session_id);
     });
   });
 
@@ -199,6 +206,43 @@ describe('daemon control verbs', () => {
       assert.equal(res.ok === false && res.code, 'PROTOCOL');
     });
   });
+
+  it('wedges and refuses tasks when the active session loses its lock', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-wt-'));
+    const d = await startDaemon({
+      storeDir: store,
+      captureDependencies: { platform: createFakePlatform(), enumerate: async () => {} },
+    });
+    const call = (req: CallRequest): Promise<ResponseEnvelope> =>
+      sendControlRequest({ socketPath: d.socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs: 5000 });
+    try {
+      const attach = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const id = rec(attach).session_id!;
+      // Steal the session's lock: overwrite its owner.lock with a foreign nonce.
+      // The daemon's session heartbeat detects the loss on its next beat.
+      const lockPath = join(store, 'sessions', id, 'owner.lock');
+      const thief = `${lockPath}.thief`;
+      await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief-nonce' }), 'utf8');
+      await rename(thief, lockPath);
+
+      // Poll until the daemon transitions to wedged (heartbeat is ~2s).
+      let wedged = false;
+      for (let i = 0; i < 60 && !wedged; i++) {
+        const status = await call({ verb: 'status' });
+        wedged = rec(status).state === 'wedged';
+        if (!wedged) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(wedged, true, 'daemon should wedge after the session lock is lost');
+
+      const bt = await call({ verb: 'begin_task', title: 'T', request_id: 'after-wedge' });
+      assert.equal(bt.ok === false && bt.code, 'STORAGE_UNAVAILABLE');
+    } finally {
+      await d.stop();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('daemon singleton', () => {
@@ -224,17 +268,83 @@ describe('daemon singleton', () => {
 
   it('refuses to remove a non-socket object squatting the control path', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-'));
-    await writeFile(join(store, 'control.sock'), 'not a socket', 'utf8');
+    const squat = join(store, 'control.sock');
+    await writeFile(squat, 'not a socket', 'utf8');
     try {
       await assert.rejects(
         startDaemon({
           storeDir: store,
           captureDependencies: { platform: createFakePlatform(), enumerate: async () => {} },
         }),
-        /control path|not a socket|EADDRINUSE/i,
+        /control path|not a socket|unresponsive|EADDRINUSE/i,
       );
+      // The squatting file is preserved, never silently deleted.
+      assert.equal((await stat(squat)).isFile(), true);
     } finally {
       await rm(store, { recursive: true, force: true });
+    }
+  });
+
+  it('stops promptly even with an idle control connection open', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-'));
+    const d = await startDaemon({
+      storeDir: store,
+      captureDependencies: { platform: createFakePlatform(), enumerate: async () => {} },
+    });
+    // Open a connection and send nothing: an unbounded idle connection must not
+    // wedge server.close() during teardown.
+    const sock = connect(d.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      sock.once('connect', resolve);
+      sock.once('error', reject);
+    });
+    try {
+      await d.stop(); // would hang forever without idle-connection teardown
+    } finally {
+      sock.destroy();
+      await rm(store, { recursive: true, force: true });
+    }
+  });
+
+  it('does not leave a capture running when the daemon stops mid-attach', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-wt-'));
+    let releaseWatch: (() => void) | undefined;
+    let subClosed = false;
+    // A platform whose watch() blocks until released, so an attach is still
+    // starting capture when the daemon is asked to stop.
+    const platform: Platform = {
+      watch: async (_o: WatchOptions): Promise<Subscription> => {
+        await new Promise<void>((resolve) => { releaseWatch = resolve; });
+        return { close: async () => { subClosed = true; } };
+      },
+    };
+    const enumerate = async (): Promise<void> => {};
+    const d = await startDaemon({ storeDir: store, captureDependencies: { platform, enumerate } });
+    try {
+      const attachP = sendControlRequest({
+        socketPath: d.socketPath,
+        request: { v: 1 as const, verb: 'attach', worktree, ...IDENTITY },
+        responseTimeoutMs: 5000,
+      }).catch(() => {});
+      // Wait until capture startup is blocked inside watch().
+      while (releaseWatch === undefined) await new Promise((r) => setTimeout(r, 10));
+      const stopP = d.stop();
+      releaseWatch(); // let capture startup finish AFTER teardown began
+      await stopP;
+      await attachP;
+      // The capture that finished starting after shutdown was stopped, not leaked.
+      assert.equal(subClosed, true);
+      // Ownership was released cleanly: a fresh daemon can take the store.
+      const d2 = await startDaemon({
+        storeDir: store,
+        captureDependencies: { platform: createFakePlatform(), enumerate },
+      });
+      await d2.stop();
+    } finally {
+      releaseWatch?.();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
     }
   });
 

@@ -175,6 +175,19 @@ describe('session', () => {
         );
       });
     });
+
+    it('rejects a fresh sessionId whose log already exists (would corrupt its sequence)', async () => {
+      await withTempPair(async (root, store) => {
+        const first = await startCapture({ root, storeDir: store, sessionId: PRE });
+        await first.stop();
+        // Re-using the same id as "fresh" must be refused: appending would restart
+        // the sequence at zero over existing history. Resuming requires resumeSessionId.
+        await assert.rejects(
+          startCapture({ root, storeDir: store, sessionId: PRE }),
+          /already exists|resumeSessionId/i,
+        );
+      });
+    });
   });
 
   describe('baseline', () => {

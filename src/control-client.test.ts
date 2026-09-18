@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { encodeMessage, createLineDecoder, type RequestEnvelope } from './control-protocol.ts';
 
-const REQ: RequestEnvelope = { v: 1, id: 'r1', verb: 'status' };
+const REQ: RequestEnvelope = { v: 1, verb: 'status' };
 
 /** A unix-socket server whose per-connection behavior is supplied by `onConn`. */
 async function withServer(
@@ -43,25 +43,12 @@ function readOneRequest(sock: Socket): Promise<unknown> {
 describe('control-client', () => {
   it('sends one request and resolves the framed response', async () => {
     await withServer((sock) => {
-      void readOneRequest(sock).then((req) => {
-        sock.write(encodeMessage({ v: 1, id: (req as RequestEnvelope).id, ok: true, state: 'detached' }));
+      void readOneRequest(sock).then(() => {
+        sock.write(encodeMessage({ v: 1, ok: true, state: 'detached' }));
       });
     }, async (socketPath) => {
       const res = await sendControlRequest({ socketPath, request: REQ });
-      assert.deepEqual(res, { v: 1, id: 'r1', ok: true, state: 'detached' });
-    });
-  });
-
-  it('echoes the correlation id back to the caller', async () => {
-    await withServer((sock) => {
-      void readOneRequest(sock).then((req) => {
-        const id = (req as RequestEnvelope).id;
-        sock.write(encodeMessage({ v: 1, id, ok: false, code: 'CAPTURE_NOT_READY', message: 'no' }));
-      });
-    }, async (socketPath) => {
-      const res = await sendControlRequest({ socketPath, request: REQ });
-      assert.equal(res.id, 'r1');
-      assert.equal(res.ok, false);
+      assert.deepEqual(res, { v: 1, ok: true, state: 'detached' });
     });
   });
 
@@ -70,17 +57,6 @@ describe('control-client', () => {
     try {
       const res = await sendControlRequest({ socketPath: join(dir, 'nope.sock'), request: REQ });
       assert.equal(res.ok, false);
-      assert.equal(res.ok === false && res.code, 'DAEMON_UNAVAILABLE');
-    } finally { await rm(dir, { recursive: true, force: true }); }
-  });
-
-  it('reports DAEMON_UNAVAILABLE, not unknown, on a pre-connect failure', async () => {
-    // Nothing is listening on this path — a connect refusal is proof nothing ran.
-    const dir = await mkdtemp(join(tmpdir(), 'slip-cc-'));
-    try {
-      const res = await sendControlRequest({
-        socketPath: join(dir, 'nobody.sock'), request: REQ, connectTimeoutMs: 200,
-      });
       assert.equal(res.ok === false && res.code, 'DAEMON_UNAVAILABLE');
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
@@ -118,4 +94,21 @@ describe('control-client', () => {
       );
     });
   });
+
+  for (const [label, reply] of [
+    ['a bare null', 'null\n'],
+    ['a success object missing the version', '{"ok":true}\n'],
+    ['an error object missing its code', '{"v":1,"ok":false,"message":"x"}\n'],
+  ] as const) {
+    it(`raises OUTCOME UNKNOWN when the reply is valid JSON but not a response envelope (${label})`, async () => {
+      await withServer((sock) => {
+        void readOneRequest(sock).then(() => sock.write(Buffer.from(reply)));
+      }, async (socketPath) => {
+        await assert.rejects(
+          sendControlRequest({ socketPath, request: REQ, responseTimeoutMs: 2000 }),
+          (err) => err instanceof OutcomeUnknownError,
+        );
+      });
+    });
+  }
 });

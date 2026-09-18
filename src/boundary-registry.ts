@@ -49,7 +49,6 @@ export interface BoundaryRegistry {
   installIfAbsent(id: string, boundary: BoundarySource): SessionRuntime;
   addFollower(id: string, ac: AbortController): void;
   removeFollower(id: string, ac: AbortController): void;
-  ids(): string[];
 }
 
 interface Entry {
@@ -101,9 +100,6 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
     removeFollower(id, ac) {
       entries.get(id)?.followers.delete(ac);
-    },
-    ids() {
-      return [...entries.keys()];
     },
   };
 }

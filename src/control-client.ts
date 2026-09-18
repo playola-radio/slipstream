@@ -39,7 +39,6 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 15000;
 /** The request reached the wire but its outcome is unknowable — the mutation may
  * or may not have committed. The caller must not retry blindly. */
 export class OutcomeUnknownError extends Error {
-  readonly code = 'OUTCOME_UNKNOWN';
   constructor(message: string) {
     super(message);
     this.name = 'OutcomeUnknownError';
@@ -48,6 +47,18 @@ export class OutcomeUnknownError extends Error {
 
 function daemonUnavailable(message: string): ResponseEnvelope {
   return { v: 1, ok: false, code: 'DAEMON_UNAVAILABLE', message };
+}
+
+/** A reply is only usable if it is a well-formed response envelope. Anything else
+ * on the wire (a bare `null`, a success object missing `ok`, a wrong protocol
+ * version) means we cannot read the daemon's answer — ambiguous after send, never
+ * a silent success. */
+function isResponseEnvelope(value: unknown): value is ResponseEnvelope {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (v.v !== 1 || typeof v.ok !== 'boolean') return false;
+  if (v.ok === false) return typeof v.code === 'string' && typeof v.message === 'string';
+  return true;
 }
 
 export function sendControlRequest(opts: ControlRequestOptions): Promise<ResponseEnvelope> {
@@ -80,14 +91,17 @@ export function sendControlRequest(opts: ControlRequestOptions): Promise<Respons
     timer = setTimeout(() => failTransport('daemon did not respond before the deadline'), connectTimeoutMs);
 
     sock.on('connect', () => {
+      // The connection is up: from here on, bytes may reach the daemon, so any
+      // later fault is ambiguous, not proof of nothing sent. Flip `sent` before
+      // the write starts and re-arm the timer as a response deadline.
+      clearTimeout(timer);
+      sent = true;
+      timer = setTimeout(
+        () => failTransport('no response before the deadline; the request may have committed'),
+        responseTimeoutMs,
+      );
       sock.write(encodeMessage(opts.request), (err) => {
-        if (err) { failTransport(`control write failed: ${err.message}`); return; }
-        sent = true;
-        clearTimeout(timer);
-        timer = setTimeout(
-          () => failTransport('no response before the deadline; the request may have committed'),
-          responseTimeoutMs,
-        );
+        if (err) failTransport(`control write failed: ${err.message}`);
       });
     });
 
@@ -102,7 +116,12 @@ export function sendControlRequest(opts: ControlRequestOptions): Promise<Respons
         return;
       }
       if (messages.length === 0) return; // response not yet complete
-      finish(() => resolve(messages[0] as ResponseEnvelope));
+      const reply = messages[0];
+      if (!isResponseEnvelope(reply)) {
+        finish(() => reject(new OutcomeUnknownError('daemon reply was not a valid control response')));
+        return;
+      }
+      finish(() => resolve(reply));
     });
 
     sock.on('error', (err) => failTransport((err as NodeJS.ErrnoException).message));

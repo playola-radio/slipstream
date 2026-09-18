@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBoundaryRegistry } from './boundary-registry.ts';
-import { staticBoundary } from './reader-runtime.ts';
+import { liveBoundary, staticBoundary } from './reader-runtime.ts';
 import { createHealth } from './health.ts';
 
 const ID = '11111111-1111-4111-8111-111111111111';
@@ -17,7 +17,7 @@ describe('boundary registry', () => {
     const reg = createBoundaryRegistry();
     const health = createHealth(0n);
     reg.reserve(ID);
-    reg.activate(ID, liveOf(health));
+    reg.activate(ID, liveBoundary(health));
     assert.equal(reg.get(ID)?.boundary.current(), 0n);
     health.setDurableSeq(5n);
     assert.equal(reg.get(ID)?.boundary.current(), 5n);
@@ -75,22 +75,4 @@ describe('boundary registry', () => {
     assert.equal(reg.get(other)?.boundary.current(), 4n);
   });
 
-  it('ids enumerates known sessions', () => {
-    const reg = createBoundaryRegistry();
-    reg.reserve(ID);
-    reg.reserve('22222222-2222-4222-8222-222222222222');
-    assert.deepEqual(reg.ids().sort(), [
-      '11111111-1111-4111-8111-111111111111',
-      '22222222-2222-4222-8222-222222222222',
-    ]);
-  });
 });
-
-function liveOf(health: ReturnType<typeof createHealth>) {
-  // A tiny live boundary over health for the activate test (mirrors
-  // reader-runtime.liveBoundary without pulling in the abort machinery).
-  return {
-    current: () => BigInt(health.snapshot().durable_seq),
-    waitForAdvance: () => new Promise<void>(() => {}),
-  };
-}

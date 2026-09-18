@@ -1,4 +1,4 @@
-import { readdir, realpath } from 'node:fs/promises';
+import { access, readdir, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
@@ -22,8 +22,13 @@ export interface CaptureOptions {
   resumeSessionId?: string;
   /** Start a FRESH session under a caller-pre-generated id. The daemon uses this
    * to reserve the reader boundary registry entry before the log dir exists on
-   * disk (D3). Mutually exclusive with {@link resumeSessionId}. */
+   * disk (D3). Mutually exclusive with {@link resumeSessionId}. A fresh id whose
+   * log already exists is rejected — appending fresh would corrupt its sequence. */
   sessionId?: string;
+  /** Notified once if this session loses its lock to another owner. Capture has
+   * already stopped acknowledging by the time this fires; the daemon uses it to
+   * wedge its state machine (decision 9). */
+  onCompromised?: (reason: string) => void;
 }
 
 export interface BeginTaskInput {
@@ -122,6 +127,18 @@ export async function startCapture(
   await assertOwnerOnly(sessionDir, 'dir'); // blobsDir perms are checked by createCas
   const logPath = join(sessionDir, 'events.jsonl');
 
+  if (opts.sessionId !== undefined) {
+    // A fresh caller-supplied id must name a session that does not exist yet:
+    // opening an existing log in append mode restarts sequencing at zero and
+    // duplicates seqs. Resuming existing history requires resumeSessionId.
+    const logExists = await access(logPath).then(() => true, () => false);
+    if (logExists) {
+      throw new Error(
+        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
+      );
+    }
+  }
+
   const cas = await createCas(blobsDir);
 
   // Durable task boundaries (Stage 3). `currentTaskId` is the latest committed
@@ -179,6 +196,7 @@ export async function startCapture(
       surrendered = true;
       console.error(`slipstream: session ownership lost: ${reason}`);
       healthRef?.markFailing({ code: 'ELOCKLOST', operation: 'lock', detected_at_ms: Date.now() });
+      opts.onCompromised?.(reason);
     },
   });
 

@@ -28,22 +28,18 @@ export type ControlErrorCode =
 
 export interface RequestEnvelope {
   v: 1;
-  /** Caller-chosen correlation id, echoed on the response. */
-  id?: string;
   verb: string;
   [key: string]: unknown;
 }
 
 export interface OkResponse {
   v: 1;
-  id?: string;
   ok: true;
   [key: string]: unknown;
 }
 
 export interface ErrorResponse {
   v: 1;
-  id?: string;
   ok: false;
   code: ControlErrorCode;
   message: string;
@@ -61,8 +57,9 @@ export class ProtocolError extends Error {
   }
 }
 
-/** One control message must fit in this many bytes, newline included. Generous
- * for a title but far short of anything that could exhaust memory. */
+/** One control line (the JSON object, excluding its trailing newline) must fit
+ * in this many bytes. Generous for a title but far short of anything that could
+ * exhaust memory. */
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
 
 const NEWLINE = 0x0a;
