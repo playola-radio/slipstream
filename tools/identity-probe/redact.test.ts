@@ -13,6 +13,17 @@ test('homeRelativize replaces the home prefix with ~ and leaves other paths', ()
   assert.equal(homeRelativize('/opt/tool', '/Users/x'), '/opt/tool');
 });
 
+test('homeRelativize rewrites a home path embedded mid-string', () => {
+  assert.equal(
+    homeRelativize('--log=/Users/alice/private', '/Users/alice'),
+    '--log=~/private',
+  );
+});
+
+test('homeRelativize does not corrupt a path that merely starts with the home prefix as a substring', () => {
+  assert.equal(homeRelativize('/Users/alice-backup/x', '/Users/alice'), '/Users/alice-backup/x');
+});
+
 test('collectAllowlistedEnv records allowlisted values, home-relativizing paths', () => {
   const env = {
     CLAUDE_CODE_SESSION_ID: 'sess-123',

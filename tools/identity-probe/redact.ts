@@ -16,9 +16,9 @@ export type EnvField = { present: true; value: string } | { present: false };
 
 /** Rewrite an absolute path under `home` to start with `~`. Non-matching paths pass through. */
 export function homeRelativize(value: string, home: string): string {
+  if (home.length === 0) return value;
   if (value === home) return '~';
-  if (home.length > 0 && value.startsWith(home + '/')) return '~' + value.slice(home.length);
-  return value;
+  return value.split(home + '/').join('~/');
 }
 
 /** Values are home-relativized for the path-bearing keys; identifiers pass through unchanged. */
