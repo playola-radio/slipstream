@@ -57,6 +57,34 @@ test('a rejecting append on startup is reported, not fatal', async () => {
   assert.deepEqual(appendErrors, [failure]);
 });
 
+test('hasArguments reports field presence, not content: empty arguments object is still present', async () => {
+  const records: Observation[] = [];
+  const h = createProbeHandlers({
+    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => 5, append: async (o) => { records.push(o); },
+  });
+  await dispatch(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    h,
+  );
+  const toolRecord = records.find((r) => r.phase === 'tool_call')!;
+  assert.equal(toolRecord.tool_call?.hasArguments, true);
+});
+
+test('hasArguments is false when the arguments field is absent entirely', async () => {
+  const records: Observation[] = [];
+  const h = createProbeHandlers({
+    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => 6, append: async (o) => { records.push(o); },
+  });
+  await dispatch(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'identity_probe_snapshot' } },
+    h,
+  );
+  const toolRecord = records.find((r) => r.phase === 'tool_call')!;
+  assert.equal(toolRecord.tool_call?.hasArguments, false);
+});
+
 test('a rejecting append on tool_call is reported and answered with an error result, not thrown', async () => {
   const appendErrors: unknown[] = [];
   const failure = new Error('EACCES: permission denied');

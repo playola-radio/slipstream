@@ -55,7 +55,7 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
             present: true,
             toolName: typeof toolParams?.name === 'string' ? toolParams.name : undefined,
             meta: isObject(toolParams) ? toolParams['_meta'] : undefined,
-            hasArguments: isObject(toolParams) && isObject(toolParams['arguments']) && Object.keys(toolParams['arguments'] as object).length > 0,
+            hasArguments: isObject(toolParams) && 'arguments' in toolParams,
           }
         : undefined,
     });
