@@ -25,7 +25,7 @@ convention as `tools/live-feed/`.
 This tool follows Slipstream's honesty constraints even though it never
 touches the production event log:
 
-- **No secrets, ever.** Only a fixed allowlist of identity-related env keys
+- **No unallowlisted env values.** Only a fixed allowlist of identity-related env keys
   (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `CLAUDECODE`,
   `CLAUDE_CODE_ENTRYPOINT`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
   `SLIPSTREAM_HOME`) is recorded **by value**. Everything else in the
@@ -33,25 +33,28 @@ touches the production event log:
   values — and only if the key name matches a discovery prefix (`CLAUDE*`,
   `CODEX*`, `MCP*`, `SLIPSTREAM*`, `CONDUCTOR*`). An unanticipated identity
   carrier is discoverable by name without ever leaking what it contains.
+- **MCP `tools/call` `_meta` is recorded verbatim.** `_meta` is protocol
+  metadata and is the Codex `threadId` carrier this diagnostic is designed to
+  measure, so it may contain whatever the client places there.
 - **No file bytes, ever.** The probe never reads a worktree file. It only
   reads its own process environment, argv, cwd, and the MCP protocol messages
   the harness sends it.
-- **Every absolute path is home-relativized.** `cwd`, `argv` entries, and
-  path-valued env fields (`CLAUDE_PROJECT_DIR`, `SLIPSTREAM_HOME`) are
-  rewritten so they start with `~` instead of the real home directory. A
-  committed finding never leaks a machine's real directory layout or
-  username.
+- **Whole-token home paths are home-relativized.** `cwd`, each `argv` entry,
+  and path-valued env fields (`CLAUDE_PROJECT_DIR`, `SLIPSTREAM_HOME`) are
+  rewritten when the whole value starts with the real home directory. An
+  absolute path embedded inside a larger argv token is not decomposed.
 - **A missing field is recorded as explicitly absent**, never omitted. Every
   allowlisted env key appears in every record as either
   `{ "present": true, "value": "…" }` or `{ "present": false }`. An
   unobserved field is itself a finding, not a silent gap.
-- **The runtime log is never committed.** Every call to
+- **The runtime log is owner-only and never committed.** Because raw records may
+  contain verbatim `_meta` and argv tokens, every call to
   `identity_probe_snapshot` appends one JSON line
   (`identity-probe-observation.v1`) to a `*.jsonl` file. `*.jsonl` is
   gitignored repo-wide, and the default log path
   (`~/.slipstream-identity-probe/observations.jsonl`) lives outside the repo
-  entirely. **Only `FINDINGS.md` — hand-curated and redacted by a human
-  reading the log — is committed.** Never `git add` an observation log.
+  entirely. **Only `FINDINGS.md` — hand-curated and human-redacted from the log
+  — is committed.** Never `git add` an observation log.
 
 ## Running it standalone (sanity check only)
 
