@@ -83,6 +83,11 @@ evidence + adapter rules are authoritative.
   concurrently); one combined fix wave applied (commit `b60306b`); re-review run.
   Findings B/C/D/E fixed; excess deletions applied. Finding A recorded below as a
   known limitation (not mine to re-architect — it changes P3 idempotency scope).
+  PR #14 opened against `develop`. Post-PR Greptile review (confidence 3/5)
+  addressed: teardown-mid-declaration race fixed (`6f2e2f1` — post-realpath
+  compromised/torn guard + teardown drain of `inflightTasks`); concrete per-harness
+  skill install paths added to docs (`714a48c`); the duplicate-task P1 replied
+  won't-fix (it is Finding A — the locked at-least-once limitation, below).
 
 ## Known limitations / follow-ups (surfaced by the adversarial review)
 - **A — cross-session duplicate under at-least-once auto-resend (design call, not
