@@ -13,10 +13,13 @@
  */
 
 /** Client-facing control error codes (the subset this PR owns). `DAEMON_UNAVAILABLE`
- * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask. */
+ * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask;
+ * `SESSION_ACTIVE` refuses a second attach while one session is already active
+ * (this PR carries exactly one active capture). */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
   | 'SESSION_NOT_SELECTED'
+  | 'SESSION_ACTIVE'
   | 'IDENTITY_UNRESOLVED'
   | 'CAPTURE_NOT_READY'
   | 'STORAGE_UNAVAILABLE'
