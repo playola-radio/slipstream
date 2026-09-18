@@ -1,7 +1,22 @@
 import { openLogCursor, parseLine, type ReaderEvent } from './log-reader.ts';
-import { onDiskHighWater, sessionLogPath, listSessions, readRuntimeDescriptor } from './store-reader.ts';
+import { onDiskHighWater, sessionLogPath, listSessions, readRuntimeDescriptor, type RuntimeDescriptor } from './store-reader.ts';
+import { renderChange, type BlobSource, type ChangeViewOptions } from './change-view.ts';
+import { diskBlobSource, httpBlobSource } from './blob-source.ts';
 
-const sanitize = (s: string) => s.replace(/[\x00-\x1f\x7f]/g, '�');
+const sanitize = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]/g, '�');
+
+/** Turns one event into the lines to print. Default is the one-line summary; the
+ *  changes view expands a `file.changed` event into a marked content block. */
+type EventRenderer = (ev: ReaderEvent) => Promise<string[]>;
+
+const oneLine: EventRenderer = async (ev) => [renderEvent(ev)];
+
+function makeRenderer(blob: BlobSource, view: ChangeViewOptions): EventRenderer {
+  return async (ev) => {
+    if (ev.type !== 'slipstream.file.changed.v1') return [renderEvent(ev)];
+    return [...await renderChange(ev, blob, view), ''];
+  };
+}
 
 function snapshotLabel(snap: unknown): string {
   if (typeof snap !== 'object' || snap === null) return '-';
@@ -23,16 +38,21 @@ export function renderEvent(ev: ReaderEvent): string {
   return parts.join(' · ');
 }
 
-export async function replayFromDisk(storeDir: string, id: string): Promise<string[]> {
+export async function replayFromDisk(
+  storeDir: string,
+  id: string,
+  out: (line: string) => void,
+  view?: ChangeViewOptions,
+): Promise<void> {
+  const render = view ? makeRenderer(diskBlobSource(storeDir), view) : oneLine;
   const logPath = sessionLogPath(storeDir, id);
   const H = await onDiskHighWater(logPath);
   const cursor = await openLogCursor(logPath, 0n);
   try {
-    const lines: string[] = [];
     for (;;) {
       const batch = await cursor.readThrough(H);
-      if (!batch.length) return lines;
-      lines.push(...batch.map(renderEvent));
+      if (!batch.length) return;
+      for (const ev of batch) for (const line of await render(ev)) out(line);
     }
   }
   finally { await cursor.close(); }
@@ -51,13 +71,35 @@ export async function runTui(argv: string[], out: (line: string) => void): Promi
   const disk = argv.includes('--disk');
   const store = argFor(argv, '--store');
   const session = argFor(argv, '--session');
-  if (!store) { out('usage: slipstream view --store <dir> [--session <id>] [--disk]'); return; }
+  const context = parseContext(argv);
+  if (context === undefined) {
+    out('usage: --context must be a non-negative integer');
+    return;
+  }
+  const view = argv.includes('--changes')
+    ? { context, full: argv.includes('--full') }
+    : undefined;
+  if (!store) {
+    out('usage: slipstream view --store <dir> [--session <id>] [--disk] [--changes] [--context N] [--full]');
+    return;
+  }
   if (!session) {
     for (const s of await listSessions(store)) out(`${s.id}  durable=${s.durableSeq}${s.removed ? '  (removed)' : ''}`);
     return;
   }
-  if (disk) { for (const line of await replayFromDisk(store, session)) out(line); return; }
-  await followHttp(store, session, out);
+  if (disk) { await replayFromDisk(store, session, out, view); return; }
+  await followHttp(store, session, out, view);
+}
+
+const DEFAULT_CONTEXT = 3;
+
+function parseContext(argv: string[]): number | undefined {
+  const i = argv.indexOf('--context');
+  if (i < 0) return DEFAULT_CONTEXT;
+  const raw = argv[i + 1];
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 function argFor(argv: string[], flag: string): string | undefined {
@@ -65,9 +107,10 @@ function argFor(argv: string[], flag: string): string | undefined {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
 }
 
-async function followHttp(store: string, session: string, out: (l: string) => void): Promise<void> {
-  const desc = await readRuntimeDescriptor(store);
+async function followHttp(store: string, session: string, out: (l: string) => void, view?: ChangeViewOptions): Promise<void> {
+  const desc: RuntimeDescriptor | null = await readRuntimeDescriptor(store);
   if (!desc) { out('no usable reader (runtime descriptor missing or invalid); try --disk'); return; }
+  const render = view ? makeRenderer(httpBlobSource(desc), view) : oneLine;
   const url = new URL(`v1/sessions/${session}/events?after=0&follow=true`, desc.url);
   let res: Response;
   const ac = new AbortController();
@@ -88,7 +131,7 @@ async function followHttp(store: string, session: string, out: (l: string) => vo
     while ((i = acc.indexOf('\n\n')) >= 0) {
       const frame = acc.slice(0, i); acc = acc.slice(i + 2);
       const data = sseDataLine(frame);
-      if (data !== undefined) out(renderEvent(parseLine(data)));
+      if (data !== undefined) for (const line of await render(parseLine(data))) out(line);
     }
   }
 }

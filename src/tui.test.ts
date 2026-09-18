@@ -2,9 +2,10 @@ import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { renderEvent, replayFromDisk, sseDataLine, runTui } from './tui.ts';
 import { parseLine } from './log-reader.ts';
+import { blobPath } from './store-reader.ts';
 
 const UUID = '55555555-5555-4555-8555-555555555555';
 
@@ -54,7 +55,7 @@ describe('tui', () => {
   });
 
   describe('replayFromDisk', () => {
-    it('returns rendered lines for the whole durable log', async () => {
+    it('emits rendered lines for the whole durable log', async () => {
       const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
       await mkdir(join(dir, 'sessions', UUID), { recursive: true });
       const mk = (seq: number) => JSON.stringify({
@@ -63,7 +64,8 @@ describe('tui', () => {
         data: { path: `f${seq}`, after: { kind: 'absent' } },
       }) + '\n';
       await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), mk(1) + mk(2), 'utf8');
-      const lines = await replayFromDisk(dir, UUID);
+      const lines: string[] = [];
+      await replayFromDisk(dir, UUID, l => lines.push(l));
       assert.equal(lines.length, 2);
       assert.match(lines[0]!, /^1 · /);
     });
@@ -97,12 +99,101 @@ it('reports a stale reader connection without throwing', async () => {
   } finally { fetchMock.mock.restore(); }
 });
 
+it('changes view renders a marked content block from the CAS on disk', async () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const writeBlob = async (hex: string, text: string) => {
+    const p = blobPath(dir, hex);
+    await mkdir(dirname(p), { recursive: true });
+    await writeFile(p, text);
+  };
+  await writeBlob(A, 'a\nb\nc');
+  await writeBlob(B, 'a\nX\nc');
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'f', before: { kind: 'content', sha256: A, size: 5 }, after: { kind: 'content', sha256: B, size: 5 } },
+  }) + '\n');
+  const lines: string[] = [];
+  await replayFromDisk(dir, UUID, l => lines.push(l), { context: 3, full: false });
+  assert.deepEqual(lines, ['#1 f', '  1 a', 'x 2 X', '  3 c', '']);
+});
+
+it('changes view renders a file with more lines than the spread-arg limit', async () => {
+  // A file whose rendered block exceeds the max function-argument count must not
+  // crash: replay pushes lines one at a time rather than spreading the array.
+  const A = 'a'.repeat(64);
+  const N = 130000;
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const p = blobPath(dir, A);
+  await mkdir(dirname(p), { recursive: true });
+  await writeFile(p, Array.from({ length: N }, () => 'x').join('\n'));
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'big.txt', before: { kind: 'absent' }, after: { kind: 'content', sha256: A, size: N * 2 } },
+  }) + '\n');
+  const lines: string[] = [];
+  await replayFromDisk(dir, UUID, l => lines.push(l), { context: 3, full: true });
+  assert.equal(lines.length, N + 3); // header + '(new file)' note + N marked lines + trailing ''
+  assert.equal(lines[0], '#1 big.txt');
+  assert.equal(lines[1], '  (new file)');
+  assert.match(lines[2]!, /^x +1 x$/);
+});
+
 it('disk replay consumes every bounded batch', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
   await mkdir(join(dir, 'sessions', UUID), { recursive: true });
   await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), Array.from({ length: 700 }, (_, i) =>
     JSON.stringify({ seq: String(i + 1), type: 'test', data: {} }) + '\n').join(''));
-  const lines = await replayFromDisk(dir, UUID);
+  const lines: string[] = [];
+  await replayFromDisk(dir, UUID, l => lines.push(l));
   assert.equal(lines.length, 700);
   assert.match(lines[699]!, /^700 · /);
+});
+
+it('runTui reports invalid --context values without rendering', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'f', after: { kind: 'absent' } },
+  }) + '\n');
+  const lines: string[] = [];
+  await runTui(['--store', dir, '--session', UUID, '--disk', '--changes', '--context', 'abc'], l => lines.push(l));
+  assert.deepEqual(lines, ['usage: --context must be a non-negative integer']);
+});
+
+it('runTui reports a trailing --context without rendering', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'f', after: { kind: 'absent' } },
+  }) + '\n');
+  const lines: string[] = [];
+  await runTui(['--store', dir, '--session', UUID, '--disk', '--changes', '--context'], l => lines.push(l));
+  assert.deepEqual(lines, ['usage: --context must be a non-negative integer']);
+});
+
+it('runTui uses a valid --context value in changes view', async () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const writeBlob = async (hex: string, text: string) => {
+    const p = blobPath(dir, hex);
+    await mkdir(dirname(p), { recursive: true });
+    await writeFile(p, text);
+  };
+  await writeBlob(A, 'a\nb\nc');
+  await writeBlob(B, 'a\nX\nc');
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'f', before: { kind: 'content', sha256: A, size: 5 }, after: { kind: 'content', sha256: B, size: 5 } },
+  }) + '\n');
+  const lines: string[] = [];
+  await runTui(['--store', dir, '--session', UUID, '--disk', '--changes', '--context', '0'], l => lines.push(l));
+  assert.deepEqual(lines, ['#1 f', 'x 2 X', '']);
 });
