@@ -63,16 +63,16 @@ evidence + adapter rules are authoritative.
 - **Daemon location:** explicit `--store` path shared with the CLI resolves socket.
 
 ## TDD stages (do retry-ambiguity early per Codex)
-- **A. `src/mcp-protocol.ts`** — JSON-RPC-over-stdio dispatch. **Status: Not Started**
+- **A. `src/mcp-protocol.ts`** — JSON-RPC-over-stdio dispatch. **Status: Complete**
 - **B. `src/harness-context.ts` + `harness-context/{claude,codex}.ts`** — fail-closed
-  identity matrix. **Status: Not Started**
-- **C. `src/task-forwarder.ts`** — begin_task orchestration + retry. **Status: Not Started**
+  identity matrix. **Status: Complete**
+- **C. `src/task-forwarder.ts`** — begin_task orchestration + retry. **Status: Complete**
 - **D. `src/daemon.ts` + `src/control-protocol.ts`** — daemon-side identity guard +
   realpath canonicalization; keep session_id guard. TOUCHED-AREA REGRESSION: run
-  FULL daemon/session/control test suites. **Status: Not Started**
+  FULL daemon/session/control test suites. **Status: Complete**
 - **E. `src/mcp-forwarder.ts` + `src/daemon-location.ts`** — wire transport+adapter+
   forwarder; `--store` socket resolution; daemon-down fast-fail; e2e vs fake daemon.
-  **Status: Not Started**
+  **Status: Complete**
 - **F. `SKILL.md` + user-level config docs** — portable core; documented install for
   Claude `~/.claude.json` and Codex `~/.codex/config.toml`. **Status: Not Started**
 - **G. Real-session acceptance + adversarial review** — three-worktree
