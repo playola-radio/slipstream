@@ -7,10 +7,12 @@ export interface InitializeCapture {
   capabilityKeys?: string[];
 }
 
+export type MetaField = { present: true; value: unknown } | { present: false };
+
 export interface ToolCallCapture {
   present: boolean;
   toolName?: string;
-  meta?: unknown;
+  meta: MetaField;
   hasArguments?: boolean;
 }
 

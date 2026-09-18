@@ -35,9 +35,24 @@ test('tool call records a tool_call observation carrying _meta and returns text'
   );
   const toolRecord = records.find((r) => r.phase === 'tool_call')!;
   assert.equal(toolRecord.tool_call?.toolName, 'identity_probe_snapshot');
-  assert.deepEqual(toolRecord.tool_call?.meta, { threadId: 't-7' });
+  assert.deepEqual(toolRecord.tool_call?.meta, { present: true, value: { threadId: 't-7' } });
   const text = (res?.result as any).content[0].text as string;
   assert.match(text, /identity-probe/);
+});
+
+test('tool call with no _meta records explicit absence, not a dropped field', async () => {
+  const records: Observation[] = [];
+  const h = createProbeHandlers({
+    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => 7, append: async (o) => { records.push(o); },
+  });
+  await dispatch(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    h,
+  );
+  const toolRecord = records.find((r) => r.phase === 'tool_call')!;
+  assert.deepEqual(toolRecord.tool_call?.meta, { present: false });
+  assert.match(JSON.stringify(toolRecord), /"meta":\{"present":false\}/);
 });
 
 test('a rejecting append on startup is reported, not fatal', async () => {

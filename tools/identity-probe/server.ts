@@ -54,7 +54,9 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
         ? {
             present: true,
             toolName: typeof toolParams?.name === 'string' ? toolParams.name : undefined,
-            meta: isObject(toolParams) ? toolParams['_meta'] : undefined,
+            meta: isObject(toolParams) && '_meta' in toolParams
+              ? { present: true, value: toolParams['_meta'] }
+              : { present: false },
             hasArguments: isObject(toolParams) && 'arguments' in toolParams,
           }
         : undefined,
@@ -84,7 +86,7 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
           'identity-probe recorded a snapshot. ' +
           `client=${obs.initialize.clientInfo?.name ?? 'unknown'} ` +
           `session_id_present=${obs.env.CLAUDE_CODE_SESSION_ID?.present ?? false} ` +
-          `tool_meta_present=${obs.tool_call?.meta !== undefined}`,
+          `tool_meta_present=${obs.tool_call?.meta.present === true}`,
       };
     },
   };

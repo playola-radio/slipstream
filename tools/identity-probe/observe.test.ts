@@ -46,8 +46,18 @@ test('buildObservation includes tool_call capture when phase is tool_call', () =
     phase: 'tool_call',
     env: {}, argv: [], cwd: '/Users/x', home: '/Users/x', nowMs: 2000,
     initialize: { present: false },
-    toolCall: { present: true, toolName: 'identity_probe_snapshot', meta: { threadId: 't-9' }, hasArguments: false },
+    toolCall: {
+      present: true,
+      toolName: 'identity_probe_snapshot',
+      meta: { present: true, value: { threadId: 't-9' } },
+      hasArguments: false,
+    },
   });
   assert.equal(obs.phase, 'tool_call');
-  assert.deepEqual(obs.tool_call, { present: true, toolName: 'identity_probe_snapshot', meta: { threadId: 't-9' }, hasArguments: false });
+  assert.deepEqual(obs.tool_call, {
+    present: true,
+    toolName: 'identity_probe_snapshot',
+    meta: { present: true, value: { threadId: 't-9' } },
+    hasArguments: false,
+  });
 });
