@@ -40,7 +40,8 @@ function isValidRequest(value: unknown): value is JsonRpcRequest {
   if (typeof value.method !== 'string') return false;
   if ('id' in value) {
     const id = value.id;
-    if (typeof id !== 'string' && typeof id !== 'number' && id !== null) return false;
+    const validId = typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id));
+    if (!validId) return false;
   }
   return true;
 }

@@ -43,6 +43,34 @@ test('parseMessage accepts a valid request', () => {
   assert.equal((res as { ok: true; value: { method: string } }).value.method, 'ping');
 });
 
+test('parseMessage rejects a non-integer numeric id', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","method":"ping","id":1.5}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects an id that overflows to Infinity', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","method":"ping","id":1e400}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage rejects a null id', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","method":"ping","id":null}');
+  assert.equal(res.ok, false);
+  assert.equal((res as { ok: false; code: number }).code, -32600);
+});
+
+test('parseMessage accepts a string id', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","method":"ping","id":"abc"}');
+  assert.equal(res.ok, true);
+});
+
+test('parseMessage accepts an integer id', () => {
+  const res = parseMessage('{"jsonrpc":"2.0","method":"ping","id":7}');
+  assert.equal(res.ok, true);
+});
+
 test('initialize echoes protocol version, advertises tools, and fires onInitialize', async () => {
   let captured: unknown;
   const res = await dispatch(
