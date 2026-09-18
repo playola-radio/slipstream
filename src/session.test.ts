@@ -138,6 +138,58 @@ describe('session', () => {
     });
   });
 
+  describe('caller-supplied sessionId', () => {
+    const PRE = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+
+    it('starts a fresh session under the pre-generated id', async () => {
+      await withTempPair(async (root, store) => {
+        const session = await startCapture({ root, storeDir: store, sessionId: PRE });
+        try {
+          assert.equal(session.sessionId, PRE);
+          assert.ok(session.logPath.includes(PRE));
+          const recs = await waitForRecords(session.logPath, (r) =>
+            r.some((e) => e.type === 'slipstream.session.started.v1'),
+          );
+          const started = recs.find((e) => e.type === 'slipstream.session.started.v1')!;
+          assert.equal(started.source, `urn:slipstream:session:${PRE}`);
+        } finally {
+          await session.stop();
+        }
+      });
+    });
+
+    it('rejects a sessionId that is not a v4 UUID', async () => {
+      await withTempPair(async (root, store) => {
+        await assert.rejects(
+          startCapture({ root, storeDir: store, sessionId: 'not-a-uuid' }),
+          /sessionId/i,
+        );
+      });
+    });
+
+    it('rejects supplying both sessionId and resumeSessionId', async () => {
+      await withTempPair(async (root, store) => {
+        await assert.rejects(
+          startCapture({ root, storeDir: store, sessionId: PRE, resumeSessionId: PRE }),
+          /sessionId.*resumeSessionId|resumeSessionId.*sessionId/i,
+        );
+      });
+    });
+
+    it('rejects a fresh sessionId whose log already exists (would corrupt its sequence)', async () => {
+      await withTempPair(async (root, store) => {
+        const first = await startCapture({ root, storeDir: store, sessionId: PRE });
+        await first.stop();
+        // Re-using the same id as "fresh" must be refused: appending would restart
+        // the sequence at zero over existing history. Resuming requires resumeSessionId.
+        await assert.rejects(
+          startCapture({ root, storeDir: store, sessionId: PRE }),
+          /already exists|resumeSessionId/i,
+        );
+      });
+    });
+  });
+
   describe('baseline', () => {
     it('does not report pre-existing content in a dirty worktree as a new edit', async () => {
       await withFakeSession(

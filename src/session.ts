@@ -1,4 +1,4 @@
-import { readdir, realpath } from 'node:fs/promises';
+import { access, readdir, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
@@ -10,6 +10,7 @@ import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
 import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
+import { isValidSessionId } from './store-reader.ts';
 import { createPlatform, type Platform, type Subscription } from './platform.ts';
 import type { AnyEvent, EventInput } from './event.ts';
 
@@ -19,6 +20,15 @@ export interface CaptureOptions {
   maxBytes?: number;
   /** Resume an existing session (restart reconciliation) instead of starting fresh. */
   resumeSessionId?: string;
+  /** Start a FRESH session under a caller-pre-generated id. The daemon uses this
+   * to reserve the reader boundary registry entry before the log dir exists on
+   * disk (D3). Mutually exclusive with {@link resumeSessionId}. A fresh id whose
+   * log already exists is rejected — appending fresh would corrupt its sequence. */
+  sessionId?: string;
+  /** Notified once if this session loses its lock to another owner. Capture has
+   * already stopped acknowledging by the time this fires; the daemon uses it to
+   * wedge its state machine (decision 9). */
+  onCompromised?: (reason: string) => void;
 }
 
 export interface BeginTaskInput {
@@ -90,6 +100,14 @@ export async function startCapture(
   dependencies: Partial<CaptureDependencies> = {},
 ): Promise<CaptureSession> {
   const deps = { ...defaultDependencies, ...dependencies };
+  if (opts.sessionId !== undefined) {
+    if (opts.resumeSessionId !== undefined) {
+      throw new Error('sessionId and resumeSessionId are mutually exclusive');
+    }
+    if (!isValidSessionId(opts.sessionId)) {
+      throw new Error(`sessionId is not a valid session UUID: ${opts.sessionId}`);
+    }
+  }
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
@@ -101,7 +119,7 @@ export async function startCapture(
   }
 
   const resuming = opts.resumeSessionId !== undefined;
-  const sessionId = opts.resumeSessionId ?? randomUUID();
+  const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
   const blobsDir = join(storeDir, 'blobs');
   const sessionDir = join(storeDir, 'sessions', sessionId);
   await mkdirpDurable(blobsDir);
@@ -166,8 +184,24 @@ export async function startCapture(
       surrendered = true;
       console.error(`slipstream: session ownership lost: ${reason}`);
       healthRef?.markFailing({ code: 'ELOCKLOST', operation: 'lock', detected_at_ms: Date.now() });
+      opts.onCompromised?.(reason);
     },
   });
+
+  if (!resuming && opts.sessionId !== undefined) {
+    // A fresh caller-supplied id must name a session that does not exist yet:
+    // opening an existing log in append mode restarts sequencing at zero and
+    // duplicates seqs. Resuming existing history requires resumeSessionId. The
+    // check runs while we hold the session lock so a concurrent caller cannot
+    // create then release the same id between the check and log creation.
+    const logExists = await access(logPath).then(() => true, () => false);
+    if (logExists) {
+      await lock.release();
+      throw new Error(
+        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
+      );
+    }
+  }
 
   let recovered: RecoveredSession | undefined;
   if (resuming) {
@@ -345,6 +379,10 @@ export async function startCapture(
   };
 
   const goLive = (): void => {
+    // A recovery attempt that finishes during stop() must not re-enable the engine
+    // or flush the buffer: stop() has already unsubscribed and is draining toward
+    // lock release, and no observation may be appended past that point.
+    if (stopped) return;
     live = true;
     for (const [rel, ts] of buffer) engine.notify(rel, ts);
     buffer.length = 0;
@@ -595,23 +633,39 @@ export async function startCapture(
     }
   };
 
+  const doStop = async (): Promise<void> => {
+    stopped = true;
+    // Stop feeding the engine immediately: if the watcher unsubscribe below
+    // rejects, late observations buffer instead of appending after the lock is
+    // released. Every step is then best-effort so a single failure never skips
+    // closing the log or releasing the lock; the first error is rethrown.
+    live = false;
+    let firstError: unknown;
+    const record = (err: unknown): void => {
+      if (firstError === undefined) firstError = err;
+    };
+    await subscription?.close().catch(record);
+    // Await any in-flight recovery: it may be mid-reopen, and appending after
+    // we release the lock would let a second owner's writes interleave. The
+    // loop stops starting new attempts once `stopped` is set.
+    await supervisorLoop.catch(() => {});
+    await engine.drain().catch(record);
+    await underlying.close().catch(record);
+    await lock.release().catch(record);
+    if (firstError !== undefined) throw firstError;
+  };
+  // Memoized so an overlapping detach + daemon shutdown (both hold the same
+  // handle) run teardown once. Two concurrent releases could otherwise both read
+  // the current nonce and the loser could unlink a successor's lock.
+  let stopPromise: Promise<void> | undefined;
+
   return {
     sessionId,
     logPath,
     blobsDir,
     health,
     beginTask,
-    stop: async () => {
-      stopped = true;
-      await subscription?.close();
-      // Await any in-flight recovery: it may be mid-reopen, and appending after
-      // we release the lock would let a second owner's writes interleave. The
-      // loop stops starting new attempts once `stopped` is set.
-      await supervisorLoop.catch(() => {});
-      await engine.drain();
-      await underlying.close().catch(() => {});
-      await lock.release();
-    },
+    stop: () => (stopPromise ??= doStop()),
   };
 }
 
