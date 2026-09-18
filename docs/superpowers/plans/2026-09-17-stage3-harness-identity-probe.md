@@ -95,19 +95,19 @@ test('collectAllowlistedEnv marks absent allowlisted keys explicitly', () => {
 
 test('discoverEnvKeys returns sorted matching names only, never values, never allowlisted', () => {
   const env = {
-    CLAUDE_CODE_ENTRYPOINT: 'cli',
-    CODEX_THREAD_ID: 't-1',
-    CONDUCTOR_WORKSPACE: 'ws',
-    AWS_SECRET_ACCESS_KEY: 'super-secret',
-    CLAUDE_CODE_SESSION_ID: 'sess-123', // allowlisted -> excluded from discovery
+    CLAUDE_CONFIG_DIR: '/Users/x/.claude',   // matches CLAUDE prefix, not allowlisted
+    CODEX_HOME: '/Users/x/.codex',            // matches CODEX prefix, not allowlisted
+    CONDUCTOR_WORKSPACE: 'ws',                // matches CONDUCTOR prefix, not allowlisted
+    AWS_SECRET_ACCESS_KEY: 'super-secret',    // no discovery prefix -> excluded
+    CLAUDE_CODE_SESSION_ID: 'sess-123',       // allowlisted -> excluded from discovery
   };
   const keys = discoverEnvKeys(env);
-  assert.deepEqual(keys, ['CLAUDE_CODE_ENTRYPOINT', 'CODEX_THREAD_ID', 'CONDUCTOR_WORKSPACE']);
+  assert.deepEqual(keys, ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CONDUCTOR_WORKSPACE']);
   assert.equal(keys.includes('AWS_SECRET_ACCESS_KEY'), false);
   assert.equal(keys.includes('CLAUDE_CODE_SESSION_ID'), false);
   // Adversarial: no value string ever appears in the discovery output.
   assert.equal(JSON.stringify(keys).includes('super-secret'), false);
-  assert.equal(JSON.stringify(keys).includes('t-1'), false);
+  assert.equal(JSON.stringify(keys).includes('sess-123'), false);
 });
 ```
 
