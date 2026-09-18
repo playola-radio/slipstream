@@ -224,7 +224,7 @@ disk-reading TUI client that consumes only public artifacts.
 - Schema-evolution guard: a client ignoring unknown event types and unknown
   object fields still renders a complete feed.
 
-**Status**: In Progress — durable write path + restart reconciliation (PR 2a)
+**Status**: Complete — durable write path + restart reconciliation (PR 2a)
 complete. Done: frozen v1 CloudEvents envelope and JSON Schemas under `schemas/`;
 single-writer contiguous decimal sequencing derived from the validated log
 (BigInt, `time` never used for ordering); durable blob publication (fsync file +
@@ -247,10 +247,15 @@ takeover is detected asynchronously, so an append already awaiting its fsync
 cannot be un-written, and any pure-Node stale-break must briefly vacate the lock
 path. That residual is closed operationally: Conductor launches one daemon per
 worktree, so concurrent acquirers on one session do not occur. On-disk tests for
-all three required failure paths pass. Remaining for
-PR 2b: the `/v1` reader API (finite NDJSON + SSE follow, one-cursor
-replay-then-follow, error codes, loopback auth), the two-reader convergence and
-stale-cursor tests, and the disk-reading TUI client.
+all three required failure paths pass. PR 2b delivered the `/v1` reader API
+(finite NDJSON and SSE follow with one-cursor replay-then-follow, HTTP error
+codes, and loopback bearer auth with host/origin checks), the two-reader
+convergence and stale-cursor reconnect tests, the schema-evolution guard, and
+the disk-reading TUI client (plus the `serve`/`view` CLI). PR #6 review fixes
+add bounded replay with backpressure, failed-startup capture cleanup, validated
+tombstones and runtime descriptors, correct schema error statuses, and immediate
+SSE headers. All 247 deterministic tests and typecheck pass. The recovery
+durable-sync gap remains tracked as separate work.
 
 ---
 

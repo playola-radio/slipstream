@@ -54,3 +54,18 @@ describe('health', () => {
     assert.equal(h.snapshot().state, 'recovering');
   });
 });
+
+describe('health subscribe', () => {
+  it('notifies listeners on setDurableSeq and stops after unsubscribe', () => {
+    const h = createHealth();
+    let calls = 0;
+    const off = h.subscribe(() => { calls += 1; });
+    h.setDurableSeq(1n);
+    h.setDurableSeq(2n);
+    assert.equal(calls, 2);
+    off();
+    h.setDurableSeq(3n);
+    assert.equal(calls, 2);
+    assert.equal(h.snapshot().durable_seq, '3');
+  });
+});
