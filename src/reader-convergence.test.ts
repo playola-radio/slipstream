@@ -46,6 +46,38 @@ describe('reader convergence', () => {
     );
   });
 
+  it('surfaces task grouping and attribution identically over HTTP and on disk', async () => {
+    await withFakeSession(
+      async () => {},
+      async ({ root, session, observe, waitFor }) => {
+        const task = await session.beginTask({ title: 'Group me', requestId: 'req-1' });
+        await writeFile(join(root, 'a.txt'), 'hi');
+        observe('a.txt');
+        await waitFor((recs) => recs.some((r) => r.type === 'slipstream.file.changed.v1'));
+
+        const storeDir = session.logPath.replace(/sessions\/.+$/, '').replace(/\/$/, '');
+        const srv = await startReaderServer({ storeDir });
+        try {
+          const res = await fetch(`${srv.url}/v1/sessions/${session.sessionId}/events?after=0`, {
+            headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}` },
+          });
+          const httpChange = (await res.text())
+            .split('\n').filter(Boolean).map((l) => JSON.parse(l))
+            .find((e) => e.type === 'slipstream.file.changed.v1' && e.data.path === 'a.txt');
+          const diskChange = (await readFile(session.logPath, 'utf8'))
+            .split('\n').filter(Boolean).map((l) => JSON.parse(l))
+            .find((e) => e.type === 'slipstream.file.changed.v1' && e.data.path === 'a.txt');
+
+          assert.ok(httpChange && diskChange);
+          assert.equal(httpChange.data.task_hint_id, task.task_id);
+          assert.equal(httpChange.data.task_hint_id, diskChange.data.task_hint_id);
+          assert.deepEqual(httpChange.data.attribution, { status: 'unknown' });
+          assert.deepEqual(httpChange.data.attribution, diskChange.data.attribution);
+        } finally { await srv.close(); }
+      },
+    );
+  });
+
   it('reconnect from a stale cursor returns exactly the suffix (idempotent by seq)', async () => {
     const UUID = '77777777-7777-4777-8777-777777777777';
     const dir = await mkdtemp(join(tmpdir(), 'slip-recon-'));

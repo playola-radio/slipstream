@@ -86,4 +86,23 @@ describe('buildEnvelope', () => {
   it('is pure — the same inputs yield an identical envelope', () => {
     assert.deepEqual(buildEnvelope(GAP_INPUT, 3n, SESSION), buildEnvelope(GAP_INPUT, 3n, SESSION));
   });
+
+  it('sets subject to task/<task_id> on a task declaration', () => {
+    const e = buildEnvelope(
+      {
+        type: 'slipstream.task.started.v1',
+        occurred_at_ms: 0,
+        data: { task_id: 'abc-123', request_id: 'req-1', title: 'Do the thing' },
+      },
+      9n,
+      SESSION,
+    );
+    assert.equal(e.subject, 'task/abc-123');
+    assert.equal(e.type, 'slipstream.task.started.v1');
+  });
+
+  it('omits subject entirely on every non-task event (absent, not empty)', () => {
+    const e = buildEnvelope(GAP_INPUT, 1n, SESSION);
+    assert.ok(!('subject' in e));
+  });
 });

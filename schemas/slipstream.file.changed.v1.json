@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.file.changed.v1.json",
   "title": "slipstream.file.changed.v1",
-  "$comment": "An observed transition at a path. `observation` distinguishes a live watcher observation from a restart/recovery reconciliation. Self-contained; unknown fields permitted for forward compatibility. `task_id`/`task_hint_id` will arrive as optional additive data fields in a later stage without a version bump.",
+  "$comment": "An observed transition at a path. `observation` distinguishes a live watcher observation from a restart/recovery reconciliation. `task_hint_id` is the immutable grouping hint (the committed task in effect when this change was ordered); `attribution` is revisable inference, never verified authorship. Self-contained; unknown fields permitted for forward compatibility.",
   "type": "object",
   "required": [
     "specversion",
@@ -79,6 +79,20 @@
         "observed_at_ms": {
           "type": "integer",
           "minimum": 0
+        },
+        "task_hint_id": {
+          "type": "string"
+        },
+        "attribution": {
+          "type": "object",
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "const": "unknown"
+            }
+          }
         }
       }
     }

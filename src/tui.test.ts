@@ -27,6 +27,27 @@ describe('tui', () => {
       const ev = parseLine(JSON.stringify({ seq: '8', type: 'future.v9', data: {} }));
       assert.match(renderEvent(ev), /^8 · future\.v9 · -/);
     });
+    it('surfaces the task grouping hint on a change so the TUI matches disk/HTTP', () => {
+      const ev = parseLine(JSON.stringify({
+        seq: '11', type: 'slipstream.file.changed.v1',
+        data: { path: 'a', after: { kind: 'absent' }, task_hint_id: 'task-abc' },
+      }));
+      assert.match(renderEvent(ev), /^11 · slipstream\.file\.changed\.v1 · a · absent · task\/task-abc$/);
+    });
+    it('omits the grouping hint on an ungrouped change', () => {
+      const ev = parseLine(JSON.stringify({
+        seq: '12', type: 'slipstream.file.changed.v1',
+        data: { path: 'a', after: { kind: 'absent' } },
+      }));
+      assert.ok(!renderEvent(ev).includes('task/'), 'an ungrouped change shows no task token');
+    });
+    it('renders a task declaration with its task and title', () => {
+      const ev = parseLine(JSON.stringify({
+        seq: '13', type: 'slipstream.task.started.v1',
+        data: { task_id: 'task-xyz', request_id: 'req-1', title: 'Implement selection' },
+      }));
+      assert.equal(renderEvent(ev), '13 · slipstream.task.started.v1 · task/task-xyz · Implement selection');
+    });
     it('sanitizes control chars in the event type', () => {
       const ev = parseLine(JSON.stringify({ seq: '9', type: 'evil\x1b[2Jtype', data: {} }));
       const line = renderEvent(ev);

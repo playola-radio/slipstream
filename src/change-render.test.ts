@@ -28,6 +28,15 @@ test('renderChange: a modified line is marked against the before-content', async
   assert.deepEqual(out, ['#42 src/foo.ts', '  1 a', 'x 2 X', '  3 c']);
 });
 
+test('renderChange: the header surfaces the task grouping hint when present', async () => {
+  const e = ev({ path: 'src/foo.ts', before: content('bbb', 10), after: content('aaa', 10), task_hint_id: 'task-abc' });
+  const out = await renderChange(e, source({
+    bbb: { kind: 'text', text: 'a\nb\nc' },
+    aaa: { kind: 'text', text: 'a\nX\nc' },
+  }), CTX);
+  assert.equal(out[0], '#42 src/foo.ts · task/task-abc');
+});
+
 test('renderChange: CRLF line endings are consumed before marking changed lines', async () => {
   const e = ev({ path: 'src/foo.ts', before: content('bbb', 6), after: content('aaa', 6) });
   const out = await renderChange(e, source({

@@ -31,7 +31,9 @@ export interface Health {
   /**
    * Register a listener called synchronously, after the value is set, on
    * every `setDurableSeq`. Returns an unsubscribe function. Listeners must
-   * be cheap; they must not perform I/O or await inside the callback.
+   * be cheap; they must not perform I/O or await inside the callback. A listener
+   * that throws is isolated (reported, not propagated) so it cannot corrupt the
+   * caller mid-append.
    */
   subscribe(listener: () => void): () => void;
 }
@@ -52,7 +54,19 @@ export function createHealth(durableSeq: bigint = 0n): Health {
     }),
     setDurableSeq: (next) => {
       seq = next;
-      for (const l of listeners) l();
+      // A listener that throws (violating its contract) must not corrupt the
+      // caller that just advanced the durable seq — e.g. break the append path
+      // between a durable commit and the bookkeeping that follows it. Report and
+      // keep notifying the rest.
+      for (const l of listeners) {
+        try {
+          l();
+        } catch (err) {
+          // String(err) never throws — a listener may throw a non-Error (even
+          // null), and re-accessing `.message` here would re-raise into the caller.
+          console.error(`slipstream: health listener threw: ${String(err)}`);
+        }
+      }
     },
     markHealthy: () => {
       state = 'healthy';

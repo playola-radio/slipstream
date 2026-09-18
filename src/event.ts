@@ -17,8 +17,11 @@ import type { Snapshot } from './snapshot.ts';
  *   CloudEvents extension names cannot contain underscores.
  * - Forward compatibility is a contract, not just syntax: consumers ignore
  *   unknown `data` fields and unknown event types (while still advancing their
- *   seq cursor), and v1 fields never change meaning. `task_id` / `task_hint_id`
- *   arrive later as optional additive `data` fields — no version bump.
+ *   seq cursor), and v1 fields never change meaning. `task_hint_id` arrives as
+ *   an optional additive `data` field on `file.changed` — no version bump.
+ * - `subject` is the one CloudEvents envelope attribute Slipstream sets: the
+ *   task declaration `slipstream.task.started.v1` carries `subject: "task/<id>"`
+ *   (ruling D2). It is optional and absent on every other event type.
  */
 export const SPEC_VERSION = '1.0';
 export const DATA_CONTENT_TYPE = 'application/json';
@@ -35,6 +38,7 @@ export const EVENT_TYPES = [
   'slipstream.file.changed.v1',
   'slipstream.capture.gap.v1',
   'slipstream.session.resumed.v1',
+  'slipstream.task.started.v1',
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -97,6 +101,33 @@ export interface FileChangedData {
   coalesced?: boolean;
   /** For reconciliation changes: the `seq` of the gap this endpoint reconciles. */
   gap_ref?: string;
+  /**
+   * The `task_id` of the latest COMMITTED task declaration in shared append
+   * order at the moment this change was ordered, or absent when the change is
+   * ungrouped. An immutable grouping hint — never rewritten once stamped, and a
+   * later declaration never regroups earlier changes.
+   */
+  task_hint_id?: string;
+  /**
+   * Attribution is revisable inference, never verified authorship. Stage 3 has
+   * no authorship evidence, so every newly emitted change is `unknown`: two
+   * writers in the watched worktree are both captured and both unattributed.
+   */
+  attribution?: { status: 'unknown' };
+}
+
+/**
+ * A durable task boundary the agent declared. Its `seq` is the boundary: changes
+ * ordered after it may reference its `task_id` as their `task_hint_id`. Declaring
+ * a task makes no completion claim about any previous one.
+ */
+export interface TaskStartedData {
+  session_id: string;
+  /** UUID minted by the capture session when the declaration is committed. */
+  task_id: string;
+  /** Caller-supplied idempotency key: a retry with the same value commits once. */
+  request_id: string;
+  title: string;
 }
 
 export interface CaptureGapData {
@@ -126,7 +157,8 @@ export type EventInput =
   | { type: 'slipstream.capture.baseline.completed.v1'; occurred_at_ms: number; data: Omit<BaselineCompletedData, 'session_id'> }
   | { type: 'slipstream.file.changed.v1'; occurred_at_ms: number; data: Omit<FileChangedData, 'session_id' | 'observed_at_ms'> }
   | { type: 'slipstream.capture.gap.v1'; occurred_at_ms: number; data: Omit<CaptureGapData, 'session_id' | 'observed_at_ms'> }
-  | { type: 'slipstream.session.resumed.v1'; occurred_at_ms: number; data: Omit<SessionResumedData, 'session_id' | 'resumed_at_ms'> };
+  | { type: 'slipstream.session.resumed.v1'; occurred_at_ms: number; data: Omit<SessionResumedData, 'session_id' | 'resumed_at_ms'> }
+  | { type: 'slipstream.task.started.v1'; occurred_at_ms: number; data: Omit<TaskStartedData, 'session_id'> };
 
 /** The `data` field into which each type mirrors the observation instant (epoch
  * ms). Types absent here carry only the envelope `time` (baseline records are
@@ -145,6 +177,7 @@ type DataFor<T extends EventType> =
   : T extends 'slipstream.file.changed.v1' ? FileChangedData
   : T extends 'slipstream.capture.gap.v1' ? CaptureGapData
   : T extends 'slipstream.session.resumed.v1' ? SessionResumedData
+  : T extends 'slipstream.task.started.v1' ? TaskStartedData
   : never;
 
 export interface CloudEvent<T extends EventType = EventType> {
@@ -155,6 +188,9 @@ export interface CloudEvent<T extends EventType = EventType> {
   datacontenttype: typeof DATA_CONTENT_TYPE;
   seq: string;
   time: string;
+  /** CloudEvents `subject`. Present only on task declarations (`task/<task_id>`);
+   * absent on every other event type. */
+  subject?: string;
   data: DataFor<T>;
 }
 
@@ -169,6 +205,11 @@ export type AnyEvent = { [T in EventType]: CloudEvent<T> }[EventType];
 export function buildEnvelope(input: EventInput, seq: bigint, sessionId: string): AnyEvent {
   const seqStr = seq.toString();
   const atMsField = AT_MS_FIELD[input.type];
+  // The only envelope `subject` Slipstream sets (ruling D2): a task declaration
+  // is subject `task/<task_id>`. Every other event omits it — an absent field,
+  // never an empty string.
+  const subject =
+    input.type === 'slipstream.task.started.v1' ? `task/${input.data.task_id}` : undefined;
   return {
     specversion: SPEC_VERSION,
     id: seqStr,
@@ -177,6 +218,7 @@ export function buildEnvelope(input: EventInput, seq: bigint, sessionId: string)
     datacontenttype: DATA_CONTENT_TYPE,
     seq: seqStr,
     time: new Date(input.occurred_at_ms).toISOString(),
+    ...(subject !== undefined ? { subject } : {}),
     data: {
       session_id: sessionId,
       ...input.data,

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.task.started.v1.json",
+  "title": "slipstream.task.started.v1",
+  "$comment": "A durable task boundary declared by the agent. `subject` is the CloudEvents grouping attribute `task/<task_id>`; `request_id` is the caller-supplied idempotency key. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "subject",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.task.started.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "subject": {
+      "type": "string",
+      "pattern": "^task/"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "task_id",
+        "request_id",
+        "title"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

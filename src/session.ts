@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
-import { createLog, type Log } from './log.ts';
+import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { createEngine } from './engine.ts';
 import { createHealth, type Health, type HealthFailure } from './health.ts';
 import { acquireSessionLock, type SessionLock } from './lock.ts';
@@ -21,11 +21,43 @@ export interface CaptureOptions {
   resumeSessionId?: string;
 }
 
+export interface BeginTaskInput {
+  title: string;
+  /** Caller-supplied idempotency key. A retry with the same value commits once. */
+  requestId: string;
+}
+
+export interface BeginTaskResult {
+  session_id: string;
+  task_id: string;
+  /** The declaration event's `id`, which equals its `seq` (CloudEvents identity
+   * is (source, id); a second UUID would add nothing). */
+  event_id: string;
+  seq: string;
+}
+
+/** A `request_id` was reused with a different title — a caller mistake, not a
+ * retry, so it never commits a second declaration. */
+export class InvalidTitleError extends Error {
+  readonly code = 'INVALID_TITLE';
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidTitleError';
+  }
+}
+
 export interface CaptureSession {
   sessionId: string;
   logPath: string;
   blobsDir: string;
   health: Health;
+  /**
+   * Declare a durable task boundary in-process. Appends one
+   * `slipstream.task.started.v1`, ordered on the single append path, and resolves
+   * only once it is durable. Idempotent per `requestId`; concurrent duplicates
+   * coalesce onto one commit. A direct method by design — no IPC, no socket.
+   */
+  beginTask(input: BeginTaskInput): Promise<BeginTaskResult>;
   stop(): Promise<void>;
 }
 
@@ -79,6 +111,48 @@ export async function startCapture(
 
   const cas = await createCas(blobsDir);
 
+  // Durable task boundaries (Stage 3). `currentTaskId` is the latest committed
+  // declaration in shared append order — the grouping hint stamped onto changes.
+  // The two maps are the idempotency index keyed by `request_id`: `committedTasks`
+  // replays a settled result, `inflightTasks` coalesces concurrent duplicates.
+  // Both the pointer and the committed index are rebuilt from the log on recovery.
+  let currentTaskId: string | undefined;
+  const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
+  const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
+
+  const seedTaskState = (rec: RecoveredSession): void => {
+    currentTaskId = rec.currentTaskId;
+    committedTasks.clear();
+    for (const [requestId, decl] of rec.taskDeclarations) {
+      committedTasks.set(requestId, {
+        title: decl.title,
+        result: Object.freeze({ session_id: sessionId, task_id: decl.taskId, event_id: decl.seq, seq: decl.seq }),
+      });
+    }
+  };
+
+  // Stamp grouping metadata inside the log's serialized sequencing section, the
+  // single place with a total order over appends: a change is stamped with the
+  // task committed before it, and the pointer advances only after a declaration
+  // is durable. Every newly emitted change also carries `attribution: unknown` —
+  // Stage 3 has no authorship evidence.
+  const taskSequencer: AppendSequencer = {
+    enrich: (input) => {
+      if (input.type !== 'slipstream.file.changed.v1') return input;
+      return {
+        ...input,
+        data: {
+          ...input.data,
+          attribution: { status: 'unknown' as const },
+          ...(currentTaskId !== undefined ? { task_hint_id: currentTaskId } : {}),
+        },
+      };
+    },
+    onCommitted: (event) => {
+      if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
+    },
+  };
+
   // Set if the lock heartbeat finds another process has taken ownership: capture
   // must stop acknowledging and must never reopen the log (the new owner has it).
   // Declared before the lock is acquired so a compromise during the startup
@@ -108,6 +182,7 @@ export async function startCapture(
       if (recovered.root !== root) {
         throw new Error(`session ${sessionId} is bound to ${recovered.root}, not ${root}`);
       }
+      seedTaskState(recovered); // rebuild the dedup index + current task before appends
     } catch (err) {
       await lock.release(); // a failed resume must not leave the session locked
       throw err;
@@ -124,6 +199,7 @@ export async function startCapture(
       filePath: logPath,
       sessionId,
       startSeq: recovered?.recoveredThroughSeq,
+      sequencer: taskSequencer,
     });
   } catch (err) {
     await lock.release();
@@ -304,7 +380,16 @@ export async function startCapture(
       if (stopped || surrendered) return false; // shutting down / dispossessed: don't reopen
       await underlying.close().catch(() => {});
       const rec = await recoverSession(logPath, sessionId, cas);
-      underlying = await deps.createLog({ filePath: logPath, sessionId, startSeq: rec.recoveredThroughSeq });
+      // Rebuild the dedup index + current task from the durable log before the log
+      // reopens: an in-process recovery must not leave a duplicate-commit window,
+      // and reconciliation changes below must stamp the recovered current task.
+      seedTaskState(rec);
+      underlying = await deps.createLog({
+        filePath: logPath,
+        sessionId,
+        startSeq: rec.recoveredThroughSeq,
+        sequencer: taskSequencer,
+      });
       health.setDurableSeq(rec.recoveredThroughSeq);
       health.markRecovering();
 
@@ -438,11 +523,84 @@ export async function startCapture(
   goLive();
   health.markHealthy();
 
+  const beginTask = async ({ title, requestId }: BeginTaskInput): Promise<BeginTaskResult> => {
+    // Readiness: only a live, healthy, still-owned session may declare a task.
+    // Domain error codes (CAPTURE_NOT_READY, STORAGE_UNAVAILABLE, ...) are a later
+    // PR's forwarder concern; in-process this is a plain refusal.
+    if (stopped || surrendered || health.snapshot().state !== 'healthy') {
+      throw new Error('capture session is not ready to accept task declarations');
+    }
+    if (typeof requestId !== 'string' || requestId.length === 0) {
+      throw new Error('beginTask requires a non-empty request_id');
+    }
+    if (typeof title !== 'string' || title.length === 0) {
+      throw new Error('beginTask requires a non-empty title');
+    }
+
+    // Idempotency keyed by (capture session, request_id); this session is the key's
+    // session component, so request_id alone indexes within it. A settled result
+    // replays as-is; a same-key call still in flight coalesces onto it; a reused
+    // key with a different title is a caller mistake, not a retry.
+    const settled = committedTasks.get(requestId);
+    if (settled !== undefined) {
+      if (settled.title !== title) {
+        throw new InvalidTitleError(`request_id ${requestId} was already used for a different title`);
+      }
+      return settled.result;
+    }
+    const pending = inflightTasks.get(requestId);
+    if (pending !== undefined) {
+      if (pending.title !== title) {
+        throw new InvalidTitleError(`request_id ${requestId} is in flight for a different title`);
+      }
+      return pending.promise;
+    }
+
+    // The registration below is synchronous (no await precedes it), so a
+    // concurrent duplicate observes the in-flight entry and never starts a second
+    // append. `task_id` is minted here; `request_id` is the caller's.
+    const taskId = randomUUID();
+    const promise = (async (): Promise<BeginTaskResult> => {
+      const event = await appendEvent({
+        type: 'slipstream.task.started.v1',
+        occurred_at_ms: Date.now(),
+        data: { task_id: taskId, request_id: requestId, title },
+      });
+      // The record may have landed durably while ownership was lost mid-fsync (an
+      // accepted residual the new owner reconciles). A surrendered session must
+      // not ACKNOWLEDGE the commit or cache it as a settled result — acknowledging
+      // after surrender is exactly what the lost lock forbids.
+      if (surrendered) {
+        throw new StorageError(
+          'lock',
+          Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }),
+        );
+      }
+      // Frozen so a caller cannot mutate the object the dedup index hands back to
+      // every future retry (the result is an immutable identity record).
+      const result: BeginTaskResult = Object.freeze({
+        session_id: sessionId,
+        task_id: taskId,
+        event_id: event.id, // equals seq by construction
+        seq: event.seq,
+      });
+      committedTasks.set(requestId, { title, result });
+      return result;
+    })();
+    inflightTasks.set(requestId, { title, promise });
+    try {
+      return await promise;
+    } finally {
+      inflightTasks.delete(requestId);
+    }
+  };
+
   return {
     sessionId,
     logPath,
     blobsDir,
     health,
+    beginTask,
     stop: async () => {
       stopped = true;
       await subscription?.close();

@@ -45,6 +45,15 @@ const SAMPLES: Record<string, EventInput> = {
     occurred_at_ms: 1789657200123,
     data: { recovered_through_seq: '41', discarded_tail_bytes: 18 },
   },
+  'slipstream.task.started.v1': {
+    type: 'slipstream.task.started.v1',
+    occurred_at_ms: 1789657200123,
+    data: {
+      task_id: '11111111-1111-4111-8111-111111111111',
+      request_id: '22222222-2222-4222-8222-222222222222',
+      title: 'Implement attachment selection',
+    },
+  },
 };
 
 describe('schema', () => {

@@ -15,11 +15,28 @@ export interface Log {
   close(): Promise<void>;
 }
 
+/**
+ * A hook the log invokes inside its serialized sequencing section — the one
+ * place with a total order over appends — so that ordering-dependent fields stay
+ * consistent with the assigned seq. `enrich` runs before the envelope is built
+ * (to stamp fields such as a change's `task_hint_id`); `onCommitted` runs after
+ * the record is durably written and before the next append is processed (to
+ * advance state such as the current task). The log stays generic: it knows
+ * nothing about tasks, only that a caller may observe and augment appends in
+ * order.
+ */
+export interface AppendSequencer {
+  enrich(input: EventInput): EventInput;
+  onCommitted(event: AnyEvent): void;
+}
+
 export interface CreateLogOptions {
   filePath: string;
   sessionId: string;
   /** Last durable seq recovered from an existing log; the first append is startSeq+1. */
   startSeq?: bigint;
+  /** Optional in-order hook for ordering-dependent enrichment (e.g. task grouping). */
+  sequencer?: AppendSequencer;
 }
 
 /**
@@ -32,7 +49,7 @@ export interface CreateLogOptions {
  * poisoned handle.
  */
 export async function createLog(opts: CreateLogOptions): Promise<Log> {
-  const { filePath, sessionId } = opts;
+  const { filePath, sessionId, sequencer } = opts;
   const isNew = !(await stat(filePath).then(() => true).catch(() => false));
 
   const handle: FileHandle = await open(filePath, 'a', FILE_MODE);
@@ -54,7 +71,7 @@ export async function createLog(opts: CreateLogOptions): Promise<Log> {
     const result = tail.then(async () => {
       if (poison) throw poison;
       const seq = durableSeq + 1n;
-      const event = buildEnvelope(input, seq, sessionId);
+      const event = buildEnvelope(sequencer ? sequencer.enrich(input) : input, seq, sessionId);
       try {
         await writeAll(handle, Buffer.from(`${JSON.stringify(event)}\n`));
         await handle.sync();
@@ -63,6 +80,9 @@ export async function createLog(opts: CreateLogOptions): Promise<Log> {
         throw poison;
       }
       durableSeq = seq;
+      // Ordered and durable: advance any sequencer state before the next append
+      // is processed, so a later change sees this commit and no earlier one does.
+      sequencer?.onCommitted(event);
       return event;
     });
     tail = result.catch(() => undefined);
