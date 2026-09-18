@@ -213,6 +213,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // stopped.
     let stopErr: unknown = abortStopError;
     if (current) {
+      // Drain in-flight task declarations before stopping, exactly like detach:
+      // `torn` is already set, so beginTask admits no new work, and the append of
+      // any task that slipped in before shutdown must not race the session log
+      // closing under session.stop().
+      await Promise.allSettled([...inflightTasks]);
       // Do NOT swallow a failed stop: if capture could not be confirmed stopped,
       // shutdown must not report success. session.stop() still releases the session
       // lock and halts the engine even when it rethrows, so releasing the store
@@ -429,16 +434,58 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is detaching');
       return errFields('SESSION_NOT_SELECTED', 'no active session');
     }
-    const { id, session } = current;
-    if (req.session_id !== undefined && req.session_id !== id) {
+    if (req.session_id !== undefined && req.session_id !== current.id) {
       // The optional target guards a retry after detach+attach-B from misrouting to
       // a different session than the caller declared.
       return errFields('SESSION_NOT_SELECTED', `session_id ${String(req.session_id)} is not the selected session`);
     }
+    // Selection guard (locked design, decision X): the caller ships its verified
+    // identity triple and only the selected session's exact triple may declare.
+    // The P4 forwarder always sends the triple; a missing one is a contract
+    // violation, so fail closed rather than declare into whatever is selected.
+    if (!nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)) {
+      return errFields('IDENTITY_UNRESOLVED', 'begin_task requires harness, harness_session_id, and worktree');
+    }
     if (!nonEmptyString(req.title)) return errFields('INVALID_TITLE', 'begin_task requires a non-empty title');
     if (!nonEmptyString(req.request_id)) return errFields('CAPTURE_NOT_READY', 'begin_task requires a non-empty request_id');
-    // Start the append synchronously (no await before add) so a concurrent detach
-    // sees this task in flight and drains it.
+    // Canonicalize the declared worktree with the SAME realpath policy as attach
+    // (startAndActivate), so a symlinked or relative declared path matches the
+    // durable root capture actually watches.
+    let declaredWorktree: string;
+    try {
+      declaredWorktree = await realpath(req.worktree);
+    } catch {
+      declaredWorktree = req.worktree; // an unresolvable path cannot match the canonical root
+    }
+    // Re-verify selection AFTER the realpath await: a concurrent detach, teardown,
+    // or store-lock loss may have changed state or swapped the session while we
+    // canonicalized. From here through inflightTasks.add there is no await, so
+    // neither a detach nor a teardown can slip between these checks and the append
+    // (they either observe the task in flight and drain it, or are observed here).
+    // Teardown fails closed without touching `state`, so check `torn`/`compromised`
+    // explicitly — otherwise a request could append after the daemon has already
+    // begun shutting down or lost its store lock.
+    if (compromised || torn) {
+      return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    }
+    if (state !== 'active' || !current) {
+      return errFields('SESSION_NOT_SELECTED', 'the selected session changed before the declaration committed');
+    }
+    // Re-apply the optional session_id target guard after the await, exactly like
+    // the pre-await check: a concurrent detach+attach may have swapped in a session
+    // sharing the triple, and a request explicitly addressed to the prior session
+    // must not commit into its replacement.
+    if (req.session_id !== undefined && req.session_id !== current.id) {
+      return errFields('SESSION_NOT_SELECTED', `session_id ${String(req.session_id)} is not the selected session`);
+    }
+    if (
+      req.harness !== current.harness ||
+      req.harness_session_id !== current.harnessSessionId ||
+      declaredWorktree !== current.worktree
+    ) {
+      return errFields('SESSION_NOT_SELECTED', 'the declared identity is not the selected session');
+    }
+    const { session } = current;
     const promise = session.beginTask({ title: req.title, requestId: req.request_id });
     inflightTasks.add(promise);
     try {

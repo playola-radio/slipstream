@@ -22,8 +22,8 @@
  * Deletion / GC of retained sessions is a later stage.
  */
 import { readFile, lstat } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
-import { homedir } from 'node:os';
+import { resolve } from 'node:path';
+import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
 import { startReaderServer } from './http-reader.ts';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
@@ -43,7 +43,7 @@ type Args =
 
 /** The shared daemon's default store lives under the home dir, not the worktree:
  * one daemon serves every worktree from a single owner-only root. */
-const DEFAULT_DAEMON_STORE = join(homedir(), '.slipstream');
+const DEFAULT_DAEMON_STORE = defaultDaemonStore();
 
 function parseDirAndStore(rest: string[]): { dir: string; store: string } | null {
   let dir = process.cwd();
@@ -142,7 +142,7 @@ function usage(): void {
  * failing here gives a clear message instead of a lock error. Returns true when
  * the caller should stop. */
 async function isDaemonOwned(store: string): Promise<boolean> {
-  const controlSock = join(store, 'control.sock');
+  const controlSock = controlSocketPath(store);
   let st;
   try {
     st = await lstat(controlSock);
@@ -174,7 +174,7 @@ function reportControl(res: ResponseEnvelope): void {
 }
 
 async function runControl(store: string, request: Record<string, unknown> & { verb: string }): Promise<void> {
-  const socketPath = join(store, 'control.sock');
+  const socketPath = controlSocketPath(store);
   try {
     const res = await sendControlRequest({ socketPath, request: { v: 1, ...request } });
     reportControl(res);

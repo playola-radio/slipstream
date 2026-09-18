@@ -305,8 +305,11 @@ MCP tool `slipstream_begin_task`.
 identity probe) and P2 (durable task boundaries) are merged. P3 (shared daemon +
 attach layer: control protocol/client, boundary registry, daemon singleton +
 attach/detach/status/begin_task, CLI start/attach/status/detach + standalone
-guard) is complete on `feature/stage3-shared-daemon-attach`. P4 (MCP forwarders,
-skill, config) and P5 (session deletion + GC) remain.
+guard) is complete on `feature/stage3-shared-daemon-attach`. P4 (MCP forwarder,
+harness identity adapters, `slipstream_begin_task` tool, portable skill + config
+docs) is implemented on this branch (daemon-side identity-triple selection guard,
+honest post-send retry, end-to-end forwarder tests); real-session acceptance and
+the PR remain. P5 (session deletion + GC) remains.
 
 ---
 
