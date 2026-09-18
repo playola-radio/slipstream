@@ -13,15 +13,30 @@ test('homeRelativize replaces the home prefix with ~ and leaves other paths', ()
   assert.equal(homeRelativize('/opt/tool', '/Users/x'), '/opt/tool');
 });
 
-test('homeRelativize rewrites a home path embedded mid-string', () => {
+test('homeRelativize normalizes a trailing slash on the home argument', () => {
+  assert.equal(homeRelativize('/Users/alice/work', '/Users/alice/'), '~/work');
+});
+
+test('homeRelativize leaves an embedded home path in a flag argument unchanged (anchored, not global)', () => {
   assert.equal(
     homeRelativize('--log=/Users/alice/private', '/Users/alice'),
-    '--log=~/private',
+    '--log=/Users/alice/private',
   );
 });
 
 test('homeRelativize does not corrupt a path that merely starts with the home prefix as a substring', () => {
   assert.equal(homeRelativize('/Users/alice-backup/x', '/Users/alice'), '/Users/alice-backup/x');
+});
+
+test('homeRelativize does not corrupt a non-home path that contains the home path as a nested substring', () => {
+  assert.equal(
+    homeRelativize('/backup/Users/alice/work', '/Users/alice'),
+    '/backup/Users/alice/work',
+  );
+});
+
+test('homeRelativize leaves an unrelated absolute path unchanged', () => {
+  assert.equal(homeRelativize('/Volumes/other/x', '/Users/alice'), '/Volumes/other/x');
 });
 
 test('collectAllowlistedEnv records allowlisted values, home-relativizing paths', () => {
@@ -52,9 +67,6 @@ test('discoverEnvKeys returns sorted matching names only, never values, never al
   };
   const keys = discoverEnvKeys(env);
   assert.deepEqual(keys, ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CONDUCTOR_WORKSPACE']);
-  assert.equal(keys.includes('AWS_SECRET_ACCESS_KEY'), false);
-  assert.equal(keys.includes('CLAUDE_CODE_SESSION_ID'), false);
   // Adversarial: no value string ever appears in the discovery output.
   assert.equal(JSON.stringify(keys).includes('super-secret'), false);
-  assert.equal(JSON.stringify(keys).includes('sess-123'), false);
 });

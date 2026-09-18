@@ -14,11 +14,13 @@ export const DISCOVERY_PREFIXES = ['CLAUDE', 'CODEX', 'MCP', 'SLIPSTREAM', 'COND
 
 export type EnvField = { present: true; value: string } | { present: false };
 
-/** Rewrite an absolute path under `home` to start with `~`. Non-matching paths pass through. */
+/** Rewrite an absolute path whose prefix is `home` to start with `~`. Non-home paths pass through unchanged. */
 export function homeRelativize(value: string, home: string): string {
-  if (home.length === 0) return value;
-  if (value === home) return '~';
-  return value.split(home + '/').join('~/');
+  const h = home.endsWith('/') ? home.slice(0, -1) : home;
+  if (h.length === 0) return value;
+  if (value === h) return '~';
+  if (value.startsWith(h + '/')) return '~' + value.slice(h.length);
+  return value;
 }
 
 /** Values are home-relativized for the path-bearing keys; identifiers pass through unchanged. */
