@@ -151,12 +151,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   let torn = false;
   let compromised = false; // store lock lost
   let sessionCompromised = false; // current session lock lost mid-attach
+  let abortStopError: unknown; // a failed stop of a session aborted mid-attach
+  // Gates DISPATCH, not acceptance: connections are tracked and given a deadline
+  // from the moment they arrive (so bind/chmod-window sockets can never orphan or
+  // hang shutdown), but no verb runs until startup is fully ready — which is also
+  // when `readerRef` is initialized, so an early request can never hit its TDZ.
+  let ready = false;
 
-  // Created without a connection handler: the listener is attached only once
-  // startup is fully ready (reader running, lock held, not torn). A control verb
-  // can therefore never dispatch during the bind/chmod window, when the reader
-  // reference is not yet initialized and a store-lock compromise could orphan it.
-  const server = createServer();
+  const server = createServer((sock) => handleConnection(sock));
   const closeServer = () => new Promise<void>((resolve) => server.close(() => resolve()));
 
   /** Remove OUR control socket. Only ever called on the normal teardown path, while
@@ -189,7 +191,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // it to settle (it self-stops once it observes `torn`), then stop whatever it or
     // an active session left installed.
     if (attachInFlight) await attachInFlight.catch(() => {});
-    let stopErr: unknown;
+    // An attach aborted mid-startup may have failed to stop its half-built session
+    // (it runs in startAndActivate, which sets abortStopError). Surface that too so
+    // shutdown never reports success over a capture that could not be confirmed
+    // stopped.
+    let stopErr: unknown = abortStopError;
     if (current) {
       // Do NOT swallow a failed stop: if capture could not be confirmed stopped,
       // shutdown must not report success. session.stop() still releases the session
@@ -253,8 +259,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   // A compromise that landed during startup already triggered teardown; honor it
-  // rather than handing back a daemon that is shutting down.
+  // rather than handing back a daemon that is shutting down. bindControl may have
+  // (re)bound the listener AFTER teardown ran — e.g. a compromise during its
+  // stale-socket probe, when the server was not yet listening for teardown to
+  // close — so close the listener explicitly here before awaiting the memoized
+  // teardown, which would otherwise no-op and leak it.
   if (torn || compromised) {
+    await closeServer();
     await teardown();
     throw new Error('slipstream daemon lost its store lock during startup');
   }
@@ -315,8 +326,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     if (torn || compromised || sessionCompromised || state !== 'attaching') {
       // Shutdown, store-lock loss, or a session compromise arrived while capture was
-      // starting: do not publish this session. Stop it and hold the boundary.
-      await session.stop().catch(() => {});
+      // starting: do not publish this session. Stop it and hold the boundary. A
+      // failed stop here is recorded (not swallowed) so teardown can surface it.
+      try {
+        await session.stop();
+      } catch (err) {
+        abortStopError ??= err;
+      }
       registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
       if (state === 'attaching') state = 'detached';
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
@@ -465,6 +481,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         answer({ v: 1, ok: false, code: 'PROTOCOL', message: `unsupported control protocol version: ${String((req as { v?: unknown }).v)}` });
         return;
       }
+      if (!ready) {
+        // A request that arrived during the bind/chmod window, before startup
+        // finished. Do not dispatch (the reader reference is not yet bound); answer
+        // a retryable error rather than orphaning the connection.
+        answer({ v: 1, ok: false, code: 'CAPTURE_NOT_READY', message: 'daemon is still starting' });
+        return;
+      }
       void dispatch(req as RequestEnvelope).then(answer).catch((err) => {
         answer({ v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: (err as Error).message });
       });
@@ -484,8 +507,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   // Startup is fully ready: reader running, lock held, not torn, readerRef bound.
-  // Only now start dispatching control traffic (see createServer above).
-  server.on('connection', handleConnection);
+  // Only now let the connection handler dispatch verbs (see the `ready` gate).
+  ready = true;
 
   return {
     socketPath,

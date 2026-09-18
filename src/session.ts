@@ -379,6 +379,10 @@ export async function startCapture(
   };
 
   const goLive = (): void => {
+    // A recovery attempt that finishes during stop() must not re-enable the engine
+    // or flush the buffer: stop() has already unsubscribed and is draining toward
+    // lock release, and no observation may be appended past that point.
+    if (stopped) return;
     live = true;
     for (const [rel, ts] of buffer) engine.notify(rel, ts);
     buffer.length = 0;
@@ -629,33 +633,39 @@ export async function startCapture(
     }
   };
 
+  const doStop = async (): Promise<void> => {
+    stopped = true;
+    // Stop feeding the engine immediately: if the watcher unsubscribe below
+    // rejects, late observations buffer instead of appending after the lock is
+    // released. Every step is then best-effort so a single failure never skips
+    // closing the log or releasing the lock; the first error is rethrown.
+    live = false;
+    let firstError: unknown;
+    const record = (err: unknown): void => {
+      if (firstError === undefined) firstError = err;
+    };
+    await subscription?.close().catch(record);
+    // Await any in-flight recovery: it may be mid-reopen, and appending after
+    // we release the lock would let a second owner's writes interleave. The
+    // loop stops starting new attempts once `stopped` is set.
+    await supervisorLoop.catch(() => {});
+    await engine.drain().catch(record);
+    await underlying.close().catch(record);
+    await lock.release().catch(record);
+    if (firstError !== undefined) throw firstError;
+  };
+  // Memoized so an overlapping detach + daemon shutdown (both hold the same
+  // handle) run teardown once. Two concurrent releases could otherwise both read
+  // the current nonce and the loser could unlink a successor's lock.
+  let stopPromise: Promise<void> | undefined;
+
   return {
     sessionId,
     logPath,
     blobsDir,
     health,
     beginTask,
-    stop: async () => {
-      stopped = true;
-      // Stop feeding the engine immediately: if the watcher unsubscribe below
-      // rejects, late observations buffer instead of appending after the lock is
-      // released. Every step is then best-effort so a single failure never skips
-      // closing the log or releasing the lock; the first error is rethrown.
-      live = false;
-      let firstError: unknown;
-      const record = (err: unknown): void => {
-        if (firstError === undefined) firstError = err;
-      };
-      await subscription?.close().catch(record);
-      // Await any in-flight recovery: it may be mid-reopen, and appending after
-      // we release the lock would let a second owner's writes interleave. The
-      // loop stops starting new attempts once `stopped` is set.
-      await supervisorLoop.catch(() => {});
-      await engine.drain().catch(record);
-      await underlying.close().catch(record);
-      await lock.release().catch(record);
-      if (firstError !== undefined) throw firstError;
-    },
+    stop: () => (stopPromise ??= doStop()),
   };
 }
 
