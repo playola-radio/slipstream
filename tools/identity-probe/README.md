@@ -53,8 +53,10 @@ touches the production event log:
   (`identity-probe-observation.v1`) to a `*.jsonl` file. `*.jsonl` is
   gitignored repo-wide, and the default log path
   (`~/.slipstream-identity-probe/observations.jsonl`) lives outside the repo
-  entirely. **Only `FINDINGS.md` — hand-curated and human-redacted from the log
-  — is committed.** Never `git add` an observation log.
+  entirely. An operator-supplied `SLIPSTREAM_IDENTITY_PROBE_LOG` path is
+  tightened best-effort to owner-only permissions. **Only `FINDINGS.md` —
+  hand-curated and human-redacted from the log — is committed.** Never `git
+  add` an observation log.
 
 ## Running it standalone (sanity check only)
 
