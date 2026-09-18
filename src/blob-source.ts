@@ -41,18 +41,31 @@ export function httpBlobSource(desc: RuntimeDescriptor, timeoutMs = 5000): BlobS
     const ac = new AbortController();
     // The timer stays armed through the body read, not just the header fetch: a
     // server that stalls mid-body must still trip the timeout rather than hang.
+    // Aborting on every early return tears down the connection so a stalled body
+    // can't hold it open after we've stopped reading.
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
       const res = await fetch(url, {
         headers: { authorization: `Bearer ${desc.token}` }, redirect: 'error', signal: ac.signal,
       });
       // Only a plain 200 carries the full blob; 204/206 and the rest are not it.
-      if (res.status !== 200) return { kind: 'missing', reason: `http-${res.status}` };
+      if (res.status !== 200) { ac.abort(); return { kind: 'missing', reason: `http-${res.status}` }; }
       const declared = Number(res.headers.get('content-length'));
-      if (Number.isFinite(declared) && declared > maxBytes) return { kind: 'oversize', size: declared };
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > maxBytes) return { kind: 'oversize', size: buf.byteLength };
-      return decode(buf);
+      if (Number.isFinite(declared) && declared > maxBytes) { ac.abort(); return { kind: 'oversize', size: declared }; }
+      if (!res.body) return { kind: 'missing', reason: 'no-body' };
+      // Read incrementally so a chunked body with no Content-Length can't be fully
+      // buffered before the cap check: stop and abort the moment it exceeds it.
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) { ac.abort(); return { kind: 'oversize', size: total }; }
+        chunks.push(value);
+      }
+      return decode(Buffer.concat(chunks));
     } catch { return { kind: 'missing', reason: 'fetch-failed' }; }
     finally { clearTimeout(timer); }
   };

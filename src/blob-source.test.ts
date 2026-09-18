@@ -120,6 +120,23 @@ test('httpBlobSource: a body larger than the cap is oversize', async () => {
   } finally { srv.close(); }
 });
 
+test('httpBlobSource: a chunked body with no content-length is capped mid-stream', async () => {
+  // No content-length header (chunked), so the cap can only be enforced while
+  // reading: the body must not be fully buffered first.
+  const srv = createServer((_req, res) => {
+    res.writeHead(200);
+    res.write('x'.repeat(50));
+    res.write('x'.repeat(50));
+    res.end();
+  });
+  const url = await listen(srv);
+  try {
+    const r = await httpBlobSource({ url, token: 't' })(SHA_A, 10);
+    assert.equal(r.kind, 'oversize');
+    if (r.kind === 'oversize') assert.ok(r.size > 10, `size ${r.size} should exceed the cap`);
+  } finally { srv.close(); }
+});
+
 test('httpBlobSource: a 204 with no body is missing, never a fake empty blob', async () => {
   const srv = createServer((_req, res) => { res.writeHead(204); res.end(); });
   const url = await listen(srv);
