@@ -25,7 +25,6 @@ export const PROBE_TOOL: ToolDef = {
 export const DEFAULT_LOG_PATH = join(homedir(), '.slipstream-identity-probe', 'observations.jsonl');
 
 interface HandlerOpts {
-  logPath: string;
   env: Record<string, string | undefined>;
   argv: string[];
   cwd: string;
@@ -95,7 +94,6 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
 export async function runServer(): Promise<void> {
   const logPath = process.env.SLIPSTREAM_IDENTITY_PROBE_LOG ?? DEFAULT_LOG_PATH;
   const handlers = createProbeHandlers({
-    logPath,
     env: process.env,
     argv: process.argv,
     cwd: process.cwd(),

@@ -12,7 +12,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 test('startup observation is recorded on initialize with client info', async () => {
   const records: Observation[] = [];
   const h = createProbeHandlers({
-    logPath: '/unused', env: { CLAUDE_CODE_SESSION_ID: 's-1' }, argv: ['node', 'server.ts'],
+    env: { CLAUDE_CODE_SESSION_ID: 's-1' }, argv: ['node', 'server.ts'],
     cwd: '/Users/x/w', home: '/Users/x', now: () => 1, append: async (o) => { records.push(o); },
   });
   await dispatch({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', clientInfo: { name: 'claude-code' } } }, h);
@@ -25,7 +25,7 @@ test('startup observation is recorded on initialize with client info', async () 
 test('tool call records a tool_call observation carrying _meta and returns text', async () => {
   const records: Observation[] = [];
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 2, append: async (o) => { records.push(o); },
   });
   await dispatch({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, h);
@@ -43,7 +43,7 @@ test('tool call records a tool_call observation carrying _meta and returns text'
 test('tool call with no _meta records explicit absence, not a dropped field', async () => {
   const records: Observation[] = [];
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 7, append: async (o) => { records.push(o); },
   });
   await dispatch(
@@ -59,7 +59,7 @@ test('a rejecting append on startup is reported, not fatal', async () => {
   const appendErrors: unknown[] = [];
   const failure = new Error('EACCES: permission denied');
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 3,
     append: async () => { throw failure; },
     onAppendError: (err) => { appendErrors.push(err); },
@@ -75,7 +75,7 @@ test('a rejecting append on startup is reported, not fatal', async () => {
 test('hasArguments reports field presence, not content: empty arguments object is still present', async () => {
   const records: Observation[] = [];
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 5, append: async (o) => { records.push(o); },
   });
   await dispatch(
@@ -89,7 +89,7 @@ test('hasArguments reports field presence, not content: empty arguments object i
 test('hasArguments is false when the arguments field is absent entirely', async () => {
   const records: Observation[] = [];
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 6, append: async (o) => { records.push(o); },
   });
   await dispatch(
@@ -104,7 +104,7 @@ test('a rejecting append on tool_call is reported and answered with an error res
   const appendErrors: unknown[] = [];
   const failure = new Error('EACCES: permission denied');
   const h = createProbeHandlers({
-    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
     now: () => 4,
     append: async () => { throw failure; },
     onAppendError: (err) => { appendErrors.push(err); },
