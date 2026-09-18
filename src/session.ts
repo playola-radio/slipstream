@@ -127,18 +127,6 @@ export async function startCapture(
   await assertOwnerOnly(sessionDir, 'dir'); // blobsDir perms are checked by createCas
   const logPath = join(sessionDir, 'events.jsonl');
 
-  if (opts.sessionId !== undefined) {
-    // A fresh caller-supplied id must name a session that does not exist yet:
-    // opening an existing log in append mode restarts sequencing at zero and
-    // duplicates seqs. Resuming existing history requires resumeSessionId.
-    const logExists = await access(logPath).then(() => true, () => false);
-    if (logExists) {
-      throw new Error(
-        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
-      );
-    }
-  }
-
   const cas = await createCas(blobsDir);
 
   // Durable task boundaries (Stage 3). `currentTaskId` is the latest committed
@@ -199,6 +187,21 @@ export async function startCapture(
       opts.onCompromised?.(reason);
     },
   });
+
+  if (!resuming && opts.sessionId !== undefined) {
+    // A fresh caller-supplied id must name a session that does not exist yet:
+    // opening an existing log in append mode restarts sequencing at zero and
+    // duplicates seqs. Resuming existing history requires resumeSessionId. The
+    // check runs while we hold the session lock so a concurrent caller cannot
+    // create then release the same id between the check and log creation.
+    const logExists = await access(logPath).then(() => true, () => false);
+    if (logExists) {
+      await lock.release();
+      throw new Error(
+        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
+      );
+    }
+  }
 
   let recovered: RecoveredSession | undefined;
   if (resuming) {
@@ -634,14 +637,24 @@ export async function startCapture(
     beginTask,
     stop: async () => {
       stopped = true;
-      await subscription?.close();
+      // Stop feeding the engine immediately: if the watcher unsubscribe below
+      // rejects, late observations buffer instead of appending after the lock is
+      // released. Every step is then best-effort so a single failure never skips
+      // closing the log or releasing the lock; the first error is rethrown.
+      live = false;
+      let firstError: unknown;
+      const record = (err: unknown): void => {
+        if (firstError === undefined) firstError = err;
+      };
+      await subscription?.close().catch(record);
       // Await any in-flight recovery: it may be mid-reopen, and appending after
       // we release the lock would let a second owner's writes interleave. The
       // loop stops starting new attempts once `stopped` is set.
       await supervisorLoop.catch(() => {});
-      await engine.drain();
-      await underlying.close().catch(() => {});
-      await lock.release();
+      await engine.drain().catch(record);
+      await underlying.close().catch(record);
+      await lock.release().catch(record);
+      if (firstError !== undefined) throw firstError;
     },
   };
 }

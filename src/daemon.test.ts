@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
-import { mkdtemp, rm, writeFile, stat, rename } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, stat, rename, realpath, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
@@ -75,8 +75,10 @@ describe('daemon control verbs', () => {
       assert.equal(rec(status).state, 'active');
       assert.equal(rec(status).session_id, id);
       // The declared capture context is bound and reported (capture scope, never
-      // authorship); the forwarder relies on it in P4.
-      assert.equal(rec(status).worktree, worktree);
+      // authorship); the forwarder relies on it in P4. The worktree is reported
+      // canonicalized to the durable root capture actually watches, so a symlinked
+      // or relative declared path resolves to the same identity.
+      assert.equal(rec(status).worktree, await realpath(worktree));
       assert.equal(rec(status).harness, IDENTITY.harness);
       assert.equal(rec(status).harness_session_id, IDENTITY.harness_session_id);
     });
@@ -204,6 +206,42 @@ describe('daemon control verbs', () => {
     await withDaemon(async ({ call }) => {
       const res = await call({ verb: 'frobnicate' });
       assert.equal(res.ok === false && res.code, 'PROTOCOL');
+    });
+  });
+
+  it('rejects a request whose protocol version is not 1 before it mutates', async () => {
+    await withDaemon(async ({ daemon }) => {
+      const raw = (line: string): Promise<Record<string, unknown>> =>
+        new Promise((resolve, reject) => {
+          const sock = connect(daemon.socketPath);
+          let buf = '';
+          sock.on('connect', () => sock.write(line + '\n'));
+          sock.on('data', (d) => { buf += d.toString('utf8'); });
+          sock.on('end', () => {
+            try { resolve(JSON.parse(buf) as Record<string, unknown>); }
+            catch (err) { reject(err); }
+          });
+          sock.on('error', reject);
+        });
+      // v:999 must be refused, and an attach carried on it must never run.
+      const res = await raw(JSON.stringify({ v: 999, verb: 'attach', worktree: '/x', ...IDENTITY }));
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'PROTOCOL');
+    });
+  });
+
+  it('reports the canonical worktree when attached through a symlink', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      const link = await mkdtemp(join(tmpdir(), 'slip-daemon-lnk-'));
+      const linked = join(link, 'wt');
+      await symlink(worktree, linked);
+      try {
+        await call({ verb: 'attach', worktree: linked, ...IDENTITY });
+        const status = await call({ verb: 'status' });
+        assert.equal(rec(status).worktree, await realpath(worktree));
+      } finally {
+        await rm(link, { recursive: true, force: true });
+      }
     });
   });
 

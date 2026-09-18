@@ -1,5 +1,5 @@
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { chmod, lstat, unlink } from 'node:fs/promises';
+import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession } from './session.ts';
@@ -152,12 +152,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   let compromised = false; // store lock lost
   let sessionCompromised = false; // current session lock lost mid-attach
 
-  const server = createServer((sock) => handleConnection(sock));
+  // Created without a connection handler: the listener is attached only once
+  // startup is fully ready (reader running, lock held, not torn). A control verb
+  // can therefore never dispatch during the bind/chmod window, when the reader
+  // reference is not yet initialized and a store-lock compromise could orphan it.
+  const server = createServer();
   const closeServer = () => new Promise<void>((resolve) => server.close(() => resolve()));
 
-  /** Remove OUR control socket, and only ours: guard the object type so a
-   * successor's socket or an unrelated file at the path is never deleted. Called
-   * while the store lock is still held, so no successor can have bound the path. */
+  /** Remove OUR control socket. Only ever called on the normal teardown path, while
+   * the store lock is still held, so no successor can have bound the path; the
+   * isSocket() guard is a belt-and-braces check against an unrelated file. On the
+   * compromise path the caller skips this entirely (ownership is already lost). */
   async function unlinkOwnSocket(): Promise<void> {
     try {
       const st = await lstat(socketPath);
@@ -167,8 +172,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
-  async function teardown(): Promise<void> {
-    if (torn) return;
+  // Memoized so repeated stop() calls (and a compromise firing mid-shutdown) await
+  // the one in-flight teardown instead of returning early while it is still running.
+  let teardownPromise: Promise<void> | undefined;
+  function teardown(): Promise<void> {
+    return (teardownPromise ??= doTeardown());
+  }
+
+  async function doTeardown(): Promise<void> {
     torn = true;
     // Drop live control connections so server.close() cannot block on an idle or
     // half-sent request.
@@ -178,15 +189,27 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // it to settle (it self-stops once it observes `torn`), then stop whatever it or
     // an active session left installed.
     if (attachInFlight) await attachInFlight.catch(() => {});
+    let stopErr: unknown;
     if (current) {
-      await current.session.stop().catch(() => {});
+      // Do NOT swallow a failed stop: if capture could not be confirmed stopped,
+      // shutdown must not report success. session.stop() still releases the session
+      // lock and halts the engine even when it rethrows, so releasing the store
+      // lock below is safe; we surface the failure once cleanup is complete.
+      try {
+        await current.session.stop();
+      } catch (err) {
+        stopErr = err;
+      }
       current = undefined;
     }
     await reader?.close().catch(() => {});
-    // Unlink the socket BEFORE releasing the lock, while we still exclusively own
-    // the path, so we can never delete a successor daemon's socket.
-    await unlinkOwnSocket();
+    // Unlink the socket only while we still hold the store lock. On the compromise
+    // path the lock is already lost, so a successor may have bound the path — an
+    // isSocket() check proves type, not ownership, so deleting it could remove the
+    // successor's socket. Leave it for the new owner instead.
+    if (!compromised) await unlinkOwnSocket();
     await lock.release();
+    if (stopErr) throw stopErr;
   }
 
   let lock: SessionLock;
@@ -210,6 +233,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   } catch (err) {
     await lock.release();
     throw err;
+  }
+
+  // A store-lock compromise during startReaderServer() already ran teardown while
+  // `reader` was still undefined, so teardown could not close this server. Close it
+  // here and abort before binding the control listener, so no listener leaks.
+  if (torn || compromised) {
+    await reader.close().catch(() => {});
+    await lock.release().catch(() => {});
+    throw new Error('slipstream daemon lost its store lock during startup');
   }
 
   try {
@@ -263,9 +295,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     harnessSessionId: string,
   ): Promise<Record<string, unknown> | ErrorFields> {
     let session: CaptureSession;
+    let resolvedWorktree: string;
     try {
+      // Canonicalize before binding: capture resolves the root with realpath, so a
+      // symlinked or relative declared path must report the same durable root in
+      // status rather than the caller's raw string (locked design, decision 5).
+      resolvedWorktree = await realpath(worktree);
       session = await startCapture(
-        { root: worktree, storeDir, sessionId: id, onCompromised: (reason) => handleSessionCompromise(id, reason) },
+        { root: resolvedWorktree, storeDir, sessionId: id, onCompromised: (reason) => handleSessionCompromise(id, reason) },
         opts.captureDependencies,
       );
     } catch (err) {
@@ -285,7 +322,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
     registry.activate(id, liveBoundary(session.health));
-    current = { id, session, worktree, harness, harnessSessionId };
+    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId };
     state = 'active';
     return { session_id: id };
   }
@@ -422,6 +459,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         answer({ v: 1, ok: false, code: 'PROTOCOL', message: 'malformed control request' });
         return;
       }
+      if ((req as { v?: unknown }).v !== 1) {
+        // Reject an unknown protocol version before any mutation runs; a v:999 or a
+        // missing version must never execute and return a v1 success.
+        answer({ v: 1, ok: false, code: 'PROTOCOL', message: `unsupported control protocol version: ${String((req as { v?: unknown }).v)}` });
+        return;
+      }
       void dispatch(req as RequestEnvelope).then(answer).catch((err) => {
         answer({ v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: (err as Error).message });
       });
@@ -439,6 +482,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     sock.on('error', () => sock.destroy());
     sock.on('close', () => { clearTimeout(deadline); connections.delete(sock); });
   }
+
+  // Startup is fully ready: reader running, lock held, not torn, readerRef bound.
+  // Only now start dispatching control traffic (see createServer above).
+  server.on('connection', handleConnection);
 
   return {
     socketPath,

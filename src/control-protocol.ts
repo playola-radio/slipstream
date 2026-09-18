@@ -50,7 +50,6 @@ export type ResponseEnvelope = OkResponse | ErrorResponse;
 /** A framing/parse fault at the transport layer. The server answers a
  * best-effort `PROTOCOL` error then closes; the client surfaces it as-is. */
 export class ProtocolError extends Error {
-  readonly code = 'PROTOCOL';
   constructor(message: string) {
     super(message);
     this.name = 'ProtocolError';
