@@ -21,12 +21,12 @@
  *
  * Deletion / GC of retained sessions is a later stage.
  */
-import { readFile, access } from 'node:fs/promises';
+import { readFile, lstat } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import { startCapture } from './session.ts';
 import { startReaderServer } from './http-reader.ts';
-import { startDaemon } from './daemon.ts';
+import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { runTui } from './tui.ts';
@@ -81,6 +81,7 @@ function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>,
   let store: string | undefined;
   let harness: string | undefined;
   let harnessSessionId: string | undefined;
+  let sawDir = false;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
     if (arg === '--store' || arg === '--harness' || arg === '--harness-session-id') {
@@ -90,7 +91,11 @@ function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>,
       else if (arg === '--harness') harness = value;
       else harnessSessionId = value;
     }
-    else if (!arg.startsWith('--')) dir = resolve(arg);
+    else if (!arg.startsWith('--')) {
+      if (sawDir) return null; // a second positional worktree is a usage error, not a silent override
+      dir = resolve(arg);
+      sawDir = true;
+    }
     else return null; // unknown flag
   }
   return { dir, store: store ?? DEFAULT_DAEMON_STORE, harness, harnessSessionId };
@@ -138,13 +143,20 @@ function usage(): void {
  * the caller should stop. */
 async function isDaemonOwned(store: string): Promise<boolean> {
   const controlSock = join(store, 'control.sock');
-  const owned = await access(controlSock).then(() => true, () => false);
-  if (owned) {
-    console.error(`slipstream: ${store} is owned by a running daemon (${controlSock} present).`);
-    console.error('slipstream: use `slipstream attach` to capture through the daemon, or choose another --store.');
-    process.exitCode = 2;
+  let st;
+  try {
+    st = await lstat(controlSock);
+  } catch {
+    return false; // no control socket: no daemon owns this store
   }
-  return owned;
+  if (!st.isSocket()) return false; // an unrelated file squatting the path is not a daemon
+  const verdict = await probeSocket(controlSock, PROBE_TIMEOUT_MS);
+  if (verdict === 'stale') return false; // socket left by a dead daemon; safe to capture
+  // 'live' or 'ambiguous': a daemon may still own this store; refuse to fight it for the lock.
+  console.error(`slipstream: ${store} is owned by a running daemon (${controlSock} answers).`);
+  console.error('slipstream: use `slipstream attach` to capture through the daemon, or choose another --store.');
+  process.exitCode = 2;
+  return true;
 }
 
 /** Print a control response: ok fields to stdout, an error to stderr with a

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { connect } from 'node:net';
-import { mkdtemp, rm, writeFile, stat, rename, realpath, symlink } from 'node:fs/promises';
+import { connect, createServer } from 'node:net';
+import { mkdtemp, rm, writeFile, stat, rename, realpath, symlink, readFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
@@ -398,4 +398,101 @@ describe('daemon singleton', () => {
     await assert.rejects(() => stat(socketPath), /ENOENT/);
     await rm(store, { recursive: true, force: true });
   });
+});
+
+for (const staleLock of [false, true]) {
+  it(`pre-probes a live listener without touching the store lock (stale=${staleLock})`, async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-probe-'));
+    const lockPath = join(store, 'owner.lock');
+    const original = JSON.stringify({ pid: process.pid, nonce: 'paused-owner' });
+    if (staleLock) {
+      await writeFile(lockPath, original, { mode: 0o600 });
+      await utimes(lockPath, new Date(0), new Date(0));
+    }
+    const server = createServer((socket) => socket.end());
+    await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+    try {
+      await assert.rejects(startDaemon({ storeDir: store }), DaemonAlreadyRunningError);
+      if (staleLock) {
+        assert.equal(await readFile(lockPath, 'utf8'), original);
+        assert.equal((await stat(lockPath)).mtimeMs, 0);
+      } else {
+        await assert.rejects(stat(lockPath), { code: 'ENOENT' });
+        await assert.rejects(stat(join(store, 'runtime')), { code: 'ENOENT' });
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(store, { recursive: true, force: true });
+    }
+  });
+}
+
+it('bounds shutdown when watcher startup never settles', async () => {
+  const store = await mkdtemp(join(tmpdir(), 'slip-stall-'));
+  const worktree = await mkdtemp(join(tmpdir(), 'slip-wt-'));
+  let enterWatch!: () => void;
+  const entered = new Promise<void>((resolve) => { enterWatch = resolve; });
+  let rejectWatch!: (error: Error) => void;
+  const watch = new Promise<Subscription>((_, reject) => { rejectWatch = reject; });
+  const d = await startDaemon({ storeDir: store, captureDependencies: {
+    platform: { watch: () => { enterWatch(); return watch; } },
+    enumerate: async () => {},
+  } });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const attach = sendControlRequest({ socketPath: d.socketPath,
+      request: { v: 1, verb: 'attach', worktree, ...IDENTITY },
+    }).catch(() => {});
+    await entered;
+    await Promise.race([
+      d.stop(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('shutdown exceeded 7 seconds')), 7000);
+      }),
+    ]);
+    await attach;
+    await assert.rejects(stat(join(store, 'owner.lock')), { code: 'ENOENT' });
+  } finally {
+    if (timer) clearTimeout(timer);
+    // Only release the stalled startup during cleanup, after the bounded-stop assertion.
+    rejectWatch(new Error('test cleanup'));
+    await d.stop();
+    await rm(store, { recursive: true, force: true });
+    await rm(worktree, { recursive: true, force: true });
+  }
+});
+
+it('reports a failed capture stop after store-lock loss without an unhandled rejection', async (t) => {
+  const store = await mkdtemp(join(tmpdir(), 'slip-loss-'));
+  const worktree = await mkdtemp(join(tmpdir(), 'slip-wt-'));
+  let reportFailure!: (args: unknown[]) => void;
+  const reported = new Promise<unknown[]>((resolve) => { reportFailure = resolve; });
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    if (String(args[0]).includes('teardown after store-lock loss failed')) reportFailure(args);
+  });
+  const stopError = new Error('watcher close failed');
+  const d = await startDaemon({ storeDir: store, captureDependencies: {
+    platform: { watch: async () => ({ close: async () => { throw stopError; } }) },
+    enumerate: async () => {},
+  } });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const attached = await sendControlRequest({ socketPath: d.socketPath,
+      request: { v: 1, verb: 'attach', worktree, ...IDENTITY },
+    });
+    assert.equal(attached.ok, true);
+    const thief = join(store, 'thief');
+    await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+    await rename(thief, join(store, 'owner.lock'));
+    const args = await Promise.race([reported, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('teardown failure was not reported')), 6000);
+    })]);
+    assert.equal(args[1], stopError);
+    await assert.rejects(d.stop(), /watcher close failed/);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await d.stop().catch(() => {});
+    await rm(store, { recursive: true, force: true });
+    await rm(worktree, { recursive: true, force: true });
+  }
 });

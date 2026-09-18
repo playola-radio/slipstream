@@ -58,10 +58,14 @@ export class DaemonAlreadyRunningError extends Error {
 
 type DaemonState = 'detached' | 'attaching' | 'active' | 'detaching' | 'wedged';
 
-const PROBE_TIMEOUT_MS = 1000;
+export const PROBE_TIMEOUT_MS = 1000;
 /** A connection must deliver one complete control request within this window;
  * otherwise it is dropped so it can never wedge shutdown. */
 const REQUEST_TIMEOUT_MS = 10_000;
+/** Teardown waits at most this long for an in-flight attach to settle. `torn` is
+ * already set, so a late-resolving startAndActivate self-stops its half-built
+ * session and freezes the boundary; proceeding after the bound is safe. */
+const ATTACH_TEARDOWN_MS = 5_000;
 
 function nonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0;
@@ -71,7 +75,7 @@ function nonEmptyString(v: unknown): v is string {
  * refused connection or a missing path proves the socket is stale and reclaimable;
  * every other error (EACCES, EMFILE, ...) is ambiguous and must fail closed, since
  * it does not prove the owner is dead (locked design, decision 4). */
-function probeSocket(socketPath: string, timeoutMs: number): Promise<'live' | 'stale' | 'ambiguous'> {
+export function probeSocket(socketPath: string, timeoutMs: number): Promise<'live' | 'stale' | 'ambiguous'> {
   return new Promise((resolve) => {
     const sock = connect(socketPath);
     const cleanup = () => { clearTimeout(timer); sock.removeAllListeners(); sock.destroy(); };
@@ -136,6 +140,22 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   await mkdirpDurable(storeDir);
   await assertOwnerOnly(storeDir, 'dir');
 
+  // Guard the store lock's stale-reclaim against a paused-but-live owner: a lock
+  // unrefreshed for STALE_MS is reclaimable even if its owner is only paused, and
+  // reclaiming it makes that owner shut down when it resumes. The control socket
+  // distinguishes a paused owner (still answers via the listen backlog) from a
+  // dead one (connection refused). Probe before we can reclaim; abort without
+  // touching the lock if a daemon still answers.
+  const startupVerdict = await probeSocket(socketPath, PROBE_TIMEOUT_MS);
+  if (startupVerdict === 'live') throw new DaemonAlreadyRunningError(socketPath);
+  if (startupVerdict === 'ambiguous') {
+    throw new Error(
+      `control socket ${socketPath} is unresponsive; refusing to start (a paused daemon may still own it). Remove it manually only if you are sure no daemon is running.`,
+    );
+  }
+  // 'stale' (connection refused / socket absent): no live daemon; the store lock's
+  // own stale logic and bindControl may proceed.
+
   // Everything teardown touches is declared before the store lock is acquired, so
   // an onCompromised callback that fires mid-startup never hits a temporal dead
   // zone (it may run with `reader` still undefined — teardown null-checks it).
@@ -190,7 +210,19 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // An attach whose capture is still starting must not outlive shutdown: wait for
     // it to settle (it self-stops once it observes `torn`), then stop whatever it or
     // an active session left installed.
-    if (attachInFlight) await attachInFlight.catch(() => {});
+    if (attachInFlight) {
+      const settled = attachInFlight.catch(() => {});
+      let timer: NodeJS.Timeout | undefined;
+      const bound = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ATTACH_TEARDOWN_MS);
+        timer.unref();
+      });
+      try {
+        await Promise.race([settled, bound]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
     // An attach aborted mid-startup may have failed to stop its half-built session
     // (it runs in startAndActivate, which sets abortStopError). Surface that too so
     // shutdown never reports success over a capture that could not be confirmed
@@ -224,7 +256,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       onCompromised: (reason) => {
         compromised = true;
         console.error(`slipstream daemon: store lock lost: ${reason}`);
-        void teardown();
+        void teardown().catch((teardownErr) => {
+          console.error('slipstream daemon: teardown after store-lock loss failed:', teardownErr);
+        });
       },
     });
   } catch (err) {

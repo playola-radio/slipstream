@@ -75,15 +75,17 @@ describe('cli parseArgs (daemon commands)', () => {
   });
 });
 
-it('watch refuses a store dir already owned by a daemon (control.sock present)', async () => {
-  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+it('watch refuses a store dir already owned by a daemon (live control socket)', async () => {
+  const { mkdtemp, mkdir, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { execFile } = await import('node:child_process');
   const dir = await mkdtemp(join(tmpdir(), 'slip-cli-guard-'));
   const root = join(dir, 'work'); const store = join(dir, 'store');
   await mkdir(root); await mkdir(store, { mode: 0o700 });
-  await writeFile(join(store, 'control.sock'), '');
+  const { createServer } = await import('node:net');
+  const server = createServer((socket) => socket.end());
+  await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
   try {
     const result = await new Promise<{ error: Error | null; stderr: string }>(resolve => {
       execFile(process.execPath, ['src/cli.ts', 'watch', root, '--store', store],
@@ -91,5 +93,50 @@ it('watch refuses a store dir already owned by a daemon (control.sock present)',
     });
     assert.ok(result.error, 'watch exited non-zero');
     assert.match(result.stderr, /daemon|control\.sock/i);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
 });
+
+it('rejects two attach worktrees and accepts one with identity flags', () => {
+  assert.equal(parseArgs(['attach', 'a', 'b', '--harness', 'x', '--harness-session-id', 'y']), null);
+  const parsed = parseArgs(['attach', 'a', '--harness', 'x', '--harness-session-id', 'y']);
+  assert.equal(parsed?.command, 'attach');
+  assert.ok(parsed && 'harness' in parsed);
+  assert.equal(parsed.harness, 'x');
+  assert.equal(parsed.harnessSessionId, 'y');
+});
+
+for (const kind of ['file', 'stale socket'] as const) {
+  for (const command of ['watch', 'serve']) {
+    it(`${command} passes the daemon guard with a ${kind}`, async () => {
+      const { mkdtemp, writeFile, rename, rm } = await import('node:fs/promises');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { execFile } = await import('node:child_process');
+      const { createServer } = await import('node:net');
+      const store = await mkdtemp(join(tmpdir(), 'slip-guard-'));
+      const socketPath = join(store, 'control.sock');
+      try {
+        if (kind === 'file') await writeFile(socketPath, 'unrelated file');
+        else {
+          const server = createServer();
+          await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+          await rename(socketPath, socketPath + '.saved');
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          await rename(socketPath + '.saved', socketPath);
+        }
+        // A missing worktree makes capture fail promptly after passing the guard,
+        // without relying on an OS watcher or a signal to end the child process.
+        const result = await new Promise<{ error: Error | null; stderr: string }>((resolve) => {
+          execFile(process.execPath, ['src/cli.ts', command, join(store, 'missing-worktree'), '--store', store],
+            { timeout: 5000 }, (error, _stdout, stderr) => resolve({ error, stderr }));
+        });
+        assert.ok(result.error);
+        assert.match(result.stderr, /ENOENT.*missing-worktree/);
+        assert.doesNotMatch(result.stderr, /owned by a running daemon/);
+      } finally { await rm(store, { recursive: true, force: true }); }
+    });
+  }
+}
