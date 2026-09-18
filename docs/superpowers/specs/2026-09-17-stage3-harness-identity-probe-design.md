@@ -178,10 +178,12 @@ log. This keeps the frozen v1 public interface untouched (SC and the hard rule).
 - Code + tests: `tools/identity-probe/` (mirrors the existing `tools/live-feed/`
   dev-tool convention; tests run under the existing `npm run test:tools`).
 - The report log the probe writes at runtime defaults to
-  `tools/identity-probe/.observations.jsonl` and is **gitignored** — it can
-  contain a machine's real (home-relativized) session ids. `FINDINGS.md` is the
-  curated, hand-redacted, committed summary; raw observation logs are not
-  committed.
+  `~/.slipstream-identity-probe/observations.jsonl` (override with
+  `$SLIPSTREAM_IDENTITY_PROBE_LOG`) — deliberately **outside the repo tree** so
+  it can never be committed regardless of gitignore rules, and additionally
+  covered by the global `*.jsonl` ignore. It can contain a machine's real
+  (home-relativized) session ids. `FINDINGS.md` is the curated, hand-redacted,
+  committed summary; raw observation logs are not committed.
 
 ## Interaction with the rest of Stage 3
 
