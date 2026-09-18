@@ -20,7 +20,7 @@ const MAX_ALIGN_CELLS = 8_000_000;
  *  not an extra blank line; empty text is zero lines. */
 export function splitLines(text: string): string[] {
   if (text === '') return [];
-  const parts = text.split('\n');
+  const parts = text.split(/\r?\n/);
   if (parts[parts.length - 1] === '') parts.pop();
   return parts;
 }

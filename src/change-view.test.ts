@@ -10,6 +10,10 @@ test('splitLines: trailing newline is a terminator, not an extra empty line', ()
   assert.deepEqual(splitLines('a\nb\n'), ['a', 'b']);
 });
 
+test('splitLines: CRLF trailing newline is a terminator, not displayed content', () => {
+  assert.deepEqual(splitLines('a\r\nb\r\n'), ['a', 'b']);
+});
+
 test('splitLines: interior blank line is preserved', () => {
   assert.deepEqual(splitLines('a\n\nb'), ['a', '', 'b']);
 });

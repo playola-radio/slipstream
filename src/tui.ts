@@ -38,19 +38,21 @@ export function renderEvent(ev: ReaderEvent): string {
   return parts.join(' · ');
 }
 
-export async function replayFromDisk(storeDir: string, id: string, view?: ChangeViewOptions): Promise<string[]> {
+export async function replayFromDisk(
+  storeDir: string,
+  id: string,
+  out: (line: string) => void,
+  view?: ChangeViewOptions,
+): Promise<void> {
   const render = view ? makeRenderer(diskBlobSource(storeDir), view) : oneLine;
   const logPath = sessionLogPath(storeDir, id);
   const H = await onDiskHighWater(logPath);
   const cursor = await openLogCursor(logPath, 0n);
   try {
-    const lines: string[] = [];
     for (;;) {
       const batch = await cursor.readThrough(H);
-      if (!batch.length) return lines;
-      // Push one line at a time: `lines.push(...bigArray)` spreads every rendered
-      // line as an argument and a huge file overflows the call-argument limit.
-      for (const ev of batch) for (const line of await render(ev)) lines.push(line);
+      if (!batch.length) return;
+      for (const ev of batch) for (const line of await render(ev)) out(line);
     }
   }
   finally { await cursor.close(); }
@@ -69,8 +71,13 @@ export async function runTui(argv: string[], out: (line: string) => void): Promi
   const disk = argv.includes('--disk');
   const store = argFor(argv, '--store');
   const session = argFor(argv, '--session');
+  const context = parseContext(argv);
+  if (context === undefined) {
+    out('usage: --context must be a non-negative integer');
+    return;
+  }
   const view = argv.includes('--changes')
-    ? { context: parseContext(argFor(argv, '--context')), full: argv.includes('--full') }
+    ? { context, full: argv.includes('--full') }
     : undefined;
   if (!store) {
     out('usage: slipstream view --store <dir> [--session <id>] [--disk] [--changes] [--context N] [--full]');
@@ -80,16 +87,19 @@ export async function runTui(argv: string[], out: (line: string) => void): Promi
     for (const s of await listSessions(store)) out(`${s.id}  durable=${s.durableSeq}${s.removed ? '  (removed)' : ''}`);
     return;
   }
-  if (disk) { for (const line of await replayFromDisk(store, session, view)) out(line); return; }
+  if (disk) { await replayFromDisk(store, session, out, view); return; }
   await followHttp(store, session, out, view);
 }
 
 const DEFAULT_CONTEXT = 3;
 
-function parseContext(raw: string | undefined): number {
-  if (raw === undefined) return DEFAULT_CONTEXT;
+function parseContext(argv: string[]): number | undefined {
+  const i = argv.indexOf('--context');
+  if (i < 0) return DEFAULT_CONTEXT;
+  const raw = argv[i + 1];
+  if (raw === undefined) return undefined;
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_CONTEXT;
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 function argFor(argv: string[], flag: string): string | undefined {

@@ -28,6 +28,16 @@ test('renderChange: a modified line is marked against the before-content', async
   assert.deepEqual(out, ['#42 src/foo.ts', '  1 a', 'x 2 X', '  3 c']);
 });
 
+test('renderChange: CRLF line endings are consumed before marking changed lines', async () => {
+  const e = ev({ path: 'src/foo.ts', before: content('bbb', 6), after: content('aaa', 6) });
+  const out = await renderChange(e, source({
+    bbb: { kind: 'text', text: 'a\r\nb\r\n' },
+    aaa: { kind: 'text', text: 'a\r\nX\r\n' },
+  }), CTX);
+  assert.deepEqual(out, ['#42 src/foo.ts', '  1 a', 'x 2 X']);
+  assert.ok(!out.join('\n').includes('�'), 'CR bytes must not render as replacement characters');
+});
+
 test('renderChange: a brand-new file marks every line under a "(new file)" note', async () => {
   const e = ev({ path: 'new.txt', before: { kind: 'absent' }, after: content('aaa', 6) });
   const out = await renderChange(e, source({ aaa: { kind: 'text', text: 'one\ntwo' } }), CTX);
