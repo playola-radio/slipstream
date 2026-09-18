@@ -56,7 +56,7 @@ async function main(): Promise<void> {
   if (!args) {
     console.error('Usage: slipstream watch [dir] [--store <dir>]');
     console.error('       slipstream serve [dir] [--store <dir>]');
-    console.error('       slipstream view [--store <dir>] [--session <id>] [--disk]');
+    console.error('       slipstream view [--store <dir>] [--session <id>] [--disk] [--changes] [--context N] [--full]');
     process.exitCode = 2;
     return;
   }

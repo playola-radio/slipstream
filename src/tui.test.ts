@@ -2,9 +2,10 @@ import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { renderEvent, replayFromDisk, sseDataLine, runTui } from './tui.ts';
 import { parseLine } from './log-reader.ts';
+import { blobPath } from './store-reader.ts';
 
 const UUID = '55555555-5555-4555-8555-555555555555';
 
@@ -95,6 +96,26 @@ it('reports a stale reader connection without throwing', async () => {
     await runTui(['--store', dir, '--session', UUID], l => lines.push(l));
     assert.match(lines.join(''), /unavailable.*--disk/);
   } finally { fetchMock.mock.restore(); }
+});
+
+it('changes view renders a marked content block from the CAS on disk', async () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const writeBlob = async (hex: string, text: string) => {
+    const p = blobPath(dir, hex);
+    await mkdir(dirname(p), { recursive: true });
+    await writeFile(p, text);
+  };
+  await writeBlob(A, 'a\nb\nc');
+  await writeBlob(B, 'a\nX\nc');
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'f', before: { kind: 'content', sha256: A, size: 5 }, after: { kind: 'content', sha256: B, size: 5 } },
+  }) + '\n');
+  const lines = await replayFromDisk(dir, UUID, { context: 3, full: false });
+  assert.deepEqual(lines, ['#1 f', '  1 a', 'x 2 X', '  3 c', '']);
 });
 
 it('disk replay consumes every bounded batch', async () => {
