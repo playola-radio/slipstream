@@ -68,4 +68,16 @@ describe('health subscribe', () => {
     assert.equal(calls, 2);
     assert.equal(h.snapshot().durable_seq, '3');
   });
+
+  it('isolates a throwing listener so the seq still advances and other listeners fire', () => {
+    const h = createHealth();
+    let good = 0;
+    h.subscribe(() => { throw new Error('listener bug'); });
+    h.subscribe(() => { throw null; }); // a non-Error throw must not escape the catch either
+    h.subscribe(() => { throw { toString() { throw new Error('nested'); } }; }); // stringifying the thrown value must itself not escape
+    h.subscribe(() => { good += 1; });
+    assert.doesNotThrow(() => h.setDurableSeq(5n)); // the writer is never corrupted
+    assert.equal(good, 1); // a later listener still runs
+    assert.equal(h.snapshot().durable_seq, '5');
+  });
 });

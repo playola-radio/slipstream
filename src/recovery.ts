@@ -35,6 +35,13 @@ export interface RecoveredSession {
   /** Seq of the disclosing gap for each recovered storage outage episode, so a
    * retried recovery reuses the surviving gap instead of appending a duplicate. */
   storageGapSeqByEpisode: Map<string, string>;
+  /** The `task_id` of the last committed task declaration; undefined if none. New
+   * changes after recovery group under this task until a fresh declaration. */
+  currentTaskId: string | undefined;
+  /** Committed task declarations keyed by their idempotency `request_id`, so the
+   * session rebuilds its dedup index: a replayed duplicate must not re-append. A
+   * torn trailing declaration is discarded with the tail, so it never appears. */
+  taskDeclarations: Map<string, { taskId: string; title: string; seq: string }>;
 }
 
 /** The envelope constraints every record must satisfy, regardless of type — so an
@@ -104,11 +111,13 @@ export async function recoverSession(
   const committed = new Map<string, Snapshot>();
   const baselineUnknownDirs = new Set<string>();
   const storageGapSeqByEpisode = new Map<string, string>();
+  const taskDeclarations = new Map<string, { taskId: string; title: string; seq: string }>();
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
   let root: string | undefined;
   let maxBytes: number | undefined;
   let baselineCompleted = false;
+  let currentTaskId: string | undefined;
   let seq = 0n;
 
   const verifyBlob = async (snap: Snapshot, where: string): Promise<void> => {
@@ -226,6 +235,18 @@ export async function recoverSession(
         }
         break;
       }
+      case 'slipstream.task.started.v1': {
+        // Replayed in order: the last committed declaration is the current task,
+        // and its request_id indexes the committed result so a replayed duplicate
+        // does not re-append or move the current task backward.
+        currentTaskId = event.data.task_id;
+        taskDeclarations.set(event.data.request_id, {
+          taskId: event.data.task_id,
+          title: event.data.title,
+          seq: event.seq,
+        });
+        break;
+      }
       case 'slipstream.session.resumed.v1':
         break;
     }
@@ -265,5 +286,7 @@ export async function recoverSession(
     committed,
     baselineUnknownDirs,
     storageGapSeqByEpisode,
+    currentTaskId,
+    taskDeclarations,
   };
 }

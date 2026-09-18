@@ -21,6 +21,11 @@ const baselineAbsent = (path: string): EventInput => ({
   occurred_at_ms: 2,
   data: { path, snapshot: { kind: 'absent' } },
 });
+const task = (taskId: string, requestId: string, title = taskId): EventInput => ({
+  type: 'slipstream.task.started.v1',
+  occurred_at_ms: 3,
+  data: { task_id: taskId, request_id: requestId, title },
+});
 
 /** Write a genuine, well-formed log via the real writer, then close it. */
 async function seedLog(dir: string, inputs: EventInput[]): Promise<string> {
@@ -62,6 +67,30 @@ describe('recovery', () => {
       assert.equal(rec.maxBytes, 1024);
       assert.equal(rec.recoveredThroughSeq, 3n);
       assert.deepEqual([...rec.committed.keys()].sort(), ['a.ts', 'b.ts']);
+    });
+  });
+
+  it('rebuilds the current task and dedup index from committed declarations', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, task('t1', 'r1', 'First'), task('t2', 'r2', 'Second')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.equal(rec.currentTaskId, 't2'); // last committed declaration wins
+      assert.deepEqual([...rec.taskDeclarations.keys()].sort(), ['r1', 'r2']);
+      assert.deepEqual(rec.taskDeclarations.get('r1'), { taskId: 't1', title: 'First', seq: '2' });
+      assert.deepEqual(rec.taskDeclarations.get('r2'), { taskId: 't2', title: 'Second', seq: '3' });
+    });
+  });
+
+  it('does not treat a torn trailing declaration as authoritative', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, task('t1', 'r1')]);
+      await appendFile(path, '{"seq":"3","type":"slipstream.task.started.v1","data":{"task_id":"t2"');
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.equal(rec.currentTaskId, 't1'); // the torn t2 declaration is discarded with the tail
+      assert.deepEqual([...rec.taskDeclarations.keys()], ['r1']);
+      assert.equal(rec.recoveredThroughSeq, 2n);
     });
   });
 

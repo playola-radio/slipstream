@@ -33,8 +33,20 @@ export function renderEvent(ev: ReaderEvent): string {
   // Every externally-supplied display string is sanitized: a terminal escape in
   // the event type or a reason must never reach the terminal.
   const parts = [ev.seq.toString(), sanitize(ev.type), path];
-  if (ev.type === 'slipstream.file.changed.v1') parts.push(snapshotLabel(d.after));
-  else if (ev.type === 'slipstream.capture.gap.v1') parts.push(`gap:${sanitize(String(d.reason ?? 'unknown'))}`);
+  if (ev.type === 'slipstream.file.changed.v1') {
+    parts.push(snapshotLabel(d.after));
+    // Surface the grouping hint the disk/HTTP readers carry in `data`, so a TUI
+    // reader sees which task a change belongs to (parity, not a new view).
+    if (typeof d.task_hint_id === 'string') parts.push(`task/${sanitize(d.task_hint_id)}`);
+  } else if (ev.type === 'slipstream.task.started.v1') {
+    // The declaration boundary: show its task and title in the path slot (a
+    // declaration names no path) so a TUI reader can correlate it with the
+    // `task/<id>` hint stamped on the changes that follow.
+    parts[2] = typeof d.task_id === 'string' ? `task/${sanitize(d.task_id)}` : '-';
+    if (typeof d.title === 'string') parts.push(sanitize(d.title));
+  } else if (ev.type === 'slipstream.capture.gap.v1') {
+    parts.push(`gap:${sanitize(String(d.reason ?? 'unknown'))}`);
+  }
   return parts.join(' · ');
 }
 

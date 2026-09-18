@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { startCapture } from './session.ts';
+import { startCapture, InvalidTitleError } from './session.ts';
 import { createLog, type Log } from './log.ts';
 import { StorageError } from './storage.ts';
 import { CorruptLogError } from './recovery.ts';
@@ -537,6 +537,156 @@ describe('session', () => {
         await session.stop();
         await rm(root, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('beginTask', () => {
+    const declarations = (recs: LoggedRecord[]): LoggedRecord[] =>
+      recs.filter((r) => r.type === 'slipstream.task.started.v1');
+
+    it('declares a durable task boundary and stamps subject only on the declaration', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ session }) => {
+          const result = await session.beginTask({ title: 'Implement selection', requestId: 'req-1' });
+          assert.equal(result.session_id, session.sessionId);
+          assert.equal(result.event_id, result.seq, 'event_id equals seq by construction');
+          assert.ok(/^[1-9][0-9]*$/.test(result.seq));
+
+          const recs = await readRecords(session.logPath);
+          const decl = recs.find((r) => r.seq === result.seq)!;
+          assert.equal(decl.type, 'slipstream.task.started.v1');
+          assert.equal(decl.subject, `task/${result.task_id}`);
+          if (decl.type === 'slipstream.task.started.v1') {
+            assert.equal(decl.data.task_id, result.task_id);
+            assert.equal(decl.data.request_id, 'req-1');
+            assert.equal(decl.data.title, 'Implement selection');
+            assert.equal(decl.data.session_id, session.sessionId);
+          }
+          // Every other event omits subject entirely (absent, not empty).
+          assert.ok(
+            recs.every((r) => r.type === 'slipstream.task.started.v1' || r.subject === undefined),
+            'only a task declaration carries a subject',
+          );
+        },
+      );
+    });
+
+    it('replays the original result for a duplicate request_id without a second append', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ session }) => {
+          const first = await session.beginTask({ title: 'A', requestId: 'req-1' });
+          const second = await session.beginTask({ title: 'A', requestId: 'req-1' });
+          assert.deepEqual(second, first);
+          assert.equal(declarations(await readRecords(session.logPath)).length, 1);
+        },
+      );
+    });
+
+    it('coalesces concurrent duplicate declarations onto a single commit', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ session }) => {
+          const [a, b, c] = await Promise.all([
+            session.beginTask({ title: 'A', requestId: 'req-1' }),
+            session.beginTask({ title: 'A', requestId: 'req-1' }),
+            session.beginTask({ title: 'A', requestId: 'req-1' }),
+          ]);
+          assert.deepEqual(b, a);
+          assert.deepEqual(c, a);
+          assert.equal(declarations(await readRecords(session.logPath)).length, 1);
+        },
+      );
+    });
+
+    it('hands back a frozen result so a caller cannot corrupt the dedup cache', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ session }) => {
+          const first = await session.beginTask({ title: 'A', requestId: 'req-1' });
+          assert.ok(Object.isFrozen(first));
+          // A retry returns the original, uncorrupted identity — not a caller's edit.
+          const replay = await session.beginTask({ title: 'A', requestId: 'req-1' });
+          assert.equal(replay.task_id, first.task_id);
+          assert.equal(replay.seq, first.seq);
+        },
+      );
+    });
+
+    it('rejects a reused request_id with a different title and appends nothing', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ session }) => {
+          await session.beginTask({ title: 'First', requestId: 'req-1' });
+          await assert.rejects(
+            session.beginTask({ title: 'Second', requestId: 'req-1' }),
+            (err: unknown) => err instanceof InvalidTitleError && err.code === 'INVALID_TITLE',
+          );
+          assert.equal(declarations(await readRecords(session.logPath)).length, 1);
+        },
+      );
+    });
+
+    it('groups later changes under the declared task and never regroups earlier ones', async () => {
+      await withFakeSession(
+        async () => {},
+        async ({ root, session, observe, waitFor }) => {
+          // A change before any declaration is ungrouped, but still attributed.
+          await writeFile(join(root, 'a.ts'), 'v1');
+          observe('a.ts');
+          const before = await waitFor((r) => changesFor(r, 'a.ts').length >= 1);
+          const beforeChange = changesFor(before, 'a.ts')[0]!;
+          assert.equal(beforeChange.data.task_hint_id, undefined);
+          assert.deepEqual(beforeChange.data.attribution, { status: 'unknown' });
+
+          const task = await session.beginTask({ title: 'Group me', requestId: 'req-1' });
+
+          // A change after the declaration groups under it.
+          await writeFile(join(root, 'b.ts'), 'v1');
+          observe('b.ts');
+          const after = await waitFor((r) => changesFor(r, 'b.ts').length >= 1);
+          const afterChange = changesFor(after, 'b.ts')[0]!;
+          assert.equal(afterChange.data.task_hint_id, task.task_id);
+          assert.deepEqual(afterChange.data.attribution, { status: 'unknown' });
+
+          // The declaration did not rewrite the change that preceded it.
+          const recs = await readRecords(session.logPath);
+          assert.equal(changesFor(recs, 'a.ts')[0]!.data.task_hint_id, undefined);
+        },
+      );
+    });
+
+    it('rebuilds the dedup index and current task across a resume', async () => {
+      await withTempPair(async (root, store) => {
+        const platform = createFakePlatform();
+        const s1 = await startCapture({ root, storeDir: store }, { platform });
+        const sessionId = s1.sessionId;
+        const original = await s1.beginTask({ title: 'Persisted', requestId: 'req-1' });
+        await s1.stop();
+
+        const s2 = await startCapture({ root, storeDir: store, resumeSessionId: sessionId }, { platform });
+        try {
+          // Dedup index rebuilt: a replayed duplicate returns the original result
+          // and appends nothing.
+          const replay = await s2.beginTask({ title: 'Persisted', requestId: 'req-1' });
+          assert.deepEqual(replay, original);
+          assert.equal(
+            declarations(await readRecords(s2.logPath)).length,
+            1,
+            'a replayed declaration must not re-append after resume',
+          );
+
+          // Current task pointer rebuilt: a change observed after resume groups
+          // under the recovered task without a fresh declaration.
+          await writeFile(join(root, 'c.ts'), 'v1');
+          platform.observe('c.ts');
+          const recs = await waitForRecords(s2.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
+          assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, original.task_id);
+        } finally {
+          await s2.stop();
+        }
+      });
     });
   });
 });

@@ -142,7 +142,10 @@ export async function renderChange(
   opts: ChangeViewOptions,
 ): Promise<string[]> {
   const path = typeof ev.data.path === 'string' ? sanitize(ev.data.path) : '(path unavailable)';
-  const header = `#${ev.seq.toString()} ${path}`;
+  // Surface the grouping hint on the header so the changes view has the same task
+  // membership the disk/HTTP readers carry in `data` (parity, not a new view).
+  const hint = typeof ev.data.task_hint_id === 'string' ? ` · task/${sanitize(ev.data.task_hint_id)}` : '';
+  const header = `#${ev.seq.toString()} ${path}${hint}`;
   const note = (msg: string): string[] => [header, `  ${msg}`];
   const cap = opts.full ? Number.POSITIVE_INFINITY : MAX_RENDER_BYTES;
 
