@@ -118,6 +118,26 @@ it('changes view renders a marked content block from the CAS on disk', async () 
   assert.deepEqual(lines, ['#1 f', '  1 a', 'x 2 X', '  3 c', '']);
 });
 
+it('changes view renders a file with more lines than the spread-arg limit', async () => {
+  // A file whose rendered block exceeds the max function-argument count must not
+  // crash: replay pushes lines one at a time rather than spreading the array.
+  const A = 'a'.repeat(64);
+  const N = 130000;
+  const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const p = blobPath(dir, A);
+  await mkdir(dirname(p), { recursive: true });
+  await writeFile(p, Array.from({ length: N }, () => 'x').join('\n'));
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), JSON.stringify({
+    seq: '1', type: 'slipstream.file.changed.v1',
+    data: { path: 'big.txt', before: { kind: 'absent' }, after: { kind: 'content', sha256: A, size: N * 2 } },
+  }) + '\n');
+  const lines = await replayFromDisk(dir, UUID, { context: 3, full: true });
+  assert.equal(lines.length, N + 2); // header + N marked lines + trailing ''
+  assert.equal(lines[0], '#1 big.txt');
+  assert.match(lines[1]!, /^x +1 x$/);
+});
+
 it('disk replay consumes every bounded batch', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'slip-tui-'));
   await mkdir(join(dir, 'sessions', UUID), { recursive: true });

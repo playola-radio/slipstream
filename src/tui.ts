@@ -3,7 +3,7 @@ import { onDiskHighWater, sessionLogPath, listSessions, readRuntimeDescriptor, t
 import { renderChange, type BlobSource, type ChangeViewOptions } from './change-view.ts';
 import { diskBlobSource, httpBlobSource } from './blob-source.ts';
 
-const sanitize = (s: string) => s.replace(/[\x00-\x1f\x7f]/g, '�');
+const sanitize = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]/g, '�');
 
 /** Turns one event into the lines to print. Default is the one-line summary; the
  *  changes view expands a `file.changed` event into a marked content block. */
@@ -48,7 +48,9 @@ export async function replayFromDisk(storeDir: string, id: string, view?: Change
     for (;;) {
       const batch = await cursor.readThrough(H);
       if (!batch.length) return lines;
-      for (const ev of batch) lines.push(...await render(ev));
+      // Push one line at a time: `lines.push(...bigArray)` spreads every rendered
+      // line as an argument and a huge file overflows the call-argument limit.
+      for (const ev of batch) for (const line of await render(ev)) lines.push(line);
     }
   }
   finally { await cursor.close(); }
