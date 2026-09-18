@@ -1,0 +1,63 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseMessage, dispatch, type McpHandlers } from './mcp.ts';
+
+function handlers(over: Partial<McpHandlers> = {}): McpHandlers {
+  return {
+    serverInfo: { name: 'slipstream-identity-probe', version: '0.0.0' },
+    protocolVersion: '2025-06-18',
+    tools: [{ name: 'identity_probe_snapshot', description: 'd', inputSchema: { type: 'object', properties: {} } }],
+    onInitialize: () => {},
+    callTool: async () => ({ text: 'ok' }),
+    ...over,
+  };
+}
+
+test('parseMessage rejects non-JSON', () => {
+  assert.equal(parseMessage('not json').ok, false);
+});
+
+test('initialize echoes protocol version, advertises tools, and fires onInitialize', async () => {
+  let captured: unknown;
+  const res = await dispatch(
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', clientInfo: { name: 'codex' } } },
+    handlers({ onInitialize: (p) => { captured = p; } }),
+  );
+  assert.equal(res?.id, 1);
+  const result = res?.result as any;
+  assert.equal(result.protocolVersion, '2025-06-18');
+  assert.deepEqual(result.serverInfo, { name: 'slipstream-identity-probe', version: '0.0.0' });
+  assert.ok(result.capabilities.tools);
+  assert.deepEqual(captured, { protocolVersion: '2025-06-18', clientInfo: { name: 'codex' } });
+});
+
+test('notifications/initialized yields no response', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', method: 'notifications/initialized' }, handlers());
+  assert.equal(res, null);
+});
+
+test('ping returns empty result', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', id: 2, method: 'ping' }, handlers());
+  assert.deepEqual(res, { jsonrpc: '2.0', id: 2, result: {} });
+});
+
+test('tools/list returns the registered tool', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, handlers());
+  const tools = (res?.result as any).tools;
+  assert.equal(tools[0].name, 'identity_probe_snapshot');
+});
+
+test('tools/call routes to callTool and wraps text content', async () => {
+  const res = await dispatch(
+    { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'identity_probe_snapshot', arguments: {} } },
+    handlers({ callTool: async (name) => ({ text: `called ${name}` }) }),
+  );
+  const result = res?.result as any;
+  assert.deepEqual(result.content, [{ type: 'text', text: 'called identity_probe_snapshot' }]);
+  assert.equal(result.isError, false);
+});
+
+test('unknown method returns -32601', async () => {
+  const res = await dispatch({ jsonrpc: '2.0', id: 5, method: 'nope' }, handlers());
+  assert.equal(res?.error?.code, -32601);
+});
