@@ -32,6 +32,7 @@ interface HandlerOpts {
   home: string;
   now: () => number;
   append: (obs: Observation) => Promise<void>;
+  onAppendError?: (err: unknown) => void;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -40,6 +41,10 @@ function isObject(v: unknown): v is Record<string, unknown> {
 
 export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
   let initialize: InitializeCapture = { present: false };
+
+  const reportAppendError = opts.onAppendError ?? ((err: unknown) => {
+    process.stderr.write(`identity-probe: failed to append observation: ${String(err)}\n`);
+  });
 
   const record = async (phase: 'startup' | 'tool_call', toolParams?: Record<string, unknown>): Promise<Observation> => {
     const obs = buildObservation({
@@ -62,7 +67,10 @@ export function createProbeHandlers(opts: HandlerOpts): McpHandlers {
     serverInfo: { name: 'slipstream-identity-probe', version: '0.0.0' },
     protocolVersion: '2025-06-18',
     tools: [PROBE_TOOL],
-    onInitialize: (params) => { initialize = captureInitialize(params); void record('startup'); },
+    onInitialize: (params) => {
+      initialize = captureInitialize(params);
+      record('startup').catch(reportAppendError);
+    },
     callTool: async (_name, params) => {
       const obs = await record('tool_call', isObject(params) ? params : undefined);
       return {

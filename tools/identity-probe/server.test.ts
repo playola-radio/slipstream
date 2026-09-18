@@ -40,6 +40,23 @@ test('tool call records a tool_call observation carrying _meta and returns text'
   assert.match(text, /identity-probe/);
 });
 
+test('a rejecting append on startup is reported, not fatal', async () => {
+  const appendErrors: unknown[] = [];
+  const failure = new Error('EACCES: permission denied');
+  const h = createProbeHandlers({
+    logPath: '/unused', env: {}, argv: [], cwd: '/Users/x', home: '/Users/x',
+    now: () => 3,
+    append: async () => { throw failure; },
+    onAppendError: (err) => { appendErrors.push(err); },
+  });
+  const res = await dispatch({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, h);
+  assert.equal(res?.result && (res.result as any).protocolVersion, '2025-06-18');
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(appendErrors, [failure]);
+});
+
 test('the real server binary completes an MCP handshake over stdio', async () => {
   const child = spawn(process.execPath, [join(HERE, 'server.ts')], {
     stdio: ['pipe', 'pipe', 'inherit'],
