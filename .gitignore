@@ -26,6 +26,9 @@ sessions/
 blobs/
 *.jsonl
 
+# Daemon control sockets (owner-only unix sockets).
+*.sock
+
 # Logs
 *.log
 npm-debug.log*
