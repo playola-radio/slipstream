@@ -324,8 +324,14 @@ describe('session', () => {
         const sessionId = s1.sessionId;
         await writeFile(join(root, 'keep.ts'), 'v2');
         await waitForRecords(s1.logPath, (r) => changesFor(r, 'keep.ts').length >= 1);
-        const recoveredThroughSeq = (await readRecords(s1.logPath)).length;
         await s1.stop();
+        // Count records only after stop() has drained the engine and closed the
+        // log. A single write can yield two watcher notifications (Linux inotify
+        // emits IN_MODIFY + IN_CLOSE_WRITE); the second coalesces into a trailing
+        // capture.gap record that lands just after the file.changed. Measuring the
+        // still-live log the instant the change appears races that gap and
+        // undercounts, so recovery's high-water would then exceed this snapshot.
+        const recoveredThroughSeq = (await readRecords(s1.logPath)).length;
 
         // Interrupted append: an unterminated trailing record left by a crash.
         const torn = '{"seq":"999","specversion":"1.0","partial":tru';
