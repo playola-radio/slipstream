@@ -301,7 +301,12 @@ MCP tool `slipstream_begin_task`.
   the feed stays correct.
 - Daemon down: forwarder returns `DAEMON_UNAVAILABLE` without hanging the agent.
 
-**Status**: Not Started
+**Status**: In Progress. Stage 3 ships as a five-PR graph (P1–P5). P1 (harness
+identity probe) and P2 (durable task boundaries) are merged. P3 (shared daemon +
+attach layer: control protocol/client, boundary registry, daemon singleton +
+attach/detach/status/begin_task, CLI start/attach/status/detach + standalone
+guard) is complete on `feature/stage3-shared-daemon-attach`. P4 (MCP forwarders,
+skill, config) and P5 (session deletion + GC) remain.
 
 ---
 
