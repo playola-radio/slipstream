@@ -175,8 +175,18 @@ function stepUser(
   const evidence: NormalizedEvidence[] = [];
   const diagnostics: Diagnostic[] = [];
   const message = record.message;
-  const content = isObject(message) ? message.content : undefined;
-  if (!Array.isArray(content)) return { state, evidence, diagnostics };
+  if (!isObject(message)) {
+    diagnostics.push({ kind: 'malformed', detail: 'user record has no message object' });
+    return { state, evidence, diagnostics };
+  }
+  const content = message.content;
+  // A user record legitimately carries plain string content (typed text) with no
+  // tool results to fold; that is a clean read, not a malformed one.
+  if (typeof content === 'string') return { state, evidence, diagnostics };
+  if (!Array.isArray(content)) {
+    diagnostics.push({ kind: 'malformed', detail: 'user record content is neither text nor a block array' });
+    return { state, evidence, diagnostics };
+  }
   const atMs = parseMs(record);
   for (const block of content) {
     if (!isObject(block) || block.type !== 'tool_result') continue;

@@ -161,4 +161,30 @@ describe('claude transcript adapter', () => {
       assert.equal(out.diagnostics[0]!.kind, 'malformed');
     }
   });
+
+  it('accepts plain string user content as a clean read, not a malformed one', () => {
+    // A user turn is typically typed text, not tool results; string content is
+    // legitimate and must produce neither evidence nor a diagnostic.
+    const record = { type: 'user', message: { role: 'user', content: 'hello there' } };
+    const out = claudeStep(initialClaudeState(), record, CTX);
+    assert.equal(out.evidence.length, 0);
+    assert.equal(out.diagnostics.length, 0);
+  });
+
+  it('reports a malformed user envelope, keeping it distinct from a clean read', () => {
+    // Content that is neither typed text nor a block array (and a null/absent
+    // message) is malformed, so coverage degrades rather than reporting a clean read.
+    const shapes: unknown[] = [
+      { type: 'user', message: null },
+      { type: 'user', message: { content: 42 } },
+      { type: 'user', message: {} },
+      { type: 'user' },
+    ];
+    for (const record of shapes) {
+      const out = claudeStep(initialClaudeState(), record, CTX);
+      assert.equal(out.evidence.length, 0);
+      assert.equal(out.diagnostics.length, 1, `expected a diagnostic for ${JSON.stringify(record)}`);
+      assert.equal(out.diagnostics[0]!.kind, 'malformed');
+    }
+  });
 });

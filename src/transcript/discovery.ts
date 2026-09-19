@@ -94,12 +94,9 @@ export function isWithinRoot(root: string, child: string): boolean {
  * disclose it rather than silently drop what might be an in-root candidate. */
 const MAX_UNRESOLVED_HOPS = 64;
 
-/** Join `base` and `segment` textually, WITHOUT collapsing `..`: any `..` must be
- * resolved against the real filesystem by a later `realpath`, since an
- * intervening symlink makes lexical collapse wrong. */
-function rawJoin(base: string, segment: string): string {
-  if (segment === '') return base;
-  return base.endsWith('/') ? base + segment : `${base}/${segment}`;
+/** Path segments, dropping empty and `.` parts. */
+function segmentsOf(path: string): string[] {
+  return path.split('/').filter((s) => s !== '' && s !== '.');
 }
 
 /**
@@ -109,61 +106,53 @@ function rawJoin(base: string, segment: string): string {
  * A textual check is unreliable both ways: the raw string may be in the root's
  * alias namespace (cwd `/tmp/proj/gone` for canonical root `/private/tmp/proj`)
  * yet be in-root, or textually in-root yet escape through an internal symlink
- * (`/work/proj/link/gone` where `link` -> `/other/project`). So we degrade the
- * way `realpath` itself would: resolve the longest existing prefix, then decide
- * membership from what remains. `probe` classifies the first component that
- * failed to resolve:
- * - `absent`: the rest is plain names off the prefix's canonical location.
- * - `symlink`: follow its RAW literal target by textual concatenation (never
- *   lexical `..` collapse — an intervening symlink must be resolved first) and
- *   re-run, letting the next `realpath` hop resolve `..` and chained links.
- * - `present`/`error`: we could not resolve through it (e.g. a permission wall),
- *   so membership is undetermined — disclose rather than silently drop.
+ * (`/work/proj/link/gone` where `link` -> `/other/project`). So we resolve the
+ * cwd the way `realpath` would — component by component over `probe`, never
+ * collapsing `..` lexically (an intervening symlink makes that wrong). We keep a
+ * CANONICAL prefix `resolved`: each component is probed against it; `..` pops the
+ * prefix; a symlink splices in its literal target (following it, so any `..`
+ * after it is evaluated against the target). A component may be absent yet a
+ * later `..` can pop back above it into living space, so we keep walking rather
+ * than stop at the first gap.
  *
  * A cwd that places outside the root is a different worktree's session, skipped
  * silently so unrelated dead sessions never degrade this root's coverage.
- * Undecidable cases (uninspectable component, hop-cap exhaustion) fail toward
- * disclosure: never claim non-membership we did not establish.
+ * Undecidable cases (an uninspectable component, a symlink cycle past the hop
+ * cap) fail toward disclosure: never claim non-membership we did not establish.
  */
 async function unresolvedCwdMayBeInRoot(
   io: DiscoveryIO,
   root: string,
   cwd: string,
 ): Promise<boolean> {
-  let path = cwd;
-  for (let hop = 0; hop < MAX_UNRESOLVED_HOPS; hop += 1) {
-    const direct = await io.realpath(path);
-    if (direct !== undefined) return isWithinRoot(root, direct);
-    // Walk up (string-only, preserving `..`) to the longest ancestor that
-    // resolves; realpath follows any symlinks it contains, so its form is exact.
-    let ancestor = dirname(path);
-    let canonical = await io.realpath(ancestor);
-    while (canonical === undefined) {
-      const parent = dirname(ancestor);
-      if (parent === ancestor) return true; // not even '/' resolves: cannot rule out
-      ancestor = parent;
-      canonical = await io.realpath(ancestor);
+  const queue = segmentsOf(cwd);
+  let cursor = 0;
+  let resolved = '/';
+  let symlinkHops = 0;
+  while (cursor < queue.length) {
+    const seg = queue[cursor];
+    cursor += 1;
+    if (seg === '..') {
+      resolved = dirname(resolved); // popping a canonical prefix is exact
+      continue;
     }
-    // The first non-resolving component is the next segment of `path` below
-    // `ancestor`; everything after it is the still-unresolved remainder.
-    const tail = path.slice(ancestor === '/' ? 1 : ancestor.length + 1);
-    const firstSeg = tail.split('/')[0]!;
-    const firstChild = rawJoin(ancestor, firstSeg);
-    const afterFirst = path.slice(firstChild.length); // '' or leading-'/' remainder
-    const probe = await io.probe(firstChild);
-    if (probe.kind === 'absent') {
-      // Plain (non-symlink) missing names: safe to resolve off the canonical
-      // parent, since none of them are symlinks that `..` could cross.
-      return isWithinRoot(root, resolve(canonical, tail));
+    const candidate = resolved === '/' ? `/${seg}` : `${resolved}/${seg}`;
+    const probe = await io.probe(candidate);
+    if (probe.kind === 'present' || probe.kind === 'absent') {
+      // An absent component still advances the prefix; a later `..` can pop back
+      // above it into living space, which the continued walk re-resolves.
+      resolved = candidate;
+      continue;
     }
-    if (probe.kind !== 'symlink') return true; // uninspectable: disclose
-    // Dangling symlink: rebuild the path from its literal target (relative
-    // targets against the link's textual parent), preserving `..` for the next
-    // realpath hop, then re-append whatever came after the link.
-    const base = isAbsolute(probe.target) ? probe.target : rawJoin(ancestor, probe.target);
-    path = `${base}${afterFirst}`;
+    if (probe.kind !== 'symlink') return true; // uninspectable: cannot rule out
+    symlinkHops += 1;
+    if (symlinkHops > MAX_UNRESOLVED_HOPS) return true; // cycle: disclose
+    // Follow the link: splice its literal target in place of this component so a
+    // trailing `..` is evaluated against the target, not the link's own parent.
+    if (isAbsolute(probe.target)) resolved = '/';
+    queue.splice(cursor, 0, ...segmentsOf(probe.target));
   }
-  return true; // hop cap exhausted (e.g. a cycle): disclose rather than drop
+  return isWithinRoot(root, resolved);
 }
 
 export async function discoverClaude(
