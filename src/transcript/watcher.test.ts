@@ -258,16 +258,18 @@ describe('transcript watcher', () => {
     );
   });
 
-  it('recreates a reader when a provisional cwd resolves, re-scoping relative writes', async () => {
-    // Tick 1: the transcript is empty, so discovery slug-trust binds cwd=root.
-    // Tick 2: the first line now records the real cwd (root/pkg), so discovery
-    // rebinds. The reader must be recreated for the new scope: a relative write
-    // then resolves to pkg/x.ts, not the root-relative x.ts a stale binding gives.
+  it('discloses a relative Claude write as unknown scope, never guessing a provisional cwd', async () => {
+    // Regression for the provisional-binding conflict: an empty transcript
+    // slug-trust binds cwd=root, then a relative write arrives before the real cwd
+    // is known. Claude's write tools declare absolute paths, so a relative one
+    // cannot be resolved without trusting a cwd that may be provisional or an alias
+    // of the root. The adapter discloses it as an unmapped possible writer — the
+    // same single unknown-scope record on every tick, so a re-read dedups and the
+    // invocation never splits into two conflicting scope variants.
     const dir = '/home/projects/-work-proj';
     const path = `${dir}/sess-a.jsonl`;
     const file = new FakeFile();
     const files = new Map<string, FakeFile>();
-    let hasContent = false;
     const watcher = createTranscriptWatcher({
       harness: 'claude-code',
       home: '/home',
@@ -275,11 +277,6 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
-        readFirstLine: async () =>
-          hasContent
-            ? { ok: true, line: JSON.stringify({ type: 'assistant', cwd: '/work/proj/pkg' }) }
-            : { ok: false, reason: 'empty' },
-        realpath: async (p) => p,
       }),
       fileIO: fileIO(files),
       sink,
@@ -287,14 +284,15 @@ describe('transcript watcher', () => {
     });
     await watcher.tick(); // empty transcript: provisional cwd=root, nothing read
     assert.equal(sink.appended.length, 0);
-    hasContent = true;
     file.append(RELATIVE_WRITE + '\n');
     files.set(path, file);
-    await watcher.tick(); // cwd resolved to root/pkg: reader recreated, re-scoped
-    const scopes = sink.appended
-      .filter((e) => e.evidence_key.record_id === 'toolu_rel' && e.timestamp.basis === 'tool-start')
-      .map((e) => e.file_scope);
-    assert.deepEqual(scopes, [{ kind: 'paths', paths: ['pkg/x.ts'] }]);
+    await watcher.tick(); // relative write arrives
+    await watcher.tick(); // a re-read must not add a second, differently-scoped variant
+    const relStarts = sink.appended.filter(
+      (e) => e.evidence_key.record_id === 'toolu_rel' && e.timestamp.basis === 'tool-start',
+    );
+    assert.equal(relStarts.length, 1, 'one record, no conflicting variant');
+    assert.equal(relStarts[0]!.file_scope.kind, 'unknown');
   });
 
   it('reports unavailable when the transcript home is inaccessible', async () => {

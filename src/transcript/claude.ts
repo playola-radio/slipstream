@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import type { EvidenceFileScope } from '../event.ts';
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 import { scopeFromPaths, type AdapterContext, type Diagnostic, type StepResult } from './types.ts';
@@ -20,6 +21,9 @@ import { scopeFromPaths, type AdapterContext, type Diagnostic, type StepResult }
  * silently dropping an unknown effect would be dishonest.
  */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+// Deliberately excludes `Task`: a subagent it launches can edit files, so a Task
+// is a possible writer whose paths we cannot see — it must fall through to
+// unknown scope, not be silenced as read-only.
 const READONLY_TOOLS = new Set([
   'Read',
   'NotebookRead',
@@ -29,7 +33,6 @@ const READONLY_TOOLS = new Set([
   'TodoWrite',
   'WebFetch',
   'WebSearch',
-  'Task',
   'BashOutput',
   'KillShell',
 ]);
@@ -79,6 +82,17 @@ function scopeForTool(
       return {
         scope: { kind: 'unknown', reason: `${toolName} record declared no file path` },
         diagnostics: [{ kind: 'malformed', detail: `${toolName} without a file path` }],
+      };
+    }
+    // Claude's write tools declare absolute paths by design. A relative path can
+    // only be resolved against the recorded cwd, which for a session's early
+    // records may still be provisional (bound to the root while the transcript was
+    // empty) or an alias of the root — resolving against it risks crediting the
+    // wrong file. Rather than guess, disclose it as an unmapped possible writer.
+    if (!isAbsolute(path)) {
+      return {
+        scope: { kind: 'unknown', reason: `${toolName} declared a non-absolute path` },
+        diagnostics: [],
       };
     }
     const scope = scopeFromPaths([path], ctx);

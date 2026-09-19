@@ -65,6 +65,45 @@ describe('claude transcript adapter', () => {
     assert.equal(bash[0]!.tool_name, 'Bash');
   });
 
+  it('discloses a Task as an unknown-scope possible writer, not a read-only no-op', () => {
+    // A Task launches a subagent that may edit files; its own record exposes no
+    // path. Treating it as read-only would silence a real possible writer, so it
+    // must emit explicit unknown-scope evidence like Bash.
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_task_1',
+            name: 'Task',
+            input: { subagent_type: 'general-purpose', prompt: 'edit x.ts' },
+          },
+        ],
+      },
+    };
+    const out = claudeStep(initialClaudeState(), record, CTX);
+    assert.equal(out.evidence.length, 1);
+    assert.equal(out.evidence[0]!.tool_name, 'Task');
+    assert.equal(out.evidence[0]!.file_scope.kind, 'unknown');
+  });
+
+  it('discloses a non-absolute write path as unknown scope, never guessing a cwd', () => {
+    // Claude write tools declare absolute paths; a relative one cannot be resolved
+    // without trusting a possibly-provisional or aliased cwd. Rather than credit
+    // the wrong file, the adapter discloses it as an unmapped possible writer.
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_rel', name: 'Write', input: { file_path: 'x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, CTX);
+    assert.equal(out.evidence.length, 1);
+    assert.equal(out.evidence[0]!.file_scope.kind, 'unknown');
+    assert.equal(out.diagnostics.length, 0);
+  });
+
   it('drops a write outside the capture root', async () => {
     const { evidence } = await runFixture();
     assert.equal(

@@ -97,18 +97,11 @@ function makeStepper(harness: HarnessName, ctx: AdapterContext) {
   return harness === 'claude-code' ? claudeStepper(ctx) : codexStepper(ctx);
 }
 
-/** The bound-context identity that gates reader reuse: the session id and the
- * resolved scope (cwd + aliases). A change in any of them means the prior reader's
- * offset and scope no longer apply. */
-function bindingCtxKey(ctx: AdapterContext): string {
-  return `${ctx.harnessSessionId}\0${ctx.cwd}\0${(ctx.rootAliases ?? []).join(',')}`;
-}
-
 export function createTranscriptWatcher(opts: TranscriptWatcherOptions): TranscriptWatcher {
   const { harness, home, root, codexScanLimit, discoveryIO, fileIO, sink, publish } = opts;
   const readers = new Map<
     string,
-    { reader: ReturnType<typeof createTranscriptFileReader>; ctxKey: string }
+    { reader: ReturnType<typeof createTranscriptFileReader>; sessionId: string }
   >();
   let lastKey: string | undefined;
 
@@ -128,16 +121,16 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
       path: string;
     }> = [];
     for (const binding of bindings) {
-      // Recreate the reader whenever its bound context changes: a changed session
-      // id is a rotated transcript (the same file name now belongs to a different
-      // harness session), and a changed cwd/aliases is a provisional binding (made
-      // while the transcript was empty) that discovery has since resolved to the
-      // real scope. Either way the old reader's offset, join state, and scope no
-      // longer apply, so drop it and reread from zero; the ingestor's log-derived
-      // dedup absorbs the re-read, and the records get their correct scope.
-      const ctxKey = bindingCtxKey(binding.ctx);
+      // Recreate the reader only when the file name now belongs to a different
+      // harness session (a rotated transcript): the old reader's offset and join
+      // state no longer apply, so drop it and reread from zero; the ingestor's
+      // log-derived dedup absorbs the re-read. A provisional binding later
+      // resolving its cwd does NOT force a recreate — Claude writes are scoped by
+      // their absolute path (relative ones are disclosed unknown), so the emitted
+      // scope never depends on which cwd the binding settled on.
+      const sessionId = binding.ctx.harnessSessionId;
       let entry = readers.get(binding.path);
-      if (!entry || entry.ctxKey !== ctxKey) {
+      if (!entry || entry.sessionId !== sessionId) {
         entry = {
           reader: createTranscriptFileReader({
             path: binding.path,
@@ -145,7 +138,7 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
             sink,
             stepper: makeStepper(harness, binding.ctx),
           }),
-          ctxKey,
+          sessionId,
         };
         readers.set(binding.path, entry);
       }
