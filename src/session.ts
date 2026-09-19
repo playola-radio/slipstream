@@ -18,7 +18,28 @@ import {
   type AttributionProducer,
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
-import type { AnyEvent, EnrichmentPolicy, EventInput } from './event.ts';
+import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
+import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
+import type { DiscoveryIO } from './transcript/discovery.ts';
+import type { TranscriptFileIO } from './transcript/file-reader.ts';
+import { nodeDiscoveryIO, nodeTranscriptFileIO } from './transcript/fs-io.ts';
+
+/** How often the transcript watcher re-runs discovery and reads new records. */
+export const DEFAULT_TRANSCRIPT_POLL_MS = 2000;
+
+/** Transcript-reading settings for a session, resolved from the daemon config.
+ * Absent (or an empty `harnesses`) means no transcript is read — capture behaves
+ * exactly as before adapters existed (an `unknown` honestly means "nothing was
+ * watched"). */
+export interface TranscriptRuntime {
+  /** The harnesses declared `configured`; only these are discovered and read. */
+  harnesses: readonly HarnessName[];
+  homes: Record<HarnessName, string>;
+  codexScanLimit: number;
+  pollIntervalMs?: number;
+  discoveryIO?: DiscoveryIO;
+  fileIO?: TranscriptFileIO;
+}
 
 export interface CaptureOptions {
   root: string;
@@ -40,6 +61,10 @@ export interface CaptureOptions {
    * wires no transcript adapters); the daemon drives coverage and timing as
    * adapters are configured. Published once on startup and bound to each change. */
   enrichmentPolicy?: EnrichmentPolicy;
+  /** Transcript-reading settings. When present with configured harnesses, the
+   * session runs a coverage watcher that reads those harnesses' transcripts for
+   * this worktree, ingesting evidence and disclosing coverage. */
+  transcript?: TranscriptRuntime;
 }
 
 export interface BeginTaskInput {
@@ -632,6 +657,34 @@ export async function startCapture(
   goLive();
   health.markHealthy();
 
+  const ingestEvidence = (evidence: NormalizedEvidence): Promise<IngestOutcome> =>
+    producer!.ingestEvidence(evidence);
+
+  // The transcript coverage watcher (A2): reads configured harnesses' transcripts
+  // for this worktree as revisable evidence. It never creates a change and its
+  // evidence flows through the same deduped, append-only producer path, so a
+  // re-read (including a late transcript after a restart) revises without
+  // duplicating. Runs only when a harness is actually configured.
+  let coverageRunner: CoverageRunner | undefined;
+  const tc = opts.transcript;
+  if (tc && tc.harnesses.length > 0) {
+    coverageRunner = createCoverageRunner({
+      harnesses: tc.harnesses,
+      homes: tc.homes,
+      codexScanLimit: tc.codexScanLimit,
+      root,
+      sink: { ingest: ingestEvidence },
+      publish: async (data) => {
+        await appendEvent({ type: 'slipstream.enrichment.coverage.v1', occurred_at_ms: Date.now(), data });
+      },
+      discoveryIO: tc.discoveryIO ?? nodeDiscoveryIO,
+      fileIO: tc.fileIO ?? nodeTranscriptFileIO,
+      intervalMs: tc.pollIntervalMs ?? DEFAULT_TRANSCRIPT_POLL_MS,
+      onError: (err) => console.error(`slipstream: transcript watcher error: ${(err as Error).message}`),
+    });
+    coverageRunner.start();
+  }
+
   const beginTask = async ({ title, requestId }: BeginTaskInput): Promise<BeginTaskResult> => {
     // Readiness: only a live, healthy, still-owned session may declare a task.
     // Domain error codes (CAPTURE_NOT_READY, STORAGE_UNAVAILABLE, ...) are a later
@@ -715,6 +768,9 @@ export async function startCapture(
     const record = (err: unknown): void => {
       if (firstError === undefined) firstError = err;
     };
+    // Stop the coverage watcher before the producer and log close: it appends
+    // evidence and coverage through both, and an append after close would throw.
+    await coverageRunner?.stop().catch(record);
     await subscription?.close().catch(record);
     // Await any in-flight recovery: it may be mid-reopen, and appending after
     // we release the lock would let a second owner's writes interleave. The
@@ -732,9 +788,6 @@ export async function startCapture(
   // handle) run teardown once. Two concurrent releases could otherwise both read
   // the current nonce and the loser could unlink a successor's lock.
   let stopPromise: Promise<void> | undefined;
-
-  const ingestEvidence = (evidence: NormalizedEvidence): Promise<IngestOutcome> =>
-    producer!.ingestEvidence(evidence);
 
   return {
     sessionId,

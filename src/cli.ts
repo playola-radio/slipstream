@@ -35,12 +35,15 @@ import { isValidSessionId } from './store-reader.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { runTui } from './tui.ts';
 import { isMainModule } from './entrypoint.ts';
+import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
+import { homedir } from 'node:os';
+import type { HarnessName } from './event.ts';
 
 type Args =
   | { command: 'watch'; dir: string; store: string }
   | { command: 'serve'; dir: string; store: string }
   | { command: 'view' }
-  | { command: 'start'; store: string }
+  | { command: 'start'; store: string; configPath?: string; overrides: ConfigOverrides }
   | { command: 'status'; store: string }
   | { command: 'detach'; store: string }
   | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string }
@@ -80,6 +83,50 @@ function parseStoreOnly(rest: string[]): string | null {
     } else return null; // positional or unknown flag
   }
   return store ?? DEFAULT_DAEMON_STORE;
+}
+
+/** `start [--store <dir>]` plus the Fork 4 enrichment overrides: a config file
+ * and per-field CLI overrides layered over it. A bad numeric or harness value is
+ * a usage error, not a silent skip. */
+function parseStart(rest: string[]): { store: string; configPath?: string; overrides: ConfigOverrides } | null {
+  let store: string | undefined;
+  let configPath: string | undefined;
+  const overrides: ConfigOverrides = {};
+  const posInt = (v: string | undefined): number | undefined => {
+    if (v === undefined || v.startsWith('--')) return undefined;
+    const n = Number(v);
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+  };
+  const asHarness = (v: string | undefined): HarnessName | undefined =>
+    v === 'claude-code' || v === 'codex' ? v : undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    if (arg === '--store') {
+      const v = rest[++i];
+      if (v === undefined || v.startsWith('--')) return null;
+      store = resolve(v);
+    } else if (arg === '--config') {
+      const v = rest[++i];
+      if (v === undefined || v.startsWith('--')) return null;
+      configPath = resolve(v);
+    } else if (arg === '--window-ms' || arg === '--grace-ms' || arg === '--codex-scan-limit') {
+      const n = posInt(rest[++i]);
+      if (n === undefined) return null;
+      if (arg === '--window-ms') overrides.windowMs = n;
+      else if (arg === '--grace-ms') overrides.graceMs = n;
+      else overrides.codexScanLimit = n;
+    } else if (arg === '--enable') {
+      const h = asHarness(rest[++i]);
+      if (h === undefined) return null;
+      overrides.sources = { ...overrides.sources, [h]: 'configured' };
+    } else if (arg === '--claude-home' || arg === '--codex-home') {
+      const v = rest[++i];
+      if (v === undefined || v.startsWith('--')) return null;
+      const h: HarnessName = arg === '--claude-home' ? 'claude-code' : 'codex';
+      overrides.homes = { ...overrides.homes, [h]: resolve(v) };
+    } else return null; // positional or unknown flag
+  }
+  return { store: store ?? DEFAULT_DAEMON_STORE, configPath, overrides };
 }
 
 /** `delete <session-id> [--store <dir>]`: exactly one required positional (the
@@ -135,7 +182,12 @@ export function parseArgs(argv: string[]): Args | null {
     if (!parsed) return null;
     return { command, dir: parsed.dir, store: parsed.store };
   }
-  if (command === 'start' || command === 'status' || command === 'detach' || command === 'gc') {
+  if (command === 'start') {
+    const parsed = parseStart(argv.slice(1));
+    if (parsed === null) return null;
+    return { command, store: parsed.store, configPath: parsed.configPath, overrides: parsed.overrides };
+  }
+  if (command === 'status' || command === 'detach' || command === 'gc') {
     const store = parseStoreOnly(argv.slice(1));
     if (store === null) return null;
     return { command, store };
@@ -162,7 +214,8 @@ async function countRecords(logPath: string): Promise<number> {
 function usage(): void {
   console.error('Usage: slipstream watch  [dir] [--store <dir>]');
   console.error('       slipstream serve  [dir] [--store <dir>]');
-  console.error('       slipstream start  [--store <dir>]');
+  console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
+  console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
   console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id>');
   console.error('       slipstream status [--store <dir>]');
   console.error('       slipstream detach [--store <dir>]');
@@ -255,7 +308,15 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'start') {
-    const daemon = await startDaemon({ storeDir: args.store });
+    const configIO: ConfigIO = { readFile: (p) => readFile(p, 'utf8').then((s) => s).catch(() => undefined) };
+    const { config, warnings } = await loadConfig({
+      path: args.configPath,
+      io: configIO,
+      cli: args.overrides,
+      homeDir: homedir(),
+    });
+    for (const w of warnings) console.error(`slipstream: ${w}`);
+    const daemon = await startDaemon({ storeDir: args.store, config });
     console.error(`slipstream: daemon control ${daemon.socketPath}`);
     console.error(`slipstream: reader ${daemon.readerUrl}`);
     console.error('slipstream: detached; `slipstream attach <dir>` a worktree to begin capture');

@@ -2,7 +2,9 @@ import { createServer, connect, type Server, type Socket } from 'node:net';
 import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { startCapture, InvalidTitleError, type CaptureSession } from './session.ts';
+import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
+import type { ResolvedConfig } from './config.ts';
+import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
@@ -49,6 +51,24 @@ export interface DaemonOptions {
   storeDir: string;
   /** Injected capture dependencies (tests drive a fake platform through here). */
   captureDependencies?: Parameters<typeof startCapture>[1];
+  /** The resolved enrichment + transcript config (Fork 4). Absent means built-in
+   * defaults: no harness is `configured`, so no transcript is read. */
+  config?: ResolvedConfig;
+}
+
+const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
+
+/** Build the per-session transcript runtime from resolved config: only harnesses
+ * the operator declared `configured` are read. */
+function transcriptRuntimeFrom(config: ResolvedConfig | undefined): TranscriptRuntime | undefined {
+  if (!config) return undefined;
+  const harnesses = HARNESSES.filter((h) => config.policy.sources[h] === 'configured');
+  if (harnesses.length === 0) return undefined;
+  return {
+    harnesses,
+    homes: config.transcript.homes,
+    codexScanLimit: config.transcript.codexScanLimit,
+  };
 }
 
 export interface Daemon {
@@ -357,8 +377,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // symlinked or relative declared path must report the same durable root in
       // status rather than the caller's raw string (locked design, decision 5).
       resolvedWorktree = await realpath(worktree);
+      const transcript = transcriptRuntimeFrom(opts.config);
       session = await startCapture(
-        { root: resolvedWorktree, storeDir, sessionId: id, onCompromised: (reason) => handleSessionCompromise(id, reason) },
+        {
+          root: resolvedWorktree,
+          storeDir,
+          sessionId: id,
+          onCompromised: (reason) => handleSessionCompromise(id, reason),
+          ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
+          ...(transcript ? { transcript } : {}),
+        },
         opts.captureDependencies,
       );
     } catch (err) {

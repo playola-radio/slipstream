@@ -50,7 +50,26 @@ it('serve releases the capture lock when reader descriptor publication fails', a
 
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
-    assert.deepEqual(parseArgs(['start', '--store', '/s']), { command: 'start', store: '/s' });
+    assert.deepEqual(parseArgs(['start', '--store', '/s']), {
+      command: 'start',
+      store: '/s',
+      configPath: undefined,
+      overrides: {},
+    });
+  });
+  it('parses start enrichment overrides into a config override layer', () => {
+    const parsed = parseArgs(['start', '--enable', 'claude-code', '--window-ms', '3000', '--codex-scan-limit', '50']);
+    assert.equal(parsed?.command, 'start');
+    assert.deepEqual((parsed as { overrides: unknown }).overrides, {
+      sources: { 'claude-code': 'configured' },
+      windowMs: 3000,
+      codexScanLimit: 50,
+    });
+  });
+  it('rejects start with a bad numeric override or unknown harness', () => {
+    assert.equal(parseArgs(['start', '--window-ms', 'oops']), null);
+    assert.equal(parseArgs(['start', '--window-ms', '0']), null);
+    assert.equal(parseArgs(['start', '--enable', 'gemini']), null);
   });
   it('rejects start with a stray positional (start takes store options only)', () => {
     assert.equal(parseArgs(['start', '/some/dir']), null);
