@@ -322,8 +322,9 @@ adversarial review + excess audit applied; PR to `develop` pending.
 attribution and function clips — as append-only enrichment.
 
 **Deliverable**: Claude Code and Codex transcript adapters emitting
-`change.attribution` events; async tree-sitter workers emitting `change.clips`
-events.
+`change.attribution` events; a versioned, public clip **projection** computed on
+demand from the immutable before/after blobs and served through the reader API
+(reader-derived, not log events — see D4 in `STAGE-4-PLAN.md`).
 
 **Success Criteria — attribution**
 - Starting policy (configurable, calibrated not guaranteed): each timestamped
@@ -339,18 +340,26 @@ events.
 - No status claims verified authorship. UI language is "possibly agent", never
   "attributed".
 
-**Success Criteria — clips**
-- Parsing runs in isolated workers against immutable before/after blobs, never on
-  the capture path. Enrichment is debounced; the capture queue is not.
+**Success Criteria — clips** (reader-derived projection, D4 — not log events)
+- Clips are a **versioned public projection** over the immutable before/after
+  blobs, computed on demand and served through the published reader API. Nothing
+  is appended to the event log. The projection is a reusable module callable
+  against on-disk artifacts, so any client — including the Stage 2 TUI — can get
+  clips without the bundled UI.
+- Parsing runs in isolated workers against immutable blobs, never on the capture
+  path. The reader bounds how much parsing it admits concurrently so a cold-cache
+  feed cannot starve capture; capture is always prioritized.
 - Budgets: parse only UTF-8 ≤ 1 MiB, 100 ms wall-clock per change; clips capped
   at 300 lines and 64 KiB per side; fallback is changed ranges ± 20 lines.
 - Clips are an **array** of paired spans. A deleted function exists only on the
   before side; a created one only on the after side.
 - A parse error *elsewhere* in the file does not void a usable enclosing
   function. Fall back only when the relevant enclosing structure is unreliable.
-- Explicit `fallback_reason` on every non-`ready` clip event.
-- Under overload, enrichment is skipped with a stated reason and raw capture
-  continues.
+- Explicit `fallback_reason` on every non-`ready` projection result; the result
+  carries its `projection_version`. A change whose blobs were GC'd yields clips
+  explicitly unavailable with a reason, never faked.
+- Under overload, the projection is skipped/deferred with a stated reason and raw
+  capture continues.
 
 **Tests**
 - Two overlapping parallel tool calls → `ambiguous`.
@@ -360,16 +369,21 @@ events.
 - Edits occurring before their task is declared → grouped by declaration
   sequence, not backdated.
 - A change touching several functions, deleting one, and editing imports → one
-  event, multiple clips, top-level fallback where appropriate.
-- Half-written unparseable file mid-edit → falls back, event still published.
-- Parser workers saturated → raw capture latency unchanged (measured).
+  projection result, multiple clips, top-level fallback where appropriate.
+- Half-written unparseable file mid-edit → falls back, projection still returned.
+- Concurrent cold-cache clip requests saturating the parse workers → raw capture
+  latency within the ratified bar (measured; D3 protocol, D4 cold-cache load).
 
-**Status**: Not Started. PR graph designed via Codex consult and ratified
-(Brian D1–D3, 2026-09-19): a 4-PR / 2-track shape — Track A attribution
+**Status**: Not Started. PR graph designed via Codex consults and ratified
+(Brian D1–D4, 2026-09-19): a 4-PR / 2-track shape — Track A attribution
 (A1 engine+contracts with fake evidence → A2 real transcript adapters), Track B
-clips (B1 bounded async workers+fallback → B2 tree-sitter extraction + measured
-latency gate). See `STAGE-4-PLAN.md` for the resolved schema forks, the
-D2 candidate-eligibility narrowing, and the D3 deferred latency bar.
+clips (B1 clip-projection contract + bounded fallback → B2 tree-sitter extraction
++ measured latency gate). D4 makes clips a **reader-derived public projection**
+over the immutable blobs (versioned, cached on demand, served via the reader API)
+rather than `change.clips` log events; attribution stays a log producer. See
+`STAGE-4-PLAN.md` for the D4 rationale, resolved schema forks, the D2
+candidate-eligibility narrowing, and the D3 deferred latency bar (retained under
+D4 — parsing contention relocates to the reader).
 
 ---
 

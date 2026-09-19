@@ -1,10 +1,11 @@
 # Stage 4 plan — honest attribution and enrichment
 
 Read `IMPLEMENTATION_PLAN.md` Stage 4 first. This file is the ratified PR graph
-and the resolved schema forks for Stage 4, produced by a Codex design consult
-(`gpt-6-astra`, 2026-09-19) and ratified by Brian's rulings D1–D3 below. It does
+and the resolved schema forks for Stage 4, produced by Codex design consults
+(`gpt-6-astra`, 2026-09-19) and ratified by Brian's rulings D1–D4 below. It does
 not restate or relax any Stage 4 success criterion — where a criterion is
-narrowed (D2) or its gate is deferred (D3), that is an explicit ratified ruling.
+narrowed (D2), its gate is deferred (D3), or a producer is redesigned into a
+public projection (D4), that is an explicit ratified ruling.
 
 ## Ratified rulings (Brian, 2026-09-19)
 
@@ -12,10 +13,10 @@ narrowed (D2) or its gate is deferred (D3), that is an explicit ratified ruling.
   Accepted tradeoff: without a shared foundation PR (P0), the wire contracts and
   the recovery-safety machinery (schedule-only-from-durable-commits, discard +
   reconstruct outstanding work on recovery, fence worker replies by recovery
-  generation, revalidate target before append) are **published and tested inside
-  A1 for attribution and inside B1 for clips**, not once up front. The two tracks
-  still share one fsync'd serialized writer and the recovery path, so they are
-  *not* fully independent — see "Accepted tradeoff" below.
+  generation, revalidate target before append) is **published and tested inside
+  A1 for attribution**, not once up front. (D4 removes the clips half: clips no
+  longer append to the log, so B1 carries none of this machinery — it is
+  attribution-internal only. See the accepted-tradeoff note.)
 - **D2 = A — ratify the candidate-eligibility narrowing.** A candidate is a
   *distinct, relevant* harness invocation whose declared file/worktree scope
   matches the changed path AND whose time window overlaps the change's
@@ -29,23 +30,48 @@ narrowed (D2) or its gate is deferred (D3), that is an explicit ratified ruling.
   capture latency baseline-vs-saturation, throughput, skipped counts) and the
   numeric pass-bar is ratified from the measured baseline at B2 review time — not
   invented now, never declared passing with a failing gate.
+- **D4 = A — clips are a reader-derived public projection, not a log producer.**
+  Ratified via a second Codex consult (`gpt-6-astra`, 2026-09-19). Clips are a
+  pure function of `(before-blob, after-blob, projection version)`, and both blobs
+  are already the source of truth, so a `change.clips` event would persist
+  redundant, recomputable state; the one property only a persisted clip event
+  buys (audit replay of "what clip was shown at seq N") has no requirement behind
+  it. Track B now publishes a **versioned clip projection** — schema + reusable
+  I/O-scoped module + reader API — computed on demand from the immutable blobs,
+  cached disposably, never appended to the log. **Dropped:**
+  `slipstream.change.clips.v1`, worker resume-from-log recovery, the
+  highest-seq-wins replacement convention, and `policy_seq` for clips.
+  **Retained verbatim:** the budgets, paired-span shape, explicit failure
+  reasons, independent-client parity, and — critically — the **D3 capture-latency
+  gate**, because parsing contention *relocates* to the reader rather than
+  disappearing (a cold-cache feed can request dozens of parses at once and
+  reproduce eager parsing's contention). Attribution is unaffected: its evidence
+  is external and ephemeral, so it stays a daemon producer writing log events.
 
 ## Accepted tradeoff (D1=B, logged)
 
-Skipping P0 is a Completeness-6 architecture call. Upgrade trigger: **if A1 and
-B1 end up duplicating the recovery-generation / worker-fencing logic, or the
-shared-writer contention shows up as measured capture regression in B2, extract
-a shared enrichment-foundation module then** (retrofit, not up front). Until
-then each track owns its own copy. This is recorded so a later reviewer does not
-read the duplication as accidental.
+Skipping P0 is a Completeness-6 architecture call. **D4 update:** clips no longer
+append to the log or share the fsync writer, so the recovery-generation /
+worker-fencing machinery is now **attribution-internal only** (A1 owns it) and
+Track B carries no log-recovery logic to duplicate. What the tracks still share is
+the enrichment-config surface (Fork 4). Upgrade trigger: **if the bounded-parse /
+overload-admission logic ends up duplicated between A1's evidence scheduling and
+B1's projection admission, or B2 measures real contention between the reader's
+parse workers and capture, extract a shared enrichment-foundation module then**
+(retrofit, not up front). This is recorded so a later reviewer does not read the
+remaining duplication as accidental.
 
 ## The two tracks
 
 Both branch off `develop`. Track A (attribution) and Track B (clips) touch
 largely disjoint code and may proceed in parallel; within a track A1→A2 and
-B1→B2 are sequential. Neither track blocks capture — every append is asynchronous
-enrichment; a failed parse or attribution degrades the view, never drops or
-delays a `file.changed` event.
+B1→B2 are sequential. Post-D4 the tracks are effectively independent: Track A
+appends attribution events to the log; Track B appends nothing — clips are a
+read-time projection over the immutable blobs, so Track B shares neither the
+fsync writer nor the recovery path with Track A (only the enrichment-config
+surface). Neither track blocks capture — attribution appends are asynchronous
+enrichment and the clip projection runs off the capture path; a failed parse or
+attribution degrades the view, never drops or delays a `file.changed` event.
 
 ### Track A — attribution
 
@@ -92,8 +118,8 @@ Scope IN:
   same agent are two candidates → `ambiguous`. Multiple records of one call =
   one candidate.
 - **Shared pure reducer (Fork 3):** I/O-free public module folding the log to
-  `(source, change_seq) → highest-seq attribution`. Same replacement convention
-  reused by clips in B1.
+  `(source, change_seq) → highest-seq attribution`. Attribution-only — clips
+  (D4) are a read-time projection, not a log fold, and do not use this reducer.
 - Durable evidence ingestion, log-derived dedup (evidence-key→record,
   change→latest attribution), revision-by-append (compare *semantic* result —
   status, evidence set, reason, policy, availability — before publishing a
@@ -132,62 +158,90 @@ not backdated (unchanged from Stage 3 `task_hint_id` semantics); late transcript
 arriving after restart → revises without duplicate evidence; native-identity
 fixtures prove the mapping for both harnesses.
 
-### Track B — clips
+### Track B — clips (reader-derived projection, D4)
 
-**B1 — Publish bounded fallback clips asynchronously (no tree-sitter yet).**
+Clips are a **versioned public projection** over the immutable before/after
+blobs, not log events. The projection is computed on demand, cached disposably,
+and served through the public reader API; nothing is appended to the event log.
+
+**B1 — Publish the clip projection contract with bounded fallback (no tree-sitter yet).**
 Scope IN:
-- `slipstream.change.clips.v1` contract (published here):
+- **Clip projection schema (public interface, published here)** — the result a
+  client receives for a change, *not* a log event:
   ```ts
-  { change_seq, policy_seq,
+  { change_seq, projection_version,
     status: 'ready'|'fallback'|'skipped'|'unavailable',
     fallback_reason?, // required unless 'ready'
     clips: Array<{ before: Span|null, after: Span|null /* +per-side method+reason */ }> }
   ```
-  Spans reference the target's existing blobs by **zero-based half-open byte
+  Spans reference the change's existing blobs by **zero-based half-open byte
   offsets** (define UTF-8 boundary + line-count rules). `null` = no corresponding
-  span (created/deleted function), never unreadable content.
-- Worker lifecycle (`worker_threads`), immutable before/after blob reads off the
-  capture path, debounced dispatch (the capture queue is never debounced),
-  crash recovery (resume unfinished jobs from the log; every committed change
-  gets its own result or an explicit `skipped`), and the same reducer/replacement
-  convention as attribution.
-- **Budgets + overload here (Codex correction — an unbounded worker is not a
-  viable intermediate):** parse only UTF-8 ≤ 1 MiB, 100 ms wall-clock/change;
-  bounded diff/fallback prep *before* any parse so a timeout keeps the fallback;
-  clips capped 300 lines & 64 KiB **across the whole array per side** (a
-  multi-span array must not circumvent the cap); fallback = changed ranges ±20
-  lines; if even bounded ranges can't be produced → `skipped` with reason, never
-  invented ranges. Under overload, enrichment is skipped with a stated reason and
-  raw capture continues. Bound admission; prioritize capture; dispatch at most
-  bounded enrichment work to the shared writer.
-- **Changed-ranges gap:** the change schema carries snapshots, not ranges. B1
-  computes bounded ranges off-path for the fallback; it does not add ranges to
-  `file.changed.v1`.
+  span (created/deleted function), never unreadable content. `projection_version`
+  names the complete algorithm (language selection + extraction queries +
+  diff/pairing + bounds + timeout policy) and is the cache key — a client always
+  knows which projection produced a clip.
+- **Reader API + reusable module.** A public reader endpoint serves the projection
+  for a change (or a bounded range) computed on demand from the immutable blobs.
+  The projection is a **reusable, I/O-scoped module callable against on-disk
+  artifacts**, which the HTTP reader wraps and the Stage 2 TUI can call *without*
+  the bundled UI — the "delete the front-end and replace it" invariant holds
+  because the capability lives in the published projection, not in UI code.
+- **Disposable cache, no log.** Computed results are cached for reuse and may be
+  dropped and rebuilt at any time; nothing is appended to the event log, there is
+  no resume-from-log recovery, no highest-seq replacement convention, and no
+  `policy_seq`. A change's clips are viewable exactly while its blobs are retained
+  — **P5 GC is unchanged** and no capped copies outlive their blobs, so there is
+  no partial resurrection of GC'd content (the honest outcome: no blobs → clips
+  explicitly unavailable, never faked).
+- **Budgets + bounded admission (retained verbatim from the producer plan):**
+  parse only UTF-8 ≤ 1 MiB, 100 ms wall-clock/change; bounded diff/fallback prep
+  *before* any parse so a timeout keeps the fallback; clips capped 300 lines &
+  64 KiB **across the whole array per side** (a multi-span array must not
+  circumvent the cap); fallback = changed ranges ±20 lines; if even bounded ranges
+  can't be produced → `skipped` with reason, never invented ranges.
+- **Cold-cache protection (the D4 risk):** the reader bounds how much parsing it
+  admits concurrently — isolated workers, bounded queue — so a feed requesting
+  many *uncached* changes at once cannot starve capture (a cold cache reproduces
+  eager parsing's contention). Excess requests get an explicit `skipped`/deferred
+  disposition with a reason, never a silent stall; capture is always prioritized.
+- **Changed-ranges:** the change schema carries snapshots, not ranges. The
+  projection computes bounded ranges from the blobs for the fallback; it does not
+  add ranges to `file.changed.v1`.
 
-Scope OUT: tree-sitter function extraction (B2).
+Scope OUT: tree-sitter function extraction (B2); rendering clips in the UI
+(Stage 5, which consumes this projection API).
 
-Tests: half-written unparseable file mid-edit → falls back, event still
-published; worker crash → job resumes from log; oversize/binary → `skipped`/
-`unavailable` with reason.
+Tests: half-written unparseable file → `fallback`, projection still returned;
+uncached change requested cold → computed on demand and cached; cache dropped then
+re-requested → identical result recomputed (same `projection_version`);
+oversize/binary → `skipped`/`unavailable` with reason; a burst of uncached
+requests → bounded admission, capture unaffected, excess deferred with a reason
+(not silently stalled); a change whose blobs were GC'd → clips explicitly
+unavailable with a reason.
 
 **B2 — Extract paired function clips + measured latency gate.**
 Scope IN: tree-sitter integration for an explicit language set (recommend
-JS/JSX/TS/TSX; fall back for unsupported); a parse error *elsewhere* in the file
-does not void a usable enclosing function (mixed event → `fallback` with
-per-hunk + event-level reasons); created/deleted/multiple-function cases +
-edited imports → one event, multiple clips, top-level fallback where appropriate;
-deterministic pairing by diff correspondence (no semantic function-identity or
-move-detection promise) and explicit truncation; **D3 measurement protocol** —
-p50/p99 capture latency baseline-vs-saturation, throughput, skipped counts under
-a predefined protocol, with the numeric pass-bar ratified from the measured
-baseline at review time.
+JS/JSX/TS/TSX; fall back for unsupported) **inside the projection**; a parse error
+*elsewhere* in the file does not void a usable enclosing function (mixed →
+`fallback` with per-hunk + projection-level reasons); created/deleted/multiple-
+function cases + edited imports → one projection result, multiple clips, top-level
+fallback where appropriate; deterministic pairing by diff correspondence (no
+semantic function-identity or move-detection promise) and explicit truncation;
+bump `projection_version` when the algorithm changes (a later version may
+legitimately show different spans for the same change — acceptable for a view,
+provided the version + fallback/truncation reasons are explicit). **D3
+measurement protocol (retained)** — p50/p99 capture latency baseline-vs-saturation,
+throughput, skipped counts under a predefined protocol that drives **concurrent
+cold-cache projection requests** against live capture, with the numeric pass-bar
+ratified from the measured baseline at review time.
 Scope OUT: UI (Stage 5); full both-tracks-on combined acceptance (Stage 5 Q14
-run). B2 measures clip-worker saturation against capture; combined attribution+
-clips acceptance is Stage 5.
+run). B2 measures the reader's parse-worker saturation against capture; combined
+attribution+clips acceptance is Stage 5.
 
 Tests: a change touching several functions, deleting one, editing imports → one
-event, multiple clips, top-level fallback where appropriate; parser workers
-saturated → raw capture latency within the ratified bar (measured).
+projection result, multiple clips, top-level fallback where appropriate;
+concurrent cold-cache clip requests saturating the parse workers → raw capture
+latency within the ratified bar (measured).
 
 ## Fork resolutions (adopted as recommended; not separately ruled)
 
@@ -196,21 +250,33 @@ saturated → raw capture latency within the ratified bar (measured).
   a discarded partial seq *can* be reused → the recovery discipline above.
 - **Fork 2 — evidence identity:** `slipstream.harness.evidence.v1` + native
   `record_id`; dedup derived from the log; persist evidence before attribution.
-- **Fork 3 — reducer:** one shared I/O-free public reducer; daemon uses it to
-  schedule + suppress dupes; HTTP reader keeps serving the raw stream (no hidden
-  projection); clients fold enrichment but keep the change's original seq +
-  `task_hint_id`; independent implementations reproduce the documented fold.
-- **Fork 4 — config:** daemon config file + CLI overrides; effective policy
-  recorded in `slipstream.enrichment.configured.v1`; results reference it via
-  `policy_seq`; **prospective by sequence** (later changes use the new policy;
-  late evidence rescopes an old change under *that change's original* policy;
-  reread/restart never silently rescores history). Clip ceilings (1 MiB / 100 ms
-  / 300 lines / 64 KiB) may only be set **stricter** — raising them is a product
-  decision, out of scope.
+- **Fork 3 — reducer (attribution):** one shared I/O-free public reducer for
+  attribution; daemon uses it to schedule + suppress dupes; HTTP reader keeps
+  serving the raw event stream (no hidden fold of attribution into it); clients
+  fold attribution but keep the change's original seq + `task_hint_id`;
+  independent implementations reproduce the documented fold. Clips (D4) are a
+  *separate, explicit, versioned* projection endpoint over the blobs, not a fold
+  of the event stream and not part of this reducer.
+- **Fork 4 — config:** daemon config file + CLI overrides. For **attribution**,
+  the effective policy is recorded in `slipstream.enrichment.configured.v1` and
+  results reference it via `policy_seq`; **prospective by sequence** (later changes
+  use the new policy; late evidence rescopes an old change under *that change's
+  original* policy; reread/restart never silently rescores history). For **clips**
+  (D4, no `policy_seq`), the bounds live in the `projection_version` instead; the
+  clip ceilings (1 MiB / 100 ms / 300 lines / 64 KiB) may only be set **stricter**
+  — raising them is a product decision, out of scope. Because clips are recomputed
+  on demand, a stricter version simply produces stricter results going forward;
+  there is no persisted history to rescore.
 
 ## Open items to ratify later (not now)
 
 - Native `record_id` / file-scope field mappings for both transcript formats —
   proven with fixtures in **A2**, not guessed now.
 - The numeric capture-latency pass-bar — set from the measured baseline in **B2**.
-- Historical rescoring under a changed policy — explicitly out of initial scope.
+- Historical rescoring under a changed attribution policy — explicitly out of
+  initial scope.
+- **Audit replay of clips** ("what clip was shown at seq N", preserved without
+  keeping old parser binaries) — the one property only a persisted clip event
+  would buy. No requirement needs it; explicitly out of scope under D4. If an
+  audit consumer ever needs it, it returns as a deliberate partial-content
+  retention contract, not a free side effect of logging clips.
