@@ -35,6 +35,8 @@ export const nodeTranscriptFileIO: TranscriptFileIO = {
   },
 };
 
+const FATAL_UTF8 = new TextDecoder('utf8', { fatal: true });
+
 function classifyDirError(err: unknown): 'missing' | 'inaccessible' {
   return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'inaccessible';
 }
@@ -100,9 +102,17 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       const buf = Buffer.allocUnsafe(64 * 1024);
       const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
       if (bytesRead === 0) return { ok: false, reason: 'empty' };
-      const text = buf.subarray(0, bytesRead).toString('utf8');
-      const nl = text.indexOf('\n');
-      return { ok: true, line: nl >= 0 ? text.slice(0, nl) : text };
+      const nl = buf.indexOf(0x0a);
+      const lineBytes = buf.subarray(0, nl >= 0 && nl < bytesRead ? nl : bytesRead);
+      let line: string;
+      try {
+        // Fatal decode: a lossily-decoded id/cwd would coin a fabricated session
+        // identity or membership. Invalid UTF-8 is malformed, not a clean read.
+        line = FATAL_UTF8.decode(lineBytes);
+      } catch {
+        return { ok: false, reason: 'malformed' };
+      }
+      return { ok: true, line };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {

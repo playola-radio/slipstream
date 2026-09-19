@@ -46,7 +46,7 @@ export type TreeResult =
  * can disclose an unreadable/empty candidate instead of silently skipping it). */
 export type FirstLineResult =
   | { ok: true; line: string }
-  | { ok: false; reason: 'inaccessible' | 'empty' };
+  | { ok: false; reason: 'inaccessible' | 'empty' | 'malformed' };
 
 export interface DiscoveryIO {
   /** Absolute paths of `*.jsonl` files directly in `dir` (Claude). */
@@ -174,6 +174,51 @@ async function unresolvedCwdMayBeInRoot(
   return isWithinRoot(root, base);
 }
 
+/** How a transcript's recorded cwd relates to the capture root. */
+type CwdClassification =
+  | { kind: 'in-root'; cwd: string; rootAliases?: string[] }
+  | { kind: 'out-of-root' } // a different worktree's session: skip silently
+  | { kind: 'unresolved-in-root' }; // an in-root candidate we could not read: disclose
+
+/**
+ * Classify a recorded cwd against the capture root, the single membership rule
+ * shared by both harnesses. The recorded cwd — never the on-disk location — is
+ * what establishes which worktree a transcript belongs to, so a slug collision
+ * (Claude) or a shared global sessions dir (Codex) cannot bind another worktree's
+ * session to this root.
+ */
+async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<CwdClassification> {
+  const canonicalCwd = await io.realpath(cwd);
+  if (canonicalCwd === undefined) {
+    return (await unresolvedCwdMayBeInRoot(io, root, cwd))
+      ? { kind: 'unresolved-in-root' }
+      : { kind: 'out-of-root' };
+  }
+  if (!isWithinRoot(root, canonicalCwd)) return { kind: 'out-of-root' };
+  // If the recorded cwd is a non-canonical alias reached through a symlinked
+  // ANCESTOR, its root form relativizes a record's absolute paths the same way
+  // capture's canonical root does. Only trust an alias root that canonicalizes
+  // back to the capture root: a leaf symlink (e.g. /links/alias -> root/pkg)
+  // yields a bogus ancestor (/links) that would mis-scope or invent evidence.
+  let rootAliases: string[] | undefined;
+  if (cwd !== canonicalCwd) {
+    const aliasRoot = resolve(cwd, relative(canonicalCwd, root));
+    if ((await io.realpath(aliasRoot)) === root) rootAliases = [aliasRoot];
+  }
+  return { kind: 'in-root', cwd: canonicalCwd, ...(rootAliases !== undefined ? { rootAliases } : {}) };
+}
+
+/** The top-level `cwd` a Claude transcript record carries, if any (its first line
+ * always records the session's working directory). */
+function parseClaudeCwd(line: string): string | undefined {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    return typeof obj.cwd === 'string' && obj.cwd.length > 0 ? obj.cwd : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function discoverClaude(
   io: DiscoveryIO,
   home: string,
@@ -185,8 +230,39 @@ export async function discoverClaude(
     return { bindings: [], issues: [{ kind: listed.reason, detail: `claude project dir ${dir}` }] };
   }
   const bindings: TranscriptBinding[] = [];
+  const issues: CoverageIssue[] = [];
   for (const path of listed.paths) {
     const sessionId = baseName(path).slice(0, -'.jsonl'.length);
+    // The slug directory alone cannot establish membership: two distinct roots can
+    // collide onto one slug (e.g. /work/a-b and /work/a/b). Validate the transcript's
+    // recorded cwd whenever it is readable; only fall back to trusting the slug when
+    // the first line is unreadable or carries no cwd (an empty/not-yet-written or
+    // summary transcript), which keeps the prior binding without over-disclosing.
+    const head = await io.readFirstLine(path);
+    const recordedCwd = head.ok ? parseClaudeCwd(head.line) : undefined;
+    if (recordedCwd !== undefined) {
+      const cls = await classifyCwd(io, root, recordedCwd);
+      if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
+      if (cls.kind === 'unresolved-in-root') {
+        issues.push({
+          kind: 'inaccessible',
+          detail: `claude transcript ${path} cwd ${recordedCwd} could not be resolved`,
+        });
+        continue;
+      }
+      bindings.push({
+        path,
+        ctx: {
+          harness: 'claude-code',
+          harnessSessionId: sessionId,
+          root,
+          cwd: cls.cwd,
+          adapterVersion: CLAUDE_ADAPTER_VERSION,
+          ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
+        },
+      });
+      continue;
+    }
     bindings.push({
       path,
       ctx: {
@@ -198,7 +274,7 @@ export async function discoverClaude(
       },
     });
   }
-  return { bindings, issues: [] };
+  return { bindings, issues };
 }
 
 function parseSessionMeta(line: string): { id: string; cwd: string } | undefined {
@@ -255,7 +331,10 @@ export async function discoverCodex(
     // sibling conceal it and report coverage as clean).
     const head = await io.readFirstLine(path);
     if (!head.ok) {
-      issues.push({ kind: head.reason === 'empty' ? 'malformed' : 'inaccessible', detail: `codex rollout ${path}` });
+      issues.push({
+        kind: head.reason === 'inaccessible' ? 'inaccessible' : 'malformed',
+        detail: `codex rollout ${path}`,
+      });
       continue;
     }
     const meta = parseSessionMeta(head.line);
@@ -263,28 +342,14 @@ export async function discoverCodex(
       issues.push({ kind: 'malformed', detail: `codex rollout ${path} has no session_meta` });
       continue;
     }
-    const canonicalCwd = await io.realpath(meta.cwd);
-    if (canonicalCwd === undefined) {
-      // Can't canonicalize the cwd. If it could still sit inside this root (directly
-      // or through the root's alias namespace), it is an in-root candidate we failed
-      // to read — disclose the gap rather than let a readable sibling report clean
-      // coverage. A cwd whose nearest living ancestor is outside the root is a
-      // different worktree's session: a genuine non-candidate, skipped silently.
-      if (await unresolvedCwdMayBeInRoot(io, root, meta.cwd)) {
-        issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
-      }
+    const cls = await classifyCwd(io, root, meta.cwd);
+    if (cls.kind === 'out-of-root') continue;
+    if (cls.kind === 'unresolved-in-root') {
+      // An in-root candidate we failed to read: disclose the gap rather than let a
+      // readable sibling report clean coverage. A cwd whose nearest living ancestor
+      // is outside the root is a different worktree's session, skipped silently.
+      issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
       continue;
-    }
-    if (!isWithinRoot(root, canonicalCwd)) continue;
-    // If the recorded cwd is a non-canonical alias reached through a symlinked
-    // ANCESTOR, its root form relativizes a record's absolute paths the same way
-    // capture's canonical root does. Only trust an alias root that canonicalizes
-    // back to the capture root: a leaf symlink (e.g. /links/alias -> root/pkg)
-    // yields a bogus ancestor (/links) that would mis-scope or invent evidence.
-    let rootAliases: string[] | undefined;
-    if (meta.cwd !== canonicalCwd) {
-      const aliasRoot = resolve(meta.cwd, relative(canonicalCwd, root));
-      if ((await io.realpath(aliasRoot)) === root) rootAliases = [aliasRoot];
     }
     bindings.push({
       path,
@@ -292,9 +357,9 @@ export async function discoverCodex(
         harness: 'codex',
         harnessSessionId: meta.id,
         root,
-        cwd: canonicalCwd,
+        cwd: cls.cwd,
         adapterVersion: CODEX_ADAPTER_VERSION,
-        ...(rootAliases !== undefined ? { rootAliases } : {}),
+        ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
       },
     });
   }

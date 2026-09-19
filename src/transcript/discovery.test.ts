@@ -115,6 +115,80 @@ describe('transcript discovery', () => {
     assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('/c/a.jsonl')));
   });
 
+  it('discloses a Codex rollout whose first line is malformed (e.g. invalid UTF-8)', async () => {
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/a.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: false as const, reason: 'malformed' as const }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+      1000,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('/c/a.jsonl')));
+  });
+
+  it('validates the Claude slug by the transcript cwd, skipping a slug-colliding other worktree', async () => {
+    // Roots '/work/proj' and '/work-proj' can collide onto one Claude slug dir. A
+    // transcript whose recorded cwd resolves OUTSIDE the root belongs to the other
+    // worktree: skip it silently (never emit its evidence or report readable).
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const record = (cwd: string) => JSON.stringify({ type: 'user', cwd, message: { content: 'hi' } });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/in.jsonl`, `${dir}/out.jsonl`] }),
+        readFirstLine: async (p) =>
+          p.endsWith('in.jsonl')
+            ? { ok: true as const, line: record('/work/proj/pkg') }
+            : { ok: true as const, line: record('/work/other') },
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.deepEqual(
+      result.bindings.map((b) => b.ctx.harnessSessionId),
+      ['in'],
+      'only the in-root transcript is bound; the colliding out-of-root one is skipped',
+    );
+    assert.equal(result.issues.length, 0, 'an out-of-root sibling is not an issue for this root');
+  });
+
+  it('derives a Claude root alias when the transcript cwd is a symlinked alias of the root', async () => {
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const record = JSON.stringify({ type: 'user', cwd: '/alias/proj', message: { content: 'hi' } });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: record }),
+        realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 1);
+    assert.deepEqual(result.bindings[0]!.ctx.rootAliases, ['/alias/proj']);
+  });
+
+  it('falls back to the slug binding when a Claude first line carries no cwd', async () => {
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: JSON.stringify({ type: 'summary' }) }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.deepEqual(
+      result.bindings.map((b) => [b.ctx.harnessSessionId, b.ctx.cwd]),
+      [['a', ROOT]],
+    );
+  });
+
   it('discloses discovery-limited when the Codex scan is truncated', async () => {
     const result = await discoverCodex(
       io({ listTreeJsonl: async () => ({ paths: [], truncated: true, incomplete: false }) }),

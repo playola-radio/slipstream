@@ -40,3 +40,45 @@ describe('nodeDiscoveryIO.probe', () => {
     });
   });
 });
+
+describe('nodeDiscoveryIO.readFirstLine', () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ss-firstline-'));
+    await writeFile(join(dir, 'good.jsonl'), '{"type":"session_meta"}\n{"more":1}\n');
+    await writeFile(join(dir, 'empty.jsonl'), '');
+    // A first line whose id string carries a raw 0xFF byte (invalid UTF-8).
+    await writeFile(
+      join(dir, 'badutf8.jsonl'),
+      Buffer.concat([Buffer.from('{"type":"session_meta","payload":{"id":"s', 'utf8'), Buffer.from([0xff]), Buffer.from('","cwd":"/x"}}\n', 'utf8')]),
+    );
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('returns the first line of a readable file', async () => {
+    assert.deepEqual(await nodeDiscoveryIO.readFirstLine(join(dir, 'good.jsonl')), {
+      ok: true,
+      line: '{"type":"session_meta"}',
+    });
+  });
+
+  it('reports an empty file distinctly', async () => {
+    assert.deepEqual(await nodeDiscoveryIO.readFirstLine(join(dir, 'empty.jsonl')), {
+      ok: false,
+      reason: 'empty',
+    });
+  });
+
+  it('reports an invalid-UTF-8 first line as malformed, never a lossily-decoded string', async () => {
+    // Lossy decoding would coin a "s�" id that JSON.parse accepts, fabricating a
+    // session identity. A fatal decode reports the line malformed instead.
+    assert.deepEqual(await nodeDiscoveryIO.readFirstLine(join(dir, 'badutf8.jsonl')), {
+      ok: false,
+      reason: 'malformed',
+    });
+  });
+});
