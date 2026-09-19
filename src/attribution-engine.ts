@@ -44,8 +44,10 @@ export interface AttributionEngineOptions {
   clearTimer: (handle: TimerHandle) => void;
   /** The current evidence events to fold (the log, in the wired engine). */
   readEvents: () => readonly AnyEvent[];
-  /** Append an attribution result; resolves once durable. */
-  appendAttribution: (data: Omit<ChangeAttributionData, 'session_id'>) => Promise<AnyEvent>;
+  /** Append an attribution result; resolves once durable. A rejection is treated
+   * as a transient storage fault — the result stays unpublished and is retried on
+   * the next evaluation, so enrichment never crashes or blocks capture. */
+  appendAttribution: (data: Omit<ChangeAttributionData, 'session_id'>) => Promise<unknown>;
 }
 
 export interface AttributionEngine {
@@ -55,8 +57,15 @@ export interface AttributionEngine {
   /** Evidence changed: re-evaluate every already-graced change now (no new grace).
    * Changes still inside their grace window pick the evidence up at their deadline. */
   onEvidenceChanged(): void;
+  /** Seed a change's last published result so replay dedups a reproduced result
+   * (prevents double-attribution across a restart). Call before onChangeCommitted. */
+  seedPublished(changeSeq: bigint, data: Omit<ChangeAttributionData, 'session_id'>): void;
   /** Resolve once all requested evaluations have settled. */
   drain(): Promise<void>;
+  /** Permanently disable this engine: cancel its timer, ignore further input, and
+   * resolve once the in-flight evaluation settles. The producer discards a stopped
+   * engine and builds a fresh one on the next start (generation boundary). */
+  stop(): Promise<void>;
 }
 
 interface Tracked extends CommittedChange {
@@ -72,6 +81,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
   const changes = new Map<bigint, Tracked>();
   const published = new Map<bigint, Omit<ChangeAttributionData, 'session_id'>>();
   let timer: TimerHandle | undefined;
+  let stopped = false;
 
   // Serialized evaluate+publish queue. Per-change dedup collapses redundant
   // requests; the pump processes one evaluation at a time.
@@ -81,7 +91,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
   let pumping = false;
 
   const requestEval = (changeSeq: bigint): void => {
-    if (queued.has(changeSeq)) return;
+    if (stopped || queued.has(changeSeq)) return;
     queued.add(changeSeq);
     queue.push(changeSeq);
     if (!pumping) pumpPromise = pump();
@@ -102,6 +112,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
   };
 
   const evaluate = async (changeSeq: bigint): Promise<void> => {
+    if (stopped) return;
     const c = changes.get(changeSeq);
     if (!c) return;
     const invocations = foldEvidence(readEvents()).values();
@@ -124,7 +135,12 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
     };
     const prev = published.get(changeSeq);
     if (prev && attributionResultsEqual(prev, data)) return;
-    await appendAttribution(data);
+    try {
+      await appendAttribution(data);
+    } catch {
+      return; // transient storage fault: leave unpublished so a later eval retries
+    }
+    if (stopped) return; // fenced after the append: a fresh generation owns state now
     published.set(changeSeq, data);
   };
 
@@ -143,6 +159,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
 
   const onTimer = (): void => {
     timer = undefined;
+    if (stopped) return;
     const t = now();
     for (const c of changes.values()) {
       if (!c.graced && c.deadlineMs !== undefined && c.deadlineMs <= t) {
@@ -153,8 +170,15 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
     rescheduleTimer();
   };
 
+  const seedPublished = (
+    changeSeq: bigint,
+    data: Omit<ChangeAttributionData, 'session_id'>,
+  ): void => {
+    published.set(changeSeq, data);
+  };
+
   const onChangeCommitted = (change: CommittedChange): void => {
-    if (changes.has(change.changeSeq)) return; // idempotent
+    if (stopped || changes.has(change.changeSeq)) return; // idempotent
     const { interval } = change;
     const deadlineMs =
       interval !== undefined && !('unavailable' in interval)
@@ -171,6 +195,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
   };
 
   const onEvidenceChanged = (): void => {
+    if (stopped) return;
     for (const c of changes.values()) {
       if (c.graced) requestEval(c.changeSeq);
     }
@@ -180,5 +205,14 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
     await pumpPromise;
   };
 
-  return { onChangeCommitted, onEvidenceChanged, drain };
+  const stop = async (): Promise<void> => {
+    stopped = true;
+    if (timer !== undefined) {
+      clearTimer(timer);
+      timer = undefined;
+    }
+    await pumpPromise;
+  };
+
+  return { onChangeCommitted, onEvidenceChanged, seedPublished, drain, stop };
 }
