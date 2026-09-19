@@ -60,12 +60,19 @@ test('a version upgrade recomputes the same blobs after discarding the old proce
   }) });
   assert.equal((await old.get(req)).projection_version, 'clip.v1');
   await old.close();
-  const current = createClipProjectionService({ storeDir: dir });
+  // This tests cache/version behavior, not cold worker startup speed. The real
+  // I/O computation remains intact; worker/deadline behavior has separate tests.
+  let recomputes = 0;
+  const current = createClipProjectionService({ storeDir: dir, compute: job => {
+    recomputes++;
+    return { promise: computeClipProjection(job), cancel: () => {} };
+  } });
   try {
     const result = await current.get(req);
     assert.equal(result.projection_version, 'clip.v3');
     assert.equal(result.status, 'ready');
     assert.equal(result.clips[0]!.after.method, 'function');
+    assert.equal(recomputes, 1);
   } finally { await current.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
