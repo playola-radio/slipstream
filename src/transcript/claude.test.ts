@@ -1,0 +1,97 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { claudeStep, initialClaudeState, type ClaudeState } from './claude.ts';
+import type { AdapterContext, Diagnostic } from './types.ts';
+import type { NormalizedEvidence } from '../evidence-ingest.ts';
+
+const CTX: AdapterContext = {
+  harness: 'claude-code',
+  harnessSessionId: 'claude-sess-1',
+  root: '/work/proj',
+  cwd: '/work/proj',
+  adapterVersion: 'claude-code/1',
+};
+
+async function runFixture(): Promise<{ evidence: NormalizedEvidence[]; diagnostics: Diagnostic[] }> {
+  const path = fileURLToPath(new URL('./fixtures/claude-sample.json', import.meta.url));
+  const records = JSON.parse(await readFile(path, 'utf8')) as unknown[];
+  let state: ClaudeState = initialClaudeState();
+  const evidence: NormalizedEvidence[] = [];
+  const diagnostics: Diagnostic[] = [];
+  for (const record of records) {
+    const out = claudeStep(state, record, CTX);
+    state = out.state;
+    evidence.push(...out.evidence);
+    diagnostics.push(...out.diagnostics);
+  }
+  return { evidence, diagnostics };
+}
+
+describe('claude transcript adapter', () => {
+  it('maps native tool_use ids to record_id, namespaced by session', async () => {
+    const { evidence } = await runFixture();
+    const starts = evidence.filter((e) => e.timestamp.basis === 'tool-start');
+    assert.deepEqual(
+      starts.map((e) => e.evidence_key.record_id),
+      ['toolu_write_a', 'toolu_edit_notebook', 'toolu_bash_1'],
+    );
+    for (const e of evidence) {
+      assert.equal(e.evidence_key.harness, 'claude-code');
+      assert.equal(e.evidence_key.harness_session_id, 'claude-sess-1');
+    }
+  });
+
+  it('scopes write tools to root-relative paths matching capture format', async () => {
+    const { evidence } = await runFixture();
+    const write = evidence.find((e) => e.evidence_key.record_id === 'toolu_write_a')!;
+    assert.deepEqual(write.file_scope, { kind: 'paths', paths: ['src/a.ts'] });
+    const notebook = evidence.find((e) => e.evidence_key.record_id === 'toolu_edit_notebook')!;
+    assert.deepEqual(notebook.file_scope, { kind: 'paths', paths: ['notes/run.ipynb'] });
+  });
+
+  it('emits nothing for read-only tools', async () => {
+    const { evidence } = await runFixture();
+    assert.equal(
+      evidence.some((e) => e.evidence_key.record_id === 'toolu_read_b'),
+      false,
+    );
+  });
+
+  it('discloses Bash as an unknown-scope possible writer', async () => {
+    const { evidence } = await runFixture();
+    const bash = evidence.filter((e) => e.evidence_key.record_id === 'toolu_bash_1');
+    assert.equal(bash.length, 2, 'a start and an end');
+    for (const e of bash) assert.equal(e.file_scope.kind, 'unknown');
+    assert.equal(bash[0]!.tool_name, 'Bash');
+  });
+
+  it('drops a write outside the capture root', async () => {
+    const { evidence } = await runFixture();
+    assert.equal(
+      evidence.some((e) => e.evidence_key.record_id === 'toolu_write_outside'),
+      false,
+    );
+  });
+
+  it('joins a result to its start as a same-key tool-end record, not a conflict', async () => {
+    const { evidence } = await runFixture();
+    const write = evidence.filter((e) => e.evidence_key.record_id === 'toolu_write_a');
+    assert.equal(write.length, 2);
+    const [start, end] = write;
+    assert.equal(start!.timestamp.basis, 'tool-start');
+    assert.equal(end!.timestamp.basis, 'tool-end');
+    assert.deepEqual(start!.file_scope, end!.file_scope);
+    assert.equal(start!.tool_name, end!.tool_name);
+    assert.ok(end!.timestamp.at_ms > start!.timestamp.at_ms);
+  });
+
+  it('ignores an orphan tool_result whose start was never seen', async () => {
+    const { evidence } = await runFixture();
+    assert.equal(
+      evidence.some((e) => e.evidence_key.record_id === 'toolu_never_started'),
+      false,
+    );
+  });
+});
