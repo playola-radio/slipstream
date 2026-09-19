@@ -405,6 +405,19 @@ describe('daemon maintenance verbs', () => {
     });
   });
 
+  it('discloses committed removal when history cleanup fails after the tombstone', async () => {
+    await withDaemon(async ({ store, call }) => {
+      // events.jsonl as a directory makes the history unlink fail AFTER the tombstone
+      // is durable: the response must say removal committed + cleanup retryable, and
+      // the tombstone must survive (never rolled back).
+      await mkdir(join(store, 'sessions', ABSENT_ID, 'events.jsonl'), { recursive: true });
+      const res = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE');
+      assert.match(res.ok === false ? res.message : '', /logically removed|retryable/i);
+      assert.equal(await exists(tombstonePath(store, ABSENT_ID)), true);
+    });
+  });
+
   it('reclaims an unreferenced blob and keeps a referenced one', async () => {
     await withDaemon(async ({ store, call }) => {
       await seedSession(store, ABSENT_ID, HEX_LIVE); // retained, references HEX_LIVE

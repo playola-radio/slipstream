@@ -41,11 +41,10 @@ function blobBaseDir(storeDir: string): string {
   return dirname(dirname(blobPath(storeDir, '0'.repeat(64))));
 }
 
-/** Signals that in-progress destructive work must stop (e.g. the daemon lost its
- * store lock and a successor may now own the shared blobs). */
-export interface SweepAbort {
-  aborted(): boolean;
-}
+/** Predicate signalling that in-progress destructive work must stop (e.g. the
+ * daemon lost its store lock and a successor may now own the shared blobs).
+ * Returns true once the sweep must abort without deleting anything further. */
+export type SweepAbort = () => boolean;
 
 /**
  * Durably publish `sessions/<id>/removed.json = {"version":1}`: unique temp,
@@ -114,7 +113,7 @@ export async function sessionExists(storeDir: string, id: string): Promise<boole
  * Mark-and-sweep the global CAS: delete every blob NOT referenced by any
  * non-removed session's durable log. Returns the number of blobs unlinked.
  * Throws (deleting nothing further) if the mark phase cannot be completed
- * safely, or if {@link SweepAbort.aborted} trips before an unlink.
+ * safely, or if the {@link SweepAbort} predicate trips before an unlink.
  */
 export async function reclaimUnreferencedBlobs(storeDir: string, abort: SweepAbort): Promise<number> {
   const live = new Set<string>();
@@ -144,14 +143,24 @@ async function collectBlobRefs(storeDir: string, id: string, live: Set<string>):
     throw new StorageError('gc-mark-open', err);
   }
   try {
+    // Validate every complete record through the log's PHYSICAL end — never stop at
+    // the final record's declared seq. `readThrough(boundary + 1n)` keeps consuming
+    // past the high-water, so a log whose tail rewinds below an interior seq (e.g.
+    // 1, 2, 1) is caught by the cursor's contiguity check or the reached-seq
+    // assertion below, rather than silently skipping the records after the boundary.
     let seq = 0n;
-    while (seq < boundary) {
-      const batch = await cursor.readThrough(boundary); // throws LogCorruptError on corruption
-      if (!batch.length) throw new LogCorruptError('gc-mark: log short of durable high-water');
+    for (;;) {
+      const batch = await cursor.readThrough(boundary + 1n); // throws on non-contiguous seq
+      if (!batch.length) break; // physical EOF (or a torn, uncommitted tail)
       for (const ev of batch) {
         addRefsFromEvent(ev.type, ev.data, live);
         seq = ev.seq;
       }
+    }
+    if (seq !== boundary) {
+      // The last complete record read is not the durable high-water: the log is
+      // short of, or runs past, its own final seq — corruption. Delete nothing.
+      throw new LogCorruptError(`gc-mark: read to seq ${seq}, not durable high-water ${boundary}`);
     }
   } finally {
     await cursor.close();
@@ -216,7 +225,7 @@ async function sweepBlobs(storeDir: string, live: Set<string>, abort: SweepAbort
     for (const name of names) {
       if (!isValidHex(name) || name.slice(0, 2) !== shard) continue; // temp/stray/misplaced
       if (live.has(name)) continue;
-      if (abort.aborted()) {
+      if (abort()) {
         throw new StorageError('gc-sweep-aborted', new Error('store ownership lost mid-sweep'));
       }
       try {

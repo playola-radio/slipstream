@@ -538,9 +538,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   ): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     if (state !== 'detached') {
-      if (state === 'active') return errFields('SESSION_ACTIVE', 'detach the active session before deleting or collecting');
+      // A capture in any stage — attaching, active, or detaching — is SESSION_ACTIVE;
+      // CAPTURE_NOT_READY is reserved for the maintenance-slot contention below.
       if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
-      return errFields('CAPTURE_NOT_READY', `cannot run maintenance while ${state}`);
+      return errFields('SESSION_ACTIVE', `a capture session is ${state}; detach it before deleting or collecting`);
     }
     if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'another maintenance operation is running; retry shortly');
     let release!: () => void;
@@ -562,19 +563,37 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     const id = req.session_id;
     return runMaintenance(async () => {
-      if (!(await sessionExists(storeDir, id))) {
-        return errFields('SESSION_NOT_FOUND', `no session ${id} to delete`);
+      let present: boolean;
+      try {
+        present = await sessionExists(storeDir, id);
+      } catch (err) {
+        return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
       }
+      if (!present) return errFields('SESSION_NOT_FOUND', `no session ${id} to delete`);
       // Durable-tombstone-first: publish the marker (fsynced) BEFORE removing any
       // history, so a crash in between leaves a session the reader already serves as
-      // gone and a later gc finishes the cleanup.
-      await publishTombstone(storeDir, id);
+      // gone and a later gc finishes the cleanup. Nothing is committed yet, so a
+      // failure here is a plain STORAGE_UNAVAILABLE — no rollback needed.
+      try {
+        await publishTombstone(storeDir, id);
+      } catch (err) {
+        return errFields('STORAGE_UNAVAILABLE', `could not durably record deletion of ${id}: ${(err as Error).message}`);
+      }
       // Now that the tombstone is durable, abort any in-flight follower of this
       // session so it re-resolves, re-reads the tombstone, and gets 410 rather than
       // streaming a log we are about to delete. The reader's installIfAbsent gives a
       // followed retained session a registry entry this freeze can reach.
       registry.freeze(id, 0n);
-      await removeSessionHistory(storeDir, id);
+      // The tombstone is durable → the session is logically removed and the marker is
+      // never rolled back. If we have since lost the store lock, or history cleanup
+      // fails, report that removal committed and cleanup is retryable via gc.
+      const committed = `session ${id} is logically removed (tombstone durable); history cleanup is retryable via gc`;
+      if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', committed);
+      try {
+        await removeSessionHistory(storeDir, id);
+      } catch (err) {
+        return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
+      }
       return { session_id: id };
     });
   }
@@ -584,15 +603,22 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       try {
         // Finish any interrupted deletion first: a session tombstoned by a
         // delete_session that crashed before cleanup still carries residual history.
-        // Re-establish the tombstone's durability and complete the removal.
+        // Re-establish the tombstone's durability, invalidate any follower a partial
+        // delete left pinned, then complete the removal — the same publish -> freeze
+        // -> remove sequence delete_session runs. Stop before any mutation if we lose
+        // the store lock: a successor now owns this store's files.
         for (const s of await listSessions(storeDir)) {
           if (!s.removed) continue;
+          if (compromised || torn) {
+            throw new StorageError('gc-aborted', new Error('store ownership lost mid-cleanup'));
+          }
           await publishTombstone(storeDir, s.id);
+          registry.freeze(s.id, 0n);
           await removeSessionHistory(storeDir, s.id);
         }
         // Abort mid-sweep if we lose the store lock: a successor may then own the
         // shared blobs, and deleting one it still references would be data loss.
-        const removed = await reclaimUnreferencedBlobs(storeDir, { aborted: () => torn || compromised });
+        const removed = await reclaimUnreferencedBlobs(storeDir, () => torn || compromised);
         return { removed };
       } catch (err) {
         // A corrupt/missing retained log or an aborted sweep deletes nothing; report

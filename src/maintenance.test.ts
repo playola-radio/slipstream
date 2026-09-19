@@ -12,7 +12,7 @@ import { LogCorruptError } from './log-reader.ts';
 
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
-const NEVER_ABORT = { aborted: () => false };
+const NEVER_ABORT = () => false;
 
 const HEX_LIVE = 'a'.repeat(64);
 const HEX_DEAD = 'b'.repeat(64);
@@ -117,15 +117,26 @@ describe('maintenance: mark-and-sweep blob reclamation', () => {
     assert.equal(await exists(blobPath(dir, HEX_DEAD)), false);
   });
 
-  it('keeps a blob shared with a retained session even if another session is removed', async () => {
+  it('keeps a blob two retained sessions both reference', async () => {
     const dir = await emptyStore();
-    await writeSession(dir, A, [baselined(1, HEX_SHARED)]);            // retained, references it
-    await mkdir(join(dir, 'sessions', B), { recursive: true });        // removed, no log
-    await writeFile(tombstonePath(dir, B), '{"version":1}', 'utf8');
+    await writeSession(dir, A, [baselined(1, HEX_SHARED)]); // both retained sessions
+    await writeSession(dir, B, [baselined(1, HEX_SHARED)]); // reference the same blob
     await writeBlob(dir, HEX_SHARED);
     const removed = await reclaimUnreferencedBlobs(dir, NEVER_ABORT);
     assert.equal(removed, 0);
     assert.equal(await exists(blobPath(dir, HEX_SHARED)), true);
+  });
+
+  it('aborts (deletes nothing) when the log tail rewinds below its high-water', async () => {
+    const dir = await emptyStore();
+    // A physically-last record whose seq (1) is below an interior record (2): the
+    // mark must read past the declared high-water, not stop at it, or record 2's
+    // blob is missed and swept. Record 2 references HEX_DEAD; only reading to EOF
+    // (and catching the rewind) keeps it.
+    await writeSession(dir, A, [baselined(1, HEX_LIVE), baselined(2, HEX_DEAD), baselined(1, HEX_LIVE)]);
+    await writeBlob(dir, HEX_DEAD);
+    await assert.rejects(() => reclaimUnreferencedBlobs(dir, NEVER_ABORT), LogCorruptError);
+    assert.equal(await exists(blobPath(dir, HEX_DEAD)), true, 'no blob deleted on a rewound-tail mark');
   });
 
   it('an incomplete mark phase (corrupt retained log) deletes nothing', async () => {
@@ -157,7 +168,7 @@ describe('maintenance: mark-and-sweep blob reclamation', () => {
     const dir = await emptyStore();
     await writeBlob(dir, HEX_DEAD);
     await assert.rejects(
-      () => reclaimUnreferencedBlobs(dir, { aborted: () => true }),
+      () => reclaimUnreferencedBlobs(dir, () => true),
       StorageError,
     );
     assert.equal(await exists(blobPath(dir, HEX_DEAD)), true);
