@@ -364,7 +364,12 @@ events.
 - Half-written unparseable file mid-edit → falls back, event still published.
 - Parser workers saturated → raw capture latency unchanged (measured).
 
-**Status**: Not Started
+**Status**: Not Started. PR graph designed via Codex consult and ratified
+(Brian D1–D3, 2026-09-19): a 4-PR / 2-track shape — Track A attribution
+(A1 engine+contracts with fake evidence → A2 real transcript adapters), Track B
+clips (B1 bounded async workers+fallback → B2 tree-sitter extraction + measured
+latency gate). See `STAGE-4-PLAN.md` for the resolved schema forks, the
+D2 candidate-eligibility narrowing, and the D3 deferred latency bar.
 
 ---
 
