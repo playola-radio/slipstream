@@ -42,41 +42,42 @@ export interface TranscriptWatcher {
   tick(): Promise<void>;
 }
 
-/** Map a per-file terminal read state to the coverage issue it discloses (a
- * successfully-read file — `readable`/`degraded` — reports its own diagnostics
- * separately and adds none here). */
-function fileStateIssue(result: FileReadResult, path: string): CoverageIssue | undefined {
-  if (result.state === 'missing') return { kind: 'missing', detail: `transcript ${path} disappeared` };
-  if (result.state === 'inaccessible') return { kind: 'inaccessible', detail: `transcript ${path} unreadable` };
-  return undefined;
-}
-
 /**
  * Fold discovery issues and per-file read results into one honest coverage
  * verdict. A file that was actually read (`readable`/`degraded`) counts as
- * coverage; a `missing`/`inaccessible` file did not. Any issue at all downgrades
- * a successful read to `degraded` so one readable transcript never conceals an
- * unreadable sibling. With nothing read, a hard failure is `unavailable` while a
+ * coverage; a `missing`/`inaccessible` file did not. Any issue at all — or a file
+ * whose evidence is still held back by ingestion backpressure — downgrades a
+ * successful read to `degraded`, so one readable transcript never conceals an
+ * unreadable sibling and `readable` never claims a scope whose evidence has not
+ * yet been recorded. With nothing read, a hard failure is `unavailable` while a
  * merely-not-yet-written home stays `pending`.
  */
 export function aggregateCoverage(
   discoveryIssues: readonly CoverageIssue[],
-  files: ReadonlyArray<{ state: FileReadResult['state']; issues: FileReadResult['issues']; path?: string }>,
+  files: ReadonlyArray<{
+    state: FileReadResult['state'];
+    issues: FileReadResult['issues'];
+    backpressured?: boolean;
+    path?: string;
+  }>,
 ): { state: CoverageState; issues: CoverageIssue[] } {
   const issues: CoverageIssue[] = [...discoveryIssues];
   let readCount = 0;
+  let backpressured = false;
   for (const f of files) {
     if (f.state === 'readable' || f.state === 'degraded') {
       readCount += 1;
+      if (f.backpressured) backpressured = true;
       for (const d of f.issues) issues.push({ kind: d.kind, detail: d.detail });
+    } else if (f.state === 'missing') {
+      issues.push({ kind: 'missing', detail: `transcript ${f.path ?? 'transcript'} disappeared` });
     } else {
-      const issue = fileStateIssue({ state: f.state, issues: f.issues, backpressured: false }, f.path ?? 'transcript');
-      if (issue) issues.push(issue);
+      issues.push({ kind: 'inaccessible', detail: `transcript ${f.path ?? 'transcript'} unreadable` });
     }
   }
   let state: CoverageState;
   if (readCount > 0) {
-    state = issues.length > 0 ? 'degraded' : 'readable';
+    state = issues.length > 0 || backpressured ? 'degraded' : 'readable';
   } else {
     const hardFailure = issues.some((i) => i.kind !== 'missing');
     state = hardFailure ? 'unavailable' : 'pending';
@@ -98,7 +99,10 @@ function makeStepper(harness: HarnessName, ctx: AdapterContext) {
 
 export function createTranscriptWatcher(opts: TranscriptWatcherOptions): TranscriptWatcher {
   const { harness, home, root, codexScanLimit, discoveryIO, fileIO, sink, publish } = opts;
-  const readers = new Map<string, ReturnType<typeof createTranscriptFileReader>>();
+  const readers = new Map<
+    string,
+    { reader: ReturnType<typeof createTranscriptFileReader>; sessionId: string }
+  >();
   let lastKey: string | undefined;
 
   const tick = async (): Promise<void> => {
@@ -110,20 +114,36 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
       codexScanLimit,
     );
 
-    const perFile: Array<{ state: FileReadResult['state']; issues: FileReadResult['issues']; path: string }> = [];
+    const perFile: Array<{
+      state: FileReadResult['state'];
+      issues: FileReadResult['issues'];
+      backpressured: boolean;
+      path: string;
+    }> = [];
     for (const binding of bindings) {
-      let reader = readers.get(binding.path);
-      if (!reader) {
-        reader = createTranscriptFileReader({
-          path: binding.path,
-          io: fileIO,
-          sink,
-          stepper: makeStepper(harness, binding.ctx),
-        });
-        readers.set(binding.path, reader);
+      // A path whose bound session id changed is a rotated transcript (the same
+      // file name now belongs to a different harness session); its old reader's
+      // offset and join state no longer apply, so drop it and reread from zero.
+      let entry = readers.get(binding.path);
+      if (!entry || entry.sessionId !== binding.ctx.harnessSessionId) {
+        entry = {
+          reader: createTranscriptFileReader({
+            path: binding.path,
+            io: fileIO,
+            sink,
+            stepper: makeStepper(harness, binding.ctx),
+          }),
+          sessionId: binding.ctx.harnessSessionId,
+        };
+        readers.set(binding.path, entry);
       }
-      const result = await reader.poll();
-      perFile.push({ state: result.state, issues: result.issues, path: binding.path });
+      const result = await entry.reader.poll();
+      perFile.push({
+        state: result.state,
+        issues: result.issues,
+        backpressured: result.backpressured,
+        path: binding.path,
+      });
     }
 
     const coverage = aggregateCoverage(discoveryIssues, perFile);
@@ -133,8 +153,8 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
         : { harness, state: coverage.state };
     const key = coverageKey(data);
     if (key !== lastKey) {
-      lastKey = key;
       await publish(data);
+      lastKey = key;
     }
   };
 

@@ -29,8 +29,8 @@ const emptyFileIO: TranscriptFileIO = {
 function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
   return {
     listDir: async (): Promise<ListResult> => ({ ok: false, reason: 'missing' }),
-    listTreeJsonl: async () => ({ paths: [], truncated: false }),
-    readFirstLine: async () => undefined,
+    listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
+    readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
     ...overrides,
   };
@@ -48,7 +48,7 @@ describe('coverage runner', () => {
       publish: async (d) => {
         published.push(d.harness);
       },
-      discoveryIO: discoveryIO({ listTreeJsonl: async () => ({ paths: [], truncated: false }) }),
+      discoveryIO: discoveryIO({ listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }) }),
       fileIO: emptyFileIO,
       intervalMs: 1000,
     });

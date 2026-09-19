@@ -49,8 +49,8 @@ class FakeSink implements EvidenceSink {
 function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
   return {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
-    listTreeJsonl: async () => ({ paths: [], truncated: false }),
-    readFirstLine: async () => undefined,
+    listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
+    readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
     ...overrides,
   };
@@ -106,6 +106,14 @@ describe('coverage aggregation', () => {
     ]);
     assert.equal(r.state, 'degraded');
     assert.equal(r.issues.some((i) => i.kind === 'inaccessible'), true);
+  });
+
+  it('is degraded, not readable, while a file still has backpressured evidence', () => {
+    // The file read cleanly (no content issue) but some evidence was held back by
+    // ingestion backpressure, so coverage must not claim the scope is fully recorded.
+    const r = aggregateCoverage([], [{ state: 'readable', issues: [], backpressured: true }]);
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues.length, 0, 'backpressure degrades without inventing an issue kind');
   });
 });
 
@@ -198,6 +206,49 @@ describe('transcript watcher', () => {
     await watcher.tick(); // no new bytes, dedup absorbs re-reads
     assert.equal(sink.appended.length, 1);
     assert.deepEqual(published, ['pending', 'readable']);
+  });
+
+  it('recreates a reader when a path is rebound to a different harness session', async () => {
+    // Same Codex rollout bytes and inode across ticks, but discovery reports a
+    // different session_meta id the second time. Nothing in the file-reader itself
+    // (offset/inode) would trigger a reread, so only the watcher's session-rotation
+    // guard can re-emit the record under the new identity.
+    const path = '/home/sessions/2026/09/19/rollout.jsonl';
+    const metaLine = (id: string) =>
+      JSON.stringify({ type: 'session_meta', timestamp: '2026-09-19T12:00:00.000Z', payload: { id, cwd: ROOT } });
+    const call = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-09-19T12:00:01.000Z',
+      payload: { type: 'function_call', name: 'shell', call_id: 'call_1', arguments: '{}' },
+    });
+    const file = new FakeFile();
+    file.append(metaLine('thread-1') + '\n' + call + '\n');
+    const files = new Map([[path, file]]);
+    let sessionId = 'thread-1';
+    const watcher = createTranscriptWatcher({
+      harness: 'codex',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listTreeJsonl: async () => ({ paths: [path], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true, line: metaLine(sessionId) }),
+        realpath: async (p) => p,
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick();
+    sessionId = 'thread-2';
+    await watcher.tick();
+    assert.deepEqual(
+      sink.appended
+        .filter((e) => e.evidence_key.record_id === 'call_1' && e.timestamp.basis === 'tool-start')
+        .map((e) => e.evidence_key.harness_session_id)
+        .sort(),
+      ['thread-1', 'thread-2'],
+    );
   });
 
   it('reports unavailable when the transcript home is inaccessible', async () => {

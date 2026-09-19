@@ -152,9 +152,9 @@ export function resolveConfig(
   file: ConfigOverrides,
   cli: ConfigOverrides,
   homeDir: string,
-): { config: ResolvedConfig; warnings: string[] } {
+): ResolvedConfig {
   const withFile = applyLayer(defaultConfig(homeDir), file, homeDir);
-  return { config: applyLayer(withFile, cli, homeDir), warnings: [] };
+  return applyLayer(withFile, cli, homeDir);
 }
 
 export interface ConfigIO {
@@ -184,6 +184,6 @@ export async function loadConfig(
       warnings.push(...parsed.warnings);
     }
   }
-  const resolved = resolveConfig(fileOverrides, opts.cli ?? {}, opts.homeDir);
-  return { config: resolved.config, warnings: [...warnings, ...resolved.warnings] };
+  const config = resolveConfig(fileOverrides, opts.cli ?? {}, opts.homeDir);
+  return { config, warnings };
 }

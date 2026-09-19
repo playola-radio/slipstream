@@ -62,7 +62,7 @@ describe('resolveConfig', () => {
   it('layers CLI over file over defaults', () => {
     const file = { windowMs: 3000, graceMs: 6000, codexScanLimit: 100 };
     const cli = { windowMs: 9000, sources: { codex: 'configured' as const } };
-    const { config } = resolveConfig(file, cli, HOME);
+    const config = resolveConfig(file, cli, HOME);
     assert.equal(config.policy.window_ms, 9000, 'CLI wins');
     assert.equal(config.policy.grace_ms, 6000, 'file kept where CLI is silent');
     assert.equal(config.transcript.codexScanLimit, 100);
@@ -71,7 +71,7 @@ describe('resolveConfig', () => {
   });
 
   it('resolves relative home overrides to absolute paths', () => {
-    const { config } = resolveConfig({}, { homes: { codex: 'rel/codex' } }, HOME);
+    const config = resolveConfig({}, { homes: { codex: 'rel/codex' } }, HOME);
     assert.equal(config.transcript.homes.codex.startsWith('/'), true);
   });
 });

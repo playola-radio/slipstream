@@ -100,14 +100,16 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
       } catch {
         return { state: 'inaccessible', issues, backpressured: false };
       }
-      const text = buf.toString('utf8');
-      const parts = text.split('\n');
-      // The final element has no trailing newline: an incomplete line we leave
-      // for a later poll (do not advance past it).
-      for (let i = 0; i < parts.length - 1; i++) {
-        const line = parts[i]!;
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // + '\n'
-        const trimmed = line.trim();
+      // Split on newline BYTES, not decoded characters: invalid UTF-8 decodes to
+      // a 3-byte replacement char, so measuring a decoded line's length would
+      // advance the cursor past bytes that were never there and skip live records.
+      // Bytes after the last newline are an incomplete line, left for a later poll.
+      let lineStart = 0;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] !== 0x0a) continue;
+        const lineBytes = i - lineStart + 1; // through the newline
+        const trimmed = buf.subarray(lineStart, i).toString('utf8').trim();
+        lineStart = i + 1;
         if (trimmed.length > 0) {
           let record: unknown;
           try {

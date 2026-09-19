@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { applyPatchPaths, codexStep, initialCodexState, type CodexState } from './codex.ts';
+import { codexStep, initialCodexState, type CodexState } from './codex.ts';
 import type { AdapterContext, Diagnostic } from './types.ts';
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 
@@ -97,11 +97,35 @@ describe('codex transcript adapter', () => {
     assert.deepEqual(out.evidence[0]!.file_scope, { kind: 'paths', paths: ['pkg/a.ts'] });
   });
 
-  describe('applyPatchPaths', () => {
-    it('parses every envelope header kind', () => {
-      const patch =
-        '*** Begin Patch\n*** Add File: a\n*** Update File: b\n*** Move to: c\n*** Delete File: d\n*** End Patch';
-      assert.deepEqual(applyPatchPaths(patch), ['a', 'b', 'c', 'd']);
-    });
+  it('reports a tool call without a stable call_id as unsupported, not evidence', () => {
+    const record = {
+      type: 'response_item',
+      timestamp: '2026-09-19T12:00:05.000Z',
+      payload: {
+        type: 'custom_tool_call',
+        name: 'apply_patch',
+        input: '*** Begin Patch\n*** Add File: a.ts\n+x\n*** End Patch\n',
+      },
+    };
+    const out = codexStep(initialCodexState(), record, CTX);
+    assert.equal(out.evidence.length, 0);
+    assert.equal(out.diagnostics.length, 1);
+    assert.equal(out.diagnostics[0]!.kind, 'unsupported');
+  });
+
+  it('reports a tool call with an empty call_id as unsupported', () => {
+    const record = {
+      type: 'response_item',
+      timestamp: '2026-09-19T12:00:05.000Z',
+      payload: {
+        type: 'custom_tool_call',
+        name: 'apply_patch',
+        call_id: '',
+        input: '*** Begin Patch\n*** Add File: a.ts\n+x\n*** End Patch\n',
+      },
+    };
+    const out = codexStep(initialCodexState(), record, CTX);
+    assert.equal(out.evidence.length, 0);
+    assert.equal(out.diagnostics[0]!.kind, 'unsupported');
   });
 });

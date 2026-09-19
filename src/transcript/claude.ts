@@ -35,6 +35,7 @@ const READONLY_TOOLS = new Set([
 ]);
 
 interface StartMemo {
+  sessionId: string;
   toolName: string;
   scope: EvidenceFileScope;
 }
@@ -94,6 +95,7 @@ function scopeForTool(
 
 function makeEvidence(
   ctx: AdapterContext,
+  harnessSessionId: string,
   recordId: string,
   toolName: string,
   scope: EvidenceFileScope,
@@ -103,7 +105,7 @@ function makeEvidence(
   return {
     evidence_key: {
       harness: ctx.harness,
-      harness_session_id: ctx.harnessSessionId,
+      harness_session_id: harnessSessionId,
       record_id: recordId,
     },
     adapter_version: ctx.adapterVersion,
@@ -124,12 +126,24 @@ function stepAssistant(
   const content = isObject(message) ? message.content : undefined;
   if (!Array.isArray(content)) return { state, evidence, diagnostics };
   const atMs = parseMs(record);
+  // The harness session is the record's own `sessionId` (the native session), so
+  // a copied/renamed transcript keeps one identity instead of splitting into
+  // filename-derived candidates; the bound file name is only a fallback.
+  const rawSession = record.sessionId;
+  const sessionId =
+    typeof rawSession === 'string' && rawSession.length > 0 ? rawSession : ctx.harnessSessionId;
   for (const block of content) {
     if (!isObject(block) || block.type !== 'tool_use') continue;
     const id = block.id;
     const toolName = block.name;
-    if (typeof id !== 'string' || typeof toolName !== 'string') {
-      diagnostics.push({ kind: 'malformed', detail: 'tool_use without id or name' });
+    // A missing/empty invocation id is not a stable identity we can key: report it
+    // unsupported (never a fabricated or empty key that would collide).
+    if (typeof id !== 'string' || id.length === 0) {
+      diagnostics.push({ kind: 'unsupported', detail: 'tool_use without a stable id' });
+      continue;
+    }
+    if (typeof toolName !== 'string' || toolName.length === 0) {
+      diagnostics.push({ kind: 'malformed', detail: `tool_use ${id} without a tool name` });
       continue;
     }
     const resolved = scopeForTool(toolName, block.input, ctx);
@@ -139,8 +153,8 @@ function stepAssistant(
       diagnostics.push({ kind: 'malformed', detail: `tool_use ${id} has no usable timestamp` });
       continue;
     }
-    state.pending.set(id, { toolName, scope: resolved.scope });
-    evidence.push(makeEvidence(ctx, id, toolName, resolved.scope, atMs, 'tool-start'));
+    state.pending.set(id, { sessionId, toolName, scope: resolved.scope });
+    evidence.push(makeEvidence(ctx, sessionId, id, toolName, resolved.scope, atMs, 'tool-start'));
   }
   return { state, evidence, diagnostics };
 }
@@ -165,7 +179,7 @@ function stepUser(
     // the start, if it is ever read, records the invocation on its own.
     if (!memo) continue;
     if (atMs === undefined) continue;
-    evidence.push(makeEvidence(ctx, id, memo.toolName, memo.scope, atMs, 'tool-end'));
+    evidence.push(makeEvidence(ctx, memo.sessionId, id, memo.toolName, memo.scope, atMs, 'tool-end'));
   }
   return { state, evidence, diagnostics };
 }

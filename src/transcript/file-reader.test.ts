@@ -74,6 +74,15 @@ const WRITE_B = JSON.stringify({
   timestamp: '2026-09-19T12:00:01.000Z',
   message: { content: [{ type: 'tool_use', id: 'toolu_b', name: 'Write', input: { file_path: '/work/proj/b.ts' } }] },
 });
+const WRITE_C = JSON.stringify({
+  type: 'assistant',
+  timestamp: '2026-09-19T12:00:02.000Z',
+  message: { content: [{ type: 'tool_use', id: 'toolu_c', name: 'Write', input: { file_path: '/work/proj/c.ts' } }] },
+});
+// A parseable record the adapter ignores, but whose payload holds multibyte UTF-8
+// (accents + an emoji): its byte length exceeds its decoded-character length, so a
+// character-indexed cursor would drift and skip the record that follows it.
+const MULTIBYTE_NOOP = JSON.stringify({ type: 'summary', summary: 'café 🚀 déjà vu' });
 
 describe('transcript file reader', () => {
   let files: Map<string, FakeFile>;
@@ -137,9 +146,36 @@ describe('transcript file reader', () => {
     const reader = makeReader();
     await reader.poll();
     assert.equal(sink.appended.length, 2);
-    file.replace(WRITE_B + '\n', file.ino); // truncate-and-regrow, same inode
+    // Truncate-and-regrow to a shorter file whose only record is brand new: it sits
+    // below the old offset, so it can be read ONLY if the shrink reset the cursor to
+    // zero. (A dedup-covered record here would pass whether or not the reset fired.)
+    file.replace(WRITE_C + '\n', file.ino);
     await reader.poll();
-    assert.equal(sink.appended.length, 2, 'toolu_b dedups; nothing new');
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a', 'toolu_b', 'toolu_c'],
+      'the shrink reset the cursor, so the new shorter content is read from zero',
+    );
+  });
+
+  it('advances the cursor by bytes, not characters, across multibyte lines', async () => {
+    file.append(MULTIBYTE_NOOP + '\n' + WRITE_A + '\n');
+    const reader = makeReader();
+    const r = await reader.poll();
+    assert.equal(r.state, 'readable', 'the ignored multibyte line is not malformed');
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a'],
+      'the record after a multibyte line is read, not skipped by a drifted cursor',
+    );
+    // The cursor landed exactly on the byte boundary: a re-poll reads nothing, and a
+    // freshly appended record is still framed correctly.
+    file.append(WRITE_B + '\n');
+    await reader.poll();
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a', 'toolu_b'],
+    );
   });
 
   it('holds the offset under backpressure and advances on retry', async () => {

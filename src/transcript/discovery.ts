@@ -15,7 +15,7 @@
  * (Stage 3: two agents in one worktree are both captured); each keeps its own
  * native session id, so their invocation identities never collide.
  */
-import { relative, sep } from 'node:path';
+import { relative, resolve, sep } from 'node:path';
 import type { CoverageIssue, HarnessName } from '../event.ts';
 import type { AdapterContext } from './types.ts';
 
@@ -36,14 +36,26 @@ export type ListResult =
   | { ok: true; paths: string[] }
   | { ok: false; reason: 'missing' | 'inaccessible' };
 
+/** A recursive scan result. `truncated`: the file cap was hit; `incomplete`: a
+ * subdirectory could not be read, so the scan may have missed transcripts. */
+export type TreeResult =
+  | { paths: string[]; truncated: boolean; incomplete: boolean }
+  | { ok: false; reason: 'missing' | 'inaccessible' };
+
+/** The first line of a transcript, or why it could not be produced (so discovery
+ * can disclose an unreadable/empty candidate instead of silently skipping it). */
+export type FirstLineResult =
+  | { ok: true; line: string }
+  | { ok: false; reason: 'inaccessible' | 'empty' };
+
 export interface DiscoveryIO {
   /** Absolute paths of `*.jsonl` files directly in `dir` (Claude). */
   listDir(dir: string): Promise<ListResult>;
   /** Absolute paths of every `*.jsonl` under `dir` recursively (Codex), capped
-   * at `limit`; `truncated` means more existed than were returned. */
-  listTreeJsonl(dir: string, limit: number): Promise<{ paths: string[]; truncated: boolean } | { ok: false; reason: 'missing' | 'inaccessible' }>;
+   * at `limit`. */
+  listTreeJsonl(dir: string, limit: number): Promise<TreeResult>;
   /** The first line of a file, for reading a Codex `session_meta`. */
-  readFirstLine(path: string): Promise<string | undefined>;
+  readFirstLine(path: string): Promise<FirstLineResult>;
   /** Canonicalize a path, or undefined if it does not resolve. */
   realpath(path: string): Promise<string | undefined>;
 }
@@ -77,9 +89,7 @@ export async function discoverClaude(
   }
   const bindings: TranscriptBinding[] = [];
   for (const path of listed.paths) {
-    const name = baseName(path);
-    if (!name.endsWith('.jsonl')) continue;
-    const sessionId = name.slice(0, -'.jsonl'.length);
+    const sessionId = baseName(path).slice(0, -'.jsonl'.length);
     bindings.push({
       path,
       ctx: {
@@ -119,7 +129,11 @@ export async function discoverCodex(
   if ('ok' in listed && listed.ok === false) {
     return { bindings: [], issues: [{ kind: listed.reason, detail: `codex sessions dir ${dir}` }] };
   }
-  const { paths, truncated } = listed as { paths: string[]; truncated: boolean };
+  const { paths, truncated, incomplete } = listed as {
+    paths: string[];
+    truncated: boolean;
+    incomplete: boolean;
+  };
   const issues: CoverageIssue[] = [];
   if (truncated) {
     issues.push({
@@ -127,15 +141,35 @@ export async function discoverCodex(
       detail: `codex session scan hit the ${limit}-file cap; some transcripts may be unread`,
     });
   }
+  if (incomplete) {
+    issues.push({
+      kind: 'inaccessible',
+      detail: `some codex session subdirectories under ${dir} were unreadable`,
+    });
+  }
   const bindings: TranscriptBinding[] = [];
   for (const path of paths) {
+    // A file we cannot read or parse is a candidate we cannot rule out, so it is
+    // disclosed as an issue — never silently skipped (which would let a readable
+    // sibling conceal it and report coverage as clean).
     const head = await io.readFirstLine(path);
-    if (head === undefined) continue;
-    const meta = parseSessionMeta(head);
-    if (!meta) continue;
+    if (!head.ok) {
+      issues.push({ kind: head.reason === 'empty' ? 'malformed' : 'inaccessible', detail: `codex rollout ${path}` });
+      continue;
+    }
+    const meta = parseSessionMeta(head.line);
+    if (!meta) {
+      issues.push({ kind: 'malformed', detail: `codex rollout ${path} has no session_meta` });
+      continue;
+    }
     const canonicalCwd = await io.realpath(meta.cwd);
+    // A cwd that no longer resolves cannot be this (existing, canonical) root, so
+    // it is a genuine non-candidate, not an unreadable one — skip without an issue.
     if (canonicalCwd === undefined) continue;
     if (!isWithinRoot(root, canonicalCwd)) continue;
+    // If the recorded cwd is a non-canonical alias, its root form relativizes a
+    // record's absolute paths the same way capture's canonical root does.
+    const aliasRoot = meta.cwd === canonicalCwd ? undefined : resolve(meta.cwd, relative(canonicalCwd, root));
     bindings.push({
       path,
       ctx: {
@@ -144,6 +178,7 @@ export async function discoverCodex(
         root,
         cwd: canonicalCwd,
         adapterVersion: CODEX_ADAPTER_VERSION,
+        ...(aliasRoot !== undefined ? { rootAliases: [aliasRoot] } : {}),
       },
     });
   }

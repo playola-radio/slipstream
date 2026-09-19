@@ -48,7 +48,7 @@ function parseMs(record: Record<string, unknown>): number | undefined {
 const PATCH_HEADER = /^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/;
 
 /** Extract every file path an apply_patch envelope names, in order. */
-export function applyPatchPaths(patch: string): string[] {
+function applyPatchPaths(patch: string): string[] {
   const paths: string[] = [];
   for (const line of patch.split('\n')) {
     const m = PATCH_HEADER.exec(line.trimEnd());
@@ -84,12 +84,11 @@ function scopeForCall(
   name: string,
   payload: Record<string, unknown>,
   ctx: AdapterContext,
-): { toolName: string; scope: EvidenceFileScope; diagnostics: Diagnostic[] } | 'skip' {
+): { scope: EvidenceFileScope; diagnostics: Diagnostic[] } | 'skip' {
   if (payloadType === 'custom_tool_call' && name === 'apply_patch') {
     const input = payload.input;
     if (typeof input !== 'string') {
       return {
-        toolName: 'apply_patch',
         scope: { kind: 'unknown', reason: 'apply_patch input was not text' },
         diagnostics: [{ kind: 'malformed', detail: 'apply_patch without a text patch' }],
       };
@@ -97,19 +96,17 @@ function scopeForCall(
     const paths = applyPatchPaths(input);
     if (paths.length === 0) {
       return {
-        toolName: 'apply_patch',
         scope: { kind: 'unknown', reason: 'apply_patch named no files' },
         diagnostics: [{ kind: 'malformed', detail: 'apply_patch envelope named no files' }],
       };
     }
     const scope = scopeFromPaths(paths, ctx);
     if (!scope) return 'skip';
-    return { toolName: 'apply_patch', scope, diagnostics: [] };
+    return { scope, diagnostics: [] };
   }
   // A shell command or any unrecognized custom tool: a possible writer we cannot
   // scope from its structured fields.
   return {
-    toolName: name,
     scope: { kind: 'unknown', reason: `unmapped ${payloadType} ${name}` },
     diagnostics: [],
   };
@@ -124,8 +121,13 @@ function stepCall(
   const callId = payload.call_id;
   const name = payload.name;
   const payloadType = payload.type;
-  if (typeof callId !== 'string' || typeof name !== 'string' || typeof payloadType !== 'string') {
-    return { state, evidence: [], diagnostics: [{ kind: 'malformed', detail: 'tool call without call_id/name' }] };
+  // A missing/empty call_id is not a stable identity we can key: unsupported, never
+  // a fabricated or empty key that would collide across unrelated calls.
+  if (typeof callId !== 'string' || callId.length === 0) {
+    return { state, evidence: [], diagnostics: [{ kind: 'unsupported', detail: 'tool call without a stable call_id' }] };
+  }
+  if (typeof name !== 'string' || name.length === 0 || typeof payloadType !== 'string') {
+    return { state, evidence: [], diagnostics: [{ kind: 'malformed', detail: `call ${callId} without a name/type` }] };
   }
   const resolved = scopeForCall(payloadType, name, payload, ctx);
   if (resolved === 'skip') return { state, evidence: [], diagnostics: [] };
@@ -133,10 +135,10 @@ function stepCall(
   if (atMs === undefined) {
     return { state, evidence: [], diagnostics: [{ kind: 'malformed', detail: `call ${callId} has no usable timestamp` }] };
   }
-  state.pending.set(callId, { toolName: resolved.toolName, scope: resolved.scope });
+  state.pending.set(callId, { toolName: name, scope: resolved.scope });
   return {
     state,
-    evidence: [makeEvidence(ctx, callId, resolved.toolName, resolved.scope, atMs, 'tool-start')],
+    evidence: [makeEvidence(ctx, callId, name, resolved.scope, atMs, 'tool-start')],
     diagnostics: resolved.diagnostics,
   };
 }

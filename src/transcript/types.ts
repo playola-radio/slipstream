@@ -23,6 +23,14 @@ export interface AdapterContext {
   /** The invocation's working directory (canonical), used to resolve a record's
    * relative paths (Codex shell/apply_patch). Absolute record paths ignore it. */
   cwd: string;
+  /**
+   * Confirmed non-canonical aliases of {@link root} (e.g. the `/tmp` form of a
+   * `/private/tmp` root when the worktree is reached through a symlinked
+   * ancestor). A record's absolute path in an alias namespace relativizes to the
+   * same in-root path as capture's canonical form, so it must not be dropped.
+   * Populated by discovery only when it observes an alias; empty otherwise.
+   */
+  rootAliases?: readonly string[];
   /** Recorded on every emitted record for provenance; excluded from the dedup
    * variant signature so an adapter version bump alone is not a new variant. */
   adapterVersion: string;
@@ -49,21 +57,25 @@ export interface StepResult<S> {
  * in-root paths, or `undefined` when nothing remains in scope.
  *
  * Pure and string-only: it assumes `root`/`cwd` are already canonical (the
- * plumbing realpaths them once at bind time). A residual symlink alias between a
- * record's absolute path and the canonical root is a documented limitation, not
- * silently reinterpreted here.
+ * plumbing realpaths them once at bind time). An absolute record path in a
+ * confirmed alias namespace (`ctx.rootAliases`) relativizes to the same in-root
+ * path as capture's canonical form, so it is kept rather than silently dropped.
  */
 export function scopeFromPaths(
   rawPaths: readonly string[],
-  ctx: Pick<AdapterContext, 'root' | 'cwd'>,
+  ctx: Pick<AdapterContext, 'root' | 'cwd' | 'rootAliases'>,
 ): Extract<EvidenceFileScope, { kind: 'paths' }> | undefined {
+  const roots = [ctx.root, ...(ctx.rootAliases ?? [])];
   const kept: string[] = [];
   for (const raw of rawPaths) {
     if (typeof raw !== 'string' || raw.length === 0) continue;
     const abs = isAbsolute(raw) ? raw : resolve(ctx.cwd, raw);
-    const rel = relative(ctx.root, abs);
-    if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
-    if (!kept.includes(rel)) kept.push(rel);
+    for (const root of roots) {
+      const rel = relative(root, abs);
+      if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
+      if (!kept.includes(rel)) kept.push(rel);
+      break;
+    }
   }
   return kept.length > 0 ? { kind: 'paths', paths: kept } : undefined;
 }

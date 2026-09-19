@@ -94,4 +94,53 @@ describe('claude transcript adapter', () => {
       false,
     );
   });
+
+  it('namespaces record_id by the record own sessionId, not the bound file name', () => {
+    // The context's harnessSessionId (from the file name) differs from the
+    // record's native sessionId; the native id wins so a copied transcript keeps
+    // one identity.
+    const ctx: AdapterContext = { ...CTX, harnessSessionId: 'file-name-slug' };
+    const record = {
+      type: 'assistant',
+      sessionId: 'native-sess-9',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_x', name: 'Write', input: { file_path: '/work/proj/x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, ctx);
+    assert.equal(out.evidence[0]!.evidence_key.harness_session_id, 'native-sess-9');
+  });
+
+  it('falls back to the bound session id when the record omits sessionId', () => {
+    const ctx: AdapterContext = { ...CTX, harnessSessionId: 'file-name-slug' };
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_x', name: 'Write', input: { file_path: '/work/proj/x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, ctx);
+    assert.equal(out.evidence[0]!.evidence_key.harness_session_id, 'file-name-slug');
+  });
+
+  it('reports a tool_use with a missing id as unsupported, not evidence', () => {
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: '/work/proj/x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, CTX);
+    assert.equal(out.evidence.length, 0);
+    assert.equal(out.diagnostics.length, 1);
+    assert.equal(out.diagnostics[0]!.kind, 'unsupported');
+  });
+
+  it('reports a tool_use with an empty id as unsupported', () => {
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', id: '', name: 'Write', input: { file_path: '/work/proj/x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, CTX);
+    assert.equal(out.evidence.length, 0);
+    assert.equal(out.diagnostics[0]!.kind, 'unsupported');
+  });
 });

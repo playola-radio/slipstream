@@ -1,7 +1,7 @@
 import { open, readdir, realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { StatResult, TranscriptFileIO } from './file-reader.ts';
-import type { DiscoveryIO, ListResult } from './discovery.ts';
+import type { DiscoveryIO, FirstLineResult, ListResult, TreeResult } from './discovery.ts';
 
 /** The real filesystem IO for transcript files. Missing → `missing`; any other
  * stat/read error → `inaccessible` (disclosed, never a silent empty read). */
@@ -46,9 +46,10 @@ export const nodeDiscoveryIO: DiscoveryIO = {
     }
   },
 
-  async listTreeJsonl(dir: string, limit: number) {
+  async listTreeJsonl(dir: string, limit: number): Promise<TreeResult> {
     const paths: string[] = [];
     let truncated = false;
+    let incomplete = false;
     const stack: string[] = [dir];
     let rootErrored: 'missing' | 'inaccessible' | undefined;
     let first = true;
@@ -59,6 +60,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
         entries = await readdir(current, { withFileTypes: true });
       } catch (err) {
         if (first) rootErrored = classifyDirError(err);
+        else incomplete = true; // a subdirectory we could not read: disclose the gap
         continue;
       } finally {
         first = false;
@@ -77,19 +79,25 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       }
     }
     if (rootErrored) return { ok: false, reason: rootErrored };
-    return { paths, truncated };
+    return { paths, truncated, incomplete };
   },
 
-  async readFirstLine(path: string): Promise<string | undefined> {
-    const handle = await open(path, 'r');
+  async readFirstLine(path: string): Promise<FirstLineResult> {
+    let handle;
+    try {
+      handle = await open(path, 'r');
+    } catch {
+      return { ok: false, reason: 'inaccessible' };
+    }
     try {
       const buf = Buffer.allocUnsafe(64 * 1024);
       const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+      if (bytesRead === 0) return { ok: false, reason: 'empty' };
       const text = buf.subarray(0, bytesRead).toString('utf8');
       const nl = text.indexOf('\n');
-      return nl >= 0 ? text.slice(0, nl) : text.length > 0 ? text : undefined;
+      return { ok: true, line: nl >= 0 ? text.slice(0, nl) : text };
     } catch {
-      return undefined;
+      return { ok: false, reason: 'inaccessible' };
     } finally {
       await handle.close();
     }
