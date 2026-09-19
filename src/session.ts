@@ -12,7 +12,13 @@ import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 import { isValidSessionId } from './store-reader.ts';
 import { createPlatform, type Platform, type Subscription } from './platform.ts';
-import type { AnyEvent, EventInput } from './event.ts';
+import {
+  createAttributionProducer,
+  DEFAULT_ENRICHMENT_POLICY,
+  type AttributionProducer,
+} from './attribution-producer.ts';
+import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
+import type { AnyEvent, EnrichmentPolicy, EventInput } from './event.ts';
 
 export interface CaptureOptions {
   root: string;
@@ -29,6 +35,11 @@ export interface CaptureOptions {
    * already stopped acknowledging by the time this fires; the daemon uses it to
    * wedge its state machine (decision 9). */
   onCompromised?: (reason: string) => void;
+  /** The effective attribution policy for this session. Defaults to
+   * {@link DEFAULT_ENRICHMENT_POLICY} (real sources `unconfigured`, since A1
+   * wires no transcript adapters); the daemon drives coverage and timing as
+   * adapters are configured. Published once on startup and bound to each change. */
+  enrichmentPolicy?: EnrichmentPolicy;
 }
 
 export interface BeginTaskInput {
@@ -68,6 +79,13 @@ export interface CaptureSession {
    * coalesce onto one commit. A direct method by design — no IPC, no socket.
    */
   beginTask(input: BeginTaskInput): Promise<BeginTaskResult>;
+  /**
+   * Ingest one normalized harness-transcript record so it may refine attribution.
+   * Evidence is durable, deduped, and append-only; it is NEVER a capture source
+   * and never creates a filesystem-change event. A2 wires real transcript
+   * adapters onto this seam; A1 exercises it with fake evidence.
+   */
+  ingestEvidence(evidence: NormalizedEvidence): Promise<IngestOutcome>;
   stop(): Promise<void>;
 }
 
@@ -138,6 +156,11 @@ export async function startCapture(
   const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
   const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
 
+  // The attribution producer, constructed once the append path exists below. Its
+  // `noteCommitted` is fed from the log's single in-order commit hook, so every
+  // durably-committed change/evidence/policy reaches it exactly once, in order.
+  let producer: AttributionProducer | undefined;
+
   const seedTaskState = (rec: RecoveredSession): void => {
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
@@ -152,8 +175,9 @@ export async function startCapture(
   // Stamp grouping metadata inside the log's serialized sequencing section, the
   // single place with a total order over appends: a change is stamped with the
   // task committed before it, and the pointer advances only after a declaration
-  // is durable. Every newly emitted change also carries `attribution: unknown` —
-  // Stage 3 has no authorship evidence.
+  // is durable. A newly emitted change carries no attribution — "no result yet"
+  // means PENDING, and the producer appends a revisable result asynchronously
+  // once the change is durable (never a fabricated inline `unknown` seed).
   const taskSequencer: AppendSequencer = {
     enrich: (input) => {
       if (input.type !== 'slipstream.file.changed.v1') return input;
@@ -161,13 +185,14 @@ export async function startCapture(
         ...input,
         data: {
           ...input.data,
-          attribution: { status: 'unknown' as const },
           ...(currentTaskId !== undefined ? { task_hint_id: currentTaskId } : {}),
         },
       };
     },
     onCommitted: (event) => {
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
+      // Route every durable commit to attribution in the same total order.
+      producer?.noteCommitted(event);
     },
   };
 
@@ -224,6 +249,7 @@ export async function startCapture(
   }
 
   const maxBytes = recovered?.maxBytes ?? opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  const enrichmentPolicy = opts.enrichmentPolicy ?? DEFAULT_ENRICHMENT_POLICY;
   const health = createHealth(recovered?.recoveredThroughSeq ?? 0n);
   healthRef = health; // the compromise callback can now disclose a lost lock
 
@@ -305,6 +331,19 @@ export async function startCapture(
   };
 
   const engine = createEngine({ reader, log: { append: appendEvent } });
+
+  // Attribution runs off the same append path. Timers are unref'd so a pending
+  // grace window never keeps the process alive; the clock is real wall time.
+  producer = createAttributionProducer({
+    appendEvent,
+    now: Date.now,
+    setTimer: (delayMs, fn) => {
+      const t = setTimeout(fn, delayMs);
+      t.unref?.();
+      return t;
+    },
+    clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  });
 
   // Never capture the store or version-control metadata. If the store lives
   // inside the watched root, excluding it is what stops the watcher from
@@ -425,6 +464,10 @@ export async function startCapture(
       // them; otherwise one could append with a stale committed `before`.
       await engine.drain();
       engine.resetNotifications();
+      // Fence the attribution generation before the log is swapped: a stale
+      // evaluation from the pre-recovery generation must never append to the
+      // reopened log. A fresh generation is armed after the log reopens.
+      await producer?.stop();
       if (stopped || surrendered) return false; // shutting down / dispossessed: don't reopen
       await underlying.close().catch(() => {});
       const rec = await recoverSession(logPath, sessionId, cas);
@@ -440,6 +483,13 @@ export async function startCapture(
       });
       health.setDurableSeq(rec.recoveredThroughSeq);
       health.markRecovering();
+
+      // Replay barrier for the new generation: rebuild projections and outstanding
+      // work from the recovered durable log (seeding prior results so nothing is
+      // re-attributed), and re-assert the effective policy, before the storage gap
+      // and reconciliation changes below route through the producer.
+      producer?.start(rec.attributionEvents);
+      await producer?.ensurePolicy(enrichmentPolicy);
 
       const rawAppend = async (input: EventInput): Promise<AnyEvent> => {
         // If the lock was lost mid-recovery, stop writing: another process now
@@ -499,6 +549,11 @@ export async function startCapture(
     subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError });
 
     if (resuming) {
+      // Replay barrier: rebuild the producer's projections and reconstruct
+      // outstanding work from the durable log, seeding prior results so a
+      // reproduced attribution is not re-appended, BEFORE any new commit routes
+      // through it. The reconciliation changes below then attribute live.
+      producer.start(recovered!.attributionEvents);
       await appendEvent({
         type: 'slipstream.session.resumed.v1',
         occurred_at_ms: Date.now(),
@@ -512,6 +567,7 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { scope: { kind: 'session' }, reason: 'restart' },
       });
+      await producer.ensurePolicy(enrichmentPolicy);
       await reconcile(
         {
           committed: recovered!.committed,
@@ -553,6 +609,10 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { unknown_scopes: unknownScopes },
       });
+      // Arm attribution and publish the effective policy before going live, so
+      // the first live change binds to a committed policy.
+      producer.start([]);
+      await producer.ensurePolicy(enrichmentPolicy);
     }
   } catch (err) {
     // A failed startup may already have kicked the recovery supervisor (an append
@@ -562,6 +622,7 @@ export async function startCapture(
     stopped = true;
     await subscription?.close().catch(() => {});
     await supervisorLoop.catch(() => {});
+    await producer.stop().catch(() => {});
     await engine.drain().catch(() => {});
     await underlying.close().catch(() => {});
     await lock.release();
@@ -660,6 +721,9 @@ export async function startCapture(
     // loop stops starting new attempts once `stopped` is set.
     await supervisorLoop.catch(() => {});
     await engine.drain().catch(record);
+    // Fence the attribution generation and flush its in-flight appends before the
+    // log closes: a stale evaluation must never append after the log is gone.
+    await producer?.stop().catch(record);
     await underlying.close().catch(record);
     await lock.release().catch(record);
     if (firstError !== undefined) throw firstError;
@@ -669,12 +733,16 @@ export async function startCapture(
   // the current nonce and the loser could unlink a successor's lock.
   let stopPromise: Promise<void> | undefined;
 
+  const ingestEvidence = (evidence: NormalizedEvidence): Promise<IngestOutcome> =>
+    producer!.ingestEvidence(evidence);
+
   return {
     sessionId,
     logPath,
     blobsDir,
     health,
     beginTask,
+    ingestEvidence,
     stop: () => (stopPromise ??= doStop()),
   };
 }

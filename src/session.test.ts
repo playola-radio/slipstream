@@ -684,13 +684,14 @@ describe('session', () => {
       await withFakeSession(
         async () => {},
         async ({ root, session, observe, waitFor }) => {
-          // A change before any declaration is ungrouped, but still attributed.
+          // A change before any declaration is ungrouped and carries no inline
+          // attribution seed ("no result yet" is PENDING, disclosed separately).
           await writeFile(join(root, 'a.ts'), 'v1');
           observe('a.ts');
           const before = await waitFor((r) => changesFor(r, 'a.ts').length >= 1);
           const beforeChange = changesFor(before, 'a.ts')[0]!;
           assert.equal(beforeChange.data.task_hint_id, undefined);
-          assert.deepEqual(beforeChange.data.attribution, { status: 'unknown' });
+          assert.equal(beforeChange.data.attribution, undefined);
 
           const task = await session.beginTask({ title: 'Group me', requestId: 'req-1' });
 
@@ -700,7 +701,7 @@ describe('session', () => {
           const after = await waitFor((r) => changesFor(r, 'b.ts').length >= 1);
           const afterChange = changesFor(after, 'b.ts')[0]!;
           assert.equal(afterChange.data.task_hint_id, task.task_id);
-          assert.deepEqual(afterChange.data.attribution, { status: 'unknown' });
+          assert.equal(afterChange.data.attribution, undefined);
 
           // The declaration did not rewrite the change that preceded it.
           const recs = await readRecords(session.logPath);

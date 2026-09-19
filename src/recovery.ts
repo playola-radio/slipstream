@@ -42,6 +42,10 @@ export interface RecoveredSession {
    * session rebuilds its dedup index: a replayed duplicate must not re-append. A
    * torn trailing declaration is discarded with the tail, so it never appears. */
   taskDeclarations: Map<string, { taskId: string; title: string; seq: string }>;
+  /** Attribution-relevant events (policy, evidence, changes, results), in commit
+   * order, so a resumed session rebuilds the attribution producer's projections
+   * and reconstructs outstanding work without re-attributing settled changes. */
+  attributionEvents: AnyEvent[];
 }
 
 /** The envelope constraints every record must satisfy, regardless of type — so an
@@ -112,6 +116,7 @@ export async function recoverSession(
   const baselineUnknownDirs = new Set<string>();
   const storageGapSeqByEpisode = new Map<string, string>();
   const taskDeclarations = new Map<string, { taskId: string; title: string; seq: string }>();
+  const attributionEvents: AnyEvent[] = [];
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
   let root: string | undefined;
@@ -191,6 +196,15 @@ export async function recoverSession(
     const errors = validate(schema, event);
     if (errors.length > 0) {
       throw new CorruptLogError(`${at}: ${event.type} fails schema: ${errors[0]}`);
+    }
+
+    if (
+      event.type === 'slipstream.file.changed.v1' ||
+      event.type === 'slipstream.harness.evidence.v1' ||
+      event.type === 'slipstream.change.attribution.v1' ||
+      event.type === 'slipstream.enrichment.configured.v1'
+    ) {
+      attributionEvents.push(event);
     }
 
     switch (event.type) {
@@ -288,5 +302,6 @@ export async function recoverSession(
     storageGapSeqByEpisode,
     currentTaskId,
     taskDeclarations,
+    attributionEvents,
   };
 }

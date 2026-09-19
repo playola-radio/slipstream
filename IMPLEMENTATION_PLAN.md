@@ -374,9 +374,19 @@ demand from the immutable before/after blobs and served through the reader API
 - Concurrent cold-cache clip requests saturating the parse workers → raw capture
   latency within the ratified bar (measured; D3 protocol, D4 cold-cache load).
 
-**Status**: Not Started. PR graph designed via Codex consults and ratified
+**Status**: In Progress. PR graph designed via Codex consults and ratified
 (Brian D1–D4, 2026-09-19): a 4-PR / 2-track shape — Track A attribution
-(A1 engine+contracts with fake evidence → A2 real transcript adapters), Track B
+(A1 engine+contracts with fake evidence → A2 real transcript adapters), Track B.
+**A1 built** on `feature/stage4-a1-attribution`: three event contracts
+(`harness.evidence`, `change.attribution`, `enrichment.configured`), the pure
+I/O-free reducer, `change_seq`-targeted attribution with ±window/grace matching,
+observed intervals on `file.changed`, durable evidence ingestion with
+log-derived dedup and disclosed conflicts, revision-by-append on semantic
+change, and restart recovery that reconstructs outstanding work behind a
+generation-fenced replay barrier (no double-attribution). The Stage-3 inline
+`attribution:{status:'unknown'}` seed is removed — no-result-yet is now PENDING,
+disclosed as a separate revisable event. Acceptance tests pass against FAKE
+evidence; real transcript adapters are A2. Track B
 clips (B1 clip-projection contract + bounded fallback → B2 tree-sitter extraction
 + measured latency gate). D4 makes clips a **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
