@@ -42,6 +42,7 @@ export const EVENT_TYPES = [
   'slipstream.harness.evidence.v1',
   'slipstream.change.attribution.v1',
   'slipstream.enrichment.configured.v1',
+  'slipstream.enrichment.coverage.v1',
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -171,13 +172,61 @@ export interface SessionResumedData {
 export type HarnessName = 'claude-code' | 'codex';
 
 /**
- * How thoroughly a harness source is covered, declared in the effective policy.
- * A1 wires no real transcript adapters, so every source is `unconfigured`: an
- * `unknown` attribution under `unconfigured` coverage honestly means "nothing was
- * watched", never "a human wrote it". A2 defines the covered/unsupported/etc.
- * vocabulary when real adapters exist and can actually distinguish those states.
+ * Declared coverage intent for a harness source, recorded in the effective
+ * policy. This is *configuration*, not observed health: `unconfigured` means no
+ * adapter is set up for the source (an `unknown` attribution under it honestly
+ * means "nothing was watched", never "a human wrote it"); `configured` means an
+ * adapter is expected to read the source. Whether reads actually succeed is
+ * observed *runtime* health, disclosed separately in
+ * `slipstream.enrichment.coverage.v1` — deliberately not folded into the policy,
+ * because the evaluator never consults `policy.sources` and Fork 4 binds policy
+ * prospectively by sequence, which would freeze stale health onto old changes.
  */
-export type SourceCoverage = 'unconfigured';
+export type SourceCoverage = 'unconfigured' | 'configured';
+
+/**
+ * Observed health of a harness source's transcript reading, at the moment the
+ * event was committed. `pending`: not yet scanned. `readable`: the declared scan
+ * scope was processed with no blocking issue (NOT a claim of complete edit
+ * history). `degraded`: some transcripts read, but at least one issue prevents a
+ * complete read (a readable transcript never conceals an unreadable one).
+ * `unavailable`: nothing in scope could be read. Folded highest-seq-wins per
+ * `(source, harness)`; the ABSENCE of any coverage event means health is unknown,
+ * never a successful read.
+ */
+export type CoverageState = 'pending' | 'readable' | 'degraded' | 'unavailable';
+
+/** A specific reason a source is not fully readable. `discovery-limited` means a
+ * bounded scan may not have found every relevant transcript — disclosed rather
+ * than pretending the scan was exhaustive. */
+export type CoverageIssueKind =
+  | 'missing'
+  | 'inaccessible'
+  | 'malformed'
+  | 'unsupported'
+  | 'discovery-limited';
+
+export interface CoverageIssue {
+  kind: CoverageIssueKind;
+  /** Human-readable specifics (may name the affected transcript), never raw
+   * captured bytes. */
+  detail: string;
+}
+
+/**
+ * Observed transcript-reading health for one harness source, disclosed so a
+ * client can tell "read the scope and found no matching evidence" apart from
+ * "could not read the scope" — the difference between an honest `unknown`
+ * attribution and a coverage gap. Never authorship, never a change.
+ */
+export interface EnrichmentCoverageData {
+  session_id: string;
+  harness: HarnessName;
+  state: CoverageState;
+  /** The concrete issues behind a `degraded`/`unavailable` state; omitted when
+   * none (a `readable`/`pending` state). */
+  issues?: CoverageIssue[];
+}
 
 /** Which end of a harness invocation a timestamp marks. A start and an end
  * record for one invocation are joined, not treated as contradictory. */
@@ -272,7 +321,8 @@ export type EventInput =
   | { type: 'slipstream.task.started.v1'; occurred_at_ms: number; data: Omit<TaskStartedData, 'session_id'> }
   | { type: 'slipstream.harness.evidence.v1'; occurred_at_ms: number; data: Omit<HarnessEvidenceData, 'session_id'> }
   | { type: 'slipstream.change.attribution.v1'; occurred_at_ms: number; data: Omit<ChangeAttributionData, 'session_id'> }
-  | { type: 'slipstream.enrichment.configured.v1'; occurred_at_ms: number; data: Omit<EnrichmentConfiguredData, 'session_id'> };
+  | { type: 'slipstream.enrichment.configured.v1'; occurred_at_ms: number; data: Omit<EnrichmentConfiguredData, 'session_id'> }
+  | { type: 'slipstream.enrichment.coverage.v1'; occurred_at_ms: number; data: Omit<EnrichmentCoverageData, 'session_id'> };
 
 /** The `data` field into which each type mirrors the observation instant (epoch
  * ms). Types absent here carry only the envelope `time` (baseline records are
@@ -295,6 +345,7 @@ type DataFor<T extends EventType> =
   : T extends 'slipstream.harness.evidence.v1' ? HarnessEvidenceData
   : T extends 'slipstream.change.attribution.v1' ? ChangeAttributionData
   : T extends 'slipstream.enrichment.configured.v1' ? EnrichmentConfiguredData
+  : T extends 'slipstream.enrichment.coverage.v1' ? EnrichmentCoverageData
   : never;
 
 export interface CloudEvent<T extends EventType = EventType> {
