@@ -289,7 +289,9 @@ describe('http-reader clip projection', () => {
   });
 
   it('serves the published projection schema and 404s an unknown version', async () => {
-    const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
+    // Schema lookup is static: it reads no session log or blobs, so an empty
+    // store is enough — no captured change needs fabricating.
+    const srv = await startReaderServer({ storeDir: await mkdtemp(join(tmpdir(), 'slip-http-')) });
     try {
       const res = await GET(srv, '/v1/schemas/projections/clip.v1');
       assert.equal(res.status, 200);
@@ -311,6 +313,34 @@ describe('http-reader clip projection', () => {
     const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
     try {
       assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/99/clips`)).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('404s a non-canonical (leading-zero) seq rather than stamping it', async () => {
+    // "02" resolves to change 2 via BigInt but would be echoed verbatim into a
+    // schema-invalid change_seq; reject it instead.
+    const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/02/clips`)).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('500s a record missing within the durable boundary (corruption, not 404)', async () => {
+    // The registry declares the high-water at 2, but the log holds only seq 1:
+    // disk is short of its declared boundary. That is corruption, never an
+    // ordinary unknown-change 404.
+    const dir = await mkdtemp(join(tmpdir(), 'slip-clips-'));
+    await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+    await writeFile(
+      join(dir, 'sessions', UUID, 'events.jsonl'),
+      ceLine(1, 'slipstream.session.started.v1', { root: '/w', max_bytes: 1024, started_at_ms: 0 }) + '\n',
+      'utf8',
+    );
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, staticBoundary(2n));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 500);
     } finally { await srv.close(); }
   });
 

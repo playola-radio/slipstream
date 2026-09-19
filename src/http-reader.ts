@@ -86,10 +86,16 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   // Bind loopback only; a non-loopback bind must be impossible, not configurable.
   // Reject the returned promise on a listen error (e.g. EADDRINUSE) rather than
   // letting it crash the process with no handler.
-  await new Promise<void>((resolve, reject) => {
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+    });
+  } catch (err) {
+    // Do not leak the clip worker if the listener never bound.
+    await clipService.close();
+    throw err;
+  }
   const port = (server.address() as AddressInfo).port;
   const hostPort = `127.0.0.1:${port}`;
   const url = `http://${hostPort}`;
@@ -97,8 +103,9 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   try {
     descriptorPath = await publishDescriptor(opts.storeDir, { url, token });
   } catch (err) {
-    // Do not leak the listener if we cannot publish the descriptor.
+    // Do not leak the listener or the clip worker if we cannot publish.
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await clipService.close();
     throw err;
   }
 
@@ -218,9 +225,14 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       send(res, 404, 'not found'); return;
     }
 
+    // Reject a non-canonical seq (leading zeros): the route regex admits "01",
+    // but that resolves via BigInt to change 1 and would then be stamped verbatim
+    // into `change_seq`, violating the published `^[1-9][0-9]*$` pattern.
+    if (!/^[1-9][0-9]*$/.test(seqStr)) { send(res, 404, 'not found'); return; }
+
     // The change must be within the durable high-water; a seq at or beyond it names
     // no committed change (the same boundary the events feed serves).
-    const seq = BigInt(seqStr); // route regex guarantees a decimal string
+    const seq = BigInt(seqStr);
     const H = (await boundaryFor(id)).current();
     if (seq < 1n || seq > H) { send(res, 404, 'not found'); return; }
 
@@ -236,7 +248,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     } finally {
       await cursor?.close();
     }
-    if (!ev || ev.type !== 'slipstream.file.changed.v1') { send(res, 404, 'not found'); return; }
+    // A seq within the durable boundary MUST have a record; its absence means the
+    // log is short of its declared high-water — corruption, not an unknown change.
+    // Reserve 404 for an existing record that simply isn't a file.changed event.
+    if (!ev) throw new LogCorruptError('record missing within durable boundary');
+    if (ev.type !== 'slipstream.file.changed.v1') { send(res, 404, 'not found'); return; }
 
     const before = parseClipSnapshot(ev.data.before);
     const after = parseClipSnapshot(ev.data.after);

@@ -57,7 +57,10 @@ the bundled front-end changes nothing about how clips are produced.
 
 `clips` is an **array** of paired before/after sides. A created file has clips with
 a `null` before span; a deleted file has clips with a `null` after span; an edit
-produces one clip per changed range.
+produces one clip per changed range. Within an edit, a hunk that is a pure
+insertion has a `null` before span (nothing on the before side), and a pure
+deletion has a `null` after span — a `null` span on a `changed-range` side means
+that side of the hunk is empty, never that content was unreadable.
 
 ## Byte and line rules
 
@@ -77,7 +80,9 @@ decoded text.
   core validates UTF-8 before producing spans; non-UTF-8 (including any NUL byte)
   content is treated as binary and never spanned.
 - **`truncated`** is `true` when the per-side budget clipped a span short of its
-  full changed range (see Budgets).
+  full changed range, or when the budget prevented a later hunk from being emitted
+  at all — in that case the last emitted span on the affected side is marked
+  `truncated` so an omission is disclosed, never silent (see Budgets).
 
 To render a clip, fetch the referenced blob (`GET /v1/blobs/sha256/:hex`, the
 `sha256` from the event's snapshot) and slice `[byte_start, byte_end)`.
@@ -110,6 +115,9 @@ Every status except `ready` carries a `fallback_reason`.
 - `no-content`, `no-change`, `not-utf8`, `oversize` — `skipped`: nothing bounded to
   show (both sides absent, before == after, binary/non-UTF-8, or over the parse
   budget).
+- `clip-too-large` — `skipped`: a diff was possible but no whole-line clip fits
+  the per-side byte ceiling (e.g. a minified file whose single line exceeds
+  64 KiB). Nothing is emitted past the locked budget rather than an oversized clip.
 - `after-missing`, `after-unavailable` (and `before-*` variants) — `unavailable`:
   the side's blob is gone or its snapshot was `unavailable`, with the reason.
 - `timeout`, `overloaded`, `worker-error` — `skipped`, transient: the projection
@@ -136,7 +144,10 @@ Fixed ceilings (may only be tightened, never relaxed):
   fallback is prepared *before* any parse, so an overrun still had a chance to
   produce ranges.
 - Clips are capped at **300 lines and 64 KiB per side, across the whole array**.
-  Hitting the cap sets `truncated: true` on the affected span(s).
+  Hitting the cap sets `truncated: true` on the affected span(s) — including the
+  last emitted span when the cap drops later hunks entirely, so the omission is
+  always visible. A single line wider than the 64 KiB clip ceiling yields no clip
+  (`skipped`/`clip-too-large`) rather than one that exceeds the budget.
 - The fallback is changed ranges **± 20 lines** of context. If even the bounded
   ranges can't be produced, the result is `skipped` with a reason — invented
   ranges are never returned.
