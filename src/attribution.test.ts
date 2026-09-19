@@ -280,6 +280,18 @@ describe('attribution reducer', () => {
       assert.equal(r.reason, 'observation-interval-unavailable');
     });
 
+    it('an inverted interval (end before start, e.g. clock regression) is unavailable, not a false match', () => {
+      const r = evaluateChange({
+        path: 'src/a.ts',
+        interval: { start_ms: 2000, end_ms: 1000 },
+        policy: POLICY,
+        invocations: [inv({ keyStr: 'k1', minAtMs: 1500, maxAtMs: 1500 })],
+      });
+      assert.equal(r.status, 'unknown');
+      assert.equal(r.reason, 'observation-interval-unavailable');
+      assert.deepEqual(r.evidenceSeqs, []);
+    });
+
     it('excludes an invocation whose scope does not include the path', () => {
       const r = evaluateChange({
         path: 'src/a.ts',

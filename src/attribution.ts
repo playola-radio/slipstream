@@ -204,7 +204,11 @@ function touchesPath(inv: Invocation, path: string): boolean {
  */
 export function evaluateChange(input: EvaluationInput): EvaluationResult {
   const { interval } = input;
-  if (interval === undefined || 'unavailable' in interval) {
+  // An absent, explicitly-unavailable, or inverted (end before start, e.g. the
+  // wall clock regressed mid-acquisition) interval bounds no real observation
+  // window. Treat all three as the honest unavailable disposition rather than
+  // matching evidence against a degenerate window and publishing a false result.
+  if (interval === undefined || 'unavailable' in interval || interval.end_ms < interval.start_ms) {
     return {
       status: 'unknown',
       reason: 'observation-interval-unavailable',
