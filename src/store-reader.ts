@@ -21,7 +21,7 @@ function sessionsDir(storeDir: string): string { return join(storeDir, 'sessions
 export function sessionLogPath(storeDir: string, id: string): string {
   return join(sessionsDir(storeDir), id, 'events.jsonl');
 }
-function tombstonePath(storeDir: string, id: string): string {
+export function tombstonePath(storeDir: string, id: string): string {
   return join(sessionsDir(storeDir), id, 'removed.json');
 }
 export function blobPath(storeDir: string, hex: string): string {
@@ -95,7 +95,10 @@ export async function listSessions(storeDir: string): Promise<SessionInfo[]> {
   for (const id of entries) {
     if (!isValidSessionId(id)) continue;
     const removed = (await readTombstone(storeDir, id)) !== null;
-    const durableSeq = await onDiskHighWater(sessionLogPath(storeDir, id));
+    // A removed session advertises no history. Short-circuit to 0 without reading
+    // high-water: a delete interrupted before cleanup can leave a corrupt residual
+    // log under a durable tombstone, and that must never break listing.
+    const durableSeq = removed ? 0n : await onDiskHighWater(sessionLogPath(storeDir, id));
     out.push({ id, durableSeq, removed });
   }
   out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
