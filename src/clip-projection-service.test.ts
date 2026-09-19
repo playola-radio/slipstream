@@ -168,6 +168,27 @@ test('burst beyond admission is skipped as overloaded, not stalled', async () =>
   await svc.close();
 });
 
+test('the default deadline cancels at 100 ms', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let canceled = false;
+  let settled = false;
+  const svc = createClipProjectionService({ storeDir: STORE, compute: () => ({
+    promise: new Promise<ClipProjection>(() => {}),
+    cancel: () => { canceled = true; },
+  }) });
+  t.after(() => svc.close());
+  const result = svc.get(contentReq('1', 1)).then(value => { settled = true; return value; });
+  t.mock.timers.tick(99);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(canceled, false);
+  t.mock.timers.tick(1);
+  const value = await result;
+  assert.equal(value.status, 'skipped');
+  assert.equal(value.fallback_reason, 'timeout');
+  assert.equal(canceled, true);
+});
+
 test('a wall-clock overrun yields skipped/timeout and cancels the compute', async () => {
   let canceled = false;
   const compute: ClipCompute = () => ({
@@ -296,27 +317,26 @@ test('close settles queued work and rejects new requests', async () => {
   await pRun; // running task settles too, no dangling promise
 });
 
-test('default worker pool computes a real projection from on-disk blobs', async () => {
+test('default worker pool computes a real projection from on-disk blobs', { timeout: 15_000 }, async t => {
+  // Verify the result before its deadline, independently of host startup speed.
+  // Real-clock cancellation tests and the live benchmark cover the time budget.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const storeDir = await mkdtemp(join(tmpdir(), 'slip-clipsvc-'));
   const svc = createClipProjectionService({ storeDir });
-  try {
-    const cas = await createCas(join(storeDir, 'blobs'));
-    const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
-    const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
-    const before: ClipSnapshot = { kind: 'content', sha256: beforeRef.sha256, size: beforeRef.size };
-    const after: ClipSnapshot = { kind: 'content', sha256: afterRef.sha256, size: afterRef.size };
-    const r = await svc.get({ changeSeq: '5', before, after });
-    assert.equal(r.status, 'fallback');
-    assert.equal(r.change_seq, '5');
-    assert.ok(r.clips.length >= 1);
-    // second identical request is a cache hit (revalidated against the real store)
-    const r2 = await svc.get({ changeSeq: '6', before, after });
-    assert.equal(r2.change_seq, '6');
-    assert.equal(r2.status, 'fallback');
-  } finally {
-    await svc.close();
-    await rm(storeDir, { recursive: true, force: true });
-  }
+  t.after(async () => { await svc.close(); await rm(storeDir, { recursive: true, force: true }); });
+  const cas = await createCas(join(storeDir, 'blobs'));
+  const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
+  const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  const before: ClipSnapshot = { kind: 'content', sha256: beforeRef.sha256, size: beforeRef.size };
+  const after: ClipSnapshot = { kind: 'content', sha256: afterRef.sha256, size: afterRef.size };
+  const r = await svc.get({ changeSeq: '5', before, after });
+  assert.equal(r.status, 'fallback');
+  assert.equal(r.change_seq, '5');
+  assert.ok(r.clips.length >= 1);
+  // second identical request is a cache hit (revalidated against the real store)
+  const r2 = await svc.get({ changeSeq: '6', before, after });
+  assert.equal(r2.change_seq, '6');
+  assert.equal(r2.status, 'fallback');
 });
 
 test('capture proceeds while projection admission is saturated', async () => {

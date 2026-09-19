@@ -1,24 +1,29 @@
 # B2 measurement and parser crash recovery
 
 Date: 2026-09-19.
-**Status: CI portability fix and refreshed measurement in progress; D3 numeric
-bar remains unratified.** The prior WASM implementation survived the qualifying
-full cold-load run below. Ubuntu CI subsequently exposed unnecessary parser
-startup on unsupported/missing input and all-three-grammar initialization. The
-adapter now skips initialization for those fallback cases and loads only the
-requested grammar. Typecheck, 647 main tests and 86 tool tests pass locally;
-Ubuntu/macOS CI and a fresh full measurement remain required. No deadline,
-capture design or budget was raised. B2 is not complete.
+**Status: final-runtime measurement qualifies; Ubuntu CI remains under
+reassessment and the D3 numeric bar remains unratified.** The WASM implementation
+survived the full cold-load run below. Parser initialization now skips unsupported
+and wholly missing inputs and loads only the requested grammar. Typecheck, 647
+main tests and 86 tool tests passed locally at the measured revision. Three Ubuntu
+runs exposed result-shape tests coupled to cold-worker startup within 100 ms,
+including paths that never import WASM. After outside reassessment, the four
+positive shape tests now hold only their deadline clock while real worker/disk/HTTP
+work runs. Their exact assertions remain, with real outer timeouts and cleanup.
+A deterministic regression verifies the default 100 ms deadline; existing
+real-clock cancellation and live-load checks remain. Typecheck and all **648 main
++ 86 tool tests** pass after this test-only correction; CI verification is pending.
+No deadline, capture design or budget was raised. B2 is not complete.
 
 ## Qualifying cold-load run — numeric bar pending
 
-Revision: `8a7dab0`, 2026-09-19, Node 24.11.0, macOS arm64, Apple M1 Max (10
+Revision: `81fa5a3`, 2026-09-19, Node 24.11.0, macOS arm64, Apple M1 Max (10
 logical CPUs). Protocol: `CLIP-LATENCY-PROTOCOL.md`, fixed before this run. Order:
 B1/S1, S2/B2, B3/S3. **All six arms captured 200/200 expected writes; all three
 saturation arms passed every cold-load sufficiency check. No process crash.**
 
 The host remained shared with other work. Per-arm one-minute load averages
-ranged from 8.34 to 12.83; free physical memory ranged from 0.076 to 1.225 GiB.
+ranged from 6.72 to 11.90; free physical memory ranged from 0.144 to 1.212 GiB.
 These are results for this host/protocol, not a claim that parsing improves
 capture speed or a universal latency guarantee. Alternating arm order reduces
 confounding from host drift but does not remove it.
@@ -28,18 +33,18 @@ samples; missing samples are zero throughout.
 
 | Arm | Overall p50 / p99 | Scheduled p50 / p99 | Burst p50 / p99 | Captures/s |
 | --- | ---: | ---: | ---: | ---: |
-| baseline repetition 1 | 805.14 / 1438.08 | 103.93 / 299.36 | 1123.01 / 1438.08 | 14.34 |
-| saturation repetition 1 | 691.42 / 1227.80 | 92.51 / 114.94 | 978.07 / 1227.80 | 15.00 |
-| saturation repetition 2 | 641.15 / 1144.00 | 88.86 / 104.68 | 901.90 / 1148.03 | 15.12 |
-| baseline repetition 2 | 822.56 / 1386.03 | 97.17 / 115.61 | 1123.42 / 1394.76 | 14.65 |
-| baseline repetition 3 | 825.26 / 1426.08 | 97.32 / 118.76 | 1146.64 / 1431.18 | 14.60 |
-| saturation repetition 3 | 638.14 / 1140.98 | 90.34 / 105.99 | 909.48 / 1145.36 | 15.11 |
+| baseline repetition 1 | 776.46 / 1239.57 | 102.25 / 126.48 | 1013.24 / 1239.57 | 14.74 |
+| saturation repetition 1 | 591.83 / 1166.26 | 90.27 / 109.37 | 933.51 / 1166.26 | 15.09 |
+| saturation repetition 2 | 488.99 / 1137.04 | 88.41 / 107.80 | 902.31 / 1140.08 | 15.13 |
+| baseline repetition 2 | 688.32 / 1398.76 | 99.54 / 130.43 | 1119.30 / 1403.89 | 14.58 |
+| baseline repetition 3 | 770.06 / 1354.39 | 97.44 / 131.02 | 1088.79 / 1360.89 | 14.68 |
+| saturation repetition 3 | 644.18 / 1128.29 | 91.12 / 109.10 | 903.97 / 1132.44 | 15.13 |
 
 | Saturation repetition | Requests / unique input keys | Ready | Skipped: overload / timeout | Ready overlapping capture | HTTP p50 / p99 (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 79,821 / 3,531 | 3,518 | 76,297 / 6 | 2,403 | 1.52 / 49.28 |
-| 2 | 83,860 / 3,581 | 3,569 | 80,286 / 5 | 2,430 | 1.46 / 48.90 |
-| 3 | 84,207 / 3,548 | 3,536 | 80,666 / 5 | 2,415 | 1.43 / 48.99 |
+| 1 | 79,821 / 3,519 | 3,506 | 76,309 / 6 | 2,384 | 1.52 / 49.32 |
+| 2 | 84,766 / 3,595 | 3,583 | 81,178 / 5 | 2,435 | 1.45 / 48.57 |
+| 3 | 83,144 / 3,479 | 3,467 | 79,672 / 5 | 2,350 | 1.46 / 50.18 |
 
 Each saturation arm reached 16 concurrent requests and maintained continuous
 request coverage through the final durable capture. Every one of its 13 capture
@@ -55,18 +60,20 @@ corresponding baseline; capture throughput must be at least **0.95×** baseline;
 zero missing writes and all load checks passing are required. This proposes a
 20% latency / 5% throughput regression allowance against the actual baseline.
 Every measured comparison satisfies this proposal, but that is not a D3 passing
-verdict until Brian ratifies it.
+verdict until Brian ratifies it. The largest paired latency ratio is 0.941×;
+the smallest paired throughput ratio is 1.023×.
 
-Validation: typecheck and **646/646 deterministic tests passed**. Full-branch
+Validation at the measured revision: typecheck, **647/647 deterministic tests**
+and **86/86 tool tests passed locally**. Full-branch
 review/challenge/Excess findings were resolved together; re-review passed. The
 subsequent harness correction also received a focused correctness/simplicity PASS.
 The native cancellation subprocess regression now survives 20 worker replacements.
 Capture design, debounce, worker/admission structure, 100 ms projection deadline,
 and all input/output ceilings are unchanged.
 
-Raw aggregate/per-repetition results remain in `.context/b2-final-measurements.json`
-and `.context/b2-final-measurements.stderr`, with startup host metadata in
-`.context/b2-final-measurement-host.json`. Only this numeric summary is committed;
+Raw aggregate/per-repetition results remain in `.context/b2-runtime-measurements.json`
+and `.context/b2-runtime-measurements.stderr`, with startup host metadata in
+`.context/b2-runtime-measurement-host.json`. Only this numeric summary is committed;
 no captured logs or blobs are committed.
 
 ## Authorized recovery

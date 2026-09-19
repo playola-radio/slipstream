@@ -404,15 +404,16 @@ reason. Byte/line rules and status/reason semantics are documented in
 function extraction for JS/JSX/TS/TSX, paired spans, explicit mixed fallback and
 the approved closed language input/cache key. The native worker-cancellation
 crash was reproduced and replaced with WASM under the original design/budgets.
-Typecheck and 646 tests pass; review/challenge/Excess findings and re-reviews are
-resolved. The qualifying full run (`8a7dab0`) captured 1,200/1,200 writes without
-crashing, and all three saturation arms passed the load checks. Baseline overall
-p99 was 1,386–1,438 ms; saturation was 1,141–1,228 ms on the shared host. The
-proposed 20% latency / 5% throughput regression bar is **not yet ratified**; the
-D3 gate has not been declared passed. Ubuntu CI subsequently exposed excessive cold parser initialization; the adapter
-now skips unsupported/missing inputs and loads only the requested grammar. Local
-typecheck, 647 main tests and 86 tool tests pass. CI, refreshed measurement and
-numeric ratification remain; PR #20 stays draft.
+Review/challenge/Excess findings and re-reviews are resolved. The final-runtime
+full run (`81fa5a3`) captured 1,200/1,200 writes without crashing, and all three
+saturation arms passed the load checks. Baseline overall p99 was 1,240–1,399 ms;
+saturation was 1,128–1,166 ms on the shared host. The proposed 20% latency / 5%
+throughput regression bar is **not yet ratified**; D3 has not been declared passed.
+Ubuntu CI exposed cold-worker startup timing in result-shape tests; after three
+failures and outside reassessment, those tests now hold their deadline clock
+while retaining real disk/worker/HTTP assertions. Real-clock deadline and load
+checks remain; production budgets and capture design are unchanged. Typecheck,
+648 main tests and 86 tool tests pass locally. CI verification remains pending; PR #20 stays draft.
 See `B2-MEASUREMENT-REPORT.md` for all numbers, host conditions and history.
 B2 and Stage 4 are not complete. D4 makes clips a
 **reader-derived public projection**
