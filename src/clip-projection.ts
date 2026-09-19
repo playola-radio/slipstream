@@ -46,7 +46,7 @@ export type SideInput =
   | { kind: 'absent' }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'missing'; reason: string }
-  | { kind: 'oversize'; size: number };
+  | { kind: 'oversize' };
 
 export interface Span {
   byte_start: number;
@@ -96,12 +96,14 @@ export function projectClips(
   after: SideInput,
   opts: ProjectOptions,
 ): ClipProjection {
+  // Options may only TIGHTEN a locked ceiling, never raise it: clamp each to its
+  // constant. Raising a budget is a product decision, out of scope (see D4).
   const limits = {
     context: opts.context ?? DEFAULT_CONTEXT,
-    maxLines: opts.maxLinesPerSide ?? MAX_LINES_PER_SIDE,
-    maxBytes: opts.maxBytesPerSide ?? MAX_BYTES_PER_SIDE,
-    maxCells: opts.maxCells ?? MAX_ALIGN_CELLS,
-    maxUtf8Bytes: opts.maxBytes ?? MAX_UTF8_BYTES,
+    maxLines: Math.min(opts.maxLinesPerSide ?? MAX_LINES_PER_SIDE, MAX_LINES_PER_SIDE),
+    maxBytes: Math.min(opts.maxBytesPerSide ?? MAX_BYTES_PER_SIDE, MAX_BYTES_PER_SIDE),
+    maxCells: Math.min(opts.maxCells ?? MAX_ALIGN_CELLS, MAX_ALIGN_CELLS),
+    maxUtf8Bytes: Math.min(opts.maxBytes ?? MAX_UTF8_BYTES, MAX_UTF8_BYTES),
   };
   const a = resolveSide(after, limits.maxUtf8Bytes);
   const b = resolveSide(before, limits.maxUtf8Bytes);
@@ -116,6 +118,12 @@ export function projectClips(
   const skipped = (reason: string) => build('skipped', reason, []);
   const unavailable = (reason: string) => build('unavailable', reason, []);
   const fallback = (clips: Clip[]) => build('fallback', FALLBACK_REASON, clips);
+  // Materialize plans within budget. If not even one bounded clip fits (e.g. a
+  // single line wider than the byte ceiling), skip rather than invent or exceed.
+  const asFallback = (plans: ClipPlan[]): ClipProjection => {
+    const clips = clipArray(plans, b, a, limits);
+    return clips.length > 0 ? fallback(clips) : skipped('clip-too-large');
+  };
 
   // The after side drives the primary disposition: if we cannot show the result
   // state, nothing else matters.
@@ -124,7 +132,7 @@ export function projectClips(
 
   if (a.kind === 'absent') {
     if (b.kind === 'text') {
-      return fallback(clipArray([{ before: wholeRange(), after: nullSide('absent') }], b, a, limits));
+      return asFallback([{ before: wholeRange(), after: nullSide('absent') }]);
     }
     if (b.kind === 'absent') return skipped('no-content');
     if (b.kind === 'gone') return unavailable(`before-${b.origin}`);
@@ -134,28 +142,26 @@ export function projectClips(
   // after is text from here on.
   if (b.kind === 'text') {
     if (b.lines.length * a.lines.length > limits.maxCells) {
-      return fallback(clipArray([wholeFileClip('diff-too-large')], b, a, limits));
+      return asFallback([wholeFileClip('diff-too-large')]);
     }
     const hunks = diffHunks(b.lines, a.lines, limits.context);
     if (hunks.length === 0) {
       if (equalBytes(b.bytes, a.bytes)) return skipped('no-change');
-      return fallback(clipArray([wholeFileClip('no-line-change')], b, a, limits));
+      return asFallback([wholeFileClip('no-line-change')]);
     }
     const plans = hunks.map((h): ClipPlan => ({
       before: { kind: 'range', range: h.before, method: 'changed-range' },
       after: { kind: 'range', range: h.after, method: 'changed-range' },
     }));
-    return fallback(clipArray(plans, b, a, limits));
+    return asFallback(plans);
   }
 
   // after text, before not text: cannot diff, show after whole-file.
   if (b.kind === 'absent') {
-    return fallback(clipArray([{ before: nullSide('absent'), after: wholeRange() }], b, a, limits));
+    return asFallback([{ before: nullSide('absent'), after: wholeRange() }]);
   }
   const beforeReason = b.kind === 'gone' ? `before-${b.origin}` : `before-${b.reason}`;
-  return fallback(
-    clipArray([{ before: nullSide('unavailable', beforeReason), after: wholeRange() }], b, a, limits),
-  );
+  return asFallback([{ before: nullSide('unavailable', beforeReason), after: wholeRange() }]);
 }
 
 // --- side resolution -------------------------------------------------------
@@ -170,7 +176,7 @@ interface TextSide {
 type ResolvedSide =
   | TextSide
   | { kind: 'absent' }
-  | { kind: 'gone'; origin: 'missing' | 'unavailable'; reason: string }
+  | { kind: 'gone'; origin: 'missing' | 'unavailable' }
   | { kind: 'skip'; reason: string };
 
 function resolveSide(side: SideInput, maxUtf8Bytes: number): ResolvedSide {
@@ -180,9 +186,9 @@ function resolveSide(side: SideInput, maxUtf8Bytes: number): ResolvedSide {
     case 'oversize':
       return { kind: 'skip', reason: 'oversize' };
     case 'missing':
-      return { kind: 'gone', origin: 'missing', reason: side.reason };
+      return { kind: 'gone', origin: 'missing' };
     case 'unavailable':
-      return { kind: 'gone', origin: 'unavailable', reason: side.reason };
+      return { kind: 'gone', origin: 'unavailable' };
     case 'bytes': {
       const bytes = side.bytes;
       if (bytes.length > maxUtf8Bytes) return { kind: 'skip', reason: 'oversize' };
@@ -196,11 +202,13 @@ function resolveSide(side: SideInput, maxUtf8Bytes: number): ResolvedSide {
 }
 
 /** Decode UTF-8 strictly; a NUL byte (binary marker) or an invalid sequence
- *  returns null. Mirrors the binary/not-text detection used elsewhere. */
+ *  returns null. `ignoreBOM` keeps a leading BOM in the text so a BOM-only change
+ *  is a real diff difference, matching the raw-byte spans. Mirrors the
+ *  binary/not-text detection used elsewhere. */
 function decodeUtf8(bytes: Uint8Array): string | null {
   for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return null;
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     return null;
   }
@@ -218,14 +226,17 @@ function indexLineStarts(bytes: Uint8Array): number[] {
   return starts;
 }
 
-/** Per-line content strings with the trailing `\r?\n` removed, matching the
- *  diff granularity of change-view's splitLines. Used only for line comparison;
- *  spans are always computed from raw bytes. */
+/** Per-line content strings that PRESERVE terminators (a trailing `\r` and the
+ *  `\n`) and final-newline presence, so a line-ending or trailing-newline change
+ *  is a real diff difference rather than a silently hidden one. Used only for
+ *  line comparison; spans are always computed from raw bytes. The result length
+ *  matches {@link indexLineStarts}. */
 function lineContents(text: string): string[] {
   if (text === '') return [];
-  const parts = text.split(/\r?\n/);
-  if (parts[parts.length - 1] === '') parts.pop();
-  return parts;
+  const parts = text.split('\n');
+  const trailingNewline = parts[parts.length - 1] === '';
+  if (trailingNewline) parts.pop();
+  return parts.map((p, i) => (i < parts.length - 1 || trailingNewline ? p + '\n' : p));
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -312,73 +323,88 @@ function wholeFileClip(reason: string): ClipPlan {
 
 interface Budget { lines: number; bytes: number }
 
+/** Per-side materialization outcome. `ok` = span fit in full (or the side has no
+ *  span); `empty` = the corresponding range is zero-length (an insertion/deletion
+ *  side — a null span, NOT budget exhaustion); `partial` = the span was clipped
+ *  short by the budget; `dropped` = nothing more fits and this clip cannot be
+ *  emitted. */
+type SideOutcome = 'ok' | 'empty' | 'partial' | 'dropped';
+interface Materialized { side: ClipSide; outcome: SideOutcome }
+
 /** Materialize clip plans into clips, enforcing the per-side line/byte caps
- *  across the whole array. Once a side's budget is exhausted the crossing span
- *  is truncated and no further clips are emitted. */
+ *  across the whole array. When a side's budget clips a span short, or prevents
+ *  a later hunk from being emitted at all, the last emitted span on that side is
+ *  marked `truncated` so the omission is disclosed rather than silent. */
 function clipArray(plans: ClipPlan[], before: ResolvedSide, after: ResolvedSide, limits: {
   maxLines: number; maxBytes: number;
 }): Clip[] {
   const beforeBudget: Budget = { lines: limits.maxLines, bytes: limits.maxBytes };
   const afterBudget: Budget = { lines: limits.maxLines, bytes: limits.maxBytes };
   const clips: Clip[] = [];
+  let beforeTrunc = false;
+  let afterTrunc = false;
   for (const plan of plans) {
-    const beforeSpan = materialize(plan.before, before, beforeBudget, clips.length === 0);
-    const afterSpan = materialize(plan.after, after, afterBudget, clips.length === 0);
-    if (beforeSpan.dropped && afterSpan.dropped) break;
-    clips.push({ before: beforeSpan.side, after: afterSpan.side });
-    if (beforeSpan.exhausted || afterSpan.exhausted) break;
+    const b = materialize(plan.before, before, beforeBudget);
+    const a = materialize(plan.after, after, afterBudget);
+    if (b.outcome === 'dropped' || a.outcome === 'dropped') {
+      if (b.outcome === 'dropped') beforeTrunc = true;
+      if (a.outcome === 'dropped') afterTrunc = true;
+      break;
+    }
+    clips.push({ before: b.side, after: a.side });
+    if (b.outcome === 'partial') beforeTrunc = true;
+    if (a.outcome === 'partial') afterTrunc = true;
+    if (b.outcome === 'partial' || a.outcome === 'partial') break;
+  }
+  if (clips.length > 0) {
+    const last = clips[clips.length - 1]!;
+    if (beforeTrunc && last.before.span) last.before.span.truncated = true;
+    if (afterTrunc && last.after.span) last.after.span.truncated = true;
   }
   return clips;
 }
 
-interface Materialized { side: ClipSide; exhausted: boolean; dropped: boolean }
-
-function materialize(plan: SidePlan, side: ResolvedSide, budget: Budget, first: boolean): Materialized {
-  if (plan.kind === 'null') {
-    const s: ClipSide = plan.reason === undefined
-      ? { span: null, method: plan.method }
-      : { span: null, method: plan.method, reason: plan.reason };
-    return { side: s, exhausted: false, dropped: false };
-  }
+function materialize(plan: SidePlan, side: ResolvedSide, budget: Budget): Materialized {
+  if (plan.kind === 'null') return { side: sideOf(plan.method, null, plan.reason), outcome: 'ok' };
   if (side.kind !== 'text') {
     // whole-file plan against a non-text side is a bug in the caller.
-    return { side: { span: null, method: 'unavailable', reason: 'internal-error' }, exhausted: false, dropped: true };
+    return { side: { span: null, method: 'unavailable', reason: 'internal-error' }, outcome: 'ok' };
   }
   const range: LineRange = plan.range ?? { s0: 0, e0: side.starts.length };
-  const clamped = clampToBudget(range, side, budget, first);
-  if (clamped === null) {
-    const s: ClipSide = plan.reason === undefined
-      ? { span: null, method: plan.method }
-      : { span: null, method: plan.method, reason: plan.reason };
-    return { side: s, exhausted: true, dropped: true };
+  if (range.e0 - range.s0 <= 0) {
+    // A zero-length corresponding range (the empty side of an insertion/deletion):
+    // a null span, not budget exhaustion. Later hunks must still be processed.
+    return { side: sideOf(plan.method, null, plan.reason), outcome: 'empty' };
   }
+  const clamped = clampToBudget(range, side, budget);
+  if (clamped === null) return { side: sideOf(plan.method, null, plan.reason), outcome: 'dropped' };
   budget.lines -= clamped.line_end - clamped.line_start + 1;
   budget.bytes -= clamped.byte_end - clamped.byte_start;
-  const s: ClipSide = plan.reason === undefined
-    ? { span: clamped, method: plan.method }
-    : { span: clamped, method: plan.method, reason: plan.reason };
-  return { side: s, exhausted: clamped.truncated, dropped: false };
+  return { side: sideOf(plan.method, clamped, plan.reason), outcome: clamped.truncated ? 'partial' : 'ok' };
+}
+
+function sideOf(method: ClipSideMethod, span: Span | null, reason: string | undefined): ClipSide {
+  return reason === undefined ? { span, method } : { span, method, reason };
 }
 
 /** Trim a line range to the remaining line/byte budget, on whole-line
- *  granularity. Returns null when nothing fits (budget already spent). When this
- *  is the first clip and a single line alone exceeds the byte budget it is still
- *  emitted (bounded by the 1 MiB file cap) and marked truncated, so the client
- *  always sees something. */
-function clampToBudget(range: LineRange, side: TextSide, budget: Budget, first: boolean): Span | null {
-  const total = range.e0 - range.s0;
-  if (total <= 0) return null;
+ *  granularity. The caller guarantees a non-empty range. Returns null when
+ *  nothing fits — either the line budget is spent, or even a single line exceeds
+ *  the byte budget (the locked 64 KiB clip ceiling is never exceeded, so a
+ *  minified line wider than the ceiling yields no clip rather than an oversized
+ *  one). */
+function clampToBudget(range: LineRange, side: TextSide, budget: Budget): Span | null {
+  const total = range.e0 - range.s0; // > 0, guaranteed by caller
   if (budget.lines <= 0) return null;
   let take = Math.min(total, budget.lines);
-  let byteEnd = lineStartByte(side, range.s0 + take);
   const byteStart = lineStartByte(side, range.s0);
+  let byteEnd = lineStartByte(side, range.s0 + take);
   while (take > 1 && byteEnd - byteStart > budget.bytes) {
     take--;
     byteEnd = lineStartByte(side, range.s0 + take);
   }
-  const overBytes = byteEnd - byteStart > budget.bytes;
-  if (overBytes && !first) return null; // one line still too big and budget is used
-  const truncated = take < total || overBytes;
+  if (byteEnd - byteStart > budget.bytes) return null; // even one line exceeds the byte budget
+  const truncated = take < total;
   return {
     byte_start: byteStart,
     byte_end: byteEnd,

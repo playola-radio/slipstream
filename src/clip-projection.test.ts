@@ -93,7 +93,7 @@ test('absent both sides: skipped no-content', () => {
 });
 
 test('after oversize: skipped oversize', () => {
-  const p = projectClips(bytes('a\n'), { kind: 'oversize', size: 2_000_000 }, { changeSeq: SEQ });
+  const p = projectClips(bytes('a\n'), { kind: 'oversize' }, { changeSeq: SEQ });
   assert.equal(p.status, 'skipped');
   assert.equal(p.fallback_reason, 'oversize');
   assert.deepEqual(p.clips, []);
@@ -156,4 +156,75 @@ test('identical content: skipped no-change', () => {
   const p = projectClips(bytes('a\nb\n'), bytes('a\nb\n'), { changeSeq: SEQ });
   assert.equal(p.status, 'skipped');
   assert.equal(p.fallback_reason, 'no-change');
+});
+
+test('a single line larger than the byte budget is never emitted: skipped', () => {
+  // A minified/one-line file whose sole line exceeds 64 KiB has no whole-line
+  // clip that fits. It must be skipped, not emitted past the locked ceiling.
+  const p = projectClips({ kind: 'absent' }, bytes('x'.repeat(70000) + '\n'), { changeSeq: SEQ });
+  assert.equal(p.status, 'skipped');
+  assert.equal(p.fallback_reason, 'clip-too-large');
+  assert.deepEqual(p.clips, []);
+});
+
+test('budget options can only tighten locked ceilings, never raise them', () => {
+  // maxBytesPerSide above the locked 64 KiB is clamped down: the 70 KB line still
+  // does not fit.
+  const p = projectClips(
+    { kind: 'absent' },
+    bytes('x'.repeat(70000) + '\n'),
+    { changeSeq: SEQ, maxBytesPerSide: 1_000_000 },
+  );
+  assert.equal(p.status, 'skipped');
+  assert.equal(p.fallback_reason, 'clip-too-large');
+
+  // maxLinesPerSide above the locked 300 is clamped down: only 300 lines emit.
+  const many = Array.from({ length: 350 }, (_, i) => `line${i}`).join('\n') + '\n';
+  const q = projectClips({ kind: 'absent' }, bytes(many), { changeSeq: SEQ, maxLinesPerSide: 400 });
+  assert.equal(q.status, 'fallback');
+  const span = q.clips[0]!.after.span!;
+  assert.equal(span.line_end, 300);
+  assert.equal(span.truncated, true);
+});
+
+test('a line-ending-only change is a real diff difference, not hidden', () => {
+  // Before this fix line comparison stripped terminators, so an LF->CRLF change
+  // produced no hunk and was silently rendered as a whole-file "no-line-change".
+  const p = projectClips(bytes('a\nb\nc\n'), bytes('a\nb\r\nc\n'), { changeSeq: SEQ, context: 0 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips[0]!.after.method, 'changed-range');
+  assert.equal(p.clips[0]!.after.span!.line_start, 2);
+});
+
+test('dropping a final newline is a real diff difference, not hidden', () => {
+  const p = projectClips(bytes('a\nb\nc\n'), bytes('a\nb\nc'), { changeSeq: SEQ, context: 0 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips[0]!.after.method, 'changed-range');
+  assert.equal(p.clips[0]!.after.span!.line_start, 3);
+});
+
+test('exact budget exhaustion discloses dropped later hunks via truncated', () => {
+  // Two distant one-line edits; a per-side line budget of exactly one fits the
+  // first hunk perfectly. The second must not vanish silently: the emitted span
+  // is marked truncated to disclose the omission.
+  const before = 'a\nb\nc\nd\ne\nf\n';
+  const after = 'A\nb\nc\nd\ne\nF\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 0, maxLinesPerSide: 1 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.length, 1);
+  assert.equal(p.clips[0]!.after.span!.truncated, true);
+  assert.equal(p.clips[0]!.before.span!.truncated, true);
+});
+
+test('an empty corresponding range (insertion) does not stop later hunks', () => {
+  // Insert X at the top and edit d->D at the bottom. The insertion's before side
+  // is an empty range (null span); it must not be mistaken for budget exhaustion
+  // and swallow the later edit.
+  const before = 'a\nb\nc\nd\n';
+  const after = 'X\na\nb\nc\nD\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 0 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.length, 2);
+  assert.equal(p.clips[0]!.before.span, null); // insertion: nothing on the before side
+  assert.equal(p.clips[1]!.after.span!.line_start, 5); // the D edit survived
 });

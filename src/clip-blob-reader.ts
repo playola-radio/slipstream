@@ -60,7 +60,7 @@ export async function resolveClipSide(
 ): Promise<SideInput> {
   if (snap.kind === 'absent') return { kind: 'absent' };
   if (snap.kind === 'unavailable') return { kind: 'unavailable', reason: snap.reason };
-  if (snap.size > maxBytes) return { kind: 'oversize', size: snap.size };
+  if (snap.size > maxBytes) return { kind: 'oversize' };
   if (!isValidHex(snap.sha256)) return { kind: 'missing', reason: 'invalid-hex' };
   // O_NOFOLLOW: a symlink planted at a valid CAS path must serve nothing but the
   // blob it names, never the link target's bytes.
@@ -72,7 +72,7 @@ export async function resolveClipSide(
   }
   try {
     const { size } = await handle.stat();
-    if (size > maxBytes) return { kind: 'oversize', size };
+    if (size > maxBytes) return { kind: 'oversize' };
     return { kind: 'bytes', bytes: await handle.readFile() };
   } catch (err) {
     return { kind: 'missing', reason: (err as NodeJS.ErrnoException).code ?? 'read-failed' };
