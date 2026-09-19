@@ -400,8 +400,11 @@ deadline that cancels and replaces a stuck worker), the reader endpoint
 No log event, no persistence: clips are viewable exactly while the blobs are
 retained, and GC'd blobs yield an explicit `unavailable` projection with a
 reason. Byte/line rules and status/reason semantics are documented in
-`CLIP-PROJECTION.md`. Tree-sitter function extraction (the `ready` status) and
-the measured cold-cache latency gate remain B2. D4 makes clips a
+`CLIP-PROJECTION.md`. **B2 in progress**: native tree-sitter extraction for JS/JSX/TS/TSX, paired
+function spans, mixed per-side fallback, and the approved closed language input
+are implemented under `clip.v2`. The D3 cold-cache measurement harness is being
+verified. Measurements, Brian's numeric-bar ratification, and final review remain;
+B2 and Stage 4 are not complete. D4 makes clips a
 **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
 rather than `change.clips` log events; attribution stays a log producer. See

@@ -238,16 +238,16 @@ const ceLine = (seq: number, type: string, data: Record<string, unknown>): strin
   });
 
 // A store with one file.changed.v1 at seq 2 whose before/after reference real blobs.
-async function storeWithChange(): Promise<{ dir: string }> {
+async function storeWithChange(path = 'x.txt', beforeText = 'a\nb\nc\n', afterText = 'a\nB\nc\n'): Promise<{ dir: string }> {
   const dir = await mkdtemp(join(tmpdir(), 'slip-clips-'));
   const cas = await createCas(join(dir, 'blobs'));
-  const before = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
-  const after = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  const before = await cas.put(Buffer.from(beforeText, 'utf8'));
+  const after = await cas.put(Buffer.from(afterText, 'utf8'));
   await mkdir(join(dir, 'sessions', UUID), { recursive: true });
   const lines = [
     ceLine(1, 'slipstream.session.started.v1', { root: '/w', max_bytes: 1024, started_at_ms: 0 }),
     ceLine(2, 'slipstream.file.changed.v1', {
-      path: 'x.txt',
+      path,
       before: { kind: 'content', sha256: before.sha256, size: before.size },
       after: { kind: 'content', sha256: after.sha256, size: after.size },
       observation: 'watcher', observed_at_ms: 0,
@@ -258,6 +258,26 @@ async function storeWithChange(): Promise<{ dir: string }> {
 }
 
 describe('http-reader clip projection', () => {
+  it('serves the same function projection as a direct-disk client without appending to the log', async () => {
+    const { computeClipProjection, parseClipSnapshot } = await import('./clip-blob-reader.ts');
+    const before = 'function f(n: string) {\n  return 1;\n}\n';
+    const { dir } = await storeWithChange('x.ts', before, before.replace('return 1', 'return 2'));
+    const logPath = join(dir, 'sessions', UUID, 'events.jsonl');
+    const { readFile } = await import('node:fs/promises');
+    const original = await readFile(logPath, 'utf8');
+    const event = JSON.parse(original.trim().split('\n')[1]!);
+    const direct = await computeClipProjection({ storeDir: dir, before: parseClipSnapshot(event.data.before)!,
+      after: parseClipSnapshot(event.data.after)!, opts: { changeSeq: '2', language: 'typescript' } });
+    const srv = await startReaderServer({ storeDir: dir });
+    try {
+      const response = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), direct);
+      assert.equal(direct.status, 'ready');
+      assert.equal(direct.clips[0]!.after.method, 'function');
+      assert.equal(await readFile(logPath, 'utf8'), original);
+    } finally { await srv.close(); await rm(dir, { recursive: true, force: true }); }
+  });
   it('returns a clip projection for a change', async () => {
     const { dir } = await storeWithChange();
     const srv = await startReaderServer({ storeDir: dir });
@@ -269,7 +289,7 @@ describe('http-reader clip projection', () => {
         change_seq: string; projection_version: string; status: string; clips: unknown[];
       };
       assert.equal(body.change_seq, '2');
-      assert.equal(body.projection_version, 'clip.v1');
+      assert.equal(body.projection_version, 'clip.v2');
       assert.equal(body.status, 'fallback');
       assert.ok(body.clips.length >= 1);
     } finally { await srv.close(); }
@@ -298,6 +318,9 @@ describe('http-reader clip projection', () => {
       const body = await res.json() as { title: string; $id: string };
       assert.equal(body.title, 'clip.v1');
       assert.match(body.$id, /projections\/clip\.v1\.json$/);
+      const v2 = await GET(srv, '/v1/schemas/projections/clip.v2');
+      assert.equal(v2.status, 200);
+      assert.equal((await v2.json() as { title: string }).title, 'clip.v2');
       assert.equal((await GET(srv, '/v1/schemas/projections/nope.v1')).status, 404);
     } finally { await srv.close(); }
   });

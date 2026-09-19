@@ -81,13 +81,17 @@ export async function resolveClipSide(
   }
 }
 
-/** Resolve both sides and run the pure projection. Deterministic given the blob
- *  bytes; the caller decides where it runs (worker or directly). */
+/** Resolve both sides and run the pure projection. Successful spans are determined by
+ *  bytes, language and version; timeouts/availability remain explicit transient
+ *  outcomes. The caller decides where it runs (worker or directly). */
 export async function computeClipProjection(job: ClipJob): Promise<ClipProjection> {
   const maxBytes = job.opts.maxBytes ?? MAX_UTF8_BYTES;
   const [before, after] = await Promise.all([
     resolveClipSide(job.storeDir, job.before, maxBytes),
     resolveClipSide(job.storeDir, job.after, maxBytes),
   ]);
-  return projectClips(before, after, job.opts);
+  // Only computing callers load the parser; the HTTP main loop also imports
+  // snapshot validation from this module and must not initialize the addon.
+  const { indexFunctions } = await import('./clip-function-parser.ts');
+  return projectClips(before, after, job.opts, indexFunctions);
 }

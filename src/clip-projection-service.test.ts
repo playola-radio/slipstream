@@ -9,6 +9,7 @@ import { CLIP_PROJECTION_VERSION, type ClipProjection } from './clip-projection.
 import type { ClipCompute } from './clip-worker-pool.ts';
 import type { ClipSnapshot } from './clip-blob-reader.ts';
 import { withFakeSession, changesFor } from './test/helpers.ts';
+import { computeClipProjection } from './clip-blob-reader.ts';
 
 const sha = (i: number): string => String(i).padStart(64, '0');
 const contentReq = (seq: string, id: number): ClipRequest => ({
@@ -25,6 +26,60 @@ const fallback = (changeSeq: string): ClipProjection => ({
 });
 const alwaysPresent = async (): Promise<boolean> => true;
 const STORE = '/nonexistent-store';
+
+test('identical blobs under different languages do not share a cached extraction', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-language-cache-'));
+  const cas = await createCas(join(dir, 'blobs'));
+  const before = await cas.put(Buffer.from('function f(n: string) {\n  return 1;\n}\n'));
+  const after = await cas.put(Buffer.from('function f(n: string) {\n  return 2;\n}\n'));
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: dir, compute: job => {
+    computes++;
+    return { promise: computeClipProjection(job), cancel: () => {} };
+  } });
+  const req: ClipRequest = { changeSeq: '2', before: { kind: 'content', ...before }, after: { kind: 'content', ...after } };
+  try {
+    const js = await svc.get({ ...req, language: 'javascript' });
+    const ts = await svc.get({ ...req, language: 'typescript' });
+    assert.equal(js.status, 'fallback');
+    assert.equal(ts.status, 'ready');
+    assert.equal((await svc.get({ ...req, language: 'typescript' })).status, 'ready');
+    assert.equal(computes, 2);
+  } finally { await svc.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a version upgrade recomputes the same blobs after discarding the old process cache', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-version-cache-'));
+  const cas = await createCas(join(dir, 'blobs'));
+  const after = await cas.put(Buffer.from('function f() {\n  return 1;\n}\n'));
+  const req: ClipRequest = { changeSeq: '2', language: 'javascript', before: { kind: 'absent' }, after: { kind: 'content', ...after } };
+  // Model the prior deployment's warm in-memory cache. There is deliberately
+  // no persisted cache to migrate and no runtime algorithm-version switch.
+  const old = createClipProjectionService({ storeDir: dir, compute: job => ({
+    promise: Promise.resolve({ ...fallback(job.opts.changeSeq), projection_version: 'clip.v1' }), cancel: () => {},
+  }) });
+  assert.equal((await old.get(req)).projection_version, 'clip.v1');
+  await old.close();
+  const current = createClipProjectionService({ storeDir: dir });
+  try {
+    const result = await current.get(req);
+    assert.equal(result.projection_version, 'clip.v2');
+    assert.equal(result.status, 'ready');
+    assert.equal(result.clips[0]!.after.method, 'function');
+  } finally { await current.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a soft parser timeout with prepared fallback is never cached', async () => {
+  let calls = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    compute: job => ({ promise: Promise.resolve({ ...fallback(job.opts.changeSeq),
+      fallback_reason: ++calls === 1 ? 'timeout' : 'no-enclosing-function' }), cancel: () => {} }) });
+  try {
+    assert.equal((await svc.get(contentReq('1', 1))).fallback_reason, 'timeout');
+    assert.equal((await svc.get(contentReq('1', 1))).fallback_reason, 'no-enclosing-function');
+    assert.equal(calls, 2);
+  } finally { await svc.close(); }
+});
 
 test('cold request computes on demand, then serves from cache', async () => {
   let calls = 0;

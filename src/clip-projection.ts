@@ -1,16 +1,17 @@
 /**
  * The clip projection: a READER-DERIVED public projection over the immutable
  * before/after blobs of a `file.changed` event. It is NOT a log event, is never
- * appended, and is a pure function of (before bytes, after bytes,
- * projection_version) — so identical blobs always yield the identical result and
+ * appended, and successful extraction is a function of (before bytes, after
+ * bytes, language, projection_version) — so identical blobs always yield the identical result and
  * a dropped cache recomputes the same answer.
  *
- * This module is the pure core: no I/O, no threads, deterministic, work-capped.
+ * This module has no I/O or threads. Span selection is deterministic and
+ * work-capped for fixed extractor outcomes; timeouts are transient exceptions.
  * The reader resolves each side to a {@link SideInput} (reading CAS blobs) and
- * calls {@link projectClips}. B2 adds tree-sitter function extraction HERE,
- * additively — a successful extraction is what flips a diffable file from
- * `fallback` to `ready`. Until then every diffable file is `fallback`, because
- * function-level clips are not yet available.
+ * calls {@link projectClips} with the tree-sitter extractor. This module has no
+ * runtime parser dependency; direct pure callers may supply the same extractor.
+ * A successful function-only result is ready; mixed/unreliable hunks fall back.
+ * Transient parser timeouts return prepared ranges and are never cached.
  *
  * Byte/line conventions (part of the published contract):
  *  - Spans reference the RAW blob bytes by ZERO-BASED HALF-OPEN byte offsets.
@@ -26,7 +27,10 @@
  *    status (or a per-side `unavailable` method) with an explicit reason.
  */
 
-export const CLIP_PROJECTION_VERSION = 'clip.v1';
+import type { ClipLanguage } from './clip-language.ts';
+import type { FunctionIndex } from './clip-function-parser.ts';
+
+export const CLIP_PROJECTION_VERSION = 'clip.v2';
 
 /** Fixed extraction budgets. May only be tightened by an explicit option (raising
  *  a ceiling is a product decision, out of scope). */
@@ -56,7 +60,7 @@ export interface Span {
   truncated: boolean;
 }
 
-export type ClipSideMethod = 'changed-range' | 'whole-file' | 'absent' | 'unavailable';
+export type ClipSideMethod = 'function' | 'changed-range' | 'whole-file' | 'absent' | 'unavailable';
 
 export interface ClipSide {
   span: Span | null;
@@ -82,6 +86,7 @@ export interface ClipProjection {
 
 export interface ProjectOptions {
   changeSeq: string;
+  language?: ClipLanguage;
   context?: number;
   maxLinesPerSide?: number;
   maxBytesPerSide?: number;
@@ -95,6 +100,7 @@ export function projectClips(
   before: SideInput,
   after: SideInput,
   opts: ProjectOptions,
+  extract?: (text: string, language: ClipLanguage) => FunctionIndex,
 ): ClipProjection {
   // Options may only TIGHTEN a locked ceiling, never raise it: clamp each to its
   // constant. Raising a budget is a product decision, out of scope (see D4).
@@ -124,6 +130,55 @@ export function projectClips(
     const clips = clipArray(plans, b, a, limits);
     return clips.length > 0 ? fallback(clips) : skipped('clip-too-large');
   };
+  // B2 extension point: bounded fallback is assembled BEFORE any parse. Only
+  // this pure core chooses spans; the I/O wrapper supplies the native extractor.
+  const enrich = (plans: ClipPlan[], blocks: RawBlock[]): ClipProjection => {
+    const prepared = asFallback(plans);
+    if (!extract || prepared.status === 'skipped') return prepared;
+    const language = opts.language ?? 'unsupported';
+    const empty: FunctionIndex = { functions: [], errors: [] };
+    let bi: FunctionIndex, ai: FunctionIndex;
+    try {
+      bi = b.kind === 'text' ? extract(b.lines.join(''), language) : empty;
+      ai = a.kind === 'text' ? extract(a.lines.join(''), language) : empty;
+    } catch {
+      bi = ai = { ...empty, reason: 'worker-error' };
+    }
+    const failure = [bi.reason, ai.reason].find(r => r === 'timeout') ?? bi.reason ?? ai.reason;
+    if (failure) {
+      prepared.fallback_reason = failure;
+      for (const c of prepared.clips) for (const side of [c.before, c.after]) {
+        if (side.span) side.reason = failure;
+      }
+      return prepared;
+    }
+    const selected = functionPlans(blocks, b, a, bi, ai, limits.context);
+    if (selected === null) {
+      prepared.fallback_reason = 'extraction-budget-exhausted';
+      for (const c of prepared.clips) for (const side of [c.before, c.after]) {
+        if (side.span) side.reason = 'extraction-budget-exhausted';
+      }
+      return prepared;
+    }
+    const clips = clipArray(selected, b, a, limits);
+    if (!clips.length) return skipped('clip-too-large');
+    // B1 marks the last emitted SPAN on each omitted side. A function insertion
+    // may spend the other side's budget before this side has emitted any span;
+    // disclose that omission at projection level without falsifying a null side.
+    for (const side of ['before', 'after'] as const) {
+      if (!clips.some(c => c[side].span) && selected.slice(clips.length).some(c => planHasContent(c[side]))) {
+        return build('fallback', `truncated-${side}`, clips);
+      }
+    }
+    // Inspect ALL plans, including any omitted by the budget: truncation must
+    // not conceal a fallback hunk and turn a mixed result into ready.
+    const reasons = selected.flatMap(c => [c.before.reason, c.after.reason]).filter(Boolean);
+    const hasFunction = selected.some(c => c.before.method === 'function' || c.after.method === 'function');
+    if (hasFunction && reasons.length === 0) {
+      return { change_seq: opts.changeSeq, projection_version: CLIP_PROJECTION_VERSION, status: 'ready', clips };
+    }
+    return build('fallback', reasons[0] ?? 'no-enclosing-function', clips);
+  };
 
   // The after side drives the primary disposition: if we cannot show the result
   // state, nothing else matters.
@@ -132,7 +187,8 @@ export function projectClips(
 
   if (a.kind === 'absent') {
     if (b.kind === 'text') {
-      return asFallback([{ before: wholeRange(), after: nullSide('absent') }]);
+      return enrich([{ before: wholeRange(), after: nullSide('absent') }],
+        [{ before: { s0: 0, e0: b.lines.length }, after: { s0: 0, e0: 0 } }]);
     }
     if (b.kind === 'absent') return skipped('no-content');
     if (b.kind === 'gone') return unavailable(`before-${b.origin}`);
@@ -144,7 +200,8 @@ export function projectClips(
     if (b.lines.length * a.lines.length > limits.maxCells) {
       return asFallback([wholeFileClip('diff-too-large')]);
     }
-    const hunks = diffHunks(b.lines, a.lines, limits.context);
+    const blocks = diffRawBlocks(b.lines, a.lines);
+    const hunks = mergeRawBlocks(blocks, b.lines.length, a.lines.length, limits.context);
     if (hunks.length === 0) {
       if (equalBytes(b.bytes, a.bytes)) return skipped('no-change');
       return asFallback([wholeFileClip('no-line-change')]);
@@ -160,12 +217,13 @@ export function projectClips(
         ? { kind: 'null', method: 'changed-range' }
         : { kind: 'range', range: h.after, method: 'changed-range' },
     }));
-    return asFallback(plans);
+    return enrich(plans, blocks);
   }
 
   // after text, before not text: cannot diff, show after whole-file.
   if (b.kind === 'absent') {
-    return asFallback([{ before: nullSide('absent'), after: wholeRange() }]);
+    return enrich([{ before: nullSide('absent'), after: wholeRange() }],
+      [{ before: { s0: 0, e0: 0 }, after: { s0: 0, e0: a.lines.length } }]);
   }
   const beforeReason = b.kind === 'gone' ? `before-${b.origin}` : `before-${b.reason}`;
   const clips = clipArray(
@@ -264,6 +322,7 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 // --- diff ------------------------------------------------------------------
 
 interface LineRange { s0: number; e0: number } // half-open, 0-based line indices
+interface RawBlock { before: LineRange; after: LineRange }
 interface Hunk {
   before: LineRange;
   after: LineRange;
@@ -277,7 +336,7 @@ interface Hunk {
 
 /** Line-level LCS diff grouped into hunks of changed lines +/- `context`
  *  unchanged lines. Hunks whose context windows would touch are merged. */
-function diffHunks(before: string[], after: string[], context: number): Hunk[] {
+function diffRawBlocks(before: string[], after: string[]): RawBlock[] {
   const n = before.length;
   const m = after.length;
   const w = m + 1;
@@ -306,7 +365,9 @@ function diffHunks(before: string[], after: string[], context: number): Hunk[] {
     }
   }
   if (pi < n || pj < m) blocks.push({ before: { s0: pi, e0: n }, after: { s0: pj, e0: m } });
-
+  return blocks;
+}
+function mergeRawBlocks(blocks: RawBlock[], n: number, m: number, context: number): Hunk[] {
   // Merge blocks separated by <= 2*context equal lines, then pad with context.
   // Raw (pre-context) emptiness must survive the merge: a merged run is only
   // "raw-empty" on a side if EVERY block it absorbed was empty on that side —
@@ -337,12 +398,95 @@ function diffHunks(before: string[], after: string[], context: number): Hunk[] {
   }));
 }
 
+/** Split raw changes at function boundaries BEFORE adding fallback context.
+ * Pair segments by their order within the same LCS block, never by names or
+ * inferred identity. Repeated edits of one paired function share one clip.
+ */
+function functionPlans(
+  blocks: RawBlock[], before: ResolvedSide, after: ResolvedSide,
+  bi: FunctionIndex, ai: FunctionIndex, context: number,
+): ClipPlan[] | null {
+  let work = 0;
+  const withinBudget = (index: FunctionIndex): boolean => (work += index.functions.length + index.errors.length + 1) <= 400_000;
+  const segments = (range: LineRange, side: ResolvedSide, index: FunctionIndex): SidePlan[] => {
+    if (side.kind !== 'text' || range.s0 === range.e0) return [];
+    const plans: SidePlan[] = [];
+    for (let row = range.s0; row < range.e0;) {
+      if (!withinBudget(index)) return [];
+      // Smallest enclosing span wins (nested functions are independently useful).
+      const fn = index.functions.filter(f => f.s0 <= row && row < f.e0)
+        .sort((x, y) => (x.e0 - x.s0) - (y.e0 - y.s0) || y.s0 - x.s0)[0];
+      if (fn) {
+        plans.push({ kind: 'range', range: fn, method: 'function' });
+        row = Math.min(fn.e0, range.e0);
+      } else {
+        const start = row++;
+        while (row < range.e0 && !index.functions.some(f => f.s0 <= row && row < f.e0)) {
+          if (!withinBudget(index)) return [];
+          row++;
+        }
+        // Separating blank lines in a created/deleted block need no standalone
+        // clip. If these are the entire edit, the caller preserves the fallback.
+        if (side.lines.slice(start, row).every(line => line.trim() === '')) continue;
+        const damaged = index.errors.some(e => e.s0 < row && start < e.e0);
+        plans.push({ kind: 'range', method: 'changed-range',
+          range: { s0: Math.max(0, start - context), e0: Math.min(side.lines.length, row + context) },
+          reason: damaged ? 'parse-error-in-enclosing-scope' : 'no-enclosing-function' });
+      }
+    }
+    return plans;
+  };
+  const absent = (side: ResolvedSide): SidePlan => side.kind === 'absent'
+    ? nullSide('absent') : { kind: 'null', method: 'changed-range' };
+  const output: ClipPlan[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    const bs = segments(block.before, before, bi);
+    const as = segments(block.after, after, ai);
+    if (work > 400_000) return null;
+    // A body insertion/deletion can still have an enclosing function on its
+    // zero-line side. Require an interior anchor and a surviving enclosing
+    // boundary on the other side; a whole newly inserted function stays null.
+    const counterpart = (empty: LineRange, other: LineRange, plans: SidePlan[], index: FunctionIndex): SidePlan | undefined => {
+      if (empty.s0 !== empty.e0 || plans.length !== 1) return undefined;
+      const p = plans[0]!;
+      if (p.kind !== 'range' || p.method !== 'function' || !p.range
+        || (p.range.s0 >= other.s0 && p.range.e0 <= other.e0)) return undefined;
+      const fn = index.functions.filter(f => f.s0 < empty.s0 && empty.s0 < f.e0)
+        .sort((x, y) => (x.e0 - x.s0) - (y.e0 - y.s0))[0];
+      return fn ? { kind: 'range', method: 'function', range: fn } : undefined;
+    };
+    if (!bs.length) {
+      const p = counterpart(block.before, block.after, as, bi);
+      if (p) bs.push(p);
+    }
+    if (!as.length) {
+      const p = counterpart(block.after, block.before, bs, ai);
+      if (p) as.push(p);
+    }
+    // Whitespace-only edits remain real changes, even outside any function.
+    if (!bs.length && !as.length) {
+      const h = mergeRawBlocks([block], before.kind === 'text' ? before.lines.length : 0,
+        after.kind === 'text' ? after.lines.length : 0, context)[0]!;
+      const side = (range: LineRange, empty: boolean, resolved: ResolvedSide): SidePlan => empty ? absent(resolved)
+        : { kind: 'range', range, method: 'changed-range', reason: 'no-enclosing-function' };
+      output.push({ before: side(h.before, h.beforeRawEmpty, before), after: side(h.after, h.afterRawEmpty, after) });
+    }
+    for (let i = 0; i < Math.max(bs.length, as.length); i++) {
+      const plan = { before: bs[i] ?? absent(before), after: as[i] ?? absent(after) };
+      const key = JSON.stringify(plan);
+      if (!seen.has(key)) { seen.add(key); output.push(plan); }
+    }
+  }
+  return output;
+}
+
 // --- clip assembly with per-side budget ------------------------------------
 
 type SidePlan =
   // `range: null` on a whole-file plan means "the entire side"; the exact range
   // is resolved from the side's line count at materialization.
-  | { kind: 'range'; range: LineRange | null; method: 'changed-range' | 'whole-file'; reason?: string }
+  | { kind: 'range'; range: LineRange | null; method: 'function' | 'changed-range' | 'whole-file'; reason?: string }
   // `changed-range` here is the pure-insertion/pure-deletion side of a hunk: the
   // RAW (pre-context) block was zero-length, so this side has no corresponding
   // span at all — never budget-clipped, distinct from `empty` materialization of

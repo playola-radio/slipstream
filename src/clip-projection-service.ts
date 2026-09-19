@@ -5,7 +5,7 @@
  * four concerns on top of the pure core:
  *
  *  - Content-addressed LRU cache: keyed by (before tag, after tag,
- *    projection_version) so identical blobs across changes reuse one result,
+ *    projection_version, language) so identical inputs across changes reuse one result,
  *    bounded by entry count AND estimated bytes. change_seq is response-only and
  *    is stamped on the way out, never part of the key.
  *  - Bounded admission: at most `concurrency` computes run at once behind a
@@ -28,9 +28,11 @@ import {
 } from './clip-projection.ts';
 import { type ClipJob, type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
+import type { ClipLanguage } from './clip-language.ts';
 
 export interface ClipRequest {
   changeSeq: string;
+  language?: ClipLanguage;
   before: ClipSnapshot;
   after: ClipSnapshot;
 }
@@ -75,7 +77,7 @@ function sideTag(s: ClipSnapshot): string {
 }
 
 function cacheKey(req: ClipRequest): string {
-  return `${sideTag(req.before)}|${sideTag(req.after)}|${CLIP_PROJECTION_VERSION}`;
+  return `${sideTag(req.before)}|${sideTag(req.after)}|${CLIP_PROJECTION_VERSION}|${req.language ?? 'unsupported'}`;
 }
 
 function contentShas(req: ClipRequest): string[] {
@@ -234,7 +236,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
         storeDir: opts.storeDir,
         before: req.before,
         after: req.after,
-        opts: { changeSeq: req.changeSeq },
+        opts: { changeSeq: req.changeSeq, language: req.language },
       };
       const p = new Promise<ClipProjection>((resolve) => {
         const task: Task = { key, job, settle: resolve };

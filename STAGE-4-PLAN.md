@@ -48,6 +48,15 @@ public projection (D4), that is an explicit ratified ruling.
   reproduce eager parsing's contention). Attribution is unaffected: its evidence
   is external and ephemeral, so it stays a daemon producer writing log events.
 
+## B2 implementation clarification (Brian, 2026-09-19)
+
+The closed language token may be added to projection inputs and the disposable
+cache key. This extends D4's input tuple to `(before blob, after blob, language,
+projection_version)` so identical bytes under TypeScript and TSX grammars cannot
+share an incorrect result. The reader selects the token from the public event
+path; direct-disk callers can supply it. The pool/admission architecture stays
+unchanged. This clarification does not change any latency or honesty gate.
+
 ## Accepted tradeoff (D1=B, logged)
 
 Skipping P0 is a Completeness-6 architecture call. **D4 update:** clips no longer
