@@ -13,7 +13,7 @@ import { computeClipProjection, type ClipJob } from './clip-blob-reader.ts';
 export interface ClipWorkerRequest { id: number; job: ClipJob }
 export type ClipWorkerResponse =
   | { id: number; ok: true; result: import('./clip-projection.ts').ClipProjection }
-  | { id: number; ok: false; error: string };
+  | { id: number; ok: false };
 
 if (!parentPort) throw new Error('clip-projection-worker must run as a worker thread');
 const port = parentPort;
@@ -21,10 +21,6 @@ const port = parentPort;
 port.on('message', (msg: ClipWorkerRequest) => {
   computeClipProjection(msg.job).then(
     (result) => port.postMessage({ id: msg.id, ok: true, result } satisfies ClipWorkerResponse),
-    (err: unknown) => port.postMessage({
-      id: msg.id,
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    } satisfies ClipWorkerResponse),
+    () => port.postMessage({ id: msg.id, ok: false } satisfies ClipWorkerResponse),
   );
 });

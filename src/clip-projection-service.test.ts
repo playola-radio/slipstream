@@ -90,7 +90,7 @@ test('burst beyond admission is skipped as overloaded, not stalled', async () =>
     return { promise: gate.then(() => fallback(job.opts.changeSeq)), cancel: () => {} };
   };
   const svc = createClipProjectionService({
-    storeDir: STORE, compute, hasBlob: alwaysPresent, concurrency: 1, queueLimit: 1,
+    storeDir: STORE, compute, hasBlob: alwaysPresent, queueLimit: 1,
   });
   const pA = svc.get(contentReq('A', 1)); // runs
   const pB = svc.get(contentReq('B', 2)); // queued
@@ -142,19 +142,96 @@ test('a hit whose blob is gone is dropped and recomputed, never served stale', a
 });
 
 test('transient outcomes (timeout/overloaded) are never cached', async () => {
-  let present = true;
-  const compute: ClipCompute = () => ({
-    promise: new Promise<ClipProjection>(() => {}),
-    cancel: () => {},
-  });
+  let calls = 0;
+  const compute: ClipCompute = () => {
+    calls++;
+    return { promise: new Promise<ClipProjection>(() => {}), cancel: () => {} };
+  };
   const svc = createClipProjectionService({
-    storeDir: STORE, compute, hasBlob: async () => present, deadlineMs: 5,
+    storeDir: STORE, compute, hasBlob: alwaysPresent, deadlineMs: 5,
   });
   const r1 = await svc.get(contentReq('1', 1));
   const r2 = await svc.get(contentReq('2', 1));
   assert.equal(r1.fallback_reason, 'timeout');
-  assert.equal(r2.fallback_reason, 'timeout'); // recomputed (timed out again), not a cached hit
+  assert.equal(r2.fallback_reason, 'timeout');
+  // Two computes prove the first timeout was NOT cached and reused — the only
+  // way to tell caching from recomputation when both outcomes read 'timeout'.
+  assert.equal(calls, 2);
   await svc.close();
+});
+
+test('a per-side unavailable fallback is not cached, so a restored blob recomputes', async () => {
+  // The before blob is missing at compute time (per-side method 'unavailable');
+  // when it is later restored the request must recompute, not serve the stale
+  // "before-missing" result — revalidate-on-hit can't catch this because the
+  // snapshot still names a content sha whose blob is back.
+  let calls = 0;
+  const unavailableSide: ClipProjection = {
+    change_seq: '',
+    projection_version: CLIP_PROJECTION_VERSION,
+    status: 'fallback',
+    fallback_reason: 'function-extraction-unavailable',
+    clips: [{
+      before: { span: null, method: 'unavailable', reason: 'before-missing' },
+      after: { span: null, method: 'whole-file' },
+    }],
+  };
+  const compute: ClipCompute = (job) => {
+    calls++;
+    return { promise: Promise.resolve({ ...unavailableSide, change_seq: job.opts.changeSeq }), cancel: () => {} };
+  };
+  const svc = createClipProjectionService({ storeDir: STORE, compute, hasBlob: alwaysPresent });
+  const r1 = await svc.get(contentReq('1', 1));
+  const r2 = await svc.get(contentReq('2', 1));
+  assert.equal(r1.clips[0]!.before.method, 'unavailable');
+  assert.equal(calls, 2); // recomputed, not served from cache
+  assert.equal(r2.change_seq, '2');
+  await svc.close();
+});
+
+test('coalesced waiters beyond admission are bounded, not accumulated', async () => {
+  // Hold one compute pending and pile identical requests onto it. Only
+  // maxPending (CONCURRENCY 1 + queueLimit) may wait; the rest are overloaded
+  // immediately rather than attaching unbounded waiters.
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const compute: ClipCompute = (job) => {
+    calls++;
+    return { promise: gate.then(() => fallback(job.opts.changeSeq)), cancel: () => {} };
+  };
+  const svc = createClipProjectionService({
+    storeDir: STORE, compute, hasBlob: alwaysPresent, queueLimit: 2,
+  });
+  const admitted = [svc.get(contentReq('1', 1)), svc.get(contentReq('2', 1)), svc.get(contentReq('3', 1))];
+  const overloaded = await svc.get(contentReq('4', 1)); // maxPending is 3 -> the 4th is rejected
+  assert.equal(overloaded.fallback_reason, 'overloaded');
+  release();
+  const results = await Promise.all(admitted);
+  assert.equal(calls, 1); // all admitted waiters coalesced onto one compute
+  assert.deepEqual(results.map((r) => r.change_seq), ['1', '2', '3']);
+  await svc.close();
+});
+
+test('close settles queued work and rejects new requests', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const compute: ClipCompute = (job) => ({
+    promise: gate.then(() => fallback(job.opts.changeSeq)),
+    cancel: () => {},
+  });
+  const svc = createClipProjectionService({
+    storeDir: STORE, compute, hasBlob: alwaysPresent, queueLimit: 2,
+  });
+  const pRun = svc.get(contentReq('A', 1)); // running
+  const pQueued = svc.get(contentReq('B', 2)); // queued (distinct blob)
+  await svc.close(); // must settle both without hanging
+  const rQueued = await pQueued;
+  assert.equal(rQueued.fallback_reason, 'worker-error'); // drained, not stalled
+  const rAfter = await svc.get(contentReq('C', 3)); // rejected after close
+  assert.equal(rAfter.fallback_reason, 'worker-error');
+  release();
+  await pRun; // running task settles too, no dangling promise
 });
 
 test('default worker pool computes a real projection from on-disk blobs', async () => {
@@ -192,7 +269,7 @@ test('capture proceeds while projection admission is saturated', async () => {
     async ({ root, observe, waitFor }) => {
       const svc = createClipProjectionService({
         storeDir: STORE, compute, hasBlob: alwaysPresent,
-        concurrency: 1, queueLimit: 1, deadlineMs: 60_000,
+        queueLimit: 1, deadlineMs: 60_000,
       });
       try {
         // Saturate admission: one running, one queued, one overloaded.

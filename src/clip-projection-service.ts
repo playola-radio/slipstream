@@ -25,9 +25,8 @@ import { blobPath } from './store-reader.ts';
 import {
   CLIP_PROJECTION_VERSION,
   type ClipProjection,
-  type ProjectOptions,
 } from './clip-projection.ts';
-import { computeClipProjection, type ClipJob, type ClipSnapshot } from './clip-blob-reader.ts';
+import { type ClipJob, type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
 
 export interface ClipRequest {
@@ -43,20 +42,21 @@ export interface ClipProjectionService {
 
 export interface ClipServiceOptions {
   storeDir: string;
-  /** Compute seam. Defaults to a worker-thread pool of `concurrency` workers. */
+  /** Compute seam. Defaults to a single clip-projection worker thread. */
   compute?: ClipCompute;
   /** Blob-presence probe for revalidate-on-hit. Defaults to a filesystem check. */
   hasBlob?: (sha256: string) => Promise<boolean>;
-  concurrency?: number;
   queueLimit?: number;
   cacheEntries?: number;
   cacheBytes?: number;
   deadlineMs?: number;
-  projectOptions?: Omit<ProjectOptions, 'changeSeq'>;
 }
 
+// B1 runs exactly one clip worker (CPU stays off the capture path); concurrency
+// is a fixed design constant, not a knob.
+const CONCURRENCY = 1;
+
 const DEFAULTS = {
-  concurrency: 1,
   queueLimit: 8,
   cacheEntries: 512,
   cacheBytes: 4 * 1024 * 1024,
@@ -97,7 +97,15 @@ function transient(changeSeq: string, reason: string): ClipProjection {
 
 function cacheable(value: ClipProjection): boolean {
   if (value.status === 'unavailable') return false;
-  return !(value.fallback_reason !== undefined && UNCACHEABLE_REASONS.has(value.fallback_reason));
+  if (value.fallback_reason !== undefined && UNCACHEABLE_REASONS.has(value.fallback_reason)) return false;
+  // A per-side `unavailable` method reflects blob presence at compute time, not
+  // content, so a later restore must recompute rather than serve the stale
+  // "before-missing" disposition. Revalidate-on-hit can't catch this: the
+  // snapshot still names a content sha whose blob is now back.
+  for (const clip of value.clips) {
+    if (clip.before.method === 'unavailable' || clip.after.method === 'unavailable') return false;
+  }
+  return true;
 }
 
 interface CacheEntry { value: ClipProjection; bytes: number }
@@ -144,10 +152,9 @@ class LruCache {
 interface Task { key: string; job: ClipJob; settle: (v: ClipProjection) => void }
 
 export function createClipProjectionService(opts: ClipServiceOptions): ClipProjectionService {
-  const concurrency = opts.concurrency ?? DEFAULTS.concurrency;
   const queueLimit = opts.queueLimit ?? DEFAULTS.queueLimit;
   const deadlineMs = opts.deadlineMs ?? DEFAULTS.deadlineMs;
-  const pool = opts.compute ? null : createClipWorkerPool(concurrency);
+  const pool = opts.compute ? null : createClipWorkerPool();
   const compute: ClipCompute = opts.compute ?? pool!.run;
   const hasBlob = opts.hasBlob ?? ((sha256: string) =>
     access(blobPath(opts.storeDir, sha256), constants.F_OK).then(() => true, () => false));
@@ -159,6 +166,14 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
 
   let active = 0;
   const queue: Task[] = [];
+  // Every admitted request occupies one of `maxPending` slots until it settles —
+  // whether it starts a compute, waits in the queue, or coalesces onto an
+  // in-flight compute. This bounds coalesced waiters too, so a burst of identical
+  // requests can't accumulate unbounded promises (and HTTP responses) outside the
+  // queue limit.
+  const maxPending = CONCURRENCY + queueLimit;
+  let pending = 0;
+  let closed = false;
 
   const stamp = (value: ClipProjection, changeSeq: string): ClipProjection =>
     ({ ...value, change_seq: changeSeq });
@@ -197,6 +212,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
   };
 
   const get = async (req: ClipRequest): Promise<ClipProjection> => {
+    if (closed) return transient(req.changeSeq, 'worker-error');
     const key = cacheKey(req);
 
     const hit = cache.get(key);
@@ -205,33 +221,41 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
-    const flight = inFlight.get(key);
-    if (flight) return stamp(await flight, req.changeSeq);
+    // Admit before attaching, whether we start, queue, or coalesce. Excess is
+    // skipped immediately, never queued or coalesced unboundedly, so a burst
+    // cannot stall behind the worker or accumulate waiters off the queue.
+    if (pending >= maxPending) return transient(req.changeSeq, 'overloaded');
+    pending++;
+    try {
+      const flight = inFlight.get(key);
+      if (flight) return stamp(await flight, req.changeSeq);
 
-    // Admit before scheduling. Excess is skipped immediately, never queued
-    // unboundedly, so a burst cannot stall behind the worker.
-    if (active >= concurrency && queue.length >= queueLimit) {
-      return transient(req.changeSeq, 'overloaded');
+      const job: ClipJob = {
+        storeDir: opts.storeDir,
+        before: req.before,
+        after: req.after,
+        opts: { changeSeq: req.changeSeq },
+      };
+      const p = new Promise<ClipProjection>((resolve) => {
+        const task: Task = { key, job, settle: resolve };
+        if (active < CONCURRENCY) runTask(task); else queue.push(task);
+      });
+      inFlight.set(key, p);
+      void p.finally(() => inFlight.delete(key));
+      return stamp(await p, req.changeSeq);
+    } finally {
+      pending--;
     }
-
-    const job: ClipJob = {
-      storeDir: opts.storeDir,
-      before: req.before,
-      after: req.after,
-      opts: { ...opts.projectOptions, changeSeq: req.changeSeq },
-    };
-    const p = new Promise<ClipProjection>((resolve) => {
-      const task: Task = { key, job, settle: resolve };
-      if (active < concurrency) runTask(task); else queue.push(task);
-    });
-    inFlight.set(key, p);
-    void p.finally(() => inFlight.delete(key));
-    return stamp(await p, req.changeSeq);
   };
 
-  const close = async (): Promise<void> => { await pool?.close(); };
+  const close = async (): Promise<void> => {
+    closed = true;
+    // Drain the queue: tasks that never reached the worker settle explicitly
+    // rather than hang. Active work is settled by the pool close below (it
+    // resolves the in-flight worker promise), which unblocks each awaiting get.
+    for (const task of queue.splice(0)) task.settle(transient(task.job.opts.changeSeq, 'worker-error'));
+    await pool?.close();
+  };
 
   return { get, close };
 }
-
-export { computeClipProjection };
