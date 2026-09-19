@@ -96,6 +96,25 @@ describe('transcript discovery', () => {
     assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('/c/d.jsonl')));
   });
 
+  it('discloses a Codex session_meta with an empty id as malformed, not an empty-namespace binding', async () => {
+    // An empty id is not a stable session identity: keying evidence under "" would
+    // collapse unrelated sessions onto one namespace. Reject it as malformed rather
+    // than bind it.
+    const meta = JSON.stringify({ type: 'session_meta', payload: { id: '', cwd: '/work/proj' } });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/a.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+      1000,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('/c/a.jsonl')));
+  });
+
   it('discloses discovery-limited when the Codex scan is truncated', async () => {
     const result = await discoverCodex(
       io({ listTreeJsonl: async () => ({ paths: [], truncated: true, incomplete: false }) }),

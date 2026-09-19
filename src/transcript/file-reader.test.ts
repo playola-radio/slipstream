@@ -158,6 +158,49 @@ describe('transcript file reader', () => {
     );
   });
 
+  it('rereads from zero when the file shrinks to exactly the offset, dropping a partial tail', async () => {
+    // A complete line, then an unterminated partial tail: the offset stops at the
+    // line boundary while the file grows past it.
+    file.append(WRITE_A + '\n' + 'x'.repeat(50));
+    const reader = makeReader();
+    await reader.poll();
+    assert.equal(sink.appended.length, 1, 'toolu_a read; the partial tail is held');
+    // Rewrite the same inode to one brand-new record whose byte length equals the
+    // old line-boundary offset (WRITE_C is the same length as WRITE_A). The FILE
+    // shrank (the partial tail is gone), but the new size equals the offset, so a
+    // size<offset check misses it. Only tracking the last observed size catches the
+    // shrink and rereads the replacement from zero.
+    assert.equal((WRITE_C + '\n').length, (WRITE_A + '\n').length, 'fixture precondition');
+    file.replace(WRITE_C + '\n', file.ino);
+    await reader.poll();
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a', 'toolu_c'],
+      'the shrink to exactly the offset still reset the cursor',
+    );
+  });
+
+  it('discloses invalid UTF-8 as malformed instead of fabricating a replacement-char path', async () => {
+    // A complete JSON line whose file_path holds a raw 0xFF byte (invalid UTF-8).
+    // Lossy decoding would coin a "�"-bearing path and emit it as real scope; honest
+    // behavior reports the line malformed and emits no fabricated evidence.
+    const head = Buffer.from(
+      '{"type":"assistant","timestamp":"2026-09-19T12:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"Write","input":{"file_path":"/work/proj/',
+      'utf8',
+    );
+    const tail = Buffer.from('.ts"}}]}}\n', 'utf8');
+    file.buf = Buffer.concat([head, Buffer.from([0xff]), tail]);
+    const reader = makeReader();
+    const r = await reader.poll();
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues[0]!.kind, 'malformed');
+    assert.equal(sink.appended.length, 0, 'no fabricated replacement-char scope is ingested');
+    // The offset still advanced past the bad line, so a following good line lands.
+    file.append(WRITE_B + '\n');
+    await reader.poll();
+    assert.deepEqual(sink.appended.map((e) => e.evidence_key.record_id), ['toolu_b']);
+  });
+
   it('advances the cursor by bytes, not characters, across multibyte lines', async () => {
     file.append(MULTIBYTE_NOOP + '\n' + WRITE_A + '\n');
     const reader = makeReader();

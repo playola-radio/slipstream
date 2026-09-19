@@ -208,7 +208,11 @@ function parseSessionMeta(line: string): { id: string; cwd: string } | undefined
     const payload = obj.payload;
     if (typeof payload !== 'object' || payload === null) return undefined;
     const p = payload as Record<string, unknown>;
-    if (typeof p.id !== 'string' || typeof p.cwd !== 'string') return undefined;
+    // An empty id or cwd is not a usable session identity/scope: keying evidence
+    // under "" would collapse unrelated sessions, so treat it as malformed (undefined).
+    if (typeof p.id !== 'string' || p.id.length === 0 || typeof p.cwd !== 'string' || p.cwd.length === 0) {
+      return undefined;
+    }
     return { id: p.id, cwd: p.cwd };
   } catch {
     return undefined;

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { claudeStep, initialClaudeState, type ClaudeState } from './claude.ts';
-import type { AdapterContext, Diagnostic } from './types.ts';
+import type { AdapterContext } from './types.ts';
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 
 const CTX: AdapterContext = {
@@ -14,19 +14,17 @@ const CTX: AdapterContext = {
   adapterVersion: 'claude-code/1',
 };
 
-async function runFixture(): Promise<{ evidence: NormalizedEvidence[]; diagnostics: Diagnostic[] }> {
+async function runFixture(): Promise<{ evidence: NormalizedEvidence[] }> {
   const path = fileURLToPath(new URL('./fixtures/claude-sample.json', import.meta.url));
   const records = JSON.parse(await readFile(path, 'utf8')) as unknown[];
   let state: ClaudeState = initialClaudeState();
   const evidence: NormalizedEvidence[] = [];
-  const diagnostics: Diagnostic[] = [];
   for (const record of records) {
     const out = claudeStep(state, record, CTX);
     state = out.state;
     evidence.push(...out.evidence);
-    diagnostics.push(...out.diagnostics);
   }
-  return { evidence, diagnostics };
+  return { evidence };
 }
 
 describe('claude transcript adapter', () => {
@@ -160,6 +158,30 @@ describe('claude transcript adapter', () => {
       assert.equal(out.diagnostics.length, 1, `expected a diagnostic for ${JSON.stringify(record)}`);
       assert.equal(out.diagnostics[0]!.kind, 'malformed');
     }
+  });
+
+  it('discloses a matched tool_result with an unparseable timestamp as malformed', () => {
+    // The start is clean; its result arrives with a garbage timestamp. Silently
+    // dropping the end would hide a malformed record behind a clean read, so the
+    // end is disclosed malformed and no fabricated tool-end is emitted.
+    let state = initialClaudeState();
+    const start = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_a', name: 'Write', input: { file_path: '/work/proj/a.ts' } }] },
+    };
+    const s1 = claudeStep(state, start, CTX);
+    state = s1.state;
+    assert.equal(s1.evidence.length, 1);
+    const result = {
+      type: 'user',
+      timestamp: 'garbage',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_a' }] },
+    };
+    const s2 = claudeStep(state, result, CTX);
+    assert.equal(s2.evidence.length, 0, 'no tool-end without a real timestamp');
+    assert.equal(s2.diagnostics.length, 1);
+    assert.equal(s2.diagnostics[0]!.kind, 'malformed');
   });
 
   it('accepts plain string user content as a clean read, not a malformed one', () => {

@@ -11,12 +11,20 @@
  * landed. A blank or unparseable line advances (it must never wedge the reader);
  * only backpressure holds the offset.
  *
- * Rotation/rewrite (inode change, or a size below the offset) resets the offset
- * and the core's join state to a fresh generation and rereads from zero.
+ * Rotation/rewrite (inode change, or a size below the last observed size) resets
+ * the offset and the core's join state to a fresh generation and rereads from
+ * zero. Tracking the last observed size, not just the offset, catches an in-place
+ * rewrite that shrinks the file to at-or-above the line-boundary offset (a partial
+ * tail replaced by shorter content) — a shrink an offset-only check would miss.
  */
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 import type { IngestOutcome } from '../evidence-ingest.ts';
 import type { Diagnostic } from './types.ts';
+
+// A fatal decoder so an invalid-UTF-8 line is rejected rather than silently decoded
+// to replacement characters (which could fabricate a path). Reused across polls;
+// safe because each call is a one-shot decode (no streaming state).
+const LINE_DECODER = new TextDecoder('utf8', { fatal: true });
 
 export type StatResult =
   | { ok: true; size: number; dev: number; ino: number }
@@ -58,6 +66,7 @@ export interface TranscriptFileReaderOptions {
 export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
   const { path, io, sink, stepper } = opts;
   let offset = 0;
+  let lastSize = 0;
   let dev: number | undefined;
   let ino: number | undefined;
   let issues: Diagnostic[] = [];
@@ -89,9 +98,14 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
     if (!st.ok) {
       return { state: st.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
     }
-    if (dev === undefined || st.dev !== dev || st.ino !== ino || st.size < offset) {
+    // A file smaller than we last saw it was truncated/rewritten in place, even when
+    // it still sits at or above the line-boundary offset (a partial tail replaced by
+    // shorter content). Reread from zero. (`size < lastSize` subsumes `size < offset`,
+    // since the offset never runs past the last observed size.)
+    if (dev === undefined || st.dev !== dev || st.ino !== ino || st.size < lastSize) {
       resetGeneration(st);
     }
+    lastSize = st.size;
     let backpressured = false;
     if (st.size > offset) {
       let buf: Buffer;
@@ -108,8 +122,19 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
       for (let i = 0; i < buf.length; i++) {
         if (buf[i] !== 0x0a) continue;
         const lineBytes = i - lineStart + 1; // through the newline
-        const trimmed = buf.subarray(lineStart, i).toString('utf8').trim();
+        const slice = buf.subarray(lineStart, i);
         lineStart = i + 1;
+        let decoded: string;
+        try {
+          decoded = LINE_DECODER.decode(slice);
+        } catch {
+          // Invalid UTF-8: decoding it lossily would coin replacement characters and
+          // could fabricate a path, so disclose it malformed and advance past it.
+          issues.push({ kind: 'malformed', detail: 'transcript line was not valid UTF-8' });
+          offset += lineBytes;
+          continue;
+        }
+        const trimmed = decoded.trim();
         if (trimmed.length > 0) {
           let record: unknown;
           try {

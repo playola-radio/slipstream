@@ -196,7 +196,12 @@ function stepUser(
     // An orphan result (start never seen) carries no tool/scope to emit honestly;
     // the start, if it is ever read, records the invocation on its own.
     if (!memo) continue;
-    if (atMs === undefined) continue;
+    // A matched result with an unusable timestamp is a malformed record, not a clean
+    // read: disclose it (as the start side does) rather than silently drop the endpoint.
+    if (atMs === undefined) {
+      diagnostics.push({ kind: 'malformed', detail: `tool_result ${id} has no usable timestamp` });
+      continue;
+    }
     evidence.push(makeEvidence(ctx, memo.sessionId, id, memo.toolName, memo.scope, atMs, 'tool-end'));
   }
   return { state, evidence, diagnostics };

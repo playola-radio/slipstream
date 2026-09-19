@@ -154,7 +154,11 @@ function stepOutput(
   const memo = state.pending.get(callId);
   if (!memo) return { state, evidence: [], diagnostics: [] };
   const atMs = parseMs(record);
-  if (atMs === undefined) return { state, evidence: [], diagnostics: [] };
+  // A matched output with an unusable timestamp is malformed, not a clean read:
+  // disclose it (as the call side does) rather than silently drop the endpoint.
+  if (atMs === undefined) {
+    return { state, evidence: [], diagnostics: [{ kind: 'malformed', detail: `call ${callId} output has no usable timestamp` }] };
+  }
   return {
     state,
     evidence: [makeEvidence(ctx, callId, memo.toolName, memo.scope, atMs, 'tool-end')],

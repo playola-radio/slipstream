@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { codexStep, initialCodexState, type CodexState } from './codex.ts';
-import type { AdapterContext, Diagnostic } from './types.ts';
+import type { AdapterContext } from './types.ts';
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 
 const CTX: AdapterContext = {
@@ -14,19 +14,17 @@ const CTX: AdapterContext = {
   adapterVersion: 'codex/1',
 };
 
-async function runFixture(): Promise<{ evidence: NormalizedEvidence[]; diagnostics: Diagnostic[] }> {
+async function runFixture(): Promise<{ evidence: NormalizedEvidence[] }> {
   const path = fileURLToPath(new URL('./fixtures/codex-sample.json', import.meta.url));
   const records = JSON.parse(await readFile(path, 'utf8')) as unknown[];
   let state: CodexState = initialCodexState();
   const evidence: NormalizedEvidence[] = [];
-  const diagnostics: Diagnostic[] = [];
   for (const record of records) {
     const out = codexStep(state, record, CTX);
     state = out.state;
     evidence.push(...out.evidence);
-    diagnostics.push(...out.diagnostics);
   }
-  return { evidence, diagnostics };
+  return { evidence };
 }
 
 describe('codex transcript adapter', () => {
@@ -127,6 +125,35 @@ describe('codex transcript adapter', () => {
     const out = codexStep(initialCodexState(), record, CTX);
     assert.equal(out.evidence.length, 0);
     assert.equal(out.diagnostics[0]!.kind, 'unsupported');
+  });
+
+  it('discloses a matched output with an unparseable timestamp as malformed', () => {
+    // The call is clean; its output arrives with a garbage timestamp. Dropping the
+    // end silently would hide a malformed record behind a clean read, so it is
+    // disclosed malformed with no fabricated tool-end.
+    let state = initialCodexState();
+    const call = {
+      type: 'response_item',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      payload: {
+        type: 'custom_tool_call',
+        name: 'apply_patch',
+        call_id: 'call_a',
+        input: '*** Begin Patch\n*** Add File: a.ts\n+x\n*** End Patch\n',
+      },
+    };
+    const s1 = codexStep(state, call, CTX);
+    state = s1.state;
+    assert.equal(s1.evidence.length, 1);
+    const output = {
+      type: 'response_item',
+      timestamp: 'garbage',
+      payload: { type: 'custom_tool_call_output', call_id: 'call_a' },
+    };
+    const s2 = codexStep(state, output, CTX);
+    assert.equal(s2.evidence.length, 0, 'no tool-end without a real timestamp');
+    assert.equal(s2.diagnostics.length, 1);
+    assert.equal(s2.diagnostics[0]!.kind, 'malformed');
   });
 
   it('reports a malformed response_item payload, keeping it distinct from a clean read', () => {
