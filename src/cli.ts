@@ -207,6 +207,22 @@ function reportControl(res: ResponseEnvelope): void {
   process.exitCode = 1;
 }
 
+/** How to recover from an unknowable outcome, per verb. `status` reports attach
+ * state only — it cannot show whether a `delete_session` or `gc` committed — so
+ * point those idempotent maintenance verbs at a check that actually confirms
+ * them, or at a safe rerun, instead of the generic "run status". */
+export function retryGuidance(verb: string): string {
+  switch (verb) {
+    case 'delete_session':
+      return 'the deletion may have committed; `slipstream delete` is idempotent — safely rerun it, '
+        + "or confirm via the reader's session listing (a removed session is served HTTP 410 gone).";
+    case 'gc':
+      return '`slipstream gc` is idempotent — safely rerun it to finish any interrupted cleanup.';
+    default:
+      return 'run `slipstream status` before retrying; the request may have committed.';
+  }
+}
+
 async function runControl(store: string, request: Record<string, unknown> & { verb: string }): Promise<void> {
   const socketPath = controlSocketPath(store);
   try {
@@ -217,7 +233,7 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
       // Honesty: the request reached the daemon but its outcome is unknowable —
       // never report it as "nothing happened".
       console.error(`slipstream: outcome unknown — ${err.message}`);
-      console.error('slipstream: run `slipstream status` before retrying; the request may have committed.');
+      console.error(`slipstream: ${retryGuidance(request.verb)}`);
       process.exitCode = 3;
       return;
     }

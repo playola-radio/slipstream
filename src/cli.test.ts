@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArgs } from './cli.ts';
+import { parseArgs, retryGuidance } from './cli.ts';
 
 describe('cli', () => {
   describe('parseArgs', () => {
@@ -72,6 +72,23 @@ describe('cli parseArgs (daemon commands)', () => {
   });
   it('rejects --harness without a following value', () => {
     assert.equal(parseArgs(['attach', '/w', '--harness']), null);
+  });
+});
+
+describe('cli retryGuidance (unknown-outcome recovery)', () => {
+  it('points delete at a rerun / listing check, never at status (status cannot confirm a tombstone)', () => {
+    const g = retryGuidance('delete_session');
+    assert.match(g, /idempotent/);
+    assert.match(g, /410|listing/);
+    assert.doesNotMatch(g, /slipstream status/);
+  });
+  it('points gc at a safe rerun, never at status', () => {
+    const g = retryGuidance('gc');
+    assert.match(g, /idempotent|rerun/);
+    assert.doesNotMatch(g, /slipstream status/);
+  });
+  it('keeps the status hint for attach-state verbs', () => {
+    assert.match(retryGuidance('detach'), /slipstream status/);
   });
 });
 
