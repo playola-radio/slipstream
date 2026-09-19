@@ -151,3 +151,16 @@ regression P5 introduces on the supported single-daemon (D3) topology.
   fsync, a later `gc` that finds the shard already empty skips the fsync, so a
   power loss in that window could resurrect a deleted blob entry. Requires a
   failed fsync *and* a crash in a tiny window; narrow durability corner.
+
+## Standing decision — pre-release schema freedom (Brian, 2026-09-19)
+Slipstream has no external consumers yet. Until the first actual release — and
+beyond that for as long as Slipstream is the *only* client of its own event log —
+the event schema and its type graph may be changed freely (including
+non-additively) when doing so improves the overall design, rather than being
+treated as a frozen public interface that requires version-bump compatibility.
+The honesty constraints still hold in full; this relaxes only the
+backward-compatibility/versioning burden, not the truthfulness of what is
+recorded. It refines (does not revoke) the "changing this after Stage 3 is a
+breaking event-type version bump" note — that framing assumed external consumers.
+Consequence for P5's GC: correctness may lean on evolving the schema and the
+collector in lockstep rather than defending against arbitrary independent writers.
