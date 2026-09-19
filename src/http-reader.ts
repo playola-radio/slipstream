@@ -191,7 +191,12 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     if (!isValidSessionId(id)) { send(res, 404, 'not found'); return; }
     if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
     const logPath = sessionLogPath(opts.storeDir, id);
-    try { await access(logPath); } catch { send(res, 404, 'not found'); return; }
+    try { await access(logPath); } catch {
+      // A delete that removed the history after the tombstone check above still owes
+      // this request a 410, not a 404: re-check the marker before reporting missing.
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      send(res, 404, 'not found'); return;
+    }
 
     // Select the effective RAW cursor first — for follow, Last-Event-ID overrides
     // the `after` param — THEN parse once, so a malformed `after` that a valid
@@ -208,6 +213,10 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     const boundary = await boundaryFor(id);
     const H = boundary.current();
     if (effectiveAfter > H) {
+      // A delete that froze this session's boundary to 0 makes any positive cursor
+      // look "beyond" it. That is removal, not a stale cursor: 410 if the marker is
+      // now durable, else the genuine 409.
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
       send(res, 409, 'cursor beyond durable high-water', { [DURABLE_SEQ_HEADER]: H.toString() });
       return;
     }
@@ -286,7 +295,9 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       registry.removeFollower(id, ac);
       res.off('close', onDisconnect);
       res.off('error', onDisconnect);
-      if (removedNow && !res.headersSent) send(res, 410, 'gone');
+      // This recheck runs before writeHead(200), so headers are never sent yet: a
+      // durable tombstone becomes a clean 410; a bare abort just tears the socket.
+      if (removedNow) send(res, 410, 'gone');
       else res.destroy();
       return;
     }
