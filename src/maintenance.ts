@@ -127,8 +127,8 @@ export async function reclaimUnreferencedBlobs(storeDir: string, abort: SweepAbo
 /**
  * Add every blob hash one non-removed session's durable log references to `live`.
  * Reads the whole log up to its durable high-water. Throws — never returns a
- * partial set — if the log is missing, corrupt, or carries an event type or
- * snapshot shape this version cannot interpret.
+ * partial set — if the log is missing, corrupt, carries an event type this
+ * version cannot interpret, or holds a content snapshot without a valid sha256.
  */
 async function collectBlobRefs(storeDir: string, id: string, live: Set<string>): Promise<void> {
   const logPath = sessionLogPath(storeDir, id);
@@ -169,33 +169,35 @@ async function collectBlobRefs(storeDir: string, id: string, live: Set<string>):
 
 function addRefsFromEvent(type: string, data: Record<string, unknown>, live: Set<string>): void {
   if (!KNOWN_EVENT_TYPES.has(type)) {
-    // A newer/unknown type may reference blobs in a field this version does not
-    // know. Refuse to sweep rather than risk deleting a live blob.
+    // A newer/unknown type may reference blobs through a mechanism this version
+    // does not know. Refuse to sweep rather than risk deleting a live blob.
     throw new LogCorruptError(`gc-mark: unknown event type ${type}; refusing to sweep`);
   }
-  if (type === 'slipstream.file.baselined.v1') {
-    addSnapshotRef(data.snapshot, live);
-  } else if (type === 'slipstream.file.changed.v1') {
-    addSnapshotRef(data.before, live);
-    addSnapshotRef(data.after, live);
-  }
-  // Every other known type carries no blob reference.
+  // A blob reference is exactly a canonical content snapshot ({kind:'content',
+  // sha256}). Collect them wherever they appear in the event's data — not just the
+  // fields this version happens to hard-code — so an additive blob-bearing field on
+  // an existing type is still marked, never orphaned and swept. Any other shape
+  // carries no blob and is ignored.
+  addRefsFromValue(data, live);
 }
 
-function addSnapshotRef(snapshot: unknown, live: Set<string>): void {
-  if (typeof snapshot !== 'object' || snapshot === null) {
-    throw new LogCorruptError('gc-mark: malformed snapshot');
+function addRefsFromValue(value: unknown, live: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const item of value) addRefsFromValue(item, live);
+    return;
   }
-  const kind = (snapshot as { kind?: unknown }).kind;
-  if (kind === 'content') {
-    const sha = (snapshot as { sha256?: unknown }).sha256;
+  if (typeof value !== 'object' || value === null) return;
+  const record = value as Record<string, unknown>;
+  if (record.kind === 'content') {
+    // A content snapshot this version cannot interpret (no valid sha256) is
+    // corruption: refuse to sweep rather than sweep a blob it might reference.
+    const sha = record.sha256;
     if (typeof sha !== 'string' || !isValidHex(sha)) {
       throw new LogCorruptError('gc-mark: content snapshot without a valid sha256');
     }
     live.add(sha);
-  } else if (kind !== 'absent' && kind !== 'unavailable') {
-    throw new LogCorruptError(`gc-mark: unknown snapshot kind ${String(kind)}`);
   }
+  for (const child of Object.values(record)) addRefsFromValue(child, live);
 }
 
 /** Delete validated CAS blobs not in `live`, fsyncing each changed shard. Only

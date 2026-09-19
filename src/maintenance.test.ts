@@ -17,6 +17,7 @@ const NEVER_ABORT = () => false;
 const HEX_LIVE = 'a'.repeat(64);
 const HEX_DEAD = 'b'.repeat(64);
 const HEX_SHARED = 'c'.repeat(64);
+const HEX_FUTURE = 'd'.repeat(64);
 
 async function emptyStore(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'slip-maint-'));
@@ -125,6 +126,31 @@ describe('maintenance: mark-and-sweep blob reclamation', () => {
     const removed = await reclaimUnreferencedBlobs(dir, NEVER_ABORT);
     assert.equal(removed, 0);
     assert.equal(await exists(blobPath(dir, HEX_SHARED)), true);
+  });
+
+  it('marks a content snapshot in any field (a future additive blob field is not swept)', async () => {
+    const dir = await emptyStore();
+    // A changed.v1 event carrying a content snapshot in a field this version does
+    // not hard-code — nested, to lock the recursive walk. GC recognizes a blob
+    // reference by the canonical content-snapshot shape wherever it appears, so a
+    // future additive blob field is marked, never orphaned and swept.
+    await writeSession(dir, A, [{
+      seq: '1', type: 'slipstream.file.changed.v1',
+      data: {
+        session_id: A, path: 'f1',
+        before: { kind: 'absent' },
+        after: { kind: 'content', sha256: HEX_LIVE, size: 3 },
+        meta: { origin: { kind: 'content', sha256: HEX_FUTURE, size: 3 } },
+      },
+    }]);
+    await writeBlob(dir, HEX_LIVE);
+    await writeBlob(dir, HEX_FUTURE);
+    await writeBlob(dir, HEX_DEAD);
+    const removed = await reclaimUnreferencedBlobs(dir, NEVER_ABORT);
+    assert.equal(removed, 1);
+    assert.equal(await exists(blobPath(dir, HEX_LIVE)), true);
+    assert.equal(await exists(blobPath(dir, HEX_FUTURE)), true, 'a nested content snapshot is still marked');
+    assert.equal(await exists(blobPath(dir, HEX_DEAD)), false);
   });
 
   it('aborts (deletes nothing) when the log tail rewinds below its high-water', async () => {
