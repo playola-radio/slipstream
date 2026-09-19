@@ -163,13 +163,27 @@ export async function discoverCodex(
       continue;
     }
     const canonicalCwd = await io.realpath(meta.cwd);
-    // A cwd that no longer resolves cannot be this (existing, canonical) root, so
-    // it is a genuine non-candidate, not an unreadable one — skip without an issue.
-    if (canonicalCwd === undefined) continue;
+    if (canonicalCwd === undefined) {
+      // Can't canonicalize the cwd. If it even textually claims to sit inside this
+      // root, it is an in-root candidate we failed to read — disclose the gap rather
+      // than let a readable sibling report clean coverage. A cwd outside the root is
+      // a different worktree's session: a genuine non-candidate, skipped silently.
+      if (isWithinRoot(root, meta.cwd)) {
+        issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
+      }
+      continue;
+    }
     if (!isWithinRoot(root, canonicalCwd)) continue;
-    // If the recorded cwd is a non-canonical alias, its root form relativizes a
-    // record's absolute paths the same way capture's canonical root does.
-    const aliasRoot = meta.cwd === canonicalCwd ? undefined : resolve(meta.cwd, relative(canonicalCwd, root));
+    // If the recorded cwd is a non-canonical alias reached through a symlinked
+    // ANCESTOR, its root form relativizes a record's absolute paths the same way
+    // capture's canonical root does. Only trust an alias root that canonicalizes
+    // back to the capture root: a leaf symlink (e.g. /links/alias -> root/pkg)
+    // yields a bogus ancestor (/links) that would mis-scope or invent evidence.
+    let rootAliases: string[] | undefined;
+    if (meta.cwd !== canonicalCwd) {
+      const aliasRoot = resolve(meta.cwd, relative(canonicalCwd, root));
+      if ((await io.realpath(aliasRoot)) === root) rootAliases = [aliasRoot];
+    }
     bindings.push({
       path,
       ctx: {
@@ -178,7 +192,7 @@ export async function discoverCodex(
         root,
         cwd: canonicalCwd,
         adapterVersion: CODEX_ADAPTER_VERSION,
-        ...(aliasRoot !== undefined ? { rootAliases: [aliasRoot] } : {}),
+        ...(rootAliases !== undefined ? { rootAliases } : {}),
       },
     });
   }

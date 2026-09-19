@@ -193,6 +193,19 @@ describe('transcript file reader', () => {
     );
   });
 
+  it('reports a malformed assistant envelope as degraded, not a clean read', async () => {
+    // A complete, parseable line whose assistant content is a string, not a block
+    // array. It yields no evidence, but it is malformed — coverage must show
+    // degraded so it is distinguishable from a clean read with no match.
+    const badEnvelope = JSON.stringify({ type: 'assistant', message: { content: 'invalid' } });
+    file.append(badEnvelope + '\n');
+    const reader = makeReader();
+    const r = await reader.poll();
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues[0]!.kind, 'malformed');
+    assert.equal(sink.appended.length, 0);
+  });
+
   it('advances past a malformed line and reports degraded, never wedging', async () => {
     file.append('{not json\n' + WRITE_A + '\n');
     const reader = makeReader();

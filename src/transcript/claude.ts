@@ -124,7 +124,16 @@ function stepAssistant(
   const diagnostics: Diagnostic[] = [];
   const message = record.message;
   const content = isObject(message) ? message.content : undefined;
-  if (!Array.isArray(content)) return { state, evidence, diagnostics };
+  if (!Array.isArray(content)) {
+    // An assistant record's content should be an array of blocks. A present-but-
+    // non-array content is a malformed envelope (unlike a user record, whose
+    // content is legitimately a string): disclose it so coverage degrades rather
+    // than passing as a clean read with no match.
+    if (content !== undefined) {
+      diagnostics.push({ kind: 'malformed', detail: 'assistant record content is not an array' });
+    }
+    return { state, evidence, diagnostics };
+  }
   const atMs = parseMs(record);
   // The harness session is the record's own `sessionId` (the native session), so
   // a copied/renamed transcript keeps one identity instead of splitting into
