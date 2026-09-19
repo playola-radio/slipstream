@@ -161,7 +161,16 @@ export function projectClips(
     return asFallback([{ before: nullSide('absent'), after: wholeRange() }]);
   }
   const beforeReason = b.kind === 'gone' ? `before-${b.origin}` : `before-${b.reason}`;
-  return asFallback([{ before: nullSide('unavailable', beforeReason), after: wholeRange() }]);
+  const clips = clipArray(
+    [{ before: nullSide('unavailable', beforeReason), after: wholeRange() }], b, a, limits,
+  );
+  if (clips.length > 0) return fallback(clips);
+  // Nothing of the after side fits the budget. When the before side is genuinely
+  // gone (GC'd/uncaptured), this outcome is availability-dependent — a restored
+  // before blob would diff and likely fit — so surface it as `unavailable` (never
+  // cached) rather than a stale `skipped`. A present-but-unparseable before
+  // (oversize/binary) is deterministic, so it stays a cacheable skip.
+  return b.kind === 'gone' ? unavailable(beforeReason) : skipped('clip-too-large');
 }
 
 // --- side resolution -------------------------------------------------------
@@ -356,12 +365,20 @@ function clipArray(plans: ClipPlan[], before: ResolvedSide, after: ResolvedSide,
     if (a.outcome === 'partial') afterTrunc = true;
     if (b.outcome === 'partial' || a.outcome === 'partial') break;
   }
-  if (clips.length > 0) {
-    const last = clips[clips.length - 1]!;
-    if (beforeTrunc && last.before.span) last.before.span.truncated = true;
-    if (afterTrunc && last.after.span) last.after.span.truncated = true;
-  }
+  if (beforeTrunc) markLastSpanTruncated(clips, 'before');
+  if (afterTrunc) markLastSpanTruncated(clips, 'after');
   return clips;
+}
+
+/** Disclose truncation on the last emitted span of a side. The last CLIP may be
+ *  a null-span insertion/deletion on that side, so walk back to the last clip
+ *  that actually has a span there — otherwise a dropped later hunk would go
+ *  silently undisclosed. */
+function markLastSpanTruncated(clips: Clip[], side: 'before' | 'after'): void {
+  for (let i = clips.length - 1; i >= 0; i--) {
+    const span = clips[i]![side].span;
+    if (span) { span.truncated = true; return; }
+  }
 }
 
 function materialize(plan: SidePlan, side: ResolvedSide, budget: Budget): Materialized {

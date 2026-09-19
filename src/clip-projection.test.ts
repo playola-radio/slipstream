@@ -216,6 +216,38 @@ test('exact budget exhaustion discloses dropped later hunks via truncated', () =
   assert.equal(p.clips[0]!.before.span!.truncated, true);
 });
 
+test('a hunk dropped after a null-span insertion still discloses truncation', () => {
+  // The budget is spent by hunk 1, hunk 2 is an insertion (null before span),
+  // hunk 3 is dropped. Disclosure must land on the last NON-null before span
+  // (hunk 1), not the trailing insertion's null span — otherwise the dropped
+  // edit vanishes with every span reading truncated:false.
+  const before = 'a\nb\nc\nk\nz\nq\n';
+  const after = 'A\nk\nI\nz\nQ\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 0, maxLinesPerSide: 3 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.some((c) => c.before.span?.truncated === true), true);
+});
+
+test('before gone with an after too large to clip is unavailable, not a cacheable skip', () => {
+  // A missing before forces a whole-file render of after; if after cannot be
+  // clipped within budget, the disposition is availability-dependent (a restored
+  // before would diff and fit), so it must be `unavailable` (never cached), not a
+  // stale `skipped`/`clip-too-large`.
+  const after = 'x'.repeat(70000) + '\n';
+  const p = projectClips({ kind: 'missing', reason: 'blob-gone' }, bytes(after), { changeSeq: SEQ });
+  assert.equal(p.status, 'unavailable');
+  assert.equal(p.fallback_reason, 'before-missing');
+});
+
+test('before present-but-oversize with an unclippable after stays a deterministic skip', () => {
+  // Both sides present (before merely too big to parse); nothing fits the budget.
+  // Deterministic given the blobs, so it is a cacheable skip, not unavailable.
+  const after = 'x'.repeat(70000) + '\n';
+  const p = projectClips({ kind: 'oversize' }, bytes(after), { changeSeq: SEQ });
+  assert.equal(p.status, 'skipped');
+  assert.equal(p.fallback_reason, 'clip-too-large');
+});
+
 test('an empty corresponding range (insertion) does not stop later hunks', () => {
   // Insert X at the top and edit d->D at the bottom. The insertion's before side
   // is an empty range (null span); it must not be mistaken for budget exhaustion
