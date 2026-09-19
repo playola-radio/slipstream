@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/projections/clip.v1.json",
+  "title": "clip.v1",
+  "$comment": "A reader-derived public projection over the immutable before/after blobs of a file.changed event. It is NOT a log event and is never appended; it is a pure function of (before bytes, after bytes, projection_version), computed on demand and cached disposably. Spans reference the raw blob bytes by zero-based half-open byte offsets; a null span means NO corresponding span on that side (created/deleted content), never unreadable content. Unreadable/gone content is a non-ready status or a per-side `unavailable` method, each with an explicit reason. `projection_version` names the complete algorithm and is the cache key. Unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "change_seq",
+    "projection_version",
+    "status",
+    "clips"
+  ],
+  "properties": {
+    "change_seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "$comment": "The `seq` of the file.changed event this projection is derived from. Stamped on the response; never part of the cache key."
+    },
+    "projection_version": {
+      "const": "clip.v1",
+      "$comment": "Names the complete extraction algorithm and is the cache key. A dropped cache recomputes an identical result under the same version."
+    },
+    "status": {
+      "enum": [
+        "ready",
+        "fallback",
+        "skipped",
+        "unavailable"
+      ],
+      "$comment": "`ready` = function-level clips (reserved for a later version). `fallback` = a diffable file rendered as changed byte ranges. `skipped` = no bounded clip could be produced (binary/oversize/no-change/etc.). `unavailable` = a referenced blob's content is gone or was never captured."
+    },
+    "fallback_reason": {
+      "type": "string",
+      "$comment": "Required for every status except `ready`. Explains why the projection is not `ready` (e.g. `function-extraction-unavailable`, `timeout`, `overloaded`, `binary`, `oversize`, a snapshot/blob reason)."
+    },
+    "clips": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/clip"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "const": "ready"
+      }
+    }
+  },
+  "then": {},
+  "else": {
+    "required": [
+      "fallback_reason"
+    ]
+  },
+  "$defs": {
+    "clip": {
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/side"
+        },
+        "after": {
+          "$ref": "#/$defs/side"
+        }
+      }
+    },
+    "side": {
+      "type": "object",
+      "required": [
+        "span",
+        "method"
+      ],
+      "properties": {
+        "span": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/span"
+            }
+          ],
+          "$comment": "null means NO corresponding span on this side (created/deleted content), never unreadable content."
+        },
+        "method": {
+          "enum": [
+            "changed-range",
+            "whole-file",
+            "absent",
+            "unavailable"
+          ],
+          "$comment": "`changed-range` = a real diff hunk. `whole-file` = the side could not be diffed (create/delete/diff-too-large/before-unavailable). `absent` = the path did not exist on this side. `unavailable` = the side's content is gone or was not captured."
+        },
+        "reason": {
+          "type": "string",
+          "$comment": "Present when the method needs one (e.g. `unavailable` carries the blob/snapshot reason)."
+        }
+      }
+    },
+    "span": {
+      "type": "object",
+      "required": [
+        "byte_start",
+        "byte_end",
+        "line_start",
+        "line_end",
+        "truncated"
+      ],
+      "properties": {
+        "byte_start": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based inclusive start byte offset into the raw blob."
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based exclusive end byte offset; the span is [byte_start, byte_end). Always lands on a UTF-8 boundary."
+        },
+        "line_start": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "1-based inclusive first line covered."
+        },
+        "line_end": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "1-based inclusive last line covered. Lines split on \\n (0x0a); a preceding \\r stays in the line (CRLF preserved); a trailing newline does not create a phantom last line."
+        },
+        "truncated": {
+          "type": "boolean",
+          "$comment": "True when the per-side line/byte budget clipped this span short of the full changed range."
+        }
+      }
+    }
+  }
+}

@@ -5,10 +5,12 @@ import type { AddressInfo } from 'node:net';
 import type { Health } from './health.ts';
 import {
   listSessions, readTombstone, isValidSessionId, sessionLogPath, onDiskHighWater,
-  blobPath, isValidHex, schemaBytes,
+  blobPath, isValidHex, schemaBytes, projectionSchemaBytes,
 } from './store-reader.ts';
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
 import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
+import { parseClipSnapshot } from './clip-blob-reader.ts';
+import { createClipProjectionService } from './clip-projection-service.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
 
@@ -70,6 +72,12 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     registry.installIfAbsent(opts.active.id, liveBoundary(opts.active.health));
   }
 
+  // The clip projection is computed on demand from the immutable blobs and cached
+  // disposably (no log, no persistence). The service owns the worker pool + bounded
+  // admission so a burst of cold-cache requests cannot starve capture; the server
+  // closes it on shutdown.
+  const clipService = createClipProjectionService({ storeDir: opts.storeDir });
+
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);
     if (!res.headersSent) send(res, 500, 'internal error'); else res.destroy();
@@ -128,6 +136,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       await handleEvents(req, res, decodeURIComponent(eventsMatch[1]!), searchParams);
       return;
     }
+    const clipsMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/changes\/([0-9]+)\/clips$/);
+    if (clipsMatch) {
+      await handleClips(res, decodeURIComponent(clipsMatch[1]!), clipsMatch[2]!);
+      return;
+    }
     const blobMatch = pathname.match(/^\/v1\/blobs\/sha256\/([^/]+)$/);
     if (blobMatch) {
       const hex = blobMatch[1]!;
@@ -159,6 +172,17 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       return;
     }
 
+    const projectionSchemaMatch = pathname.match(/^\/v1\/schemas\/projections\/([^/]+)$/);
+    if (projectionSchemaMatch) {
+      let version: string;
+      try { version = decodeURIComponent(projectionSchemaMatch[1]!); }
+      catch { send(res, 400, 'invalid version'); return; }
+      const bytes = await projectionSchemaBytes(version);
+      if (!bytes) { send(res, 404, 'not found'); return; }
+      send(res, 200, bytes, { 'content-type': 'application/json; charset=utf-8' });
+      return;
+    }
+
     const schemaMatch = pathname.match(/^\/v1\/schemas\/([^/]+)$/);
     if (schemaMatch) {
       let type: string;
@@ -183,6 +207,48 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     const runtime = registry.get(id);
     if (runtime) return runtime.boundary;
     return staticBoundary(await onDiskHighWater(sessionLogPath(opts.storeDir, id)));
+  }
+
+  async function handleClips(res: ServerResponse, id: string, seqStr: string): Promise<void> {
+    if (!isValidSessionId(id)) { send(res, 404, 'not found'); return; }
+    if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+    const logPath = sessionLogPath(opts.storeDir, id);
+    try { await access(logPath); } catch {
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      send(res, 404, 'not found'); return;
+    }
+
+    // The change must be within the durable high-water; a seq at or beyond it names
+    // no committed change (the same boundary the events feed serves).
+    const seq = BigInt(seqStr); // route regex guarantees a decimal string
+    const H = (await boundaryFor(id)).current();
+    if (seq < 1n || seq > H) { send(res, 404, 'not found'); return; }
+
+    // Read exactly the record at `seq`. openLogCursor positions after seq-1 and
+    // readThrough(seq) yields that single event; corruption in the scanned prefix
+    // throws LogCorruptError and surfaces as a clean 500 (never a faked projection).
+    let ev;
+    let cursor: LogCursor | undefined;
+    try {
+      cursor = await openLogCursor(logPath, seq - 1n);
+      const batch = await cursor.readThrough(seq);
+      ev = batch.find((e) => e.seq === seq);
+    } finally {
+      await cursor?.close();
+    }
+    if (!ev || ev.type !== 'slipstream.file.changed.v1') { send(res, 404, 'not found'); return; }
+
+    const before = parseClipSnapshot(ev.data.before);
+    const after = parseClipSnapshot(ev.data.after);
+    if (!before || !after) {
+      throw new LogCorruptError('file.changed record missing a before/after snapshot');
+    }
+
+    // The projection itself carries availability: GC'd blobs yield an `unavailable`
+    // status with a reason, served as a normal 200. The HTTP status reports whether
+    // the request succeeded, not whether the content is still retained.
+    const projection = await clipService.get({ changeSeq: seqStr, before, after });
+    sendJson(res, 200, projection);
   }
 
   async function handleEvents(
@@ -358,6 +424,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     close: async () => {
       closing = true;
       for (const ac of followers) ac.abort();
+      await clipService.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // Remove the descriptor this server published; a dead reader must not leave
       // a stale pointer behind. ENOENT (already gone) is fine.
