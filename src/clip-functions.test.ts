@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { projectClips as core, type SideInput, type ProjectOptions } from './clip-projection.ts';
 
@@ -8,6 +8,21 @@ const projectClips = (before: SideInput, after: SideInput, opts: ProjectOptions)
 
 const bytes = (text: string): SideInput => ({ kind: 'bytes', bytes: Buffer.from(text) });
 const project = (before: string, after: string) => projectClips(bytes(before), bytes(after), { changeSeq: '42' });
+
+// These assertions test syntax/selection, not host scheduling. Keep the parser's
+// cooperative clock deterministic; the worker/deadline suites and live benchmark
+// exercise the real wall-clock limit. A separate test below advances this clock.
+beforeEach(() => { mock.method(performance, 'now', () => 0); });
+afterEach(() => { mock.restoreAll(); });
+
+test('WASM progress cancellation returns a timeout and leaves the next parse usable', t => {
+  let ticks = 0;
+  t.mock.method(performance, 'now', () => ticks++ === 0 ? 0 : 21);
+  const timed = indexFunctions('function f() {\n' + 'let a=1;\n'.repeat(1000) + '}\n', 'typescript');
+  assert.equal(timed.reason, 'timeout');
+  t.mock.method(performance, 'now', () => 0);
+  assert.equal(indexFunctions('function f() { return 1; }', 'typescript').functions.length, 1);
+});
 
 test('extracts the enclosing function for JavaScript, JSX, TypeScript and TSX syntax', () => {
   for (const [language, source] of [
@@ -19,7 +34,7 @@ test('extracts the enclosing function for JavaScript, JSX, TypeScript and TSX sy
     const after = source.replace('old', 'new');
     const p = projectClips(bytes(source), bytes(after), { changeSeq: '42', language });
     assert.equal(p.status, 'ready', source);
-    assert.equal(p.projection_version, 'clip.v2');
+    assert.equal(p.projection_version, 'clip.v3');
     assert.equal(p.fallback_reason, undefined);
     assert.equal(p.clips.length, 1);
     for (const side of ['before', 'after'] as const) {
@@ -43,11 +58,69 @@ test('language selection is a closed set and unsupported files keep bounded fall
   assert.equal(p.clips[0]!.after.reason, 'unsupported-language');
 });
 
-test('a supported source above the native default buffer size still extracts', () => {
+test('a supported source above 32 KiB still extracts', () => {
   const source = '// ' + 'x'.repeat(40_000) + '\nfunction f() {\n  return 1;\n}\n';
   const p = project(source, source.replace('return 1', 'return 2'));
   assert.equal(p.status, 'ready');
   assert.equal(p.clips[0]!.after.span!.line_start, 2);
+});
+
+test('function expressions, generators and methods retain enclosing function spans', () => {
+  for (const language of ['javascript', 'typescript', 'tsx'] as const) {
+    for (const source of [
+      'const f = function() {\n  return 1;\n};\n',
+      'const f = function*() {\n  yield 1;\n};\n',
+      'function* f() {\n  yield 1;\n}\n',
+      'class C {\n  f() {\n    return 1;\n  }\n}\n',
+    ]) {
+      const p = projectClips(bytes(source), bytes(source.replace('1;', '2;')),
+        { changeSeq: '42', language });
+      assert.equal(p.status, 'ready', `${language}: ${source}`);
+      assert.equal(p.clips[0]!.after.method, 'function');
+      assert.equal(p.clips[0]!.after.span!.line_start, source.startsWith('class') ? 2 : 1);
+      assert.equal(p.clips[0]!.after.span!.line_end, source.startsWith('class') ? 4 : 3);
+    }
+  }
+});
+
+test('extracts a bounded changed function when fallback context starts with an oversized top-level comment', () => {
+  const source = '// ' + 'x'.repeat(70_000) + '\nfunction f() {\n  return 1;\n}\n';
+  const p = project(source, source.replace('return 1', 'return 2'));
+  assert.equal(p.status, 'ready');
+  for (const side of ['before', 'after'] as const) {
+    assert.equal(p.clips[0]![side].method, 'function');
+    assert.equal(p.clips[0]![side].span!.line_start, 2);
+  }
+});
+
+test('retains a bounded changed-range fallback when an enclosing function header is oversized', () => {
+  const header = 'function f(/* ' + 'x'.repeat(70_000) + ' */) {';
+  const body = Array.from({ length: 21 }, (_, i) => `  const v${i} = ${i};`);
+  const before = [header, ...body, '  return 1;', '}'].join('\n') + '\n';
+  const after = before.replace('return 1', 'return 2');
+  const index = { functions: [{ s0: 0, e0: body.length + 3 }], errors: [] };
+  const p = core(bytes(before), bytes(after), { changeSeq: '42', language: 'typescript' }, () => index);
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.fallback_reason, 'function-clip-too-large');
+  for (const side of ['before', 'after'] as const) {
+    assert.equal(p.clips[0]![side].method, 'changed-range');
+    assert.equal(p.clips[0]![side].reason, 'function-clip-too-large');
+    assert.equal(p.clips[0]![side].span!.line_start, 3);
+  }
+});
+
+test('parser faults retain their transient reason when no prepared fallback clip fits', () => {
+  const source = '// ' + 'x'.repeat(70_000) + '\nfunction f() {\n  return 1;\n}\n';
+  const after = source.replace('return 1', 'return 2');
+  for (const { extractor, reason } of [
+    { extractor: () => ({ functions: [], errors: [], reason: 'timeout' }), reason: 'timeout' },
+    { extractor: () => { throw new Error('parser failure'); }, reason: 'worker-error' },
+  ]) {
+    const p = core(bytes(source), bytes(after), { changeSeq: '42', language: 'typescript' }, extractor);
+    assert.equal(p.status, 'skipped');
+    assert.equal(p.fallback_reason, reason);
+    assert.deepEqual(p.clips, []);
+  }
 });
 
 test('a parse timeout returns prepared ranges and explicit transient reasons', () => {

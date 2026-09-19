@@ -91,7 +91,7 @@ export async function computeClipProjection(job: ClipJob): Promise<ClipProjectio
     resolveClipSide(job.storeDir, job.after, maxBytes),
   ]);
   // Only computing callers load the parser; the HTTP main loop also imports
-  // snapshot validation from this module and must not initialize the addon.
+  // snapshot validation from this module and must not initialize the WASM runtime.
   const { indexFunctions } = await import('./clip-function-parser.ts');
   return projectClips(before, after, job.opts, indexFunctions);
 }

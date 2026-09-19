@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/projections/clip.v3.json",
+  "title": "clip.v3",
+  "$comment": "Reader-derived projection over immutable blobs and a closed language token. No log event, seq or policy_seq is appended. Spans cover raw UTF-8 bytes on whole-line boundaries. Pairing follows LCS diff correspondence, not semantic identity or move detection. Successful results are deterministic for pinned grammar versions; transient timing/availability outcomes are never cached.",
+  "type": "object",
+  "required": [
+    "change_seq",
+    "projection_version",
+    "status",
+    "clips"
+  ],
+  "properties": {
+    "change_seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "$comment": "The `seq` of the file.changed event this projection is derived from. Stamped on the response; never part of the cache key."
+    },
+    "projection_version": {
+      "const": "clip.v3",
+      "$comment": "Names the complete extraction algorithm and is the cache key. A dropped cache recomputes an identical result under the same version."
+    },
+    "status": {
+      "enum": [
+        "ready",
+        "fallback",
+        "skipped",
+        "unavailable"
+      ],
+      "$comment": "ready: every changed segment is function-derived or a corresponding null side; fallback: at least one segment is not reliably enclosed by a function, parsing failed, or a soft timeout retained bounded ranges. Inspect per-side methods/reasons and truncated independently."
+    },
+    "fallback_reason": {
+      "type": "string",
+      "$comment": "Required unless ready: unsupported-language, no-enclosing-function, parse-error-in-enclosing-scope, extraction-budget-exhausted, timeout, and B1 availability/budget reasons. timeout is transient even with fallback clips."
+    },
+    "clips": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/clip"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "const": "ready"
+      }
+    }
+  },
+  "then": {},
+  "else": {
+    "required": [
+      "fallback_reason"
+    ]
+  },
+  "$defs": {
+    "clip": {
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/side"
+        },
+        "after": {
+          "$ref": "#/$defs/side"
+        }
+      }
+    },
+    "side": {
+      "type": "object",
+      "required": [
+        "span",
+        "method"
+      ],
+      "properties": {
+        "span": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/span"
+            }
+          ],
+          "$comment": "null means NO corresponding span on this side (created/deleted content), never unreadable content."
+        },
+        "method": {
+          "enum": [
+            "function",
+            "changed-range",
+            "whole-file",
+            "absent",
+            "unavailable"
+          ],
+          "$comment": "function: enclosing function rounded out to whole lines; changed-range: bounded diff range (null for no corresponding range); whole-file: no bounded diff; absent/unavailable: B1 dispositions."
+        },
+        "reason": {
+          "type": "string",
+          "$comment": "Present when the method needs one (e.g. `unavailable` carries the blob/snapshot reason)."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "absent"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "whole-file"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/span"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "function"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/span"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "span": {
+      "type": "object",
+      "required": [
+        "byte_start",
+        "byte_end",
+        "line_start",
+        "line_end",
+        "truncated"
+      ],
+      "properties": {
+        "byte_start": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based inclusive start byte offset into the raw blob."
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based exclusive end byte offset; the span is [byte_start, byte_end). Always lands on a UTF-8 boundary."
+        },
+        "line_start": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "1-based inclusive first line covered."
+        },
+        "line_end": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "1-based inclusive last line covered. Lines split on \\n (0x0a); a preceding \\r stays in the line (CRLF preserved); a trailing newline does not create a phantom last line."
+        },
+        "truncated": {
+          "type": "boolean",
+          "$comment": "True when the per-side line/byte budget clipped this span short of the full changed range."
+        }
+      }
+    }
+  }
+}

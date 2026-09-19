@@ -30,7 +30,7 @@
 import type { ClipLanguage } from './clip-language.ts';
 import type { FunctionIndex } from './clip-function-parser.ts';
 
-export const CLIP_PROJECTION_VERSION = 'clip.v2';
+export const CLIP_PROJECTION_VERSION = 'clip.v3';
 
 /** Fixed extraction budgets. May only be tightened by an explicit option (raising
  *  a ceiling is a product decision, out of scope). */
@@ -131,10 +131,10 @@ export function projectClips(
     return clips.length > 0 ? fallback(clips) : skipped('clip-too-large');
   };
   // B2 extension point: bounded fallback is assembled BEFORE any parse. Only
-  // this pure core chooses spans; the I/O wrapper supplies the native extractor.
+  // this pure core chooses spans; the I/O wrapper supplies the WASM extractor.
   const enrich = (plans: ClipPlan[], blocks: RawBlock[]): ClipProjection => {
     const prepared = asFallback(plans);
-    if (!extract || prepared.status === 'skipped') return prepared;
+    if (!extract) return prepared;
     const language = opts.language ?? 'unsupported';
     const empty: FunctionIndex = { functions: [], errors: [] };
     let bi: FunctionIndex, ai: FunctionIndex;
@@ -161,7 +161,18 @@ export function projectClips(
       return prepared;
     }
     const clips = clipArray(selected, b, a, limits);
-    if (!clips.length) return skipped('clip-too-large');
+    // An enclosing function can start with a line too large to render even when
+    // the changed hunk itself already fit. Keep that prepared hunk: `skipped`
+    // means no bounded clip exists at all, not merely that the expanded one did
+    // not fit.
+    if (!clips.length) {
+      if (prepared.clips.length === 0) return skipped('clip-too-large');
+      prepared.fallback_reason = 'function-clip-too-large';
+      for (const c of prepared.clips) for (const side of [c.before, c.after]) {
+        if (side.span) side.reason = 'function-clip-too-large';
+      }
+      return prepared;
+    }
     // B1 marks the last emitted SPAN on each omitted side. A function insertion
     // may spend the other side's budget before this side has emitted any span;
     // disclose that omission at projection level without falsifying a null side.

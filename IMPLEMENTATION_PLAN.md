@@ -400,14 +400,15 @@ deadline that cancels and replaces a stuck worker), the reader endpoint
 No log event, no persistence: clips are viewable exactly while the blobs are
 retained, and GC'd blobs yield an explicit `unavailable` projection with a
 reason. Byte/line rules and status/reason semantics are documented in
-`CLIP-PROJECTION.md`. **B2 blocked by measurement**: native tree-sitter extraction for JS/JSX/TS/TSX,
+`CLIP-PROJECTION.md`. **B2 in progress**: tree-sitter extraction for JS/JSX/TS/TSX,
 paired function spans, mixed per-side fallback, and the approved closed language
-input are implemented under `clip.v2`. Typecheck and 631 deterministic tests
-passed, but the full D3 cold-cache run aborted in `tree-sitter.node` during its
-second saturation repetition (exit 134, uncaught `Napi::Error`). The final latency
-report was not produced; no numeric bar is ratified and the gate has not passed.
-See `B2-MEASUREMENT-REPORT.md` for smoke numbers and the stop disposition. Final
-review and PR remain outstanding. B2 and Stage 4 are not complete. D4 makes clips a
+input are implemented. The first full D3 run aborted in the native parser during
+worker cancellation. Brian authorized a binding replacement on 2026-09-19;
+`clip.v3` uses WASM with the original capture design and budgets. The cancellation
+regression and all 73 clip tests pass. A valid full measurement, numeric-bar
+ratification, final review and PR remain outstanding. See
+`B2-MEASUREMENT-REPORT.md` for the historical failure and subsequent measurements.
+B2 and Stage 4 are not complete. D4 makes clips a
 **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
 rather than `change.clips` log events; attribution stays a log producer. See

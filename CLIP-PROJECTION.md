@@ -1,4 +1,4 @@
-# Clip projection (`clip.v2`)
+# Clip projection (`clip.v3`)
 
 The clip projection is a **reader-derived public projection** over the immutable
 `before`/`after` blobs of a `file.changed` event. It is **not a log event**: it is
@@ -9,8 +9,8 @@ produce the same spans; transient timeouts and availability failures are never
 cached. The language input and cache-key extension were approved by Brian for B2
 (2026-09-19).
 
-The current JSON schema is `schemas/projections/clip.v2.json`, served at
-`GET /v1/schemas/projections/clip.v2`. The historical `clip.v1` schema remains
+The current JSON schema is `schemas/projections/clip.v3.json`, served at
+`GET /v1/schemas/projections/clip.v3`. The historical `clip.v1` and `clip.v2` schemas remain
 available; the clips endpoint computes the current version. This document is the prose companion to
 that schema.
 
@@ -45,7 +45,7 @@ the bundled front-end changes nothing about how clips are produced.
 ```jsonc
 {
   "change_seq": "42",              // seq of the file.changed event (response-only)
-  "projection_version": "clip.v2", // names the complete algorithm; the cache key
+  "projection_version": "clip.v3", // names the complete algorithm; the cache key
   "status": "fallback",            // ready | fallback | skipped | unavailable
   "fallback_reason": "no-enclosing-function", // required unless ready
   "clips": [
@@ -73,17 +73,24 @@ The reader derives it from the event's path with `languageForPath`: `.js`/`.mjs`
 Everything else is unsupported. A direct-disk caller passes `opts.language`;
 omitting it means unsupported. No filename/content-based language guessing occurs.
 
-B2 pins `tree-sitter` 0.21.1, `tree-sitter-javascript` 0.21.4 and
-`tree-sitter-typescript` 0.23.2. JavaScript's grammar also handles JSX. Native
-parser indices are UTF-16; the projection uses row positions and its own raw-byte
-line index, preserving UTF-8, BOM and CRLF bytes.
+B2 pins `web-tree-sitter` 0.25.10 and the prebuilt grammar bundle
+`tree-sitter-wasms` 0.1.13, loading only JavaScript, TypeScript and TSX grammars.
+JavaScript also handles JSX. The WASM binding replaces the native binding whose
+worker cancellation could abort the host process; this grammar/runtime change
+bumps the algorithm from `clip.v2` to `clip.v3`. Parser indices are UTF-16; the
+projection uses row positions and its own raw-byte line index, preserving UTF-8,
+BOM and CRLF bytes. Each tree and parser is freed after indexing; grammars are
+loaded once per worker.
 
 Declarations, expressions, generators, arrow functions and methods qualify when
 the node has no syntax errors and is not inside an ERROR/missing node. The
 smallest reliable enclosing function is selected. An error elsewhere does not
 invalidate a usable sibling. Import/top-level changes remain contextual fallback
 with a per-side reason; the projection is fallback if any planned segment needs it,
-including one later omitted by budget. A wholly unparseable input keeps ranges.
+including one later omitted by budget. A wholly unparseable input keeps ranges. If an expanded function cannot fit
+but its prepared changed-range clip can, that range is retained with
+`function-clip-too-large`. An oversized contextual line never prevents trying a
+bounded enclosing function.
 
 Pairing uses raw LCS diff blocks and segment order only: it promises neither
 semantic function identity nor move detection. A whole inserted/deleted function
@@ -186,8 +193,8 @@ Fixed ceilings (may only be tightened, never relaxed):
 - Parse only UTF-8 content **≤ 1 MiB** per side. Larger → `skipped`/`oversize`.
 - **100 ms** wall-clock per change. A parse that overruns is cancelled (its worker
   is terminated and replaced) and the change is `skipped`/`timeout`. Bounded
-  fallback is prepared *before* parsing; each native parse has a stricter 20 ms
-  interruptible budget so a soft timeout can return those ranges. The hard
+  fallback is prepared *before* parsing; each WASM parse has a stricter 20 ms
+  cooperative progress-callback budget so a soft timeout can return those ranges. The hard
   deadline includes blob reads, computation and worker communication.
 - Deterministic extraction caps: 20,000 visited syntax nodes per side and
   400,000 function/error-range selection checks per change. Exhaustion keeps
@@ -228,7 +235,7 @@ prioritized.
 
 `projection_version` names the **complete** extraction algorithm and is the cache
 key. Any change to how spans are computed is a new version (e.g. `clip.v3`), served
-under its own schema at `/v1/schemas/projections/clip.v2`. A client should treat an
+under its own schema at `/v1/schemas/projections/clip.v3`. A client should treat an
 unrecognized `projection_version` as opaque and fetch its schema rather than assume
 the `clip.v1` rules. Within a version, unknown fields are permitted for forward
 compatibility — ignore fields you don't recognize.

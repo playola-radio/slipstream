@@ -1,14 +1,43 @@
-# B2 measurement: blocked by native parser process abort
+# B2 measurement and parser crash recovery
 
-Date: 2026-09-19. Revision measured: `fba33e8`.
-**Status: BLOCKED. B2 is not complete; the D3 gate has not passed.**
+Date: 2026-09-19.
+**Status: IN PROGRESS. Native crash reproduced and WASM replacement implemented;
+a new full measurement and numeric-bar ratification remain required. B2 is not
+complete; the D3 gate has not passed.**
+
+## Authorized recovery
+
+Brian authorized changing the tree-sitter binding, including WASM, on 2026-09-19,
+while preserving the capture design and budgets. A subprocess reproducer now
+terminates/replaces a worker 20 times while it repeatedly parses/indexes a
+1,000-line TypeScript function. With a 20 ms cancellation delay the native binding
+aborts the subprocess with the same uncaught `Napi::Error`/SIGABRT. This establishes
+worker cancellation during active extraction as a trigger; it does not isolate
+which native call throws.
+
+`clip.v3` replaces the native addon with pinned `web-tree-sitter` 0.25.10 and
+`tree-sitter-wasms` 0.1.13. WASM initialization and grammar loading remain inside
+the existing worker job's 100 ms deadline. Each parse has a 20 ms cooperative
+progress callback; each tree and parser is freed after indexing. Capture, pool,
+admission, input and output ceilings are unchanged. The cancellation regression
+now passes, as do all 73 clip tests and typecheck; the full deterministic suite passes 637/637 tests. The two oversized selection
+cases listed below also have regression tests and fixes.
+
+Completed benchmark repetitions now emit a JSON line between arms, retaining
+finished results if a later repetition fails. No logging was added inside a
+measured capture interval.
+
+## Historical native run
+
+Revision measured: `fba33e8`. The following records the initial failed run and
+stop disposition; it is not a result for the WASM implementation.
 
 The predefined protocol is in `CLIP-LATENCY-PROTOCOL.md`. The full run used
 `node src/clip-bench.ts` on Node 24.11.0, macOS arm64, Apple M1 Max (10 logical
 CPUs). Other work was active on the host; starting load averages were
 14.06 / 13.28 / 13.34. No review jobs were started alongside this run.
 
-## Full-run failure
+### Full-run failure
 
 The process aborted with exit code **134** during saturation:
 
@@ -40,7 +69,7 @@ failure. Per the project's measurement stop rule, implementation stops here;
 there is no automatic parser replacement, budget increase, capture-source change,
 or success-criterion revision.
 
-## Earlier smoke evidence (not the acceptance gate)
+### Earlier smoke evidence (not the acceptance gate)
 
 The smoke run used four scheduled writes and a ten-file burst, one repetition
 per arm. Both arms captured 14/14 expected writes, with zero missing samples.
@@ -62,7 +91,7 @@ request p50/p99 was 12.31/388.46 ms, including HTTP and queue waiting.
 These smoke samples establish integration and load overlap only. They are too
 small and do not meet the three-repetition full protocol; they cannot ratify D3.
 
-## Work retained and remaining
+### Work retained at the initial stop
 
 - `clip.v2` extraction, language-aware inputs/cache, schema, documentation and
   tests are committed in `3cf56d4`; the measurement harness is in `fba33e8`.

@@ -63,7 +63,7 @@ test('a version upgrade recomputes the same blobs after discarding the old proce
   const current = createClipProjectionService({ storeDir: dir });
   try {
     const result = await current.get(req);
-    assert.equal(result.projection_version, 'clip.v2');
+    assert.equal(result.projection_version, 'clip.v3');
     assert.equal(result.status, 'ready');
     assert.equal(result.clips[0]!.after.method, 'function');
   } finally { await current.close(); await rm(dir, { recursive: true, force: true }); }

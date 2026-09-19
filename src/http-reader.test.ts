@@ -289,7 +289,7 @@ describe('http-reader clip projection', () => {
         change_seq: string; projection_version: string; status: string; clips: unknown[];
       };
       assert.equal(body.change_seq, '2');
-      assert.equal(body.projection_version, 'clip.v2');
+      assert.equal(body.projection_version, 'clip.v3');
       assert.equal(body.status, 'fallback');
       assert.ok(body.clips.length >= 1);
     } finally { await srv.close(); }
@@ -321,6 +321,9 @@ describe('http-reader clip projection', () => {
       const v2 = await GET(srv, '/v1/schemas/projections/clip.v2');
       assert.equal(v2.status, 200);
       assert.equal((await v2.json() as { title: string }).title, 'clip.v2');
+      const v3 = await GET(srv, '/v1/schemas/projections/clip.v3');
+      assert.equal(v3.status, 200);
+      assert.equal((await v3.json() as { title: string }).title, 'clip.v3');
       assert.equal((await GET(srv, '/v1/schemas/projections/nope.v1')).status, 404);
     } finally { await srv.close(); }
   });

@@ -323,7 +323,13 @@ async function main(): Promise<void> {
     const corpus = await createHistoricalCorpus(storeDir, config.corpusChanges);
     const reports: CaptureArmReport[] = [];
     for (const arm of ['baseline', 'saturation'] as const) {
-      for (let repetition = 0; repetition < config.repetitions; repetition++) reports.push(await runReplication(arm, repetition, storeDir, corpus, config));
+      for (let repetition = 0; repetition < config.repetitions; repetition++) {
+        const report = await runReplication(arm, repetition, storeDir, corpus, config);
+        reports.push(report);
+        // Emit only between measured arms. A later process crash must not erase
+        // the completed repetitions' measurements, as the first B2 run did.
+        console.error(JSON.stringify({ completed: report.name, report }));
+      }
     }
     console.log(JSON.stringify({ protocol: 'B2 live capture vs cold-cache clip saturation', smoke, config, attribution: 'capture uses the existing default enrichment producer (unconfigured sources)', reports, interpretation: 'No numeric bar or pass verdict is defined here; Brian must ratify one from this baseline.' }, null, 2));
   } finally { await rm(storeDir, { recursive: true, force: true }); }
