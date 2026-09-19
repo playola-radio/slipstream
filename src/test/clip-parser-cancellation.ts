@@ -16,8 +16,9 @@ if (isMainThread) {
     }
   }
 } else {
-  const { indexFunctions } = await import('../clip-function-parser.ts');
+  const { createFunctionIndexer } = await import('../clip-function-parser.ts');
+  const indexFunctions = await createFunctionIndexer('typescript');
   const source = 'function f(){\n' + 'let a=1;\n'.repeat(1000) + '}\n';
   parentPort!.postMessage('ready');
-  for (;;) indexFunctions(source, 'typescript');
+  for (;;) indexFunctions(source);
 }

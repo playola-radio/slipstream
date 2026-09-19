@@ -90,8 +90,13 @@ export async function computeClipProjection(job: ClipJob): Promise<ClipProjectio
     resolveClipSide(job.storeDir, job.before, maxBytes),
     resolveClipSide(job.storeDir, job.after, maxBytes),
   ]);
-  // Only computing callers load the parser; the HTTP main loop also imports
-  // snapshot validation from this module and must not initialize the WASM runtime.
-  const { indexFunctions } = await import('./clip-function-parser.ts');
-  return projectClips(before, after, job.opts, indexFunctions);
+  const language = job.opts.language ?? 'unsupported';
+  if (language === 'unsupported' || (before.kind !== 'bytes' && after.kind !== 'bytes')) {
+    return projectClips(before, after, job.opts,
+      () => ({ functions: [], errors: [], reason: 'unsupported-language' }));
+  }
+  // Only supported-content computations load the parser. HTTP snapshot
+  // validation and honest unsupported/unavailable results need no WASM startup.
+  const { createFunctionIndexer } = await import('./clip-function-parser.ts');
+  return projectClips(before, after, job.opts, await createFunctionIndexer(language));
 }

@@ -2,8 +2,13 @@ import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { projectClips as core, type SideInput, type ProjectOptions } from './clip-projection.ts';
 
-import { indexFunctions } from './clip-function-parser.ts';
-import { languageForPath } from './clip-language.ts';
+import { createFunctionIndexer } from './clip-function-parser.ts';
+import { languageForPath, type ClipLanguage } from './clip-language.ts';
+const indexers = new Map(await Promise.all(
+  (['javascript', 'jsx', 'typescript', 'tsx', 'unsupported'] as const)
+    .map(async language => [language, await createFunctionIndexer(language)] as const),
+));
+const indexFunctions = (text: string, language: ClipLanguage) => indexers.get(language)!(text);
 const projectClips = (before: SideInput, after: SideInput, opts: ProjectOptions) => core(before, after, { language: 'tsx', ...opts }, indexFunctions);
 
 const bytes = (text: string): SideInput => ({ kind: 'bytes', bytes: Buffer.from(text) });

@@ -80,7 +80,8 @@ worker cancellation could abort the host process; this grammar/runtime change
 bumps the algorithm from `clip.v2` to `clip.v3`. Parser indices are UTF-16; the
 projection uses row positions and its own raw-byte line index, preserving UTF-8,
 BOM and CRLF bytes. Each tree and parser is freed after indexing; grammars are
-loaded once per worker.
+loaded on demand per worker (JS/JSX share one). Unsupported or wholly missing
+content does not initialize WASM. Failed grammar loads are not retained.
 
 Declarations, expressions, generators, arrow functions and methods qualify when
 the node has no syntax errors and is not inside an ERROR/missing node. The
@@ -104,7 +105,8 @@ clip; a whitespace-only edit still receives a fallback range.
 
 `computeClipProjection` loads the parser when invoked and supplies it to the
 I/O-free `projectClips` core. Pure-core callers wanting extraction pass
-`indexFunctions` as the fourth argument. The daemon computes only through its
+the synchronous extractor returned by `await createFunctionIndexer(language)`
+as the fourth argument, using the same language as `opts.language`. The daemon computes only through its
 existing clip worker; the pool, queue and cancellation protocol are unchanged.
 
 ## Byte and line rules

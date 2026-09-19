@@ -4,6 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCas } from './cas.ts';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   computeClipProjection,
   resolveClipSide,
@@ -28,6 +30,39 @@ async function withStore(fn: (ctx: {
     await rm(storeDir, { recursive: true, force: true });
   }
 }
+
+test('unsupported and missing content remain readable when the parser cannot initialize', async () => {
+  await withStore(async ({ storeDir, put }) => {
+    const before = await put('old\n');
+    const after = await put('new\n');
+    const missing: ClipSnapshot = { kind: 'content', sha256: 'f'.repeat(64), size: 4 };
+    // A fresh process makes the missing parser dependency deterministic, rather
+    // than testing startup speed or depending on a previous module import.
+    const script = `
+      import { registerHooks } from 'node:module';
+      import { computeClipProjection } from ${JSON.stringify(new URL('./clip-blob-reader.ts', import.meta.url).href)};
+      registerHooks({ resolve(specifier, context, next) {
+        if (specifier.endsWith('clip-function-parser.ts')) throw new Error('parser unavailable');
+        return next(specifier, context);
+      }});
+      const results = [];
+      for (const job of JSON.parse(process.argv[1])) results.push(await computeClipProjection(job));
+      console.log(JSON.stringify(results));
+    `;
+    const jobs = [
+      { storeDir, before, after, opts: { changeSeq: '1', language: 'unsupported' } },
+      { storeDir, before: missing, after: missing, opts: { changeSeq: '2', language: 'typescript' } },
+    ];
+    const { stdout } = await promisify(execFile)(process.execPath,
+      ['--input-type=module', '-e', script, JSON.stringify(jobs)], { timeout: 15_000 });
+    const [unsupported, unavailable] = JSON.parse(stdout);
+    assert.equal(unsupported.status, 'fallback');
+    assert.equal(unsupported.fallback_reason, 'unsupported-language');
+    assert.ok(unsupported.clips.length > 0);
+    assert.equal(unavailable.status, 'unavailable');
+    assert.ok(unavailable.fallback_reason);
+  });
+});
 
 test('parseClipSnapshot accepts valid shapes and rejects malformed', () => {
   assert.deepEqual(parseClipSnapshot({ kind: 'absent' }), { kind: 'absent' });

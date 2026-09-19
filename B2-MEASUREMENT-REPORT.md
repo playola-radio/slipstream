@@ -1,9 +1,14 @@
 # B2 measurement and parser crash recovery
 
 Date: 2026-09-19.
-**Status: IMPLEMENTATION VERIFIED; D3 numeric-bar ratification pending.** The
-WASM implementation survived the qualifying full cold-load run. B2 is not yet
-complete: Brian must ratify the numeric bar at review time.
+**Status: CI portability fix and refreshed measurement in progress; D3 numeric
+bar remains unratified.** The prior WASM implementation survived the qualifying
+full cold-load run below. Ubuntu CI subsequently exposed unnecessary parser
+startup on unsupported/missing input and all-three-grammar initialization. The
+adapter now skips initialization for those fallback cases and loads only the
+requested grammar. Typecheck, 647 main tests and 86 tool tests pass locally;
+Ubuntu/macOS CI and a fresh full measurement remain required. No deadline,
+capture design or budget was raised. B2 is not complete.
 
 ## Qualifying cold-load run — numeric bar pending
 

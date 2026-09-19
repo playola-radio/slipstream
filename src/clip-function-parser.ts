@@ -14,14 +14,29 @@ export interface FunctionIndex {
   reason?: string;
 }
 
-// This module is dynamically imported by computing callers only. Initialization
-// stays inside the existing worker job and its 100ms deadline, never HTTP startup.
+// Computing callers prepare only the requested grammar. Initialization remains
+// inside the existing job/deadline; unused grammars do not tax cold requests.
 const require = createRequire(import.meta.url);
-await Parser.init();
-const [javascript, typescript, tsx] = await Promise.all(
-  ['javascript', 'typescript', 'tsx'].map(name =>
-    Language.load(require.resolve(`tree-sitter-wasms/out/tree-sitter-${name}.wasm`))),
-);
+let initialization: Promise<void> | undefined;
+const grammars = new Map<string, Promise<Language>>();
+
+/** Return a synchronous extractor bound to one language. Promise caching joins
+ * concurrent direct callers; JS/JSX share one grammar. Failed loads can retry. */
+export async function createFunctionIndexer(language: ClipLanguage): Promise<(text: string) => FunctionIndex> {
+  if (language === 'unsupported') return () => ({ functions: [], errors: [], reason: 'unsupported-language' });
+  const name = language === 'jsx' ? 'javascript' : language;
+  let pending = grammars.get(name);
+  if (!pending) {
+    pending = (async () => {
+      initialization ??= Parser.init().catch(error => { initialization = undefined; throw error; });
+      await initialization;
+      return Language.load(require.resolve(`tree-sitter-wasms/out/tree-sitter-${name}.wasm`));
+    })().catch(error => { grammars.delete(name); throw error; });
+    grammars.set(name, pending);
+  }
+  const grammar = await pending;
+  return text => indexFunctions(text, grammar);
+}
 const FUNCTION_TYPES = new Set([
   'function_declaration', 'function_expression', 'generator_function_declaration',
   'generator_function', 'arrow_function', 'method_definition',
@@ -35,14 +50,12 @@ const PARSE_TIMEOUT_MS = 20;
  * parser startIndex (UTF-16, not a raw-blob byte offset). Trees/nodes are local
  * to this call; no retained parse state or incremental edits.
  */
-export function indexFunctions(text: string, language: ClipLanguage): FunctionIndex {
+function indexFunctions(text: string, grammar: Language): FunctionIndex {
   const empty = (reason: string): FunctionIndex => ({ functions: [], errors: [], reason });
-  if (language === 'unsupported') return empty('unsupported-language');
   const parser = new Parser();
   let tree: Tree | null = null;
   try {
-    parser.setLanguage(language === 'typescript' ? typescript!
-      : language === 'tsx' ? tsx! : javascript!);
+    parser.setLanguage(grammar);
     const deadline = performance.now() + PARSE_TIMEOUT_MS;
     tree = parser.parse(text, null, { progressCallback: () => performance.now() > deadline });
     if (!tree) return empty('timeout');
