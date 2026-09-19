@@ -6,6 +6,13 @@ import { startCapture, InvalidTitleError, type CaptureSession } from './session.
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
+import { isValidSessionId, listSessions } from './store-reader.ts';
+import {
+  publishTombstone,
+  removeSessionHistory,
+  sessionExists,
+  reclaimUnreferencedBlobs,
+} from './maintenance.ts';
 import { createBoundaryRegistry } from './boundary-registry.ts';
 import { liveBoundary } from './reader-runtime.ts';
 import {
@@ -21,10 +28,12 @@ import {
  * at most ONE active capture session, and the boundary registry that keeps the two
  * honest as a session attaches and detaches beneath the long-lived reader.
  *
- * It speaks the PRIVATE control protocol (attach / detach / status / begin_task).
- * Every verb WRITES public events or reports state; none reads or serves the feed
- * — readers get the feed through the public HTTP view like any other client. There
- * is no privileged back channel for reading.
+ * It speaks the PRIVATE control protocol (attach / detach / status / begin_task /
+ * delete_session / gc). Every verb WRITES public events, maintains the store, or
+ * reports state; none reads or serves the feed — readers get the feed through the
+ * public HTTP view like any other client. There is no privileged back channel for
+ * reading. delete_session and gc are DETACHED-ONLY: they run only when no capture
+ * is active and never while a session is attaching or detaching.
  *
  * Singleton-ness rests on two independent guards: the store lock (a live owner
  * makes {@link acquireSessionLock} throw {@link SessionOwnedError}) and, because a
@@ -163,6 +172,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const inflightTasks = new Set<Promise<unknown>>();
   const connections = new Set<Socket>();
   let attachInFlight: Promise<unknown> | undefined;
+  // At most one detached-only maintenance op (delete_session / gc) runs at a time.
+  // The slot is claimed synchronously in runMaintenance before its first await, and
+  // attach refuses while it is held — so a single-threaded turn makes maintenance
+  // and attach mutually exclusive without a lock.
+  let maintenanceInFlight: Promise<unknown> | undefined;
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
@@ -207,6 +221,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // it to settle (it self-stops once it observes `torn`), then stop whatever it or
     // an active session left installed.
     if (attachInFlight) await attachInFlight.catch(() => {});
+    // A maintenance op in flight has already seen `torn` (gc aborts its sweep); wait
+    // for it to settle so a durable tombstone or blob unlink is not racing shutdown.
+    if (maintenanceInFlight) await maintenanceInFlight.catch(() => {});
     // An attach aborted mid-startup may have failed to stop its half-built session
     // (it runs in startAndActivate, which sets abortStopError). Surface that too so
     // shutdown never reports success over a capture that could not be confirmed
@@ -383,6 +400,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
       return errFields('CAPTURE_NOT_READY', `cannot attach while ${state}`);
     }
+    // Refuse to attach over an in-flight maintenance op. This check and the
+    // `state === 'detached'` guard in runMaintenance are the two halves of the same
+    // mutual exclusion: both are synchronous, so whichever claims its slot first in
+    // this turn locks the other out. (Kept before `state = 'attaching'` so a refused
+    // attach leaves the state machine untouched.)
+    if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'a maintenance operation is running; retry shortly');
     // Set attaching BEFORE the first await so a concurrent attach is refused.
     state = 'attaching';
     sessionCompromised = false;
@@ -505,6 +528,80 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  /** Admit and run a detached-only maintenance op. Admission is synchronous through
+   * claiming `maintenanceInFlight`, so it cannot interleave with attach (which sets
+   * `state` synchronously and refuses while the slot is held). The op runs only in
+   * `detached`; anything else — an active/attaching/detaching session, a wedged or
+   * compromised store, an op already running — is refused without touching disk. */
+  async function runMaintenance(
+    op: () => Promise<Record<string, unknown> | ErrorFields>,
+  ): Promise<Record<string, unknown> | ErrorFields> {
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    if (state !== 'detached') {
+      if (state === 'active') return errFields('SESSION_ACTIVE', 'detach the active session before deleting or collecting');
+      if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
+      return errFields('CAPTURE_NOT_READY', `cannot run maintenance while ${state}`);
+    }
+    if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'another maintenance operation is running; retry shortly');
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => { release = resolve; });
+    maintenanceInFlight = slot;
+    try {
+      return await op();
+    } finally {
+      release();
+      if (maintenanceInFlight === slot) maintenanceInFlight = undefined;
+    }
+  }
+
+  async function deleteSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    // Validate the id shape before admission: it names an on-disk path, so a
+    // malformed or traversing id is a protocol fault, never a lookup miss.
+    if (!nonEmptyString(req.session_id) || !isValidSessionId(req.session_id)) {
+      return errFields('PROTOCOL', 'delete_session requires a valid session_id');
+    }
+    const id = req.session_id;
+    return runMaintenance(async () => {
+      if (!(await sessionExists(storeDir, id))) {
+        return errFields('SESSION_NOT_FOUND', `no session ${id} to delete`);
+      }
+      // Durable-tombstone-first: publish the marker (fsynced) BEFORE removing any
+      // history, so a crash in between leaves a session the reader already serves as
+      // gone and a later gc finishes the cleanup.
+      await publishTombstone(storeDir, id);
+      // Now that the tombstone is durable, abort any in-flight follower of this
+      // session so it re-resolves, re-reads the tombstone, and gets 410 rather than
+      // streaming a log we are about to delete. The reader's installIfAbsent gives a
+      // followed retained session a registry entry this freeze can reach.
+      registry.freeze(id, 0n);
+      await removeSessionHistory(storeDir, id);
+      return { session_id: id };
+    });
+  }
+
+  async function gc(): Promise<Record<string, unknown> | ErrorFields> {
+    return runMaintenance(async () => {
+      try {
+        // Finish any interrupted deletion first: a session tombstoned by a
+        // delete_session that crashed before cleanup still carries residual history.
+        // Re-establish the tombstone's durability and complete the removal.
+        for (const s of await listSessions(storeDir)) {
+          if (!s.removed) continue;
+          await publishTombstone(storeDir, s.id);
+          await removeSessionHistory(storeDir, s.id);
+        }
+        // Abort mid-sweep if we lose the store lock: a successor may then own the
+        // shared blobs, and deleting one it still references would be data loss.
+        const removed = await reclaimUnreferencedBlobs(storeDir, { aborted: () => torn || compromised });
+        return { removed };
+      } catch (err) {
+        // A corrupt/missing retained log or an aborted sweep deletes nothing; report
+        // the store as unavailable rather than a partial success.
+        return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+      }
+    });
+  }
+
   async function dispatch(req: RequestEnvelope): Promise<ResponseEnvelope> {
     if (compromised) return { v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'daemon lost its store lock' };
     let outcome: Record<string, unknown> | ErrorFields;
@@ -513,6 +610,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'attach': outcome = await attach(req); break;
       case 'detach': outcome = await detach(); break;
       case 'begin_task': outcome = await beginTask(req); break;
+      case 'delete_session': outcome = await deleteSession(req); break;
+      case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };
     }
     if (isErrorFields(outcome)) return { v: 1, ok: false, code: outcome.code, message: outcome.message };
