@@ -113,12 +113,13 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       // record would otherwise advertise H+1 while /events still uses H; a
       // reserved-but-not-yet-active session reads 0 until capture commits).
       sendJson(res, 200, sessions.map((s) => {
+        // A removed session advertises no history: report durable_seq 0 regardless
+        // of any stale registry entry (a prior detach left one frozen at its final
+        // seq, and a delete does not clear it). Otherwise trust the registry over
+        // disk for every session it knows (see the reserved/active-window note).
         const runtime = registry.get(s.id);
-        return {
-          id: s.id,
-          durable_seq: (runtime ? runtime.boundary.current() : s.durableSeq).toString(),
-          removed: s.removed,
-        };
+        const durableSeq = s.removed ? 0n : (runtime ? runtime.boundary.current() : s.durableSeq);
+        return { id: s.id, durable_seq: durableSeq.toString(), removed: s.removed };
       }));
       return;
     }
@@ -262,6 +263,10 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     res.on('close', onDisconnect);
     res.on('error', onDisconnect);
     followers.add(ac);
+    // A retained session (known only from disk) has no registry entry, so a delete's
+    // freeze(id, 0n) would have nothing to abort. Install a static entry first so
+    // the follower we are about to register is reachable by that freeze.
+    registry.installIfAbsent(id, boundary);
     // Join the registry's per-session abort set and re-resolve the boundary from
     // the SAME entry, synchronously with no await between: a session transition
     // (activate/freeze) has therefore either already happened (so we read its new
@@ -269,6 +274,22 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     // A follower is never left pinned to a stale boundary while unregistered.
     registry.addFollower(id, ac);
     const followBoundary = registry.get(id)?.boundary ?? boundary;
+    // Final tombstone re-check, AFTER registration: a delete that raced this follower
+    // either aborted it via the freeze above (ac now aborted) or made the tombstone
+    // durable before we registered (readTombstone sees it). Either way, 410 before
+    // any 200 headers rather than streaming a log that is being deleted. An
+    // already-started stream cannot be turned into a 410; the client reconnects and
+    // this top-of-handler check (or line 191) then 410s it.
+    const removedNow = await readTombstone(opts.storeDir, id);
+    if (removedNow || ac.signal.aborted) {
+      followers.delete(ac);
+      registry.removeFollower(id, ac);
+      res.off('close', onDisconnect);
+      res.off('error', onDisconnect);
+      if (removedNow && !res.headersSent) send(res, 410, 'gone');
+      else res.destroy();
+      return;
+    }
     res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
     res.flushHeaders();
 

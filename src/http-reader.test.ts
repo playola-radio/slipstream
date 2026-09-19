@@ -343,6 +343,59 @@ describe('http-reader SSE follow', () => {
   });
 });
 
+describe('http-reader deletion', () => {
+  it('lists a removed session at durable_seq 0 even with a stale registry entry', async () => {
+    const dir = await storeWithSession();
+    const registry = createBoundaryRegistry();
+    // A prior detach left a frozen entry at the session's final seq; a delete does
+    // not clear it, so the listing must not surface that stale boundary.
+    registry.installIfAbsent(UUID, staticBoundary(2n));
+    await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      const body = await (await GET(srv, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: true }]);
+    } finally { await srv.close(); }
+  });
+
+  it('aborts an in-flight follower on delete, then 410s the reconnect', async () => {
+    const dir = await storeWithSession();
+    const health = createHealth(2n);
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, liveBoundary(health));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    const ac = new AbortController();
+    try {
+      const res = await fetch(`${srv.url}/v1/sessions/${UUID}/events?after=0&follow=true`, {
+        headers: { authorization: `Bearer ${srv.token}`, host: `127.0.0.1:${srv.port}` },
+        signal: ac.signal,
+      });
+      assert.equal(res.status, 200);
+      const reader = res.body!.getReader();
+      await reader.read(); // headers + first frames flushed: the follower is registered
+
+      // Simulate delete_session: durable tombstone, then freeze(id, 0n).
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+      registry.freeze(UUID, 0n);
+
+      // The freeze aborts the in-flight follower: its stream ends (a clean done, or
+      // a socket error from the server's abrupt destroy — both are "ended").
+      const drain = (async () => {
+        try { for (;;) { const r = await reader.read(); if (r.done) return true; } }
+        catch { return true; }
+      })();
+      const guard = new Promise<never>((_r, reject) =>
+        setTimeout(() => reject(new Error('follower was not aborted on delete')), 4000).unref());
+      assert.equal(await Promise.race([drain, guard]), true);
+
+      // A reconnect now sees the durable tombstone: 410.
+      const again = await GET(srv, `/v1/sessions/${UUID}/events?after=0&follow=true`);
+      assert.equal(again.status, 410);
+      await again.body?.cancel();
+    } finally { ac.abort(); await srv.close(); }
+  });
+});
+
 it('returns 400 for malformed schema tokens and encoding', async () => {
   const srv = await startReaderServer({ storeDir: await storeWithSession() });
   try {
