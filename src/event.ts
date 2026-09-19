@@ -186,7 +186,8 @@ export type SourceCoverage = 'unconfigured' | 'configured';
 
 /**
  * Observed health of a harness source's transcript reading, at the moment the
- * event was committed. `pending`: not yet scanned. `readable`: the declared scan
+ * event was committed. `pending`: not yet scanned, or nothing to read yet (the
+ * transcript home has not been written). `readable`: the declared scan
  * scope was processed with no blocking issue (NOT a claim of complete edit
  * history). `degraded`: some transcripts read, but at least one issue prevents a
  * complete read (a readable transcript never conceals an unreadable one).

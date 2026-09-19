@@ -1,0 +1,220 @@
+import { describe, it, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { aggregateCoverage, createTranscriptWatcher, type CoveragePublish } from './watcher.ts';
+import type { DiscoveryIO, ListResult } from './discovery.ts';
+import type { StatResult, TranscriptFileIO } from './file-reader.ts';
+import type { EvidenceSink } from './file-reader.ts';
+import { evidenceKeyString, variantSignature } from '../attribution.ts';
+import type { IngestOutcome, NormalizedEvidence } from '../evidence-ingest.ts';
+import type { EnrichmentCoverageData } from '../event.ts';
+
+const ROOT = '/work/proj';
+
+class FakeFile {
+  buf = Buffer.alloc(0);
+  dev = 1;
+  ino = 100;
+  append(text: string): void {
+    this.buf = Buffer.concat([this.buf, Buffer.from(text, 'utf8')]);
+  }
+}
+
+function fileIO(files: Map<string, FakeFile>): TranscriptFileIO {
+  return {
+    async stat(path): Promise<StatResult> {
+      const f = files.get(path);
+      if (!f) return { ok: false, reason: 'missing' };
+      return { ok: true, size: f.buf.length, dev: f.dev, ino: f.ino };
+    },
+    async read(path, start, end): Promise<Buffer> {
+      const f = files.get(path);
+      if (!f) throw new Error('missing');
+      return f.buf.subarray(start, end);
+    },
+  };
+}
+
+class FakeSink implements EvidenceSink {
+  appended: NormalizedEvidence[] = [];
+  private seen = new Set<string>();
+  async ingest(evidence: NormalizedEvidence): Promise<IngestOutcome> {
+    const sig = `${evidenceKeyString(evidence.evidence_key)}|${variantSignature(evidence)}`;
+    if (this.seen.has(sig)) return { status: 'duplicate' };
+    this.seen.add(sig);
+    this.appended.push(evidence);
+    return { status: 'appended', seq: BigInt(this.appended.length) };
+  }
+}
+
+function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
+  return {
+    listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
+    listTreeJsonl: async () => ({ paths: [], truncated: false }),
+    readFirstLine: async () => undefined,
+    realpath: async (p) => p,
+    ...overrides,
+  };
+}
+
+const WRITE_A = JSON.stringify({
+  type: 'assistant',
+  timestamp: '2026-09-19T12:00:00.000Z',
+  message: { content: [{ type: 'tool_use', id: 'toolu_a', name: 'Write', input: { file_path: '/work/proj/a.ts' } }] },
+});
+
+describe('coverage aggregation', () => {
+  it('is pending when configured but nothing is discovered yet', () => {
+    assert.deepEqual(aggregateCoverage([], []), { state: 'pending', issues: [] });
+  });
+
+  it('is readable when every discovered transcript read cleanly', () => {
+    const r = aggregateCoverage([], [{ state: 'readable', issues: [] }]);
+    assert.equal(r.state, 'readable');
+    assert.equal(r.issues.length, 0);
+  });
+
+  it('is degraded when a transcript read but a sibling issue exists', () => {
+    const r = aggregateCoverage(
+      [{ kind: 'discovery-limited', detail: 'cap hit' }],
+      [{ state: 'readable', issues: [] }],
+    );
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues[0]!.kind, 'discovery-limited');
+  });
+
+  it('is degraded when a read transcript had a malformed line', () => {
+    const r = aggregateCoverage([], [{ state: 'degraded', issues: [{ kind: 'malformed', detail: 'bad' }] }]);
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues[0]!.kind, 'malformed');
+  });
+
+  it('is unavailable when nothing could be read and the failure is hard', () => {
+    const r = aggregateCoverage([{ kind: 'inaccessible', detail: 'perm' }], []);
+    assert.equal(r.state, 'unavailable');
+  });
+
+  it('stays pending when the only signal is a not-yet-written transcript home', () => {
+    const r = aggregateCoverage([{ kind: 'missing', detail: 'no dir yet' }], []);
+    assert.equal(r.state, 'pending');
+    assert.equal(r.issues[0]!.kind, 'missing');
+  });
+
+  it('surfaces an unreadable file even when another is fine', () => {
+    const r = aggregateCoverage([], [
+      { state: 'readable', issues: [] },
+      { state: 'inaccessible', issues: [] },
+    ]);
+    assert.equal(r.state, 'degraded');
+    assert.equal(r.issues.some((i) => i.kind === 'inaccessible'), true);
+  });
+});
+
+describe('transcript watcher', () => {
+  let sink: FakeSink;
+  let published: EnrichmentCoverageData['state'][];
+  let publishedFull: Array<Omit<EnrichmentCoverageData, 'session_id'>>;
+  const publish: CoveragePublish = async (data) => {
+    published.push(data.state);
+    publishedFull.push(data);
+  };
+
+  beforeEach(() => {
+    sink = new FakeSink();
+    published = [];
+    publishedFull = [];
+  });
+
+  it('discovers a Claude transcript, ingests its evidence, and publishes readable', async () => {
+    const dir = '/home/projects/-work-proj';
+    const file = new FakeFile();
+    file.append(WRITE_A + '\n');
+    const files = new Map([[`${dir}/sess-a.jsonl`, file]]);
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (d): Promise<ListResult> =>
+          d === dir ? { ok: true, paths: [`${dir}/sess-a.jsonl`] } : { ok: false, reason: 'missing' },
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick();
+    assert.equal(sink.appended.length, 1);
+    assert.equal(sink.appended[0]!.evidence_key.record_id, 'toolu_a');
+    assert.deepEqual(published, ['readable']);
+  });
+
+  it('publishes coverage only when it changes', async () => {
+    const dir = '/home/projects/-work-proj';
+    const file = new FakeFile();
+    file.append(WRITE_A + '\n');
+    const files = new Map([[`${dir}/sess-a.jsonl`, file]]);
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: true, paths: [`${dir}/sess-a.jsonl`] }),
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick();
+    await watcher.tick();
+    assert.deepEqual(published, ['readable'], 'unchanged coverage is not republished');
+  });
+
+  it('reads incrementally across ticks, keeping each transcript offset', async () => {
+    const dir = '/home/projects/-work-proj';
+    const path = `${dir}/sess-a.jsonl`;
+    const file = new FakeFile();
+    const files = new Map<string, FakeFile>();
+    let present = false; // the transcript appears only after the agent starts writing
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> =>
+          present ? { ok: true, paths: [path] } : { ok: false, reason: 'missing' },
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick(); // nothing written yet: pending
+    present = true;
+    file.append(WRITE_A + '\n');
+    files.set(path, file);
+    await watcher.tick(); // transcript appeared with a record
+    assert.equal(sink.appended.length, 1);
+    await watcher.tick(); // no new bytes, dedup absorbs re-reads
+    assert.equal(sink.appended.length, 1);
+    assert.deepEqual(published, ['pending', 'readable']);
+  });
+
+  it('reports unavailable when the transcript home is inaccessible', async () => {
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: false, reason: 'inaccessible' }),
+      }),
+      fileIO: fileIO(new Map()),
+      sink,
+      publish,
+    });
+    await watcher.tick();
+    assert.deepEqual(published, ['unavailable']);
+    assert.equal(publishedFull[0]!.issues![0]!.kind, 'inaccessible');
+  });
+});
