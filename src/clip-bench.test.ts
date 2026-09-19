@@ -1,6 +1,43 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { scoreCaptureArm } from './clip-bench.ts';
+import type { ClipResponse } from './clip-bench.ts';
+
+const ns = (ms: number) => BigInt(ms) * 1_000_000n;
+function loadScenario(responses: ClipResponse[], durableMs = 3_000) {
+  return scoreCaptureArm({
+    name: 'saturation',
+    writes: [{ path: 'one.ts', sha256: 'a', startedAtNs: ns(1_000), phase: 'scheduled' }],
+    records: [{ type: 'slipstream.file.changed.v1', seq: '1', data: { path: 'one.ts', after: { kind: 'content', sha256: 'a' } } }],
+    durableAtNsBySeq: new Map([['1', ns(durableMs)]]),
+    clipResponses: responses,
+    requestedClipKeys: responses.map((_, i) => `key-${i}`),
+    concurrentClipRequests: 16, maxConcurrentRequests: 16, coldCacheServerFresh: true,
+    loadStartedAtNs: ns(0), loadStoppedAtNs: ns(4_000),
+  });
+}
+const continuousResponses = (): ClipResponse[] => Array.from({ length: 40 }, (_, i) => [
+  { httpStatus: 200, status: 'ready', latencyMs: 100, startedAtNs: ns(i * 100), completedAtNs: ns((i + 1) * 100) },
+  { httpStatus: 200, status: 'skipped', reason: 'overloaded', latencyMs: 100, startedAtNs: ns(i * 100), completedAtNs: ns((i + 1) * 100) },
+]).flat();
+
+test('accepts continuous requests with completed cold parses and overload in every time window', () => {
+  assert.equal(loadScenario(continuousResponses()).load.sufficient, true);
+});
+
+test('rejects idle gaps even when load lifecycle, peak concurrency and one parse look sufficient', () => {
+  const report = loadScenario(continuousResponses().filter(r => r.completedAtNs! <= ns(1_100)));
+  assert.equal(report.load.sufficient, false);
+  assert.match(report.load.reasons.join(' '), /continuous|window/);
+});
+
+test('late durable samples remain in the percentiles and invalidate load ending before drain', () => {
+  const report = loadScenario(continuousResponses(), 5_000);
+  assert.equal(report.captured, 1);
+  assert.equal(report.latency.p99, 4_000);
+  assert.equal(report.load.sufficient, false);
+  assert.equal(report.load.overlap, false);
+});
 
 test('scores latency at the durable-sequence boundary and discloses a missing write', () => {
   const report = scoreCaptureArm({

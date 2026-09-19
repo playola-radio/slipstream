@@ -83,6 +83,54 @@ test('function expressions, generators and methods retain enclosing function spa
   }
 });
 
+test('shared-line top-level edits fall back instead of borrowing a preceding function', () => {
+  const before = 'function f() { return 0; } const x = 1;\n';
+  const after = 'function f() { return 0; } const x = ;\n';
+  const p = project(before, after);
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.fallback_reason, 'no-enclosing-function');
+  assert.equal(p.clips[0]!.before.method, 'changed-range');
+  assert.equal(p.clips[0]!.before.reason, 'no-enclosing-function');
+  assert.equal(p.clips[0]!.after.method, 'changed-range');
+  assert.equal(p.clips[0]!.after.reason, 'parse-error-in-enclosing-scope');
+});
+
+test('a shared-line function rename does not omit the following function body', () => {
+  const before = 'function a() {return 1;} function b() {\n return 2;\n}\n';
+  const after = before.replace('function b', 'function c');
+  const p = project(before, after);
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.fallback_reason, 'no-enclosing-function');
+  assert.equal(p.clips[0]!.after.method, 'changed-range');
+  assert.equal(p.clips[0]!.after.span!.line_end, 3);
+});
+
+test('a shared-line top-level edit beside an assigned arrow falls back', () => {
+  const before = 'const fn = () => 1; const top = 2;\n';
+  const after = before.replace('top = 2', 'top = 3');
+  const p = project(before, after);
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.fallback_reason, 'no-enclosing-function');
+  assert.equal(p.clips[0]!.after.method, 'changed-range');
+});
+
+test('a contiguous top-level edit on a function closing line remains a fallback', () => {
+  const before = 'function f() {\n return 1;\n} const x = 1;\n';
+  const after = before.replace('return 1', 'return 2').replace('x = 1', 'x = 2');
+  const p = project(before, after);
+  assert.equal(p.status, 'fallback');
+  assert.ok(p.clips.some(c => c.after.method === 'changed-range' && c.after.span?.line_end === 3));
+});
+
+test('indented CRLF method boundaries remain function-derived', () => {
+  const before = 'class C {\r\n  method() {\r\n    return 1;\r\n  }\r\n}\r\n';
+  const p = project(before, before.replace('method', 'renamed'));
+  assert.equal(p.status, 'ready');
+  assert.equal(p.clips[0]!.after.method, 'function');
+  assert.equal(p.clips[0]!.after.span!.line_start, 2);
+  assert.equal(p.clips[0]!.after.span!.line_end, 4);
+});
+
 test('extracts a bounded changed function when fallback context starts with an oversized top-level comment', () => {
   const source = '// ' + 'x'.repeat(70_000) + '\nfunction f() {\n  return 1;\n}\n';
   const p = project(source, source.replace('return 1', 'return 2'));
@@ -98,7 +146,7 @@ test('retains a bounded changed-range fallback when an enclosing function header
   const body = Array.from({ length: 21 }, (_, i) => `  const v${i} = ${i};`);
   const before = [header, ...body, '  return 1;', '}'].join('\n') + '\n';
   const after = before.replace('return 1', 'return 2');
-  const index = { functions: [{ s0: 0, e0: body.length + 3 }], errors: [] };
+  const index = { functions: [{ s0: 0, e0: body.length + 3, c0: 0, c1: 1 }], errors: [] };
   const p = core(bytes(before), bytes(after), { changeSeq: '42', language: 'typescript' }, () => index);
   assert.equal(p.status, 'fallback');
   assert.equal(p.fallback_reason, 'function-clip-too-large');

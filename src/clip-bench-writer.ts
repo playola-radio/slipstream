@@ -39,13 +39,11 @@ async function writeOne(phase: 'scheduled' | 'burst', index: number): Promise<Wr
 
 async function run(): Promise<void> {
   const written: WrittenFile[] = [];
-  port.postMessage({ type: 'phase', phase: 'scheduled' });
   for (let index = 0; index < data.scheduledWrites; index++) {
     written.push(await writeOne('scheduled', index));
     if (index + 1 < data.scheduledWrites) await sleep(data.scheduledIntervalMs);
   }
 
-  port.postMessage({ type: 'phase', phase: 'burst' });
   const burst = await Promise.all(
     Array.from({ length: data.burstWrites }, (_, index) => writeOne('burst', index)),
   );

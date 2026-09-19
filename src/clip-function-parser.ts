@@ -2,7 +2,12 @@ import { createRequire } from 'node:module';
 import { Parser, Language, type Node, type Tree } from 'web-tree-sitter';
 import type { ClipLanguage } from './clip-language.ts';
 
-export interface FunctionRange { s0: number; e0: number }
+export interface FunctionRange {
+  s0: number;
+  e0: number;
+  c0: number;
+  c1: number;
+}
 export interface FunctionIndex {
   functions: FunctionRange[];
   errors: FunctionRange[];
@@ -53,6 +58,8 @@ export function indexFunctions(text: string, language: ClipLanguage): FunctionIn
       const range = {
         s0: node.startPosition.row,
         e0: node.endPosition.row + (node.endPosition.column > 0 ? 1 : 0),
+        c0: node.startPosition.column,
+        c1: node.endPosition.column,
       };
       if (node.isError || node.isMissing) {
         result.errors.push({ ...range, e0: Math.max(range.e0, range.s0 + 1) });

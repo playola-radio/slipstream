@@ -419,20 +419,34 @@ function functionPlans(
 ): ClipPlan[] | null {
   let work = 0;
   const withinBudget = (index: FunctionIndex): boolean => (work += index.functions.length + index.errors.length + 1) <= 400_000;
+  // A line diff gives no character range within its changed line. At a function
+  // boundary, only use the function when it owns that whole line; otherwise a
+  // same-line top-level declaration could be incorrectly reported as function
+  // content. Interior rows are unambiguous.
+  const enclosesRow = (fn: FunctionIndex['functions'][number], row: number, side: TextSide): boolean => {
+    if (fn.s0 > row || row >= fn.e0) return false;
+    const line = side.lines[row]!;
+    return (fn.s0 !== row || line.slice(0, fn.c0).trim() === '')
+      && (fn.e0 !== row + 1 || line.slice(fn.c1).trim() === '');
+  };
   const segments = (range: LineRange, side: ResolvedSide, index: FunctionIndex): SidePlan[] => {
     if (side.kind !== 'text' || range.s0 === range.e0) return [];
     const plans: SidePlan[] = [];
     for (let row = range.s0; row < range.e0;) {
       if (!withinBudget(index)) return [];
       // Smallest enclosing span wins (nested functions are independently useful).
-      const fn = index.functions.filter(f => f.s0 <= row && row < f.e0)
+      const fn = index.functions.filter(f => enclosesRow(f, row, side))
         .sort((x, y) => (x.e0 - x.s0) - (y.e0 - y.s0) || y.s0 - x.s0)[0];
       if (fn) {
         plans.push({ kind: 'range', range: fn, method: 'function' });
-        row = Math.min(fn.e0, range.e0);
+        // Do not jump past an ambiguous final boundary row. It can carry a
+        // contiguous top-level edit after the closing brace and needs its own
+        // changed-range fallback.
+        const finalRow = fn.e0 - 1;
+        row = Math.min(enclosesRow(fn, finalRow, side) ? fn.e0 : finalRow, range.e0);
       } else {
         const start = row++;
-        while (row < range.e0 && !index.functions.some(f => f.s0 <= row && row < f.e0)) {
+        while (row < range.e0 && !index.functions.some(f => enclosesRow(f, row, side))) {
           if (!withinBudget(index)) return [];
           row++;
         }

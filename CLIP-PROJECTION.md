@@ -84,7 +84,10 @@ loaded once per worker.
 
 Declarations, expressions, generators, arrow functions and methods qualify when
 the node has no syntax errors and is not inside an ERROR/missing node. The
-smallest reliable enclosing function is selected. An error elsewhere does not
+smallest reliable enclosing function is selected. Syntax columns are retained
+for enclosure checks: a changed boundary line with non-whitespace syntax outside
+the function conservatively uses changed-range fallback, rather than borrowing
+an unrelated function on the same line. Emitted spans still round to whole lines. An error elsewhere does not
 invalidate a usable sibling. Import/top-level changes remain contextual fallback
 with a per-side reason; the projection is fallback if any planned segment needs it,
 including one later omitted by budget. A wholly unparseable input keeps ranges. If an expanded function cannot fit

@@ -52,7 +52,7 @@ export interface CaptureArmReport {
   burstLatency: LatencyStats;
   throughputPerSecond: number;
   clipResponses: { byStatus: Record<string, number>; byReason: Record<string, number>; errors: number; latency: LatencyStats };
-  load: { applicable: boolean; sufficient: boolean; reasons: string[]; requested: number; uniqueKeys: number; maxConcurrentRequests: number; readyResponses: number; readyOverlappingCapture: number; nonSkippedResponses: number; overloadResponses: number; freshServer: boolean; corpusExhausted: boolean; overlap: boolean };
+  load: { applicable: boolean; sufficient: boolean; reasons: string[]; requested: number; uniqueKeys: number; maxConcurrentRequests: number; readyResponses: number; readyOverlappingCapture: number; nonSkippedResponses: number; overloadResponses: number; freshServer: boolean; corpusExhausted: boolean; overlap: boolean; continuousRequests: boolean; activityWindows: Array<{ ready: number; overloaded: number }> };
 }
 
 interface ChangedLike { type?: unknown; seq?: unknown; data?: { path?: unknown; after?: { kind?: unknown; sha256?: unknown } } }
@@ -112,9 +112,35 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
   ).length;
   const overlap = firstStart !== undefined && lastDurable !== undefined && input.loadStartedAtNs !== undefined && input.loadStoppedAtNs !== undefined
     && input.loadStartedAtNs <= firstStart && input.loadStoppedAtNs >= lastDurable;
+  const intervals = input.clipResponses.filter(r => r.startedAtNs !== undefined && r.completedAtNs !== undefined)
+    .sort((a, b) => a.startedAtNs! < b.startedAtNs! ? -1 : a.startedAtNs! > b.startedAtNs! ? 1 : 0);
+  let coveredThrough = firstStart;
+  for (const r of intervals) {
+    if (coveredThrough === undefined || r.startedAtNs! > coveredThrough) break;
+    if (r.completedAtNs! > coveredThrough) coveredThrough = r.completedAtNs!;
+  }
+  const continuousRequests = lastDurable !== undefined && coveredThrough !== undefined && coveredThrough >= lastDurable;
+  // HTTP occupancy alone is not parser work. In every ~1s window require a
+  // complete cold ready request (so its parse happened inside that window) and
+  // an overload. Equal windows avoid a tiny final tail. This proves recurring
+  // parse work + admission pressure, not a claim of measured CPU utilization.
+  const activityWindows: Array<{ ready: number; overloaded: number }> = [];
+  if (firstStart !== undefined && lastDurable !== undefined && lastDurable > firstStart) {
+    const duration = lastDurable - firstStart;
+    const count = Math.max(1, Math.floor(Number(duration) / 1e9));
+    for (let i = 0; i < count; i++) {
+      const start = firstStart + duration * BigInt(i) / BigInt(count);
+      const end = firstStart + duration * BigInt(i + 1) / BigInt(count);
+      activityWindows.push({
+        ready: intervals.filter(r => r.status === 'ready' && r.startedAtNs! >= start && r.completedAtNs! <= end).length,
+        overloaded: intervals.filter(r => r.reason === 'overloaded' && r.completedAtNs! >= start && r.completedAtNs! < end).length,
+      });
+    }
+  }
   const applicable = input.name.startsWith('saturation');
   const reasons: string[] = applicable ? [] : ['baseline arm intentionally makes no clip requests'];
   if (applicable) {
+    if (missingWrites.length > 0) reasons.push('missing durable samples prevent complete capture-interval coverage');
     if ((input.maxConcurrentRequests ?? input.concurrentClipRequests) < DEFAULTS.concurrentClipRequests) reasons.push('fewer than 16 concurrent clip requests were outstanding');
     if (uniqueKeys !== input.requestedClipKeys.length) reasons.push('a clip request repeated a content key, so cold-cache load was not guaranteed');
     if (!(input.coldCacheServerFresh ?? false)) reasons.push('reader server was not freshly started for this load');
@@ -124,6 +150,10 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
     if (readyOverlappingCapture === 0) reasons.push('no ready response overlapped the measured capture interval');
     if (overloadResponses === 0) reasons.push('no explicit overloaded response demonstrated bounded-admission saturation');
     if (!overlap) reasons.push('saturation load did not span first write through final durable capture');
+    if (!continuousRequests) reasons.push('request intervals did not provide continuous coverage through final durable capture');
+    if (!activityWindows.length || activityWindows.some(w => w.ready === 0 || w.overloaded === 0)) {
+      reasons.push('a capture time window lacked a completed cold parse or admission overload');
+    }
     if (input.corpusExhausted) reasons.push('historical cold corpus was exhausted before capture drain');
     if (input.drainTimedOut) reasons.push('capture drain timed out');
   }
@@ -141,7 +171,7 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
     burstLatency: stats(burstLatencies),
     throughputPerSecond: elapsedNs !== undefined && elapsedNs > 0n ? latencies.length / (Number(elapsedNs) / 1e9) : NaN,
     clipResponses: { byStatus, byReason, errors, latency: stats(input.clipResponses.map((response) => response.latencyMs)) },
-    load: { applicable, sufficient: applicable && reasons.length === 0, reasons, requested: input.requestedClipKeys.length, uniqueKeys, maxConcurrentRequests: input.maxConcurrentRequests ?? input.concurrentClipRequests, readyResponses, readyOverlappingCapture, nonSkippedResponses, overloadResponses, freshServer: input.coldCacheServerFresh ?? false, corpusExhausted: input.corpusExhausted ?? false, overlap },
+    load: { applicable, sufficient: applicable && reasons.length === 0, reasons, requested: input.requestedClipKeys.length, uniqueKeys, maxConcurrentRequests: input.maxConcurrentRequests ?? input.concurrentClipRequests, readyResponses, readyOverlappingCapture, nonSkippedResponses, overloadResponses, freshServer: input.coldCacheServerFresh ?? false, corpusExhausted: input.corpusExhausted ?? false, overlap, continuousRequests, activityWindows },
   };
 }
 
@@ -170,8 +200,8 @@ async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
 
 interface HistoricalChange { sessionId: string; seq: string; key: string }
 function corpusBody(index: number, changed: boolean): string {
-  const lines = Array.from({ length: 296 }, (_, line) => `  total += ${line === 147 ? (changed ? 2 : 1) : 1};`);
-  return `export function corpus_${index}(value: number): number {\n  let total = value;\n${lines.join('\n')}\n  return total;\n}\n`;
+  const lines = Array.from({ length: 296 }, (_, line) => `  total += ${line === 147 && changed ? index + 2 : 1};`);
+  return `export function corpus(value: number): number {\n  let total = value;\n${lines.join('\n')}\n  return total;\n}\n`;
 }
 
 async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
@@ -213,7 +243,7 @@ function runWriter(root: string, repetition: number, config: BenchmarkConfig): P
     };
     worker.once('error', (err) => finish(err));
     worker.once('exit', (code) => { if (!settled) finish(new Error(`clip benchmark writer exited unexpectedly (${code})`)); });
-    worker.on('message', (message: { type: string; phase?: string; written?: WorkerWrite[]; error?: string }) => {
+    worker.on('message', (message: { type: string; written?: WorkerWrite[]; error?: string }) => {
       if (message.type === 'error') finish(new Error(message.error));
       if (message.type === 'complete') finish(message.written ?? []);
     });
@@ -286,9 +316,11 @@ async function runReplication(arm: 'baseline' | 'saturation', repetition: number
     if (arm === 'saturation') load = startContinuousLoad(server.url, server.token, corpus, config.concurrentClipRequests);
     const written = await runWriter(root, repetition, config);
     const drained = await waitForQuietCapture(session);
+    // Quiet is only a heuristic. stop() actually drains pending capture work;
+    // keep both load and durable timestamp collection alive through that drain.
+    await session.stop();
     const loadSummary = load ? await load.stop() : undefined;
     off();
-    await session.stop();
     const writes = written.map((item) => ({ path: item.path, sha256: sha(item.body), startedAtNs: BigInt(item.startedAtNs), phase: item.phase }));
     return scoreCaptureArm({
       name: `${arm} repetition ${repetition + 1}`,
