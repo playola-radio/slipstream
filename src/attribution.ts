@@ -15,9 +15,7 @@ import type {
   AttributionStatus,
   AnyEvent,
   ChangeAttributionData,
-  CloudEvent,
   EnrichmentPolicy,
-  EvidenceFileScope,
   EvidenceKey,
   HarnessEvidenceData,
   ObservedInterval,
@@ -28,23 +26,22 @@ import type {
 export interface Invocation {
   key: EvidenceKey;
   keyStr: string;
-  /** The agreed tool name, or undefined when records disagree (a conflict). */
-  toolName: string | undefined;
   /** Earliest/latest timestamp across the joined records (pre-window). */
   minAtMs: number;
   maxAtMs: number;
-  /** Merged declared scope; `unknown` if any record could not name its paths. */
-  scope: EvidenceFileScope;
+  /** Union of every declared known path across the joined records, ascending. A
+   * record with `unknown` scope contributes no path — we cannot claim it touched
+   * a given file — but its conflict is still disclosed when a sibling variant
+   * names the change's path. */
+  knownPaths: readonly string[];
   /** True when records under this key contradict each other; such an invocation
    * is never counted as a candidate, only disclosed. */
   conflicted: boolean;
-  conflictReason?: string;
   /** Seqs of the distinct evidence records making up this invocation, ascending. */
   evidenceSeqs: bigint[];
 }
 
 export interface EvaluationInput {
-  changeSeq: bigint;
   path: string;
   /** The change's observation interval; undefined for legacy records with none. */
   interval: ObservedInterval | undefined;
@@ -65,23 +62,24 @@ export interface EvaluationResult {
 const EVIDENCE = 'slipstream.harness.evidence.v1';
 const FILE_CHANGED = 'slipstream.file.changed.v1';
 const ATTRIBUTION = 'slipstream.change.attribution.v1';
-const POLICY = 'slipstream.enrichment.configured.v1';
 
-/** A stable string identity for an evidence key, safe as a Map key. The unit
- * separator cannot appear in the component ids, so distinct keys never collide. */
+/** A stable string identity for an evidence key, safe as a Map key. JSON-encoded
+ * so no component's bytes can bleed into another's: plain concatenation (even with
+ * a unit separator) collides, since the schema forbids no character in these ids. */
 export function evidenceKeyString(key: EvidenceKey): string {
-  return `${key.harness}${key.harness_session_id}${key.record_id}`;
+  return JSON.stringify([key.harness, key.harness_session_id, key.record_id]);
 }
 
 /** Canonical signature of the semantic fact a record asserts, used for both dedup
  * (identical signature = one variant) and conflict detection. Adapter version is
- * deliberately excluded: a re-emit under a newer adapter is the same fact. */
+ * deliberately excluded: a re-emit under a newer adapter is the same fact. Scope is
+ * a structured value, so `['a,b']` (one path) and `['a','b']` (two) never collide. */
 export function variantSignature(data: Omit<HarnessEvidenceData, 'session_id'>): string {
   const scope =
     data.file_scope.kind === 'paths'
-      ? `paths:${[...data.file_scope.paths].sort().join(',')}`
-      : `unknown:${data.file_scope.reason}`;
-  return `${data.tool_name}${data.timestamp.basis}${data.timestamp.at_ms}${scope}`;
+      ? { kind: 'paths', paths: [...data.file_scope.paths].sort() }
+      : { kind: 'unknown', reason: data.file_scope.reason };
+  return JSON.stringify([data.tool_name, data.timestamp.basis, data.timestamp.at_ms, scope]);
 }
 
 /**
@@ -125,92 +123,64 @@ export function foldEvidence(events: readonly AnyEvent[]): Map<string, Invocatio
     }
     const tools = new Set(variants.map((v) => v.data.tool_name));
     const conflicted = sameBasisConflict || tools.size > 1;
-    const conflictReason = conflicted
-      ? sameBasisConflict
-        ? 'contradictory-records-under-one-key'
-        : 'tool-name-disagreement'
-      : undefined;
 
     let minAtMs = Infinity;
     let maxAtMs = -Infinity;
-    let unknownScope: string | undefined;
+    // Union of known paths across every variant. An `unknown`-scope variant adds
+    // no path (we cannot say what it touched), but a sibling variant that names a
+    // path keeps the invocation relevant — so a conflict is still disclosed.
     const paths = new Set<string>();
     for (const v of variants) {
       minAtMs = Math.min(minAtMs, v.data.timestamp.at_ms);
       maxAtMs = Math.max(maxAtMs, v.data.timestamp.at_ms);
-      if (v.data.file_scope.kind === 'unknown') unknownScope ??= v.data.file_scope.reason;
-      else for (const p of v.data.file_scope.paths) paths.add(p);
+      if (v.data.file_scope.kind === 'paths') for (const p of v.data.file_scope.paths) paths.add(p);
     }
-    const scope: EvidenceFileScope =
-      unknownScope !== undefined
-        ? { kind: 'unknown', reason: unknownScope }
-        : { kind: 'paths', paths: [...paths].sort() };
 
     out.set(keyStr, {
       key: group.key,
       keyStr,
-      toolName: tools.size === 1 ? [...tools][0] : undefined,
       minAtMs,
       maxAtMs,
-      scope,
+      knownPaths: [...paths].sort(),
       conflicted,
-      conflictReason,
       evidenceSeqs,
     });
   }
   return out;
 }
 
-/** Every declared policy in ascending seq order. */
-export function foldPolicies(
-  events: readonly AnyEvent[],
-): Array<{ seq: bigint; policy: EnrichmentPolicy }> {
-  const out: Array<{ seq: bigint; policy: EnrichmentPolicy }> = [];
-  for (const e of events) {
-    if (e.type !== POLICY) continue;
-    out.push({ seq: BigInt(e.seq), policy: e.data.policy });
-  }
-  out.sort((a, b) => (a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : 0));
-  return out;
-}
-
-/** The policy bound to a change: the highest-seq policy that strictly precedes
- * the change. Undefined for a change older than any policy (legacy disposition). */
-export function bindPolicy(
-  policies: ReadonlyArray<{ seq: bigint; policy: EnrichmentPolicy }>,
-  changeSeq: bigint,
-): { seq: bigint; policy: EnrichmentPolicy } | undefined {
-  let bound: { seq: bigint; policy: EnrichmentPolicy } | undefined;
-  for (const p of policies) {
-    if (p.seq < changeSeq) bound = p;
-    else break; // ascending: no later policy can precede
-  }
-  return bound;
+/** The Fork-1 identity of a change/attribution target: `(source, change_seq)`.
+ * A change seq alone is NOT unique — two sessions each hold a change seq `2` — so
+ * a fold over a multi-session stream must key by both or silently drop one. */
+export function attributionTargetKey(source: string, changeSeq: bigint | string): string {
+  return JSON.stringify([source, String(changeSeq)]);
 }
 
 /**
- * The Fork-3 public fold: each change's current attribution. An attribution is
- * counted only if its target reference is valid — an existing `file.changed.v1`
- * in the same source with a strictly smaller seq (Fork 1). The highest-seq valid
- * attribution wins, so a revision supersedes without mutating any prior record.
+ * The Fork-3 public fold: each change's current attribution, keyed by the
+ * `(source, change_seq)` identity. An attribution is counted only if its target
+ * reference is valid — an existing `file.changed.v1` in the same source with a
+ * strictly smaller seq (Fork 1). The highest-seq valid attribution wins, so a
+ * revision supersedes without mutating any prior record.
  */
 export function foldAttributions(
   events: readonly AnyEvent[],
-): Map<bigint, { seq: bigint; data: ChangeAttributionData }> {
-  const changeSeqsBySource = new Set<string>();
+): Map<string, { seq: bigint; source: string; data: ChangeAttributionData }> {
+  const changeTargets = new Set<string>();
   for (const e of events) {
-    if (e.type === FILE_CHANGED) changeSeqsBySource.add(`${e.source}${e.seq}`);
+    if (e.type === FILE_CHANGED) changeTargets.add(attributionTargetKey(e.source, e.seq));
   }
-  const latest = new Map<bigint, { seq: bigint; data: ChangeAttributionData }>();
+  const latest = new Map<string, { seq: bigint; source: string; data: ChangeAttributionData }>();
   for (const e of events) {
     if (e.type !== ATTRIBUTION) continue;
     if (!/^[1-9][0-9]*$/.test(e.data.change_seq)) continue;
     const changeSeq = BigInt(e.data.change_seq);
     const attrSeq = BigInt(e.seq);
     if (changeSeq >= attrSeq) continue; // must strictly precede its target
-    if (!changeSeqsBySource.has(`${e.source}${e.data.change_seq}`)) continue;
-    const cur = latest.get(changeSeq);
-    if (!cur || attrSeq > cur.seq) latest.set(changeSeq, { seq: attrSeq, data: e.data });
+    const targetKey = attributionTargetKey(e.source, e.data.change_seq);
+    if (!changeTargets.has(targetKey)) continue;
+    const cur = latest.get(targetKey);
+    if (!cur || attrSeq > cur.seq) latest.set(targetKey, { seq: attrSeq, source: e.source, data: e.data });
   }
   return latest;
 }
@@ -222,8 +192,8 @@ function windowOverlaps(inv: Invocation, start: number, end: number, windowMs: n
   return winStart <= end && winEnd >= start;
 }
 
-function scopeIncludes(scope: EvidenceFileScope, path: string): boolean {
-  return scope.kind === 'paths' && scope.paths.includes(path);
+function touchesPath(inv: Invocation, path: string): boolean {
+  return inv.knownPaths.includes(path);
 }
 
 /**
@@ -247,7 +217,7 @@ export function evaluateChange(input: EvaluationInput): EvaluationResult {
   const conflicts: Invocation[] = [];
   for (const inv of input.invocations) {
     const relevant =
-      scopeIncludes(inv.scope, input.path) &&
+      touchesPath(inv, input.path) &&
       windowOverlaps(inv, interval.start_ms, interval.end_ms, input.policy.window_ms);
     if (!relevant) continue;
     if (inv.conflicted) conflicts.push(inv);
@@ -300,5 +270,3 @@ export function attributionResultsEqual(
   const cb = (b.excluded_conflicts ?? []).map(evidenceKeyString);
   return sameStringSet(ca, cb);
 }
-
-export type AttributionEvent = CloudEvent<'slipstream.change.attribution.v1'>;

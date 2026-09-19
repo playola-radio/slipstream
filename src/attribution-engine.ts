@@ -117,7 +117,6 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
     if (!c) return;
     const invocations = foldEvidence(readEvents()).values();
     const result = evaluateChange({
-      changeSeq,
       path: c.path,
       interval: c.interval,
       policy: c.policy,

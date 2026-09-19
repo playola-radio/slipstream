@@ -1,14 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildEnvelope, type AnyEvent, type EnrichmentPolicy, type EvidenceKey } from './event.ts';
+import { buildEnvelope, sourceFor, type AnyEvent, type EnrichmentPolicy, type EvidenceKey } from './event.ts';
 import {
   attributionResultsEqual,
-  bindPolicy,
+  attributionTargetKey,
   evaluateChange,
   evidenceKeyString,
   foldAttributions,
   foldEvidence,
-  foldPolicies,
   type Invocation,
 } from './attribution.ts';
 
@@ -126,7 +125,7 @@ describe('attribution reducer', () => {
       assert.equal(only.minAtMs, 1000);
       assert.equal(only.maxAtMs, 3000);
       assert.deepEqual(only.evidenceSeqs, [1n, 2n]);
-      assert.deepEqual(only.scope, { kind: 'paths', paths: ['src/a.ts'] });
+      assert.deepEqual(only.knownPaths, ['src/a.ts']);
     });
 
     it('dedups a byte-identical reread to a single variant seq', () => {
@@ -157,40 +156,35 @@ describe('attribution reducer', () => {
       assert.equal([...inv.values()][0]!.conflicted, true);
     });
 
-    it('merges an unknown-scope record into an unknown invocation scope', () => {
+    it('contributes no known path for an unknown-scope record', () => {
       const inv = foldEvidence([
         evidence(1n, key('r1'), { at_ms: 1000, basis: 'tool-start', unknownScope: 'no-tool-input' }),
       ]);
-      assert.equal([...inv.values()][0]!.scope.kind, 'unknown');
+      assert.deepEqual([...inv.values()][0]!.knownPaths, []);
     });
-  });
 
-  describe('policy binding', () => {
-    it('binds a change to the latest policy that precedes it by sequence', () => {
-      const policies = foldPolicies([
-        policyEvent(1n, POLICY),
-        policyEvent(10n, { ...POLICY, window_ms: 9999 }),
+    it('keeps a sibling path known when one variant is unknown-scope, so the conflict is disclosable', () => {
+      const inv = foldEvidence([
+        evidence(1n, key('r1'), { at_ms: 1000, basis: 'record-time', paths: ['src/a.ts'] }),
+        evidence(2n, key('r1'), { at_ms: 1000, basis: 'record-time', unknownScope: 'parse-failed' }),
       ]);
-      assert.equal(bindPolicy(policies, 5n)?.seq, 1n);
-      assert.equal(bindPolicy(policies, 11n)?.seq, 10n);
-      assert.equal(bindPolicy(policies, 10n)?.seq, 1n, 'strictly preceding, not equal');
-    });
-
-    it('returns undefined for a change with no preceding policy (legacy)', () => {
-      const policies = foldPolicies([policyEvent(5n, POLICY)]);
-      assert.equal(bindPolicy(policies, 3n), undefined);
+      const only = [...inv.values()][0]!;
+      assert.equal(only.conflicted, true);
+      assert.deepEqual(only.knownPaths, ['src/a.ts']);
     });
   });
 
   describe('foldAttributions', () => {
+    const targetKey = (changeSeq: string) => attributionTargetKey(sourceFor(SESSION), changeSeq);
+
     it('keeps the highest-seq attribution per change and validates the target', () => {
       const latest = foldAttributions([
         change(2n, 'src/a.ts'),
         attribution(3n, { change_seq: '2', policy_seq: '1', status: 'unknown', reason: 'no-matching-evidence', evidence_seqs: [] }),
         attribution(9n, { change_seq: '2', policy_seq: '1', status: 'heuristic', reason: 'single-candidate', evidence_seqs: ['5'] }),
       ]);
-      assert.equal(latest.get(2n)?.data.status, 'heuristic');
-      assert.equal(latest.get(2n)?.seq, 9n);
+      assert.equal(latest.get(targetKey('2'))?.data.status, 'heuristic');
+      assert.equal(latest.get(targetKey('2'))?.seq, 9n);
     });
 
     it('ignores an attribution whose target does not exist', () => {
@@ -220,10 +214,9 @@ describe('attribution reducer', () => {
   describe('evaluateChange', () => {
     const inv = (over: Partial<Invocation> & { keyStr: string }): Invocation => ({
       key: key(over.keyStr),
-      toolName: 'Write',
       minAtMs: 1000,
       maxAtMs: 1000,
-      scope: { kind: 'paths', paths: ['src/a.ts'] },
+      knownPaths: ['src/a.ts'],
       conflicted: false,
       evidenceSeqs: [1n],
       ...over,
@@ -233,7 +226,6 @@ describe('attribution reducer', () => {
 
     it('one eligible candidate -> heuristic', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,
@@ -247,7 +239,6 @@ describe('attribution reducer', () => {
 
     it('two eligible candidates -> ambiguous', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,
@@ -262,14 +253,13 @@ describe('attribution reducer', () => {
     });
 
     it('no candidates under an available interval -> unknown / no-matching-evidence', () => {
-      const r = evaluateChange({ changeSeq: 10n, path: 'src/a.ts', interval, policy: POLICY, invocations: [] });
+      const r = evaluateChange({ path: 'src/a.ts', interval, policy: POLICY, invocations: [] });
       assert.equal(r.status, 'unknown');
       assert.equal(r.reason, 'no-matching-evidence');
     });
 
     it('an unavailable interval -> unknown / observation-interval-unavailable', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval: { unavailable: true, reason: 'reconciliation' },
         policy: POLICY,
@@ -282,7 +272,6 @@ describe('attribution reducer', () => {
 
     it('a missing interval is read as unavailable', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval: undefined,
         policy: POLICY,
@@ -293,22 +282,20 @@ describe('attribution reducer', () => {
 
     it('excludes an invocation whose scope does not include the path', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,
-        invocations: [inv({ keyStr: 'k1', scope: { kind: 'paths', paths: ['src/other.ts'] } })],
+        invocations: [inv({ keyStr: 'k1', knownPaths: ['src/other.ts'] })],
       });
       assert.equal(r.status, 'unknown');
     });
 
-    it('excludes an unknown-scope invocation from candidacy', () => {
+    it('excludes an invocation with no known paths from candidacy', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,
-        invocations: [inv({ keyStr: 'k1', scope: { kind: 'unknown', reason: 'x' } })],
+        invocations: [inv({ keyStr: 'k1', knownPaths: [] })],
       });
       assert.equal(r.status, 'unknown');
     });
@@ -316,7 +303,6 @@ describe('attribution reducer', () => {
     it('treats window overlap as inclusive at the boundary', () => {
       // window = [minAt - 2000, maxAt + 2000] = [-1000, 3000]; interval starts at 3000.
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval: { start_ms: 3000, end_ms: 4000 },
         policy: POLICY,
@@ -327,7 +313,6 @@ describe('attribution reducer', () => {
 
     it('excludes an invocation whose window falls entirely before the interval', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval: { start_ms: 10000, end_ms: 11000 },
         policy: POLICY,
@@ -338,7 +323,6 @@ describe('attribution reducer', () => {
 
     it('discloses a relevant conflict and never counts it as a candidate', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,
@@ -352,7 +336,6 @@ describe('attribution reducer', () => {
 
     it('keeps an eligible candidate while still disclosing a separate conflict', () => {
       const r = evaluateChange({
-        changeSeq: 10n,
         path: 'src/a.ts',
         interval,
         policy: POLICY,

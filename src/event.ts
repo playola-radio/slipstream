@@ -172,12 +172,12 @@ export type HarnessName = 'claude-code' | 'codex';
 
 /**
  * How thoroughly a harness source is covered, declared in the effective policy.
- * A1 wires no real transcript adapters, so real sources are `unconfigured`;
- * `covered` is reachable only through test fixtures. An `unknown` attribution
- * under `unconfigured` coverage honestly means "nothing was watched", never
- * "a human wrote it".
+ * A1 wires no real transcript adapters, so every source is `unconfigured`: an
+ * `unknown` attribution under `unconfigured` coverage honestly means "nothing was
+ * watched", never "a human wrote it". A2 defines the covered/unsupported/etc.
+ * vocabulary when real adapters exist and can actually distinguish those states.
  */
-export type SourceCoverage = 'unconfigured' | 'covered' | 'unsupported' | 'inaccessible';
+export type SourceCoverage = 'unconfigured';
 
 /** Which end of a harness invocation a timestamp marks. A start and an end
  * record for one invocation are joined, not treated as contradictory. */

@@ -190,17 +190,7 @@ describe('attribution engine', () => {
     assert.equal(h.events[0]?.seq, firstSeq, 'the original attribution event is immutable');
     assert.equal(h.results()[0]?.status, 'unknown');
     assert.equal(h.results()[1]?.change_seq, '10');
-  });
-
-  it('scores a revision under the change original policy, not a later one', async () => {
-    const h = harness();
-    h.engine.onChangeCommitted(change(10n, { start_ms: 1000, end_ms: 1000 }));
-    h.sched.advance(6000);
-    await h.engine.drain();
-    h.evidence.push(evidenceEvent(3n, key('r1'), { at_ms: 1500 }));
-    h.engine.onEvidenceChanged();
-    await h.engine.drain();
-    assert.equal(h.results()[0]?.policy_seq, '5');
+    assert.equal(h.results()[0]?.policy_seq, '5', 'both results carry the change bound policy');
     assert.equal(h.results()[1]?.policy_seq, '5');
   });
 

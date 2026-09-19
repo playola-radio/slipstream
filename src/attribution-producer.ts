@@ -139,8 +139,15 @@ export function createAttributionProducer(
       return Promise.resolve({ status: 'rejected', reason: 'queue-full', retryable: true });
     }
     const p = ingestor.ingest(evidence);
-    const tracked = p.finally(() => inflightIngests.delete(tracked));
-    inflightIngests.add(tracked);
+    // Track a settled (never-rejecting) view so drain/stop can await it without a
+    // second rejecting chain producing an unhandled rejection; return the original
+    // promise so the caller still observes ingestion failures.
+    const settled = p.then(
+      () => {},
+      () => {},
+    );
+    inflightIngests.add(settled);
+    void settled.finally(() => inflightIngests.delete(settled));
     return p;
   };
 
@@ -182,8 +189,8 @@ export function createAttributionProducer(
 
     // Seed prior results BEFORE scheduling, so a replayed evaluation that
     // reproduces the same result appends nothing (no double-attribution).
-    for (const [changeSeq, { data }] of foldAttributions(events)) {
-      engine.seedPublished(changeSeq, data);
+    for (const { data } of foldAttributions(events).values()) {
+      engine.seedPublished(BigInt(data.change_seq), data);
     }
     for (const { event, policy } of pendingChanges) registerChange(event, policy);
   };

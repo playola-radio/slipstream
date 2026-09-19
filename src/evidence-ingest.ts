@@ -86,7 +86,10 @@ export function createEvidenceIngestor(opts: EvidenceIngestorOptions): EvidenceI
     return { status: 'appended', seq: BigInt(event.seq) };
   };
 
-  const ingest = (evidence: NormalizedEvidence): Promise<IngestOutcome> => {
+  const ingest = (caller: NormalizedEvidence): Promise<IngestOutcome> => {
+    // Snapshot at the boundary: the caller may mutate its object after we return,
+    // but the record we persist (and mirror in memory) must be the fact as ingested.
+    const evidence = structuredClone(caller);
     // Admission is synchronous: no `await` sits between the bound check and the
     // reservation, so concurrent callers can never collectively over-admit.
     const size = Buffer.byteLength(JSON.stringify(evidence));
