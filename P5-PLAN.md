@@ -128,3 +128,26 @@ deletes nothing.)
 `npm run typecheck && npm test && npm run test:os` clean. TOUCHED-AREA REGRESSION:
 edits to daemon / readers / control-protocol run the FULL daemon/session/control/
 reader suites. PR targets `develop`, title `feature:` + jargon-free.
+
+## Deferred follow-ups (adversarial-review findings, consciously out of P5 scope)
+Ruled defer + document by Brian (D1=A, D2=A, D3=A) on 2026-09-19. None is a
+regression P5 introduces on the supported single-daemon (D3) topology.
+
+- **C2 — cross-process ownership (P1, data-loss corner, defer + document):**
+  standalone `watch`/`serve` capture takes `sessions/<uuid>/owner.lock` while the
+  shared daemon takes `<store>/owner.lock` — different files — and `watch` only
+  refuses to start when a daemon *control socket* already exists. So a daemon that
+  starts *after* a standalone `watch` could run `gc`/`delete_session` concurrently
+  with that writer and reclaim a blob it is about to reference. Mixing standalone
+  capture and a shared daemon on one store is already outside the supported D3
+  topology; a real fix is a unified cross-process store-ownership protocol, which
+  is a product/architecture decision, not a P5 change. Documented, not remedied.
+- **C6 — symlinked session dir / CAS shard (P2, defer):** a symlink planted where
+  a `sessions/<uuid>` dir or a blob shard should be could let destructive ops
+  escape the store. Planting it needs write access to the 0700 user-owned store,
+  which already grants direct deletion. `storage.ts` (lstat) and the reader
+  (`O_NOFOLLOW`) set the convention to extend here later; low real-world risk.
+- **C7 — shard-dir re-fsync on gc retry (P3, defer):** after a failed shard-dir
+  fsync, a later `gc` that finds the shard already empty skips the fsync, so a
+  power loss in that window could resurrect a deleted blob entry. Requires a
+  failed fsync *and* a crash in a tiny window; narrow durability corner.
