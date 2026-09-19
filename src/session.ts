@@ -367,7 +367,17 @@ export async function startCapture(
         await append({
           type: 'slipstream.file.changed.v1',
           occurred_at_ms: Date.now(),
-          data: { path, before, after, observation: 'reconciliation', gap_ref: gapSeq },
+          data: {
+            path,
+            before,
+            after,
+            observation: 'reconciliation',
+            gap_ref: gapSeq,
+            // A reconciliation endpoint is a state diff discovered on restart, not a
+            // watched transition, so it cannot bound a real interval. Disclose that
+            // explicitly rather than fabricate one; attribution reads it as unknown.
+            observed_interval_ms: { unavailable: true, reason: 'reconciliation' },
+          },
         });
       }
       engine.setBaseline(path, snapshotsEqual(before, after) ? before : after);

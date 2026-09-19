@@ -73,16 +73,19 @@ export async function withLog(
   });
 }
 
-/** An engine backed by a real log and a caller-supplied (usually fake) reader. */
+/** An engine backed by a real log and a caller-supplied (usually fake) reader.
+ * `now` injects the snapshot-acquisition clock (the interval's `end_ms`); tests
+ * that assert intervals supply a deterministic one. */
 export async function withEngine(
   reader: Reader,
   fn: (ctx: { engine: Engine; read: () => Promise<LoggedRecord[]> }) => Promise<void>,
+  opts: { now?: () => number } = {},
 ): Promise<void> {
   await withTempDir(async (dir) => {
     const path = join(dir, 'events.jsonl');
     const log = await createLog({ filePath: path, sessionId: TEST_SESSION_ID });
     try {
-      await fn({ engine: createEngine({ reader, log }), read: () => readRecords(path) });
+      await fn({ engine: createEngine({ reader, log, now: opts.now }), read: () => readRecords(path) });
     } finally {
       await log.close();
     }

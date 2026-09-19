@@ -7,6 +7,9 @@ export interface EngineOptions {
   reader: Reader;
   /** The engine only appends; it neither tracks durability nor closes the log. */
   log: Pick<Log, 'append'>;
+  /** Epoch-ms clock read the instant snapshot acquisition completes, to close the
+   * observed interval. Injected for deterministic tests; defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface Engine {
@@ -34,7 +37,7 @@ export interface Engine {
  * Notifies arriving while a path is being processed coalesce into a single
  * follow-up cycle; a state skipped that way is surfaced as a capture gap.
  */
-export function createEngine({ reader, log }: EngineOptions): Engine {
+export function createEngine({ reader, log, now = Date.now }: EngineOptions): Engine {
   const committed = new Map<string, Snapshot>();
   const pending = new Map<string, number>(); // path -> earliest observed_at_ms
   const coalesced = new Set<string>();
@@ -83,6 +86,10 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
 
   const handleOnce = async (path: string, observedAtMs: number, wasCoalesced: boolean): Promise<void> => {
     const after = await reader.read(path);
+    // Close the observation interval the instant acquisition finishes. A regressed
+    // clock (end < start) is recorded truthfully, never clamped into a fabricated
+    // interval — interpretation handles the inversion, capture does not lie.
+    const endMs = now();
     const before = committed.get(path) ?? priorFor(path);
     if (snapshotsEqual(before, after)) {
       // Nothing to record — but if we coalesced, an intermediate state may have
@@ -99,7 +106,14 @@ export function createEngine({ reader, log }: EngineOptions): Engine {
     await log.append({
       type: 'slipstream.file.changed.v1',
       occurred_at_ms: observedAtMs,
-      data: { path, before, after, observation: 'watcher', coalesced: wasCoalesced },
+      data: {
+        path,
+        before,
+        after,
+        observation: 'watcher',
+        coalesced: wasCoalesced,
+        observed_interval_ms: { start_ms: observedAtMs, end_ms: endMs },
+      },
     });
     committed.set(path, after);
   };
