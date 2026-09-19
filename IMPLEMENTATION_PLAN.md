@@ -400,14 +400,17 @@ deadline that cancels and replaces a stuck worker), the reader endpoint
 No log event, no persistence: clips are viewable exactly while the blobs are
 retained, and GC'd blobs yield an explicit `unavailable` projection with a
 reason. Byte/line rules and status/reason semantics are documented in
-`CLIP-PROJECTION.md`. **B2 in progress**: tree-sitter extraction for JS/JSX/TS/TSX,
-paired function spans, mixed per-side fallback, and the approved closed language
-input are implemented. The first full D3 run aborted in the native parser during
-worker cancellation. Brian authorized a binding replacement on 2026-09-19;
-`clip.v3` uses WASM with the original capture design and budgets. The cancellation
-regression and all 73 clip tests pass. A valid full measurement, numeric-bar
-ratification, final review and PR remain outstanding. See
-`B2-MEASUREMENT-REPORT.md` for the historical failure and subsequent measurements.
+`CLIP-PROJECTION.md`. **B2 awaiting D3 numeric-bar ratification**: `clip.v3` provides WASM
+function extraction for JS/JSX/TS/TSX, paired spans, explicit mixed fallback and
+the approved closed language input/cache key. The native worker-cancellation
+crash was reproduced and replaced with WASM under the original design/budgets.
+Typecheck and 646 tests pass; review/challenge/Excess findings and re-reviews are
+resolved. The qualifying full run (`8a7dab0`) captured 1,200/1,200 writes without
+crashing, and all three saturation arms passed the load checks. Baseline overall
+p99 was 1,386–1,438 ms; saturation was 1,141–1,228 ms on the shared host. The
+proposed 20% latency / 5% throughput regression bar is **not yet ratified**; the
+D3 gate has not been declared passed. Numeric ratification and PR review remain.
+See `B2-MEASUREMENT-REPORT.md` for all numbers, host conditions and history.
 B2 and Stage 4 are not complete. D4 makes clips a
 **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
