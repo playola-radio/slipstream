@@ -5,13 +5,14 @@ import type { ClipResponse } from './clip-bench.ts';
 
 const ns = (ms: number) => BigInt(ms) * 1_000_000n;
 function loadScenario(responses: ClipResponse[], durableMs = 3_000) {
+  const keyed = responses.map((r, i) => ({ ...r, key: r.key ?? `key-${i}` }));
   return scoreCaptureArm({
     name: 'saturation',
     writes: [{ path: 'one.ts', sha256: 'a', startedAtNs: ns(1_000), phase: 'scheduled' }],
     records: [{ type: 'slipstream.file.changed.v1', seq: '1', data: { path: 'one.ts', after: { kind: 'content', sha256: 'a' } } }],
     durableAtNsBySeq: new Map([['1', ns(durableMs)]]),
-    clipResponses: responses,
-    requestedClipKeys: responses.map((_, i) => `key-${i}`),
+    clipResponses: keyed,
+    requestedClipKeys: keyed.map(r => r.key),
     concurrentClipRequests: 16, maxConcurrentRequests: 16, coldCacheServerFresh: true,
     loadStartedAtNs: ns(0), loadStoppedAtNs: ns(4_000),
   });
@@ -23,6 +24,25 @@ const continuousResponses = (): ClipResponse[] => Array.from({ length: 40 }, (_,
 
 test('accepts continuous requests with completed cold parses and overload in every time window', () => {
   assert.equal(loadScenario(continuousResponses()).load.sufficient, true);
+});
+
+test('sequential retries stay cold only after an explicit uncached overload', () => {
+  const responses = continuousResponses();
+  responses[0] = { ...responses[0]!, key: 'retry', status: 'skipped', reason: 'overloaded' };
+  responses[2] = { ...responses[2]!, key: 'retry' };
+  assert.equal(loadScenario(responses).load.sufficient, true);
+  // A previous successful response might be cached; any other prior outcome is
+  // retired too. An overlap could coalesce with an admitted request instead.
+  for (const previous of [
+    { status: 'ready', reason: undefined },
+    { status: 'skipped', reason: 'timeout' },
+  ]) {
+    const changed = [...responses];
+    changed[0] = { ...responses[0]!, ...previous };
+    assert.equal(loadScenario(changed).load.sufficient, false);
+  }
+  responses[2] = { ...responses[2]!, startedAtNs: ns(50) };
+  assert.equal(loadScenario(responses).load.sufficient, false);
 });
 
 test('rejects idle gaps even when load lifecycle, peak concurrency and one parse look sufficient', () => {

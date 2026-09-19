@@ -27,6 +27,43 @@ Completed benchmark repetitions now emit a JSON line between arms, retaining
 finished results if a later repetition fails. No logging was added inside a
 measured capture interval.
 
+## First WASM full run: load validation failed
+
+Revision: `e097dee`, Node 24.11.0, macOS arm64, M1 Max, 10 logical CPUs.
+The process completed all six repetitions without a crash; **1,200/1,200 writes
+were durably captured, zero missing**. Typecheck and 645 deterministic tests
+passed, and the combined review fix wave received PASS before this run.
+
+This is **not qualifying D3 saturation evidence**. All three saturation arms
+failed the predefined per-window load check: cold ready parses continued, but
+later windows had no admission overload. The public endpoint scans the log prefix for each lookup, so requests to a
+single 4,096-change historical session incur increasing lookup work. That is a
+possible contributor, not an isolated cause: these aggregate counters do not
+measure queue depth or parser utilization, and steady ready throughput does not
+prove parser idleness. All arms kept
+16 client slots, distinct cold keys, continuous request coverage, no request
+errors, and no corpus exhaustion; those facts alone do not prove sustained
+parser pressure.
+
+The host was heavily contended: setup started at load averages 57.69 / 21.00 /
+15.14; the one-minute load reached 136.87 during setup/early capture and declined
+to 32.21 near the final saturation arm. These changing conditions also prevent a
+clean causal interpretation of baseline versus saturation. No bar is ratified.
+
+All latencies below are milliseconds; each arm has 100 scheduled + 100 burst
+samples. Counts are measured results, not a pass verdict.
+
+| Arm | Overall p50 / p99 | Scheduled p50 / p99 | Burst p50 / p99 | Captures/s | Ready / skipped |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline repetition 1 | 720.15 / 1324.06 | 99.25 / 125.78 | 1008.88 / 1324.06 | 14.72 | 0 / 0 |
+| baseline repetition 2 | 835.59 / 1649.59 | 95.77 / 117.15 | 1263.81 / 1649.59 | 14.35 | 0 / 0 |
+| baseline repetition 3 | 786.63 / 1436.55 | 94.66 / 130.86 | 1175.11 / 1441.67 | 14.61 | 0 / 0 |
+| saturation repetition 1 | 593.16 / 1842.18 | 120.41 / 166.28 | 1254.73 / 1842.18 | 14.30 | 2779 / 1031 |
+| saturation repetition 2 | 682.70 / 1799.77 | 120.34 / 162.93 | 1232.43 / 1809.05 | 14.36 | 2770 / 1073 |
+| saturation repetition 3 | 719.45 / 1800.23 | 124.95 / 168.83 | 1246.89 / 1813.72 | 14.31 | 2775 / 1078 |
+
+Raw aggregate results and per-repetition output are retained in `.context/b2-wasm-measurements.json` and `.context/b2-wasm-measurements.stderr`; host samples are retained separately. A revised, predefined synthetic-load protocol is needed before ratifying the latency gate.
+
 ## Historical native run
 
 Revision measured: `fba33e8`. The following records the initial failed run and

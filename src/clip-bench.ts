@@ -5,7 +5,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, loadavg, freemem } from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { createCas } from './cas.ts';
 import { percentile } from './bench.ts';
@@ -14,15 +14,18 @@ import type { AnyEvent } from './event.ts';
 import { startReaderServer } from './http-reader.ts';
 import { createLog } from './log.ts';
 import { startCapture, type CaptureSession } from './session.ts';
+import { CLIP_PROJECTION_VERSION } from './clip-projection.ts';
 
 interface BenchmarkConfig { repetitions: number; scheduledWrites: number; scheduledIntervalMs: number; burstWrites: number; concurrentClipRequests: number; corpusChanges: number }
-const DEFAULTS: Readonly<BenchmarkConfig> = Object.freeze({ repetitions: 3, scheduledWrites: 100, scheduledIntervalMs: 120, burstWrites: 100, concurrentClipRequests: 16, corpusChanges: 4096 });
+const DEFAULTS: Readonly<BenchmarkConfig> = Object.freeze({ repetitions: 3, scheduledWrites: 100, scheduledIntervalMs: 120, burstWrites: 100, concurrentClipRequests: 16, corpusChanges: 8192 });
+const CHANGES_PER_HISTORICAL_SESSION = 64;
+const MAX_REQUEST_ATTEMPTS = 100_000;
 const QUIET_MS = 1_000;
 const DRAIN_TIMEOUT_MS = 15_000;
 const NS_PER_MS = 1_000_000n;
 
 export interface ExpectedWrite { path: string; sha256: string; startedAtNs: bigint; phase: 'scheduled' | 'burst' }
-export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string; startedAtNs?: bigint; completedAtNs?: bigint }
+export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string; key?: string; startedAtNs?: bigint; completedAtNs?: bigint }
 export interface CaptureArmInput {
   name: string;
   writes: ExpectedWrite[];
@@ -36,11 +39,13 @@ export interface CaptureArmInput {
   loadStartedAtNs?: bigint;
   loadStoppedAtNs?: bigint;
   corpusExhausted?: boolean;
+  attemptLimitReached?: boolean;
   drainTimedOut?: boolean;
 }
 
 interface LatencyStats { n: number; p50: number | null; p99: number | null }
 export interface CaptureArmReport {
+  host?: { before: ReturnType<typeof hostSample>; after: ReturnType<typeof hostSample> };
   name: string;
   written: number;
   matchedRecords: number;
@@ -114,6 +119,16 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
     && input.loadStartedAtNs <= firstStart && input.loadStoppedAtNs >= lastDurable;
   const intervals = input.clipResponses.filter(r => r.startedAtNs !== undefined && r.completedAtNs !== undefined)
     .sort((a, b) => a.startedAtNs! < b.startedAtNs! ? -1 : a.startedAtNs! > b.startedAtNs! ? 1 : 0);
+  let coldKeysVerified = intervals.length === input.clipResponses.length
+    && JSON.stringify(input.clipResponses.map(r => r.key).sort()) === JSON.stringify([...input.requestedClipKeys].sort());
+  const prior = new Map<string, ClipResponse>();
+  for (const r of intervals) {
+    if (r.key === undefined) { coldKeysVerified = false; continue; }
+    const previous = prior.get(r.key);
+    if (previous && (previous.status !== 'skipped' || previous.reason !== 'overloaded'
+      || previous.completedAtNs! > r.startedAtNs!)) coldKeysVerified = false;
+    prior.set(r.key, r);
+  }
   let coveredThrough = firstStart;
   for (const r of intervals) {
     if (coveredThrough === undefined || r.startedAtNs! > coveredThrough) break;
@@ -142,7 +157,7 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
   if (applicable) {
     if (missingWrites.length > 0) reasons.push('missing durable samples prevent complete capture-interval coverage');
     if ((input.maxConcurrentRequests ?? input.concurrentClipRequests) < DEFAULTS.concurrentClipRequests) reasons.push('fewer than 16 concurrent clip requests were outstanding');
-    if (uniqueKeys !== input.requestedClipKeys.length) reasons.push('a clip request repeated a content key, so cold-cache load was not guaranteed');
+    if (!coldKeysVerified) reasons.push('a clip request repeated a content key without a completed uncached overload, or its key trace was incomplete');
     if (!(input.coldCacheServerFresh ?? false)) reasons.push('reader server was not freshly started for this load');
     if (input.clipResponses.length !== input.requestedClipKeys.length) reasons.push('not every requested clip produced a response');
     if (errors > 0) reasons.push('one or more clip requests failed');
@@ -155,6 +170,7 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
       reasons.push('a capture time window lacked a completed cold parse or admission overload');
     }
     if (input.corpusExhausted) reasons.push('historical cold corpus was exhausted before capture drain');
+    if (input.attemptLimitReached) reasons.push('the bounded request-attempt limit was reached');
     if (input.drainTimedOut) reasons.push('capture drain timed out');
   }
 
@@ -205,27 +221,33 @@ function corpusBody(index: number, changed: boolean): string {
 }
 
 async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
-  const sessionId = randomUUID();
-  await mkdir(join(storeDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
   const cas = await createCas(join(storeDir, 'blobs'));
-  const log = await createLog({ filePath: join(storeDir, 'sessions', sessionId, 'events.jsonl'), sessionId });
+  let sessionId = '';
+  let log: Awaited<ReturnType<typeof createLog>> | undefined;
   try {
-    await log.append({ type: 'slipstream.session.started.v1', occurred_at_ms: Date.now(), data: { root: '/synthetic-clip-corpus', max_bytes: 1024 * 1024 } });
     // Every requested after-blob is unique; the shared before blob keeps corpus
     // setup bounded without weakening the cold-cache key guarantee.
     const before = await cas.put(Buffer.from(corpusBody(0, false)));
     const changes: HistoricalChange[] = [];
     for (let index = 0; index < count; index++) {
+      if (index % CHANGES_PER_HISTORICAL_SESSION === 0) {
+        await log?.close();
+        sessionId = randomUUID();
+        await mkdir(join(storeDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
+        log = await createLog({ filePath: join(storeDir, 'sessions', sessionId, 'events.jsonl'), sessionId });
+        await log.append({ type: 'slipstream.session.started.v1', occurred_at_ms: Date.now(), data: { root: '/synthetic-clip-corpus', max_bytes: 1024 * 1024 } });
+      }
       const after = await cas.put(Buffer.from(corpusBody(index, true)));
       const observedAtMs = Date.now();
-      const event = await log.append({
+      const event = await log!.append({
         type: 'slipstream.file.changed.v1', occurred_at_ms: observedAtMs,
         data: { path: `corpus-${index}.ts`, before: { kind: 'content', sha256: before.sha256, size: before.size }, after: { kind: 'content', sha256: after.sha256, size: after.size }, observation: 'watcher', observed_interval_ms: { start_ms: observedAtMs, end_ms: Date.now() } },
       });
-      changes.push({ sessionId, seq: event.seq, key: `${sessionId}/${event.seq}/${after.sha256}` });
+      changes.push({ sessionId, seq: event.seq, key: `${before.sha256}/${after.sha256}/${CLIP_PROJECTION_VERSION}/typescript` });
     }
+    if (new Set(changes.map(c => c.key)).size !== changes.length) throw new Error('historical corpus contains duplicate projection inputs');
     return changes;
-  } finally { await log.close(); }
+  } finally { await log?.close(); }
 }
 
 interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
@@ -263,7 +285,7 @@ async function requestClip(url: string, token: string, change: HistoricalChange)
   }
 }
 
-interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean }
+interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
 function startContinuousLoad(url: string, token: string, corpus: HistoricalChange[], concurrent: number): { stop: () => Promise<LoadSummary> } {
   const startedAtNs = process.hrtime.bigint();
   const responses: ClipResponse[] = [];
@@ -273,14 +295,23 @@ function startContinuousLoad(url: string, token: string, corpus: HistoricalChang
   let maxConcurrentRequests = 0;
   let stopping = false;
   let corpusExhausted = false;
+  let attemptLimitReached = false;
   const slot = async (): Promise<void> => {
+    let change: HistoricalChange | undefined;
     while (!stopping) {
-      const change = corpus[next++];
+      if (requested.length >= MAX_REQUEST_ATTEMPTS) { attemptLimitReached = true; return; }
+      change ??= corpus[next++];
       if (!change) { corpusExhausted = true; return; }
       requested.push(change.key);
       active++;
       maxConcurrentRequests = Math.max(maxConcurrentRequests, active);
-      try { responses.push(await requestClip(url, token, change)); }
+      try {
+        const response = await requestClip(url, token, change);
+        responses.push({ ...response, key: change.key });
+        // This slot alone owns this key. Overload is never admitted or cached;
+        // retrying it stays cold. Retire every other outcome permanently.
+        if (response.status !== 'skipped' || response.reason !== 'overloaded') change = undefined;
+      }
       finally { active--; }
     }
   };
@@ -289,12 +320,15 @@ function startContinuousLoad(url: string, token: string, corpus: HistoricalChang
     stop: async () => {
       stopping = true;
       await Promise.all(slots);
-      return { responses, requested, maxConcurrentRequests, startedAtNs, stoppedAtNs: process.hrtime.bigint(), corpusExhausted };
+      return { responses, requested, maxConcurrentRequests, startedAtNs, stoppedAtNs: process.hrtime.bigint(), corpusExhausted, attemptLimitReached };
     },
   };
 }
 
+function hostSample() { return { at: new Date().toISOString(), loadavg: loadavg(), freeMemoryGiB: freemem() / 2 ** 30 }; }
+
 async function runReplication(arm: 'baseline' | 'saturation', repetition: number, storeDir: string, corpus: HistoricalChange[], config: BenchmarkConfig): Promise<CaptureArmReport> {
+  const hostBefore = hostSample();
   const root = await mkdtemp(join(tmpdir(), 'slip-clip-bench-wt-'));
   let session: CaptureSession | undefined;
   let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
@@ -322,7 +356,7 @@ async function runReplication(arm: 'baseline' | 'saturation', repetition: number
     const loadSummary = load ? await load.stop() : undefined;
     off();
     const writes = written.map((item) => ({ path: item.path, sha256: sha(item.body), startedAtNs: BigInt(item.startedAtNs), phase: item.phase }));
-    return scoreCaptureArm({
+    const report = scoreCaptureArm({
       name: `${arm} repetition ${repetition + 1}`,
       writes,
       records: await readRecords(session.logPath),
@@ -335,8 +369,10 @@ async function runReplication(arm: 'baseline' | 'saturation', repetition: number
       loadStartedAtNs: loadSummary?.startedAtNs,
       loadStoppedAtNs: loadSummary?.stoppedAtNs,
       corpusExhausted: loadSummary?.corpusExhausted,
+      attemptLimitReached: loadSummary?.attemptLimitReached,
       drainTimedOut: !drained,
     });
+    return { ...report, host: { before: hostBefore, after: hostSample() } };
   } finally {
     await load?.stop().catch(() => {});
     await server?.close();
@@ -354,8 +390,8 @@ async function main(): Promise<void> {
     // reader only. Live captures below are produced only by @parcel/watcher.
     const corpus = await createHistoricalCorpus(storeDir, config.corpusChanges);
     const reports: CaptureArmReport[] = [];
-    for (const arm of ['baseline', 'saturation'] as const) {
-      for (let repetition = 0; repetition < config.repetitions; repetition++) {
+    for (let repetition = 0; repetition < config.repetitions; repetition++) {
+      for (const arm of (repetition % 2 === 0 ? ['baseline', 'saturation'] : ['saturation', 'baseline']) as Array<'baseline' | 'saturation'>) {
         const report = await runReplication(arm, repetition, storeDir, corpus, config);
         reports.push(report);
         // Emit only between measured arms. A later process crash must not erase
