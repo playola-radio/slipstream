@@ -366,13 +366,9 @@ describe('transcript discovery', () => {
       io({
         listTreeJsonl: async () => ({ paths: ['/c/ea.jsonl'], truncated: false, incomplete: false }),
         readFirstLine: async () => ({ ok: true as const, line: meta }),
-        realpath: async () => undefined,
-        probe: async (p) =>
-          p === '/links'
-            ? { kind: 'present' }
-            : p === '/links/alias'
-              ? { kind: 'error' }
-              : { kind: 'absent' },
+        // /links resolves normally; only inspecting /links/alias hits the wall.
+        realpath: async (p) => (p === '/links' ? '/links' : undefined),
+        probe: async (p) => (p === '/links/alias' ? { kind: 'error' } : { kind: 'absent' }),
       }),
       '/home',
       ROOT,
@@ -459,5 +455,60 @@ describe('transcript discovery', () => {
     assert.equal(result.bindings.length, 1);
     assert.equal(result.bindings[0]!.ctx.cwd, '/work/proj/pkg');
     assert.equal(result.bindings[0]!.ctx.rootAliases, undefined);
+  });
+
+  it('discloses a deleted in-root cwd recorded with different case on a case-insensitive FS', async () => {
+    // macOS's default filesystem is case-insensitive: cwd /WORK/PROJ/gone names the
+    // same directory as canonical root /work/proj. The tail is deleted, so realpath
+    // of the whole string fails, but the kernel still canonicalizes each living
+    // component (folding case), placing it in-root. Reimplementing membership by
+    // comparing raw spelling would silently drop this in-root candidate.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-case', cwd: '/WORK/PROJ/gone' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/case.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        // The kernel folds case per living component; `gone` is deleted.
+        realpath: async (p) =>
+          p === '/WORK' ? '/work' : p === '/work/PROJ' || p === '/WORK/PROJ' ? ROOT : undefined,
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(
+      result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/WORK/PROJ/gone')),
+    );
+  });
+
+  it('skips an out-of-root cwd whose parent component is a file (ENOTDIR), without disclosing it', async () => {
+    // Another worktree's former directory /other/project/pkg is now a regular file,
+    // so /other/project/pkg/gone can never exist (ENOTDIR). That is confirmed
+    // absence, not an inspection failure: the cwd places outside the root and must
+    // not degrade this root's coverage.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-notdir', cwd: '/other/project/pkg/gone' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/nd.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        // pkg is a file (realpath resolves it); below it, realpath fails with ENOTDIR.
+        realpath: async (p) =>
+          p === '/other' || p === '/other/project' || p === '/other/project/pkg' ? p : undefined,
+        // fs-io maps ENOTDIR to absence, so probe of the dead tail is `absent`.
+        probe: async () => ({ kind: 'absent' }),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.equal(result.issues.length, 0);
   });
 });

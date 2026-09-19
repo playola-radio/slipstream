@@ -107,13 +107,18 @@ function segmentsOf(path: string): string[] {
  * alias namespace (cwd `/tmp/proj/gone` for canonical root `/private/tmp/proj`)
  * yet be in-root, or textually in-root yet escape through an internal symlink
  * (`/work/proj/link/gone` where `link` -> `/other/project`). So we resolve the
- * cwd the way `realpath` would — component by component over `probe`, never
- * collapsing `..` lexically (an intervening symlink makes that wrong). We keep a
- * CANONICAL prefix `resolved`: each component is probed against it; `..` pops the
- * prefix; a symlink splices in its literal target (following it, so any `..`
- * after it is evaluated against the target). A component may be absent yet a
- * later `..` can pop back above it into living space, so we keep walking rather
- * than stop at the first gap.
+ * cwd the way `realpath` would — but `realpath` on the whole string fails because
+ * of the deleted tail. Instead we walk it component by component and let the
+ * KERNEL canonicalize every component that still exists: `realpath` on a living
+ * component resolves symlinks, case-insensitive names, and unicode normalization
+ * exactly, rather than reimplementing those rules. We keep a canonical prefix
+ * `base`: for each component, `realpath(base/seg)` supplies its true form; only
+ * when that component does NOT resolve do we fall back to `probe`. A truly
+ * nonexistent component contains no symlinks below it, so a `..` after it is
+ * resolved lexically (exact); a `..` can also pop back above a gap into living
+ * space, which the continued walk re-canonicalizes. A component that exists only
+ * as a broken symlink is followed by splicing its literal target, so any `..`
+ * after it is evaluated against the target, not the link's own parent.
  *
  * A cwd that places outside the root is a different worktree's session, skipped
  * silently so unrelated dead sessions never degrade this root's coverage.
@@ -127,32 +132,46 @@ async function unresolvedCwdMayBeInRoot(
 ): Promise<boolean> {
   const queue = segmentsOf(cwd);
   let cursor = 0;
-  let resolved = '/';
+  let base = '/';
   let symlinkHops = 0;
   while (cursor < queue.length) {
     const seg = queue[cursor];
     cursor += 1;
     if (seg === '..') {
-      resolved = dirname(resolved); // popping a canonical prefix is exact
+      base = dirname(base); // popping a canonical prefix is exact
       continue;
     }
-    const candidate = resolved === '/' ? `/${seg}` : `${resolved}/${seg}`;
+    const candidate = base === '/' ? `/${seg}` : `${base}/${seg}`;
+    // Let the kernel canonicalize any component that still resolves (dir, file, or
+    // a symlink whose target resolves): this handles symlinks, case-insensitive
+    // names, and unicode normalization exactly instead of reimplementing them.
+    const canonical = await io.realpath(candidate);
+    if (canonical !== undefined) {
+      base = canonical;
+      continue;
+    }
+    // The component does not fully resolve; distinguish the reasons.
     const probe = await io.probe(candidate);
-    if (probe.kind === 'present' || probe.kind === 'absent') {
-      // An absent component still advances the prefix; a later `..` can pop back
-      // above it into living space, which the continued walk re-resolves.
-      resolved = candidate;
+    if (probe.kind === 'absent') {
+      // Confirmed nonexistent (ENOENT/ENOTDIR): no symlinks live below it, so
+      // advancing the prefix lexically is exact. A later `..` may still pop back
+      // above this gap into living space, which the continued walk re-resolves.
+      base = candidate;
       continue;
     }
-    if (probe.kind !== 'symlink') return true; // uninspectable: cannot rule out
-    symlinkHops += 1;
-    if (symlinkHops > MAX_UNRESOLVED_HOPS) return true; // cycle: disclose
-    // Follow the link: splice its literal target in place of this component so a
-    // trailing `..` is evaluated against the target, not the link's own parent.
-    if (isAbsolute(probe.target)) resolved = '/';
-    queue.splice(cursor, 0, ...segmentsOf(probe.target));
+    if (probe.kind === 'symlink') {
+      // A symlink whose target does not resolve (dangling, or reaching through
+      // deleted space). Follow its literal target so a `..` after it is evaluated
+      // against the target and the target's living parts get canonicalized above.
+      symlinkHops += 1;
+      if (symlinkHops > MAX_UNRESOLVED_HOPS) return true; // cycle: disclose
+      if (isAbsolute(probe.target)) base = '/';
+      queue.splice(cursor, 0, ...segmentsOf(probe.target));
+      continue;
+    }
+    return true; // uninspectable (e.g. permissions): cannot rule out membership
   }
-  return isWithinRoot(root, resolved);
+  return isWithinRoot(root, base);
 }
 
 export async function discoverClaude(

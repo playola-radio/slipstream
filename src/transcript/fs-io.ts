@@ -123,9 +123,11 @@ export const nodeDiscoveryIO: DiscoveryIO = {
     try {
       stats = await fsLstat(path);
     } catch (err) {
-      // ENOENT is confirmed absence; anything else (e.g. EACCES) is a failure to
-      // inspect, which must NOT masquerade as "not present".
-      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { kind: 'absent' } : { kind: 'error' };
+      // ENOENT (nothing there) and ENOTDIR (a parent component is not a directory,
+      // so nothing can exist below it) are both confirmed absence. Anything else
+      // (e.g. EACCES) is a failure to inspect, which must NOT masquerade as absence.
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === 'ENOENT' || code === 'ENOTDIR' ? { kind: 'absent' } : { kind: 'error' };
     }
     if (!stats.isSymbolicLink()) return { kind: 'present' };
     try {
