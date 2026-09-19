@@ -400,28 +400,30 @@ deadline that cancels and replaces a stuck worker), the reader endpoint
 No log event, no persistence: clips are viewable exactly while the blobs are
 retained, and GC'd blobs yield an explicit `unavailable` projection with a
 reason. Byte/line rules and status/reason semantics are documented in
-`CLIP-PROJECTION.md`. **B2 awaiting D3 numeric-bar ratification**: `clip.v3` provides WASM
+`CLIP-PROJECTION.md`. **B2 implementation and acceptance complete; PR #20 awaiting merge**: `clip.v3` provides WASM
 function extraction for JS/JSX/TS/TSX, paired spans, explicit mixed fallback and
 the approved closed language input/cache key. The native worker-cancellation
 crash was reproduced and replaced with WASM under the original design/budgets.
 Review/challenge/Excess findings and re-reviews are resolved. The final-runtime
 full run (`81fa5a3`) captured 1,200/1,200 writes without crashing, and all three
 saturation arms passed the load checks. Baseline overall p99 was 1,240–1,399 ms;
-saturation was 1,128–1,166 ms on the shared host. The proposed 20% latency / 5%
-throughput regression bar is **not yet ratified**; D3 has not been declared passed.
+saturation was 1,128–1,166 ms on the shared host. Brian ratified the 20% latency /
+5% throughput regression allowance on 2026-09-19, with zero missing writes and
+all load checks required. **D3 passes**: all 18 latency and three throughput
+comparisons satisfy the bar.
 Ubuntu CI exposed cold-worker startup timing in result-shape tests; after three
 failures and outside reassessment, those tests now hold their deadline clock
 while retaining real disk/worker/HTTP assertions. Real-clock deadline and load
 checks remain; production budgets and capture design are unchanged. Typecheck,
 648 main tests and 86 tool tests pass locally; Ubuntu and macOS CI are green at
-`7ea847f`. PR #20 stays draft.
+`7ea847f` and the subsequent documentation revision `33f111d`.
 See `B2-MEASUREMENT-REPORT.md` for all numbers, host conditions and history.
-B2 and Stage 4 are not complete. D4 makes clips a
+Stage 4 as a whole remains in progress. D4 makes clips a
 **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
 rather than `change.clips` log events; attribution stays a log producer. See
 `STAGE-4-PLAN.md` for the D4 rationale, resolved schema forks, the D2
-candidate-eligibility narrowing, and the D3 deferred latency bar (retained under
+candidate-eligibility narrowing, and the D3 latency ruling (retained under
 D4 — parsing contention relocates to the reader).
 
 ---

@@ -1,6 +1,6 @@
 # B2 Clip-Latency Measurement Protocol
 
-This protocol measures whether cold-cache reader projection work competes with live watcher capture. It reports measurements for Brian to ratify; it defines no numeric bar and emits no pass verdict.
+This protocol measures whether cold-cache reader projection work competes with live watcher capture. The harness reports measurements without emitting a performance verdict. The procedure below was fixed before the final run; the separate acceptance bar was ratified from that run at review time.
 
 Each full run has three repetitions of each arm, paired in the fixed order baseline/saturation, saturation/baseline, baseline/saturation. Host load averages and free memory are recorded before and after each repetition. Every repetition writes 100 isolated TypeScript files at 120 ms intervals, then a burst of 100 files. The writer runs in a worker thread so the coordinator's HTTP work cannot delay writes. Missing writes stay visible in the report and are never included in percentiles. Overall, scheduled, and burst latency distributions are reported separately.
 
@@ -15,3 +15,13 @@ For each arm/repetition the JSON report includes p50/p99 durable-boundary latenc
 Run `node src/clip-bench.ts` for the full protocol. `node src/clip-bench.ts --smoke` uses a smaller writer while retaining the same cold corpus, so it can validate continuous-load lifecycle and cleanup without lowering the corpus below the sustained-load requirement. It intentionally does not meet the repetition or sample-count protocol.
 
 Each completed repetition is also emitted as one JSON line on stderr between arms. The final aggregate stays on stdout. A later process failure therefore preserves completed measurements without adding logging inside a measured capture interval.
+
+## Ratified B2 acceptance bar (Brian, 2026-09-19)
+
+For each of the three matched baseline/saturation repetitions:
+
+- Overall, scheduled, and burst capture latency p50 and p99 must each be at most **1.20×** the corresponding baseline (18 comparisons in total).
+- Capture throughput must be at least **0.95×** its paired baseline.
+- Both arms must have **zero missing writes**, and the saturation arm must pass every cold-load sufficiency check above.
+
+All conditions are required. This bar applies to the full protocol, never the smoke run. The final-runtime run at `81fa5a3` passes; see `B2-MEASUREMENT-REPORT.md` for measurements, comparisons, shared-host limitations, and the ratification record. Ratification changes no capture or projection budget.

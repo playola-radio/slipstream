@@ -1,8 +1,8 @@
 # B2 measurement and parser crash recovery
 
 Date: 2026-09-19.
-**Status: final-runtime measurement qualifies; CI is green at `7ea847f` and the
-D3 numeric bar remains unratified.** The WASM implementation
+**Status: B2 implementation and acceptance complete; D3 passed the numeric bar
+ratified by Brian on 2026-09-19.** The WASM implementation
 survived the full cold-load run below. Parser initialization now skips unsupported
 and wholly missing inputs and loads only the requested grammar. Typecheck, 647
 main tests and 86 tool tests passed locally at the measured revision. Three Ubuntu
@@ -14,9 +14,10 @@ A deterministic regression verifies the default 100 ms deadline; existing
 real-clock cancellation and live-load checks remain. Typecheck and all **648 main
 + 86 tool tests** pass after this test-only correction; Ubuntu and macOS CI are
 green at `7ea847f`.
-No deadline, capture design or budget was raised. B2 is not complete.
+No deadline, capture design or budget was raised. PR #20 is awaiting merge;
+Stage 4 as a whole remains in progress.
 
-## Qualifying cold-load run — numeric bar pending
+## Qualifying cold-load run — D3 passed
 
 Revision: `81fa5a3`, 2026-09-19, Node 24.11.0, macOS arm64, Apple M1 Max (10
 logical CPUs). Protocol: `CLIP-LATENCY-PROTOCOL.md`, fixed before this run. Order:
@@ -55,14 +56,23 @@ failures occurred. Repeated input keys followed only completed uncached overload
 no successful input was reused within a repetition. Parser CPU utilization was
 not instrumented or claimed.
 
-**Proposed bar, NOT RATIFIED:** for each matched repetition, p50 and p99 for
+**Ratified bar (Brian, 2026-09-19):** for each matched repetition, p50 and p99 for
 overall, scheduled, and burst capture latency must each be at most **1.20×** the
 corresponding baseline; capture throughput must be at least **0.95×** baseline;
-zero missing writes and all load checks passing are required. This proposes a
-20% latency / 5% throughput regression allowance against the actual baseline.
-Every measured comparison satisfies this proposal, but that is not a D3 passing
-verdict until Brian ratifies it. The largest paired latency ratio is 0.941×;
-the smallest paired throughput ratio is 1.023×.
+zero missing writes and all load checks passing are required. Brian approved this
+20% latency / 5% throughput regression allowance after reviewing the measurements
+and the recommendation to retain headroom for shared-host variability.
+
+**D3 verdict: PASS.** Recalculation from the raw final-runtime results confirms
+all 18 paired latency comparisons and all three throughput comparisons pass,
+with 1,200/1,200 captures and all three load checks passing. The largest paired
+latency ratio is 0.941×; the smallest paired throughput ratio is 1.023×.
+
+| Repetition | Largest latency ratio (limit 1.20×) | Throughput ratio (minimum 0.95×) | Missing writes | Load checks |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 0.941× | 1.023× | 0 | Pass |
+| 2 | 0.888× | 1.038× | 0 | Pass |
+| 3 | 0.935× | 1.030× | 0 | Pass |
 
 Validation at the measured revision: typecheck, **647/647 deterministic tests**
 and **86/86 tool tests passed locally**. Full-branch
