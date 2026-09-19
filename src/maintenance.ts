@@ -188,12 +188,15 @@ function addRefsFromValue(value: unknown, live: Set<string>): void {
   }
   if (typeof value !== 'object' || value === null) return;
   const record = value as Record<string, unknown>;
-  if (record.kind === 'content') {
-    // A content snapshot this version cannot interpret (no valid sha256) is
-    // corruption: refuse to sweep rather than sweep a blob it might reference.
+  if (record.kind === 'content' || 'sha256' in record) {
+    // Anything shaped like a blob reference — a content snapshot, or any object
+    // carrying a sha256 — must be a fully valid content snapshot. A partial or
+    // malformed one (a sha256 without kind:'content', or a bad hex) is corruption
+    // this version cannot interpret: fail closed rather than silently drop the
+    // reference and sweep a blob it may protect.
     const sha = record.sha256;
-    if (typeof sha !== 'string' || !isValidHex(sha)) {
-      throw new LogCorruptError('gc-mark: content snapshot without a valid sha256');
+    if (record.kind !== 'content' || typeof sha !== 'string' || !isValidHex(sha)) {
+      throw new LogCorruptError('gc-mark: malformed content snapshot');
     }
     live.add(sha);
   }

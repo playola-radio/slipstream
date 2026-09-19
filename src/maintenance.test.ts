@@ -174,6 +174,21 @@ describe('maintenance: mark-and-sweep blob reclamation', () => {
     assert.equal(await exists(blobPath(dir, HEX_DEAD)), true, 'no blob deleted on an aborted mark');
   });
 
+  it('aborts (deletes nothing) on a blob-shaped snapshot missing kind:content (corruption)', async () => {
+    const dir = await emptyStore();
+    // A snapshot carrying a sha256 but no `kind: 'content'` is corruption our writer
+    // never emits (the log reader does not validate snapshot shapes). It is shaped
+    // like a blob reference but cannot be interpreted as one, so gc must fail closed
+    // rather than silently drop it and sweep the blob.
+    await writeSession(dir, A, [{
+      seq: '1', type: 'slipstream.file.baselined.v1',
+      data: { session_id: A, path: 'f1', snapshot: { sha256: HEX_DEAD, size: 3 } },
+    }]);
+    await writeBlob(dir, HEX_DEAD);
+    await assert.rejects(() => reclaimUnreferencedBlobs(dir, NEVER_ABORT), LogCorruptError);
+    assert.equal(await exists(blobPath(dir, HEX_DEAD)), true);
+  });
+
   it('aborts (deletes nothing) on an unknown/newer event type', async () => {
     const dir = await emptyStore();
     await writeSession(dir, A, [{ seq: '1', type: 'slipstream.file.changed.v2', data: {} }]);
