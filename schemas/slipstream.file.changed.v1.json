@@ -80,6 +80,26 @@
           "type": "integer",
           "minimum": 0
         },
+        "observed_interval_ms": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["start_ms", "end_ms"],
+              "properties": {
+                "start_ms": { "type": "integer", "minimum": 0 },
+                "end_ms": { "type": "integer", "minimum": 0 }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["unavailable", "reason"],
+              "properties": {
+                "unavailable": { "const": true },
+                "reason": { "type": "string" }
+              }
+            }
+          ]
+        },
         "task_hint_id": {
           "type": "string"
         },

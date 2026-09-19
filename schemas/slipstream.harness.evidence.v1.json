@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.harness.evidence.v1.json",
+  "title": "slipstream.harness.evidence.v1",
+  "$comment": "One durable, normalized harness-transcript record used to refine attribution. Never a filesystem-change event and never authorship. Records sharing an evidence_key describe one invocation (e.g. a start and an end); conflicting records under one key are all retained and disclosed, never merged. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.harness.evidence.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "evidence_key",
+        "adapter_version",
+        "tool_name",
+        "timestamp",
+        "file_scope"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "evidence_key": {
+          "type": "object",
+          "required": [
+            "harness",
+            "harness_session_id",
+            "record_id"
+          ],
+          "properties": {
+            "harness": {
+              "enum": [
+                "claude-code",
+                "codex"
+              ]
+            },
+            "harness_session_id": {
+              "type": "string"
+            },
+            "record_id": {
+              "type": "string"
+            }
+          }
+        },
+        "adapter_version": {
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "object",
+          "required": [
+            "at_ms",
+            "basis"
+          ],
+          "properties": {
+            "at_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "basis": {
+              "enum": [
+                "tool-start",
+                "tool-end",
+                "record-time"
+              ]
+            }
+          }
+        },
+        "file_scope": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "paths"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "paths"
+                },
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "reason"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "unknown"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

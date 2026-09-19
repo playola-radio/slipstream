@@ -54,6 +54,46 @@ const SAMPLES: Record<string, EventInput> = {
       title: 'Implement attachment selection',
     },
   },
+  'slipstream.harness.evidence.v1': {
+    type: 'slipstream.harness.evidence.v1',
+    occurred_at_ms: 1789657200123,
+    data: {
+      evidence_key: {
+        harness: 'claude-code',
+        harness_session_id: 'hs-1',
+        record_id: 'call-7',
+      },
+      adapter_version: 'claude-code/1',
+      tool_name: 'Write',
+      timestamp: { at_ms: 1789657200000, basis: 'tool-start' },
+      file_scope: { kind: 'paths', paths: ['src/a.ts'] },
+    },
+  },
+  'slipstream.change.attribution.v1': {
+    type: 'slipstream.change.attribution.v1',
+    occurred_at_ms: 1789657200123,
+    data: {
+      change_seq: '12',
+      policy_seq: '3',
+      status: 'heuristic',
+      reason: 'single-candidate',
+      evidence_seqs: ['9'],
+      excluded_conflicts: [
+        { harness: 'codex', harness_session_id: 'hs-2', record_id: 'call-3' },
+      ],
+    },
+  },
+  'slipstream.enrichment.configured.v1': {
+    type: 'slipstream.enrichment.configured.v1',
+    occurred_at_ms: 1789657200123,
+    data: {
+      policy: {
+        window_ms: 2000,
+        grace_ms: 5000,
+        sources: { 'claude-code': 'unconfigured', codex: 'unconfigured' },
+      },
+    },
+  },
 };
 
 describe('schema', () => {

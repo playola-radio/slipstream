@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.enrichment.configured.v1.json",
+  "title": "slipstream.enrichment.configured.v1",
+  "$comment": "The resolved effective attribution policy. Committed before the changes it governs and bound to each change by sequence, so a later revision scores under the policy in force when the change occurred. sources declares per-harness coverage; A1 wires no real adapters, so real sources are 'unconfigured'. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.enrichment.configured.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "policy"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "object",
+          "required": [
+            "window_ms",
+            "grace_ms",
+            "sources"
+          ],
+          "properties": {
+            "window_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "grace_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sources": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    }
+  }
+}

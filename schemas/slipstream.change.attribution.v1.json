@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.change.attribution.v1.json",
+  "title": "slipstream.change.attribution.v1",
+  "$comment": "A full-replacement attribution result for one file.changed change, targeted by change_seq within this event's own source. Revisable inference, never verified authorship: the highest-seq attribution for a change_seq wins. policy_seq binds the result to the effective policy that preceded the change, so revisions score under the change's original policy. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.change.attribution.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "change_seq",
+        "policy_seq",
+        "status",
+        "reason",
+        "evidence_seqs"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "change_seq": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "policy_seq": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "status": {
+          "enum": [
+            "heuristic",
+            "ambiguous",
+            "unknown"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "single-candidate",
+            "multiple-candidates",
+            "no-matching-evidence",
+            "observation-interval-unavailable"
+          ]
+        },
+        "evidence_seqs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$"
+          }
+        },
+        "excluded_conflicts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "harness",
+              "harness_session_id",
+              "record_id"
+            ],
+            "properties": {
+              "harness": {
+                "enum": [
+                  "claude-code",
+                  "codex"
+                ]
+              },
+              "harness_session_id": {
+                "type": "string"
+              },
+              "record_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
