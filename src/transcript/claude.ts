@@ -140,6 +140,16 @@ function stepAssistant(
   const rawSession = record.sessionId;
   const sessionId =
     typeof rawSession === 'string' && rawSession.length > 0 ? rawSession : ctx.harnessSessionId;
+  // Resolve relative write paths against the record's OWN cwd, which is always
+  // current, rather than the cwd bound at discovery time (which may be a
+  // provisional fallback captured before the transcript was written, or a
+  // slug-colliding sibling's). Absolute paths ignore it. Falls back to the bound
+  // cwd when a record omits its own.
+  const rawCwd = record.cwd;
+  const scopeCtx =
+    typeof rawCwd === 'string' && rawCwd.length > 0 && rawCwd !== ctx.cwd
+      ? { ...ctx, cwd: rawCwd }
+      : ctx;
   for (const block of content) {
     if (!isObject(block) || block.type !== 'tool_use') continue;
     const id = block.id;
@@ -154,7 +164,7 @@ function stepAssistant(
       diagnostics.push({ kind: 'malformed', detail: `tool_use ${id} without a tool name` });
       continue;
     }
-    const resolved = scopeForTool(toolName, block.input, ctx);
+    const resolved = scopeForTool(toolName, block.input, scopeCtx);
     if (resolved === 'skip') continue;
     diagnostics.push(...resolved.diagnostics);
     if (atMs === undefined) {

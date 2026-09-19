@@ -36,6 +36,10 @@ export const nodeTranscriptFileIO: TranscriptFileIO = {
 };
 
 const FATAL_UTF8 = new TextDecoder('utf8', { fatal: true });
+const FIRST_LINE_CHUNK = 64 * 1024;
+/** A first line longer than this is not line-delimited JSONL; disclose it
+ * malformed rather than accumulate unbounded memory. */
+const MAX_FIRST_LINE = 16 * 1024 * 1024;
 
 function classifyDirError(err: unknown): 'missing' | 'inaccessible' {
   return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'inaccessible';
@@ -99,16 +103,39 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       return { ok: false, reason: 'inaccessible' };
     }
     try {
-      const buf = Buffer.allocUnsafe(64 * 1024);
-      const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-      if (bytesRead === 0) return { ok: false, reason: 'empty' };
-      const nl = buf.indexOf(0x0a);
-      const lineBytes = buf.subarray(0, nl >= 0 && nl < bytesRead ? nl : bytesRead);
+      // Read the COMPLETE first line: a Claude first record can exceed one chunk,
+      // and a truncated prefix fails to parse, which would silently fall through to
+      // slug-trust (mis-binding) or falsely split a multibyte char (false malformed).
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let pos = 0;
+      let sawByte = false;
+      for (;;) {
+        const buf = Buffer.allocUnsafe(FIRST_LINE_CHUNK);
+        const { bytesRead } = await handle.read(buf, 0, FIRST_LINE_CHUNK, pos);
+        if (bytesRead === 0) break; // EOF before any newline
+        sawByte = true;
+        pos += bytesRead;
+        const nl = buf.subarray(0, bytesRead).indexOf(0x0a);
+        if (nl >= 0) {
+          chunks.push(buf.subarray(0, nl));
+          total += nl;
+          break;
+        }
+        chunks.push(buf.subarray(0, bytesRead));
+        total += bytesRead;
+        // A single line beyond this bound is pathological (not line-delimited
+        // JSONL); disclose it malformed rather than read unbounded memory.
+        if (total > MAX_FIRST_LINE) return { ok: false, reason: 'malformed' };
+      }
+      if (!sawByte) return { ok: false, reason: 'empty' };
       let line: string;
       try {
-        // Fatal decode: a lossily-decoded id/cwd would coin a fabricated session
-        // identity or membership. Invalid UTF-8 is malformed, not a clean read.
-        line = FATAL_UTF8.decode(lineBytes);
+        // Fatal decode over the COMPLETE line bytes: a lossily-decoded id/cwd would
+        // coin a fabricated session identity or membership. Invalid UTF-8 is
+        // malformed, not a clean read; decoding the whole line at once keeps a
+        // multibyte char that straddles a chunk boundary intact.
+        line = FATAL_UTF8.decode(Buffer.concat(chunks, total));
       } catch {
         return { ok: false, reason: 'malformed' };
       }

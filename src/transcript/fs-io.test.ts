@@ -53,6 +53,12 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
       join(dir, 'badutf8.jsonl'),
       Buffer.concat([Buffer.from('{"type":"session_meta","payload":{"id":"s', 'utf8'), Buffer.from([0xff]), Buffer.from('","cwd":"/x"}}\n', 'utf8')]),
     );
+    // A valid first line longer than the internal read chunk (64 KiB), with a
+    // multibyte character (é) straddling the 64 KiB boundary, followed by a
+    // second line. A chunked read must return the COMPLETE first line, never a
+    // truncated prefix and never a false "malformed" from a split multibyte char.
+    const pad = 'x'.repeat(65_535);
+    await writeFile(join(dir, 'longline.jsonl'), `{"pad":"${pad}é","cwd":"/work/proj"}\n{"next":1}\n`);
   });
 
   after(async () => {
@@ -71,6 +77,15 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
       ok: false,
       reason: 'empty',
     });
+  });
+
+  it('returns a complete first line longer than the read chunk, decoding across the boundary', async () => {
+    const result = await nodeDiscoveryIO.readFirstLine(join(dir, 'longline.jsonl'));
+    assert.equal(result.ok, true);
+    assert.ok(result.ok && result.line.startsWith('{"pad":"'));
+    assert.ok(result.ok && result.line.endsWith('é","cwd":"/work/proj"}'), 'multibyte across the boundary survives');
+    assert.ok(result.ok && !result.line.includes('\n'), 'stops at the first newline');
+    assert.ok(result.ok && JSON.parse(result.line).cwd === '/work/proj', 'the complete line parses');
   });
 
   it('reports an invalid-UTF-8 first line as malformed, never a lossily-decoded string', async () => {

@@ -119,6 +119,37 @@ describe('claude transcript adapter', () => {
     assert.equal(out.evidence[0]!.evidence_key.harness_session_id, 'file-name-slug');
   });
 
+  it('resolves a relative write path against the record own cwd, not the bound cwd', () => {
+    // The reader was bound with a provisional cwd (root) before the transcript's
+    // first record arrived. That record declares its real cwd (root/pkg); a
+    // relative write path must scope against the record's cwd so a stale bound cwd
+    // cannot mis-credit the wrong file.
+    const ctx: AdapterContext = { ...CTX, cwd: '/work/proj' };
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      cwd: '/work/proj/pkg',
+      message: { content: [{ type: 'tool_use', id: 'toolu_rel', name: 'Write', input: { file_path: 'x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, ctx);
+    assert.deepEqual(out.evidence[0]!.file_scope, { kind: 'paths', paths: ['pkg/x.ts'] });
+  });
+
+  it('drops a relative write from a slug-colliding record whose own cwd is another worktree', () => {
+    // A transcript sharing this root's slug dir but recorded in a colliding
+    // worktree (/work/proj-alt) declares that cwd; a relative write there resolves
+    // outside the capture root and must be dropped, never scoped as in-root.
+    const ctx: AdapterContext = { ...CTX, cwd: '/work/proj' };
+    const record = {
+      type: 'assistant',
+      timestamp: '2026-09-19T12:00:00.000Z',
+      cwd: '/work/proj-alt',
+      message: { content: [{ type: 'tool_use', id: 'toolu_alt', name: 'Write', input: { file_path: 'x.ts' } }] },
+    };
+    const out = claudeStep(initialClaudeState(), record, ctx);
+    assert.equal(out.evidence.length, 0);
+  });
+
   it('reports a tool_use with a missing id as unsupported, not evidence', () => {
     const record = {
       type: 'assistant',
