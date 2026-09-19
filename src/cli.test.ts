@@ -83,13 +83,9 @@ describe('cli parseArgs (maintenance commands)', () => {
   it('rejects gc with a stray positional', () => {
     assert.equal(parseArgs(['gc', 'extra']), null);
   });
-  it('parses delete with a session id and store override', () => {
+  it('parses delete with a session id and store override (kept verbatim, never path-resolved)', () => {
     assert.deepEqual(parseArgs(['delete', UUID, '--store', '/s']),
       { command: 'delete', store: '/s', sessionId: UUID });
-  });
-  it('keeps the session id verbatim (never resolves it as a path)', () => {
-    const parsed = parseArgs(['delete', UUID, '--store', '/s']);
-    assert.equal(parsed?.command === 'delete' && parsed.sessionId, UUID);
   });
   it('rejects delete with no session id', () => {
     assert.equal(parseArgs(['delete', '--store', '/s']), null);
