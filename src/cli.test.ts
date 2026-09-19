@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArgs } from './cli.ts';
+import { parseArgs, retryGuidance } from './cli.ts';
 
 describe('cli', () => {
   describe('parseArgs', () => {
@@ -73,6 +73,54 @@ describe('cli parseArgs (daemon commands)', () => {
   it('rejects --harness without a following value', () => {
     assert.equal(parseArgs(['attach', '/w', '--harness']), null);
   });
+});
+
+describe('cli retryGuidance (unknown-outcome recovery)', () => {
+  it('points delete at a rerun / listing check, never at status (status cannot confirm a tombstone)', () => {
+    const g = retryGuidance('delete_session');
+    assert.match(g, /idempotent/);
+    assert.match(g, /410|listing/);
+    assert.doesNotMatch(g, /slipstream status/);
+  });
+  it('points gc at a safe rerun, never at status', () => {
+    const g = retryGuidance('gc');
+    assert.match(g, /idempotent|rerun/);
+    assert.doesNotMatch(g, /slipstream status/);
+  });
+  it('keeps the status hint for attach-state verbs', () => {
+    assert.match(retryGuidance('detach'), /slipstream status/);
+  });
+});
+
+describe('cli parseArgs (maintenance commands)', () => {
+  const UUID = '11111111-1111-4111-8111-111111111111';
+  it('parses gc as a store-only command', () => {
+    assert.deepEqual(parseArgs(['gc', '--store', '/s']), { command: 'gc', store: '/s' });
+  });
+  it('rejects gc with a stray positional', () => {
+    assert.equal(parseArgs(['gc', 'extra']), null);
+  });
+  it('parses delete with a session id and store override (kept verbatim, never path-resolved)', () => {
+    assert.deepEqual(parseArgs(['delete', UUID, '--store', '/s']),
+      { command: 'delete', store: '/s', sessionId: UUID });
+  });
+  it('rejects delete with no session id', () => {
+    assert.equal(parseArgs(['delete', '--store', '/s']), null);
+  });
+  it('rejects delete with a second positional', () => {
+    assert.equal(parseArgs(['delete', UUID, 'again']), null);
+  });
+});
+
+it('delete rejects a malformed session id client-side with exit code 2', async () => {
+  const { execFile } = await import('node:child_process');
+  const result = await new Promise<{ code: number | null; stderr: string }>((res) => {
+    execFile(process.execPath, ['src/cli.ts', 'delete', 'not-a-uuid', '--store', '/tmp/none'],
+      { timeout: 5000 }, (error, _stdout, stderr) =>
+        res({ code: error && typeof error.code === 'number' ? error.code : 0, stderr }));
+  });
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /valid session id/i);
 });
 
 it('watch refuses a store dir already owned by a daemon (live control socket)', async () => {

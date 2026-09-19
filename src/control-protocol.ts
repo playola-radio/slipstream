@@ -1,9 +1,10 @@
 /**
  * The Slipstream daemon control protocol: newline-delimited JSON over an
  * owner-only `node:net` unix socket. This is a PRIVATE CONTROL channel — its
- * verbs (attach / detach / status / begin_task) WRITE public events and never
- * read or serve the feed. Readers keep serving the public HTTP/disk view; there
- * is no privileged back channel for reading.
+ * verbs (attach / detach / status / begin_task / delete_session / gc) WRITE
+ * public events or maintain the store and never read or serve the feed. Readers
+ * keep serving the public HTTP/disk view; there is no privileged back channel
+ * for reading.
  *
  * Framing is one JSON object per line. A length prefix would buy nothing here:
  * the real hazards are unbounded buffering of an unterminated line, a UTF-8
@@ -15,10 +16,12 @@
 /** Client-facing control error codes (the subset this PR owns). `DAEMON_UNAVAILABLE`
  * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask;
  * `SESSION_ACTIVE` refuses a second attach while one session is already active
- * (this PR carries exactly one active capture). */
+ * (this PR carries exactly one active capture); `SESSION_NOT_FOUND` refuses a
+ * delete of a well-formed session id that names no session on disk. */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
   | 'SESSION_NOT_SELECTED'
+  | 'SESSION_NOT_FOUND'
   | 'SESSION_ACTIVE'
   | 'IDENTITY_UNRESOLVED'
   | 'CAPTURE_NOT_READY'

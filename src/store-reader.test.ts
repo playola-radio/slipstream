@@ -99,6 +99,15 @@ describe('store-reader', () => {
       const sessions = await listSessions(dir);
       assert.equal(sessions[0]!.removed, true);
     });
+
+    it('reports durableSeq 0 for a removed session with a corrupt residual log', async () => {
+      // A delete interrupted between tombstone and cleanup can leave a corrupt log
+      // under a durable tombstone; reading its high-water must not break listing.
+      const dir = await store();
+      await writeFile(sessionLogPath(dir, UUID), 'not json at all\n', 'utf8');
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+      assert.deepEqual(await listSessions(dir), [{ id: UUID, durableSeq: 0n, removed: true }]);
+    });
   });
 
   describe('readTombstone', () => {

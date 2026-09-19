@@ -1,10 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';
-import { mkdtemp, rm, writeFile, stat, rename, realpath, symlink, readFile, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
+import { blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
 import { sendControlRequest } from './control-client.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
@@ -27,6 +28,7 @@ async function withDaemon(
   fn: (ctx: {
     daemon: Daemon;
     worktree: string;
+    store: string;
     call: (req: CallRequest) => Promise<ResponseEnvelope>;
   }) => Promise<void>,
 ): Promise<void> {
@@ -42,6 +44,7 @@ async function withDaemon(
     await fn({
       daemon: d,
       worktree,
+      store,
       call: (req) => sendControlRequest({
         socketPath: d.socketPath,
         request: { v: 1 as const, ...req },
@@ -330,6 +333,126 @@ describe('daemon control verbs', () => {
       await rm(store, { recursive: true, force: true });
       await rm(worktree, { recursive: true, force: true });
     }
+  });
+});
+
+const ABSENT_ID = '99999999-9999-4999-8999-999999999999';
+const HEX_LIVE = 'a'.repeat(64);
+const HEX_DEAD = 'b'.repeat(64);
+
+/** A durable session log referencing one blob, seeded straight onto disk so a
+ * maintenance test does not depend on capture internals. */
+async function seedSession(store: string, id: string, sha: string): Promise<void> {
+  await mkdir(join(store, 'sessions', id), { recursive: true });
+  const rec = {
+    seq: '1', type: 'slipstream.file.baselined.v1',
+    data: { session_id: id, path: 'f', snapshot: { kind: 'content', sha256: sha, size: 3 } },
+  };
+  await writeFile(sessionLogPath(store, id), JSON.stringify(rec) + '\n', 'utf8');
+}
+
+async function seedBlob(store: string, sha: string): Promise<void> {
+  const path = blobPath(store, sha);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, 'xyz', 'utf8');
+}
+
+async function exists(path: string): Promise<boolean> {
+  try { await stat(path); return true; } catch { return false; }
+}
+
+describe('daemon maintenance verbs', () => {
+  it('refuses to delete a well-formed session id that names no session', async () => {
+    await withDaemon(async ({ call }) => {
+      const res = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(res.ok === false && res.code, 'SESSION_NOT_FOUND');
+    });
+  });
+
+  it('refuses a delete whose session id is structurally invalid', async () => {
+    await withDaemon(async ({ call }) => {
+      const res = await call({ verb: 'delete_session', session_id: '../etc' });
+      assert.equal(res.ok === false && res.code, 'PROTOCOL');
+    });
+  });
+
+  it('tombstones a detached session and removes its history', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, ABSENT_ID, HEX_LIVE);
+      const res = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(res.ok, true);
+      assert.equal(rec(res).session_id, ABSENT_ID);
+      assert.equal(await exists(tombstonePath(store, ABSENT_ID)), true);
+      assert.equal(await exists(sessionLogPath(store, ABSENT_ID)), false);
+    });
+  });
+
+  it('is idempotent: deleting an already-removed session still succeeds', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, ABSENT_ID, HEX_LIVE);
+      await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      const again = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(again.ok, true);
+    });
+  });
+
+  it('refuses to delete while a session is active', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      const attach = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const id = rec(attach).session_id!;
+      const res = await call({ verb: 'delete_session', session_id: id });
+      assert.equal(res.ok === false && res.code, 'SESSION_ACTIVE');
+    });
+  });
+
+  it('discloses committed removal when history cleanup fails after the tombstone', async () => {
+    await withDaemon(async ({ store, call }) => {
+      // events.jsonl as a directory makes the history unlink fail AFTER the tombstone
+      // is durable: the response must say removal committed + cleanup retryable, and
+      // the tombstone must survive (never rolled back).
+      await mkdir(join(store, 'sessions', ABSENT_ID, 'events.jsonl'), { recursive: true });
+      const res = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE');
+      assert.match(res.ok === false ? res.message : '', /logically removed|retryable/i);
+      assert.equal(await exists(tombstonePath(store, ABSENT_ID)), true);
+    });
+  });
+
+  it('reclaims an unreferenced blob and keeps a referenced one', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, ABSENT_ID, HEX_LIVE); // retained, references HEX_LIVE
+      await seedBlob(store, HEX_LIVE);
+      await seedBlob(store, HEX_DEAD);
+      const res = await call({ verb: 'gc' });
+      assert.equal(res.ok, true);
+      assert.equal((res as unknown as Record<string, unknown>).removed, 1);
+      assert.equal(await exists(blobPath(store, HEX_LIVE)), true);
+      assert.equal(await exists(blobPath(store, HEX_DEAD)), false);
+    });
+  });
+
+  it('finishes an interrupted deletion: removes residual history under a tombstone', async () => {
+    await withDaemon(async ({ store, call }) => {
+      // A delete that crashed after the tombstone but before cleanup: tombstone
+      // present, log still on disk.
+      await seedSession(store, ABSENT_ID, HEX_DEAD);
+      await seedBlob(store, HEX_DEAD);
+      await writeFile(tombstonePath(store, ABSENT_ID), '{"version":1}', 'utf8');
+      const res = await call({ verb: 'gc' });
+      assert.equal(res.ok, true);
+      assert.equal(await exists(sessionLogPath(store, ABSENT_ID)), false);
+      assert.equal(await exists(tombstonePath(store, ABSENT_ID)), true);
+      // The removed session protects nothing, so its blob is reclaimed.
+      assert.equal(await exists(blobPath(store, HEX_DEAD)), false);
+    });
+  });
+
+  it('refuses to gc while a session is active', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const res = await call({ verb: 'gc' });
+      assert.equal(res.ok === false && res.code, 'SESSION_ACTIVE');
+    });
   });
 });
 

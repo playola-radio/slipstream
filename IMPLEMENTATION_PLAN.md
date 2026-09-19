@@ -309,7 +309,10 @@ guard) is complete on `feature/stage3-shared-daemon-attach`. P4 (MCP forwarder,
 harness identity adapters, `slipstream_begin_task` tool, portable skill + config
 docs) is implemented on this branch (daemon-side identity-triple selection guard,
 honest post-send retry, end-to-end forwarder tests); real-session acceptance and
-the PR remain. P5 (session deletion + GC) remains.
+the PR remain. P5 (detached-only `delete_session` + `gc`: durable-tombstone-first
+deletion with retryable history cleanup, and conservative detached mark-and-sweep
+blob reclamation) is implemented on this branch (`briankeane/maseru`) with the
+adversarial review + excess audit applied; PR to `develop` pending.
 
 ---
 
