@@ -413,7 +413,8 @@ Ubuntu CI exposed cold-worker startup timing in result-shape tests; after three
 failures and outside reassessment, those tests now hold their deadline clock
 while retaining real disk/worker/HTTP assertions. Real-clock deadline and load
 checks remain; production budgets and capture design are unchanged. Typecheck,
-648 main tests and 86 tool tests pass locally. CI verification remains pending; PR #20 stays draft.
+648 main tests and 86 tool tests pass locally; Ubuntu and macOS CI are green at
+`7ea847f`. PR #20 stays draft.
 See `B2-MEASUREMENT-REPORT.md` for all numbers, host conditions and history.
 B2 and Stage 4 are not complete. D4 makes clips a
 **reader-derived public projection**

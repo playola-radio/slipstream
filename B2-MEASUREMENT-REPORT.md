@@ -1,8 +1,8 @@
 # B2 measurement and parser crash recovery
 
 Date: 2026-09-19.
-**Status: final-runtime measurement qualifies; Ubuntu CI remains under
-reassessment and the D3 numeric bar remains unratified.** The WASM implementation
+**Status: final-runtime measurement qualifies; CI is green at `7ea847f` and the
+D3 numeric bar remains unratified.** The WASM implementation
 survived the full cold-load run below. Parser initialization now skips unsupported
 and wholly missing inputs and loads only the requested grammar. Typecheck, 647
 main tests and 86 tool tests passed locally at the measured revision. Three Ubuntu
@@ -12,7 +12,8 @@ positive shape tests now hold only their deadline clock while real worker/disk/H
 work runs. Their exact assertions remain, with real outer timeouts and cleanup.
 A deterministic regression verifies the default 100 ms deadline; existing
 real-clock cancellation and live-load checks remain. Typecheck and all **648 main
-+ 86 tool tests** pass after this test-only correction; CI verification is pending.
++ 86 tool tests** pass after this test-only correction; Ubuntu and macOS CI are
+green at `7ea847f`.
 No deadline, capture design or budget was raised. B2 is not complete.
 
 ## Qualifying cold-load run — numeric bar pending
