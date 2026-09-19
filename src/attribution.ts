@@ -76,7 +76,7 @@ export function evidenceKeyString(key: EvidenceKey): string {
 /** Canonical signature of the semantic fact a record asserts, used for both dedup
  * (identical signature = one variant) and conflict detection. Adapter version is
  * deliberately excluded: a re-emit under a newer adapter is the same fact. */
-function variantSignature(data: HarnessEvidenceData): string {
+export function variantSignature(data: Omit<HarnessEvidenceData, 'session_id'>): string {
   const scope =
     data.file_scope.kind === 'paths'
       ? `paths:${[...data.file_scope.paths].sort().join(',')}`
