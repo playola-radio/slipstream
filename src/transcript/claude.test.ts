@@ -143,4 +143,22 @@ describe('claude transcript adapter', () => {
     assert.equal(out.evidence.length, 0);
     assert.equal(out.diagnostics[0]!.kind, 'unsupported');
   });
+
+  it('reports a malformed assistant envelope, keeping it distinct from a clean read', () => {
+    // Every shape here is a complete, parseable assistant record whose content is
+    // not a block array. None yields evidence, and each must yield a malformed
+    // diagnostic so coverage degrades rather than reporting a clean read.
+    const shapes: unknown[] = [
+      { type: 'assistant', message: { content: 'invalid' } },
+      { type: 'assistant', message: {} },
+      { type: 'assistant', message: null },
+      { type: 'assistant' },
+    ];
+    for (const record of shapes) {
+      const out = claudeStep(initialClaudeState(), record, CTX);
+      assert.equal(out.evidence.length, 0);
+      assert.equal(out.diagnostics.length, 1, `expected a diagnostic for ${JSON.stringify(record)}`);
+      assert.equal(out.diagnostics[0]!.kind, 'malformed');
+    }
+  });
 });

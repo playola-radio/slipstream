@@ -15,7 +15,7 @@
  * (Stage 3: two agents in one worktree are both captured); each keeps its own
  * native session id, so their invocation identities never collide.
  */
-import { relative, resolve, sep } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import type { CoverageIssue, HarnessName } from '../event.ts';
 import type { AdapterContext } from './types.ts';
 
@@ -75,6 +75,32 @@ export function isWithinRoot(root: string, child: string): boolean {
   if (child === root) return true;
   const rel = relative(root, child);
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && rel[0] !== '/';
+}
+
+/**
+ * True when an UNRESOLVABLE cwd could still sit inside the capture root, so it is
+ * an in-root candidate we failed to read rather than a genuine non-candidate. The
+ * raw string may be in the root's alias namespace (e.g. cwd `/tmp/proj/gone` for
+ * canonical root `/private/tmp/proj`), so a textual check is not enough: walk up
+ * to the nearest ancestor that DOES resolve and test its canonical form. A cwd
+ * whose nearest living ancestor canonicalizes outside the root is a different
+ * worktree's session and is skipped silently, keeping unrelated dead sessions
+ * from degrading this root's coverage.
+ */
+async function unresolvedCwdMayBeInRoot(
+  io: DiscoveryIO,
+  root: string,
+  cwd: string,
+): Promise<boolean> {
+  if (isWithinRoot(root, cwd)) return true;
+  let cur = cwd;
+  for (;;) {
+    const parent = dirname(cur);
+    if (parent === cur) return false;
+    const canonical = await io.realpath(parent);
+    if (canonical !== undefined) return isWithinRoot(root, canonical);
+    cur = parent;
+  }
 }
 
 export async function discoverClaude(
@@ -164,11 +190,12 @@ export async function discoverCodex(
     }
     const canonicalCwd = await io.realpath(meta.cwd);
     if (canonicalCwd === undefined) {
-      // Can't canonicalize the cwd. If it even textually claims to sit inside this
-      // root, it is an in-root candidate we failed to read — disclose the gap rather
-      // than let a readable sibling report clean coverage. A cwd outside the root is
-      // a different worktree's session: a genuine non-candidate, skipped silently.
-      if (isWithinRoot(root, meta.cwd)) {
+      // Can't canonicalize the cwd. If it could still sit inside this root (directly
+      // or through the root's alias namespace), it is an in-root candidate we failed
+      // to read — disclose the gap rather than let a readable sibling report clean
+      // coverage. A cwd whose nearest living ancestor is outside the root is a
+      // different worktree's session: a genuine non-candidate, skipped silently.
+      if (await unresolvedCwdMayBeInRoot(io, root, meta.cwd)) {
         issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
       }
       continue;

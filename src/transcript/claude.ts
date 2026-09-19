@@ -125,13 +125,12 @@ function stepAssistant(
   const message = record.message;
   const content = isObject(message) ? message.content : undefined;
   if (!Array.isArray(content)) {
-    // An assistant record's content should be an array of blocks. A present-but-
-    // non-array content is a malformed envelope (unlike a user record, whose
-    // content is legitimately a string): disclose it so coverage degrades rather
-    // than passing as a clean read with no match.
-    if (content !== undefined) {
-      diagnostics.push({ kind: 'malformed', detail: 'assistant record content is not an array' });
-    }
+    // Every Claude assistant record carries a `message.content` array of blocks.
+    // Anything else — a string, a null/absent message, a missing content — is a
+    // malformed envelope, not a clean read: disclose it so coverage degrades and
+    // stays distinct from a successfully-read record with no tool evidence. (User
+    // records, whose content is legitimately a string, are handled separately.)
+    diagnostics.push({ kind: 'malformed', detail: 'assistant record has no content block array' });
     return { state, evidence, diagnostics };
   }
   const atMs = parseMs(record);

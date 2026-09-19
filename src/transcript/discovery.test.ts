@@ -193,6 +193,30 @@ describe('transcript discovery', () => {
     );
   });
 
+  it('discloses a deleted cwd in the root alias namespace via its living ancestor', async () => {
+    // cwd /tmp/proj/deleted no longer resolves, and is not textually inside the
+    // canonical root. But its living ancestor /tmp/proj canonicalizes to the root,
+    // so it is an in-root candidate we failed to read — disclosed, not dropped.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-alias-gone', cwd: '/tmp/proj/deleted' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/ag.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/tmp/proj' ? ROOT : undefined),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(
+      result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/tmp/proj/deleted')),
+    );
+  });
+
   it('does not invent an over-broad alias from a leaf-symlink cwd', async () => {
     // cwd /links/alias is a LEAF symlink to root/pkg. Walking `..` from it yields
     // /links, which is NOT an alias of the root (realpath('/links') !== root), so
