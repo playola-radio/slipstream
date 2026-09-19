@@ -181,7 +181,8 @@ describe('transcript discovery', () => {
       io({
         listTreeJsonl: async () => ({ paths: ['/c/v.jsonl'], truncated: false, incomplete: false }),
         readFirstLine: async () => ({ ok: true as const, line: meta }),
-        realpath: async () => undefined,
+        // The root remains captured; only the pkg subdir was deleted.
+        realpath: async (p) => (p === ROOT ? ROOT : undefined),
       }),
       '/home',
       ROOT,
@@ -191,6 +192,29 @@ describe('transcript discovery', () => {
     assert.ok(
       result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/work/proj/pkg')),
     );
+  });
+
+  it('does not disclose a deleted cwd that escaped the root through an internal symlink', async () => {
+    // cwd /work/proj/link/gone is textually inside the root, but `link` is a
+    // symlink to /other/project, so the session's real location is outside the
+    // root. Its nearest living ancestor canonicalizes out of root, so it is a
+    // different worktree's session and must NOT degrade this root's coverage.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-escaped', cwd: '/work/proj/link/gone' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/esc.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/work/proj/link' ? '/other/project' : p === ROOT ? ROOT : undefined),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.equal(result.issues.length, 0);
   });
 
   it('discloses a deleted cwd in the root alias namespace via its living ancestor', async () => {

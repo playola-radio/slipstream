@@ -79,20 +79,24 @@ export function isWithinRoot(root: string, child: string): boolean {
 
 /**
  * True when an UNRESOLVABLE cwd could still sit inside the capture root, so it is
- * an in-root candidate we failed to read rather than a genuine non-candidate. The
- * raw string may be in the root's alias namespace (e.g. cwd `/tmp/proj/gone` for
- * canonical root `/private/tmp/proj`), so a textual check is not enough: walk up
- * to the nearest ancestor that DOES resolve and test its canonical form. A cwd
+ * an in-root candidate we failed to read rather than a genuine non-candidate.
+ *
+ * A textual check is unreliable in both directions: the raw string may be in the
+ * root's alias namespace (cwd `/tmp/proj/gone` for canonical root
+ * `/private/tmp/proj`) yet be in-root, or it may be textually in-root yet escape
+ * through an internal symlink (cwd `/work/proj/link/gone` where `link` points to
+ * `/other/project`). The only sound test is the membership of the nearest ancestor
+ * that DOES resolve: the deleted suffix hangs off that ancestor's canonical
+ * location, and no non-existent suffix segment can itself be a symlink. A cwd
  * whose nearest living ancestor canonicalizes outside the root is a different
- * worktree's session and is skipped silently, keeping unrelated dead sessions
- * from degrading this root's coverage.
+ * worktree's session, skipped silently so unrelated dead sessions never degrade
+ * this root's coverage.
  */
 async function unresolvedCwdMayBeInRoot(
   io: DiscoveryIO,
   root: string,
   cwd: string,
 ): Promise<boolean> {
-  if (isWithinRoot(root, cwd)) return true;
   let cur = cwd;
   for (;;) {
     const parent = dirname(cur);
