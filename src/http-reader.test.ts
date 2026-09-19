@@ -376,6 +376,22 @@ describe('http-reader clip projection', () => {
     } finally { await srv.close(); }
   });
 
+  it('500s malformed file.changed paths instead of projecting them as unsupported', async () => {
+    for (const path of [undefined, 42]) {
+      const { dir } = await storeWithChange();
+      const logPath = join(dir, 'sessions', UUID, 'events.jsonl');
+      const lines = (await (await import('node:fs/promises')).readFile(logPath, 'utf8')).trim().split('\n');
+      const change = JSON.parse(lines[1]!);
+      delete change.data.path;
+      if (path !== undefined) change.data.path = path;
+      await writeFile(logPath, `${lines[0]}\n${JSON.stringify(change)}\n`, 'utf8');
+      const srv = await startReaderServer({ storeDir: dir });
+      try {
+        assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 500);
+      } finally { await srv.close(); await rm(dir, { recursive: true, force: true }); }
+    }
+  });
+
   it('404s an unknown session and 410s a tombstoned one', async () => {
     const { dir } = await storeWithChange();
     const srv = await startReaderServer({ storeDir: dir });

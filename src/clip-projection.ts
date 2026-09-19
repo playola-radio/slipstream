@@ -418,6 +418,7 @@ function functionPlans(
   bi: FunctionIndex, ai: FunctionIndex, context: number,
 ): ClipPlan[] | null {
   let work = 0;
+  let exhausted = false;
   const withinBudget = (index: FunctionIndex): boolean => (work += index.functions.length + index.errors.length + 1) <= 400_000;
   // A line diff gives no character range within its changed line. At a function
   // boundary, only use the function when it owns that whole line; otherwise a
@@ -477,6 +478,9 @@ function functionPlans(
       const p = plans[0]!;
       if (p.kind !== 'range' || p.method !== 'function' || !p.range
         || (p.range.s0 >= other.s0 && p.range.e0 <= other.e0)) return undefined;
+      // This scans the full index, so it belongs to the same deterministic
+      // selection budget as the row scans above.
+      if (!withinBudget(index)) { exhausted = true; return undefined; }
       const fn = index.functions.filter(f => f.s0 < empty.s0 && empty.s0 < f.e0)
         .sort((x, y) => (x.e0 - x.s0) - (y.e0 - y.s0))[0];
       return fn ? { kind: 'range', method: 'function', range: fn } : undefined;
@@ -489,6 +493,7 @@ function functionPlans(
       const p = counterpart(block.after, block.before, bs, ai);
       if (p) as.push(p);
     }
+    if (exhausted) return null;
     // Whitespace-only edits remain real changes, even outside any function.
     if (!bs.length && !as.length) {
       const h = mergeRawBlocks([block], before.kind === 'text' ? before.lines.length : 0,

@@ -185,6 +185,17 @@ test('a parse timeout returns prepared ranges and explicit transient reasons', (
   assert.ok(p.clips[0]!.after.span);
 });
 
+test('counterpart selection charges its function scan to the extraction budget', () => {
+  const before = 'function f() {\n}\n';
+  const after = 'function f() {\n  added();\n}\n';
+  const many = (end: number) => Array.from({ length: 200_000 }, () => ({ s0: 0, e0: end, c0: 0, c1: 1 }));
+  let calls = 0;
+  const p = core(bytes(before), bytes(after), { changeSeq: '42', language: 'typescript' }, () =>
+    ({ functions: many(++calls === 1 ? 2 : 3), errors: [] }));
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.fallback_reason, 'extraction-budget-exhausted');
+});
+
 test('an error elsewhere does not discard a usable enclosing function', () => {
   const source = 'function good() {\n  return 1;\n}\n\nconst broken = ;\n';
   const p = project(source, source.replace('return 1', 'return 2'));
