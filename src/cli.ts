@@ -19,7 +19,10 @@
  *   slipstream status [--store <dir>]
  *   slipstream detach [--store <dir>]
  *
- * Deletion / GC of retained sessions is a later stage.
+ * Maintenance of retained sessions (only while the daemon is detached):
+ *
+ *   slipstream delete <session-id> [--store <dir>]
+ *   slipstream gc     [--store <dir>]
  */
 import { readFile, lstat } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -28,6 +31,7 @@ import { startCapture } from './session.ts';
 import { startReaderServer } from './http-reader.ts';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
+import { isValidSessionId } from './store-reader.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { runTui } from './tui.ts';
 import { isMainModule } from './entrypoint.ts';
@@ -39,7 +43,9 @@ type Args =
   | { command: 'start'; store: string }
   | { command: 'status'; store: string }
   | { command: 'detach'; store: string }
-  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string };
+  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string }
+  | { command: 'delete'; store: string; sessionId: string }
+  | { command: 'gc'; store: string };
 
 /** The shared daemon's default store lives under the home dir, not the worktree:
  * one daemon serves every worktree from a single owner-only root. */
@@ -76,6 +82,27 @@ function parseStoreOnly(rest: string[]): string | null {
   return store ?? DEFAULT_DAEMON_STORE;
 }
 
+/** `delete <session-id> [--store <dir>]`: exactly one required positional (the
+ * session id, NOT a path — never `resolve`d) plus an optional `--store`. A missing
+ * id, a second positional, or an unknown flag is a usage error. */
+function parseDelete(rest: string[]): { store: string; sessionId: string } | null {
+  let store: string | undefined;
+  let sessionId: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    if (arg === '--store') {
+      const value = rest[++i];
+      if (value === undefined || value.startsWith('--')) return null;
+      store = resolve(value);
+    } else if (!arg.startsWith('--')) {
+      if (sessionId !== undefined) return null; // a second positional is a usage error
+      sessionId = arg;
+    } else return null; // unknown flag
+  }
+  if (sessionId === undefined) return null; // the session id is required
+  return { store: store ?? DEFAULT_DAEMON_STORE, sessionId };
+}
+
 function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>, 'command'> | null {
   let dir = process.cwd();
   let store: string | undefined;
@@ -108,7 +135,7 @@ export function parseArgs(argv: string[]): Args | null {
     if (!parsed) return null;
     return { command, dir: parsed.dir, store: parsed.store };
   }
-  if (command === 'start' || command === 'status' || command === 'detach') {
+  if (command === 'start' || command === 'status' || command === 'detach' || command === 'gc') {
     const store = parseStoreOnly(argv.slice(1));
     if (store === null) return null;
     return { command, store };
@@ -117,6 +144,11 @@ export function parseArgs(argv: string[]): Args | null {
     const parsed = parseAttach(argv.slice(1));
     if (!parsed) return null;
     return { command: 'attach', ...parsed };
+  }
+  if (command === 'delete') {
+    const parsed = parseDelete(argv.slice(1));
+    if (!parsed) return null;
+    return { command: 'delete', ...parsed };
   }
   if (command === 'view') return { command: 'view' };
   return null;
@@ -134,6 +166,8 @@ function usage(): void {
   console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id>');
   console.error('       slipstream status [--store <dir>]');
   console.error('       slipstream detach [--store <dir>]');
+  console.error('       slipstream delete <session-id> [--store <dir>]');
+  console.error('       slipstream gc     [--store <dir>]');
   console.error('       slipstream view   [--store <dir>] [--session <id>] [--disk] [--changes] [--context N] [--full]');
 }
 
@@ -239,6 +273,24 @@ async function main(): Promise<void> {
       harness: args.harness,
       harness_session_id: args.harnessSessionId,
     });
+    return;
+  }
+
+  if (args.command === 'gc') {
+    await runControl(args.store, { verb: 'gc' });
+    return;
+  }
+
+  if (args.command === 'delete') {
+    // Validate the id client-side so a typo is a clear local error, not a round
+    // trip: an invalid id can never name a real session, and this keeps a malformed
+    // path off the wire. The daemon re-validates and re-checks existence.
+    if (!isValidSessionId(args.sessionId)) {
+      console.error(`slipstream: not a valid session id: ${args.sessionId}`);
+      process.exitCode = 2;
+      return;
+    }
+    await runControl(args.store, { verb: 'delete_session', session_id: args.sessionId });
     return;
   }
 
