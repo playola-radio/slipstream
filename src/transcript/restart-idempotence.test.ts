@@ -56,7 +56,7 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
-    readlink: async () => undefined,
+    probe: async () => ({ kind: 'absent' }),
   };
   const fileIO: TranscriptFileIO = {
     async stat(p): Promise<StatResult> {

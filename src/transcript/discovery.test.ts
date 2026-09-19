@@ -17,7 +17,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
-    readlink: async () => undefined,
+    probe: async () => ({ kind: 'absent' }),
     ...overrides,
   };
 }
@@ -159,7 +159,8 @@ describe('transcript discovery', () => {
       io({
         listTreeJsonl: async () => ({ paths: ['/c/dead.jsonl'], truncated: false, incomplete: false }),
         readFirstLine: async () => ({ ok: true as const, line: meta }),
-        realpath: async () => undefined,
+        // Only the filesystem root still resolves; /gone is a plain deleted dir.
+        realpath: async (p) => (p === '/' ? '/' : undefined),
       }),
       '/home',
       ROOT,
@@ -255,7 +256,8 @@ describe('transcript discovery', () => {
         listTreeJsonl: async () => ({ paths: ['/c/do.jsonl'], truncated: false, incomplete: false }),
         readFirstLine: async () => ({ ok: true as const, line: meta }),
         realpath: async (p) => (p === ROOT ? ROOT : p === '/other' ? '/other' : undefined),
-        readlink: async (p) => (p === '/work/proj/link' ? '/other/deleted' : undefined),
+        probe: async (p) =>
+          p === '/work/proj/link' ? { kind: 'symlink', target: '/other/deleted' } : { kind: 'absent' },
       }),
       '/home',
       ROOT,
@@ -278,7 +280,8 @@ describe('transcript discovery', () => {
         listTreeJsonl: async () => ({ paths: ['/c/di.jsonl'], truncated: false, incomplete: false }),
         readFirstLine: async () => ({ ok: true as const, line: meta }),
         realpath: async (p) => (p === '/links' ? '/links' : p === ROOT ? ROOT : undefined),
-        readlink: async (p) => (p === '/links/alias' ? '/work/proj/deleted' : undefined),
+        probe: async (p) =>
+          p === '/links/alias' ? { kind: 'symlink', target: '/work/proj/deleted' } : { kind: 'absent' },
       }),
       '/home',
       ROOT,
@@ -288,6 +291,139 @@ describe('transcript discovery', () => {
     assert.ok(
       result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/links/alias')),
     );
+  });
+
+  it('follows a `..` symlink target through its intervening symlink to disclose an in-root cwd', async () => {
+    // /alias -> /work/proj/sub; /work/proj/sub/link -> ../gone (gone deleted);
+    // cwd /alias/link. The `..` must be evaluated AFTER resolving the alias, so the
+    // true target is /work/proj/gone (in-root). A lexical collapse would yield /gone
+    // and hide an in-root candidate.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-dotdot-in', cwd: '/alias/link' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/dd.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) =>
+          p === '/alias' ? '/work/proj/sub' : p === '/alias/..' ? ROOT : undefined,
+        probe: async (p) =>
+          p === '/alias/link' ? { kind: 'symlink', target: '../gone' } : { kind: 'absent' },
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/alias/link')));
+  });
+
+  it('follows a `..` symlink target through its intervening symlink to skip an out-of-root cwd', async () => {
+    // /work/proj/alias -> /outside/sub; its link -> ../gone; cwd /work/proj/alias/link.
+    // The true target is /outside/gone, so it must NOT be disclosed even though the
+    // recorded path is textually inside the root.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-dotdot-out', cwd: '/work/proj/alias/link' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/ddo.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) =>
+          p === '/work/proj/alias'
+            ? '/outside/sub'
+            : p === '/work/proj/alias/..'
+              ? '/outside'
+              : undefined,
+        probe: async (p) =>
+          p === '/work/proj/alias/link' ? { kind: 'symlink', target: '../gone' } : { kind: 'absent' },
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.equal(result.issues.length, 0);
+  });
+
+  it('discloses a cwd whose component cannot be inspected (permission wall), never dropping it', async () => {
+    // /links/alias -> (somewhere), but /links denies search: realpath('/links')
+    // succeeds while inspecting the child fails with EACCES. An unreadable component
+    // does not establish non-membership, so the candidate is disclosed.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-eacces', cwd: '/links/alias' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/ea.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/links' ? '/links' : undefined),
+        probe: async (p) => (p === '/links/alias' ? { kind: 'error' } : { kind: 'absent' }),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/links/alias')));
+  });
+
+  it('follows a long acyclic symlink chain to its true (out-of-root) target', async () => {
+    // A 10-link chain /l0 -> /l1 -> ... -> /l9 -> /other/gone must be followed to its
+    // end and skipped, proving the final link's target is always evaluated rather
+    // than the walk fail-opening at some boundary.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-chain', cwd: '/l0' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/chain.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/' ? '/' : p === '/other' ? '/other' : undefined),
+        probe: async (p) => {
+          const m = /^\/l(\d+)$/.exec(p);
+          if (!m) return { kind: 'absent' };
+          const i = Number(m[1]);
+          return { kind: 'symlink', target: i < 9 ? `/l${i + 1}` : '/other/gone' };
+        },
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.equal(result.issues.length, 0);
+  });
+
+  it('discloses (never silently drops) a cwd trapped in a symlink cycle', async () => {
+    // /a -> /b -> /a never resolves. Exhausting the hop cap must fail toward
+    // disclosure, not assert the unestablished claim that the cwd is out of root.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-cycle', cwd: '/a' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/cyc.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/' ? '/' : undefined),
+        probe: async (p) =>
+          p === '/a'
+            ? { kind: 'symlink', target: '/b' }
+            : p === '/b'
+              ? { kind: 'symlink', target: '/a' }
+              : { kind: 'absent' },
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/a')));
   });
 
   it('does not invent an over-broad alias from a leaf-symlink cwd', async () => {

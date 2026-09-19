@@ -15,7 +15,7 @@
  * (Stage 3: two agents in one worktree are both captured); each keeps its own
  * native session id, so their invocation identities never collide.
  */
-import { dirname, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { CoverageIssue, HarnessName } from '../event.ts';
 import type { AdapterContext } from './types.ts';
 
@@ -58,10 +58,19 @@ export interface DiscoveryIO {
   readFirstLine(path: string): Promise<FirstLineResult>;
   /** Canonicalize a path, or undefined if it does not resolve. */
   realpath(path: string): Promise<string | undefined>;
-  /** The absolute target of `path` if it is a symlink (even a dangling one),
-   * or undefined if `path` is not a symlink or does not exist. */
-  readlink(path: string): Promise<string | undefined>;
+  /** Inspect a single path component WITHOUT resolving it, so a dangling symlink,
+   * a plain missing entry, and an un-inspectable one (permissions) stay distinct. */
+  probe(path: string): Promise<MissingProbe>;
 }
+
+/** The result of inspecting one path with {@link DiscoveryIO.probe}. `target` for
+ * a symlink is its RAW literal target (unresolved, possibly relative, possibly
+ * dangling); callers must resolve it against the real filesystem, never lexically. */
+export type MissingProbe =
+  | { kind: 'absent' } // confirmed not present (ENOENT)
+  | { kind: 'symlink'; target: string } // a symlink, possibly dangling
+  | { kind: 'present' } // exists but is not a symlink
+  | { kind: 'error' }; // could not be inspected (e.g. permissions)
 
 /** Claude's on-disk slug for a worktree: the absolute path with '/'→'-'. */
 export function claudeSlug(root: string): string {
@@ -81,9 +90,17 @@ export function isWithinRoot(root: string, child: string): boolean {
 }
 
 /** A generous bound on symlink hops while degrading a broken cwd, defeating a
- * symlink cycle. Beyond it, a cwd is too pathological to place — treat it as a
- * non-candidate rather than risk a wrong disclosure. */
-const MAX_UNRESOLVED_HOPS = 40;
+ * symlink cycle. Beyond it, a cwd is too pathological to place cheaply, so we
+ * disclose it rather than silently drop what might be an in-root candidate. */
+const MAX_UNRESOLVED_HOPS = 64;
+
+/** Join `base` and `segment` textually, WITHOUT collapsing `..`: any `..` must be
+ * resolved against the real filesystem by a later `realpath`, since an
+ * intervening symlink makes lexical collapse wrong. */
+function rawJoin(base: string, segment: string): string {
+  if (segment === '') return base;
+  return base.endsWith('/') ? base + segment : `${base}/${segment}`;
+}
 
 /**
  * True when an UNRESOLVABLE cwd could still sit inside the capture root, so it is
@@ -94,12 +111,19 @@ const MAX_UNRESOLVED_HOPS = 40;
  * yet be in-root, or textually in-root yet escape through an internal symlink
  * (`/work/proj/link/gone` where `link` -> `/other/project`). So we degrade the
  * way `realpath` itself would: resolve the longest existing prefix, then decide
- * membership from what remains. The first component that fails to resolve is
- * either truly absent — the rest is plain names off the prefix's canonical
- * location — or a DANGLING symlink, whose literal target (via readlink, since
- * realpath cannot follow it) we re-resolve. A cwd that places outside the root is
- * a different worktree's session, skipped silently so unrelated dead sessions
- * never degrade this root's coverage.
+ * membership from what remains. `probe` classifies the first component that
+ * failed to resolve:
+ * - `absent`: the rest is plain names off the prefix's canonical location.
+ * - `symlink`: follow its RAW literal target by textual concatenation (never
+ *   lexical `..` collapse — an intervening symlink must be resolved first) and
+ *   re-run, letting the next `realpath` hop resolve `..` and chained links.
+ * - `present`/`error`: we could not resolve through it (e.g. a permission wall),
+ *   so membership is undetermined — disclose rather than silently drop.
+ *
+ * A cwd that places outside the root is a different worktree's session, skipped
+ * silently so unrelated dead sessions never degrade this root's coverage.
+ * Undecidable cases (uninspectable component, hop-cap exhaustion) fail toward
+ * disclosure: never claim non-membership we did not establish.
  */
 async function unresolvedCwdMayBeInRoot(
   io: DiscoveryIO,
@@ -108,32 +132,38 @@ async function unresolvedCwdMayBeInRoot(
 ): Promise<boolean> {
   let path = cwd;
   for (let hop = 0; hop < MAX_UNRESOLVED_HOPS; hop += 1) {
-    // Walk up to the nearest ancestor that resolves (realpath follows any symlinks
-    // it contains, so its canonical form is exact).
-    let cur = path;
-    let canonical = await io.realpath(cur);
+    const direct = await io.realpath(path);
+    if (direct !== undefined) return isWithinRoot(root, direct);
+    // Walk up (string-only, preserving `..`) to the longest ancestor that
+    // resolves; realpath follows any symlinks it contains, so its form is exact.
+    let ancestor = dirname(path);
+    let canonical = await io.realpath(ancestor);
     while (canonical === undefined) {
-      const parent = dirname(cur);
-      if (parent === cur) return false; // nothing on this path resolves
-      cur = parent;
-      canonical = await io.realpath(cur);
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return true; // not even '/' resolves: cannot rule out
+      ancestor = parent;
+      canonical = await io.realpath(ancestor);
     }
-    if (cur === path) return isWithinRoot(root, canonical);
-    // `cur` resolves; its child toward `path` is the first component that failed.
-    const suffix = relative(cur, path);
-    const firstChild = resolve(cur, suffix.split(sep)[0]!);
-    const linkTarget = await io.readlink(firstChild);
-    if (linkTarget === undefined) {
-      // Truly absent (not a symlink): the whole suffix is plain names off the
-      // prefix's canonical location.
-      return isWithinRoot(root, resolve(canonical, suffix));
+    // The first non-resolving component is the next segment of `path` below
+    // `ancestor`; everything after it is the still-unresolved remainder.
+    const tail = path.slice(ancestor === '/' ? 1 : ancestor.length + 1);
+    const firstSeg = tail.split('/')[0]!;
+    const firstChild = rawJoin(ancestor, firstSeg);
+    const afterFirst = path.slice(firstChild.length); // '' or leading-'/' remainder
+    const probe = await io.probe(firstChild);
+    if (probe.kind === 'absent') {
+      // Plain (non-symlink) missing names: safe to resolve off the canonical
+      // parent, since none of them are symlinks that `..` could cross.
+      return isWithinRoot(root, resolve(canonical, tail));
     }
-    // Dangling symlink: follow its literal target, re-appending whatever came
-    // after it, and resolve again from there.
-    const rest = relative(firstChild, path);
-    path = rest === '' ? linkTarget : resolve(linkTarget, rest);
+    if (probe.kind !== 'symlink') return true; // uninspectable: disclose
+    // Dangling symlink: rebuild the path from its literal target (relative
+    // targets against the link's textual parent), preserving `..` for the next
+    // realpath hop, then re-append whatever came after the link.
+    const base = isAbsolute(probe.target) ? probe.target : rawJoin(ancestor, probe.target);
+    path = `${base}${afterFirst}`;
   }
-  return false;
+  return true; // hop cap exhausted (e.g. a cycle): disclose rather than drop
 }
 
 export async function discoverClaude(

@@ -1,7 +1,14 @@
-import { open, readdir, readlink as fsReadlink, realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import {
+  lstat as fsLstat,
+  open,
+  readdir,
+  readlink as fsReadlink,
+  realpath as fsRealpath,
+  stat as fsStat,
+} from 'node:fs/promises';
+import { join } from 'node:path';
 import type { StatResult, TranscriptFileIO } from './file-reader.ts';
-import type { DiscoveryIO, FirstLineResult, ListResult, TreeResult } from './discovery.ts';
+import type { DiscoveryIO, FirstLineResult, ListResult, MissingProbe, TreeResult } from './discovery.ts';
 
 /** The real filesystem IO for transcript files. Missing → `missing`; any other
  * stat/read error → `inaccessible` (disclosed, never a silent empty read). */
@@ -111,14 +118,22 @@ export const nodeDiscoveryIO: DiscoveryIO = {
     }
   },
 
-  async readlink(path: string): Promise<string | undefined> {
+  async probe(path: string): Promise<MissingProbe> {
+    let stats;
     try {
-      const target = await fsReadlink(path);
-      // Resolve a relative target against the link's own directory so callers
-      // always receive an absolute path.
-      return resolve(dirname(path), target);
+      stats = await fsLstat(path);
+    } catch (err) {
+      // ENOENT is confirmed absence; anything else (e.g. EACCES) is a failure to
+      // inspect, which must NOT masquerade as "not present".
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { kind: 'absent' } : { kind: 'error' };
+    }
+    if (!stats.isSymbolicLink()) return { kind: 'present' };
+    try {
+      // The RAW literal target: callers resolve it against the filesystem so an
+      // intervening symlink is followed before any `..` in the target.
+      return { kind: 'symlink', target: await fsReadlink(path) };
     } catch {
-      return undefined;
+      return { kind: 'error' };
     }
   },
 };
