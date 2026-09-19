@@ -107,6 +107,43 @@ describe('engine', () => {
     });
   });
 
+  describe('observed interval', () => {
+    it('stamps start_ms from the observation and end_ms from acquisition completion', async () => {
+      let clock = 500;
+      await withEngine(
+        scriptedReader([content('bbb')]),
+        async ({ engine, read }) => {
+          engine.setBaseline('f.ts', content('aaa'));
+          engine.notify('f.ts', 100);
+          await engine.drain();
+          const [rec] = await read();
+          assert.equal(rec?.type, CHANGED);
+          if (rec?.type === CHANGED) {
+            assert.deepEqual(rec.data.observed_interval_ms, { start_ms: 100, end_ms: 500 });
+            assert.equal(rec.data.observed_at_ms, 100, 'start_ms mirrors observed_at_ms');
+          }
+        },
+        { now: () => clock++ },
+      );
+    });
+
+    it('records a regressed acquisition clock truthfully, without clamping', async () => {
+      await withEngine(
+        scriptedReader([content('bbb')]),
+        async ({ engine, read }) => {
+          engine.setBaseline('f.ts', content('aaa'));
+          engine.notify('f.ts', 1000);
+          await engine.drain();
+          const [rec] = await read();
+          if (rec?.type === CHANGED) {
+            assert.deepEqual(rec.data.observed_interval_ms, { start_ms: 1000, end_ms: 400 });
+          }
+        },
+        { now: () => 400 },
+      );
+    });
+  });
+
   describe('coalescing and serialization', () => {
     it('discards stale coalesced notifications when recovery resets bookkeeping', async () => {
       let releaseFirst!: () => void;

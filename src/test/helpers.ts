@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { createCas, type Cas } from '../cas.ts';
 import { createReader, type Reader } from '../reader.ts';
 import { createLog, type Log } from '../log.ts';
-import type { AnyEvent, CloudEvent } from '../event.ts';
+import type { AnyEvent, CloudEvent, EnrichmentPolicy } from '../event.ts';
 import { createEngine, type Engine } from '../engine.ts';
 import { startCapture, type CaptureSession } from '../session.ts';
 import { createFakePlatform } from './fake-platform.ts';
@@ -73,16 +73,19 @@ export async function withLog(
   });
 }
 
-/** An engine backed by a real log and a caller-supplied (usually fake) reader. */
+/** An engine backed by a real log and a caller-supplied (usually fake) reader.
+ * `now` injects the snapshot-acquisition clock (the interval's `end_ms`); tests
+ * that assert intervals supply a deterministic one. */
 export async function withEngine(
   reader: Reader,
   fn: (ctx: { engine: Engine; read: () => Promise<LoggedRecord[]> }) => Promise<void>,
+  opts: { now?: () => number } = {},
 ): Promise<void> {
   await withTempDir(async (dir) => {
     const path = join(dir, 'events.jsonl');
     const log = await createLog({ filePath: path, sessionId: TEST_SESSION_ID });
     try {
-      await fn({ engine: createEngine({ reader, log }), read: () => readRecords(path) });
+      await fn({ engine: createEngine({ reader, log, now: opts.now }), read: () => readRecords(path) });
     } finally {
       await log.close();
     }
@@ -141,7 +144,7 @@ export async function withFakeSession(
     observe: (path: string) => void;
     waitFor: (predicate: (recs: LoggedRecord[]) => boolean) => Promise<LoggedRecord[]>;
   }) => Promise<void>,
-  opts: { maxBytes?: number; enumerate?: EnumerateFn } = {},
+  opts: { maxBytes?: number; enumerate?: EnumerateFn; enrichmentPolicy?: EnrichmentPolicy } = {},
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'slip-fwt-'));
   const store = await mkdtemp(join(tmpdir(), 'slip-fst-'));
@@ -150,7 +153,7 @@ export async function withFakeSession(
   try {
     await setup(root);
     session = await startCapture(
-      { root, storeDir: store, maxBytes: opts.maxBytes },
+      { root, storeDir: store, maxBytes: opts.maxBytes, enrichmentPolicy: opts.enrichmentPolicy },
       opts.enumerate ? { platform, enumerate: opts.enumerate } : { platform },
     );
     const s = session;

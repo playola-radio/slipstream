@@ -39,6 +39,9 @@ export const EVENT_TYPES = [
   'slipstream.capture.gap.v1',
   'slipstream.session.resumed.v1',
   'slipstream.task.started.v1',
+  'slipstream.harness.evidence.v1',
+  'slipstream.change.attribution.v1',
+  'slipstream.enrichment.configured.v1',
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -89,6 +92,19 @@ export interface BaselineCompletedData {
   unknown_scopes: string[];
 }
 
+/**
+ * The wall-clock window a watcher observation spanned: `start_ms` is the
+ * occurrence instant (equal to `observed_at_ms`), `end_ms` the moment snapshot
+ * acquisition completed. Attribution overlaps candidate windows against it.
+ * Reconciliation changes cannot bound a real interval, so they carry the
+ * explicit `unavailable` disposition rather than a fabricated one; legacy
+ * changes (recorded before this field existed) simply omit it and are read as
+ * unavailable in interpretation, never rewritten.
+ */
+export type ObservedInterval =
+  | { start_ms: number; end_ms: number }
+  | { unavailable: true; reason: string };
+
 export interface FileChangedData {
   session_id: string;
   path: string;
@@ -97,6 +113,8 @@ export interface FileChangedData {
   observation: Observation;
   /** Observation instant in epoch ms (mirrors envelope `time`; never ordering). */
   observed_at_ms: number;
+  /** The observation's wall-clock span; absent on legacy pre-A1 records. */
+  observed_interval_ms?: ObservedInterval;
   /** True when intermediate states may have been coalesced before this commit. */
   coalesced?: boolean;
   /** For reconciliation changes: the `seq` of the gap this endpoint reconciles. */
@@ -148,6 +166,99 @@ export interface SessionResumedData {
   resumed_at_ms: number;
 }
 
+/** The harnesses whose transcripts may refine attribution. Never a capture
+ * source (a harness log may never create a filesystem-change event). */
+export type HarnessName = 'claude-code' | 'codex';
+
+/**
+ * How thoroughly a harness source is covered, declared in the effective policy.
+ * A1 wires no real transcript adapters, so every source is `unconfigured`: an
+ * `unknown` attribution under `unconfigured` coverage honestly means "nothing was
+ * watched", never "a human wrote it". A2 defines the covered/unsupported/etc.
+ * vocabulary when real adapters exist and can actually distinguish those states.
+ */
+export type SourceCoverage = 'unconfigured';
+
+/** Which end of a harness invocation a timestamp marks. A start and an end
+ * record for one invocation are joined, not treated as contradictory. */
+export type EvidenceBasis = 'tool-start' | 'tool-end' | 'record-time';
+
+/** Identifies one harness invocation. Namespaced by harness session so record
+ * ids from different harness runs never collide. */
+export interface EvidenceKey {
+  harness: HarnessName;
+  harness_session_id: string;
+  record_id: string;
+}
+
+/** What files an invocation declared it touched. `unknown` scope cannot confirm
+ * a specific path, so it never counts as an eligible candidate. */
+export type EvidenceFileScope =
+  | { kind: 'paths'; paths: string[] }
+  | { kind: 'unknown'; reason: string };
+
+/**
+ * One durable, normalized harness-transcript record. Evidence refines
+ * attribution; it is never a change and never authorship. Multiple records may
+ * share an `evidence_key` (e.g. a start and an end); conflicting records under
+ * one key are all retained and disclosed, never silently merged.
+ */
+export interface HarnessEvidenceData {
+  session_id: string;
+  evidence_key: EvidenceKey;
+  adapter_version: string;
+  tool_name: string;
+  timestamp: { at_ms: number; basis: EvidenceBasis };
+  file_scope: EvidenceFileScope;
+}
+
+/** Attribution is revisable inference, never verified authorship. */
+export type AttributionStatus = 'heuristic' | 'ambiguous' | 'unknown';
+
+export type AttributionReason =
+  | 'single-candidate'
+  | 'multiple-candidates'
+  | 'no-matching-evidence'
+  | 'observation-interval-unavailable';
+
+/**
+ * A full-replacement attribution result for one `file.changed` change. Later
+ * evidence appends a fresh record (the target event is immutable); the
+ * highest-seq attribution for a `change_seq` wins. `policy_seq` binds the result
+ * to the effective policy that preceded the change, so a revision is scored
+ * under the change's original policy, never today's.
+ */
+export interface ChangeAttributionData {
+  session_id: string;
+  /** `seq` of the target `file.changed.v1` in this event's own `source`. */
+  change_seq: string;
+  /** `seq` of the `enrichment.configured.v1` policy bound to the change. */
+  policy_seq: string;
+  status: AttributionStatus;
+  reason: AttributionReason;
+  /** Seqs of the supporting evidence records (eligible invocations). */
+  evidence_seqs: string[];
+  /** Invocations excluded because their records conflict; omitted when none.
+   * Disclosure that a conflict affected the result, never a silent drop. */
+  excluded_conflicts?: EvidenceKey[];
+}
+
+/** The effective attribution policy. Bound to each change by sequence so a later
+ * revision keeps scoring under the policy in force when the change occurred. */
+export interface EnrichmentPolicy {
+  /** Half-width in ms each invocation contributes around its timestamps. */
+  window_ms: number;
+  /** Grace in ms after an observation interval ends before the first result. */
+  grace_ms: number;
+  /** Declared coverage per harness source (A1 real sources: `unconfigured`). */
+  sources: Record<string, SourceCoverage>;
+}
+
+export interface EnrichmentConfiguredData {
+  session_id: string;
+  policy: EnrichmentPolicy;
+}
+
 /** A caller supplies the type, its data (minus the injected `session_id`), and
  * the occurrence time in epoch ms; the log injects `session_id`, `source`,
  * `seq`, `id`, `time`, and the CloudEvents constants. */
@@ -158,7 +269,10 @@ export type EventInput =
   | { type: 'slipstream.file.changed.v1'; occurred_at_ms: number; data: Omit<FileChangedData, 'session_id' | 'observed_at_ms'> }
   | { type: 'slipstream.capture.gap.v1'; occurred_at_ms: number; data: Omit<CaptureGapData, 'session_id' | 'observed_at_ms'> }
   | { type: 'slipstream.session.resumed.v1'; occurred_at_ms: number; data: Omit<SessionResumedData, 'session_id' | 'resumed_at_ms'> }
-  | { type: 'slipstream.task.started.v1'; occurred_at_ms: number; data: Omit<TaskStartedData, 'session_id'> };
+  | { type: 'slipstream.task.started.v1'; occurred_at_ms: number; data: Omit<TaskStartedData, 'session_id'> }
+  | { type: 'slipstream.harness.evidence.v1'; occurred_at_ms: number; data: Omit<HarnessEvidenceData, 'session_id'> }
+  | { type: 'slipstream.change.attribution.v1'; occurred_at_ms: number; data: Omit<ChangeAttributionData, 'session_id'> }
+  | { type: 'slipstream.enrichment.configured.v1'; occurred_at_ms: number; data: Omit<EnrichmentConfiguredData, 'session_id'> };
 
 /** The `data` field into which each type mirrors the observation instant (epoch
  * ms). Types absent here carry only the envelope `time` (baseline records are
@@ -178,6 +292,9 @@ type DataFor<T extends EventType> =
   : T extends 'slipstream.capture.gap.v1' ? CaptureGapData
   : T extends 'slipstream.session.resumed.v1' ? SessionResumedData
   : T extends 'slipstream.task.started.v1' ? TaskStartedData
+  : T extends 'slipstream.harness.evidence.v1' ? HarnessEvidenceData
+  : T extends 'slipstream.change.attribution.v1' ? ChangeAttributionData
+  : T extends 'slipstream.enrichment.configured.v1' ? EnrichmentConfiguredData
   : never;
 
 export interface CloudEvent<T extends EventType = EventType> {

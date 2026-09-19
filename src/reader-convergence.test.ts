@@ -71,8 +71,10 @@ describe('reader convergence', () => {
           assert.ok(httpChange && diskChange);
           assert.equal(httpChange.data.task_hint_id, task.task_id);
           assert.equal(httpChange.data.task_hint_id, diskChange.data.task_hint_id);
-          assert.deepEqual(httpChange.data.attribution, { status: 'unknown' });
-          assert.deepEqual(httpChange.data.attribution, diskChange.data.attribution);
+          // Attribution is no longer an inline seed on the change: "no result yet"
+          // is PENDING, disclosed as a separate revisable change.attribution event.
+          assert.equal(httpChange.data.attribution, undefined);
+          assert.equal(diskChange.data.attribution, undefined);
         } finally { await srv.close(); }
       },
     );
