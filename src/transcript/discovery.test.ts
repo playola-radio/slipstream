@@ -16,7 +16,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [] }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -38,12 +38,14 @@ describe('transcript discovery', () => {
 
   it('binds each Claude session file in the slug dir to its session id', async () => {
     const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const record = JSON.stringify({ type: 'user', cwd: ROOT, message: { content: 'hi' } });
     const result = await discoverClaude(
       io({
         listDir: async (d): Promise<ListResult> =>
           d === dir
             ? { ok: true, paths: [`${dir}/sess-a.jsonl`, `${dir}/sess-b.jsonl`] }
             : { ok: false, reason: 'missing' },
+        readFirstLine: async () => ({ ok: true as const, line: record }),
       }),
       '/home',
       ROOT,
@@ -186,7 +188,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: preamble }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd] }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false }),
         realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
       }),
       '/home',
@@ -206,7 +208,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: preamble }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd] }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -233,20 +235,46 @@ describe('transcript discovery', () => {
     assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('bad.jsonl')));
   });
 
-  it('falls back to the slug binding when a Claude first line carries no cwd', async () => {
+  it('withholds a Claude transcript still in its cwd-less preamble (no binding, no issue)', async () => {
+    // A transcript whose head is fully read but carries no cwd yet is not slug-trusted:
+    // binding it would risk a slug-colliding sibling worktree. It is withheld with no
+    // issue (coverage stays pending) and re-checked next tick once the cwd is written.
     const dir = `/home/projects/${claudeSlug(ROOT)}`;
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: JSON.stringify({ type: 'summary' }) }),
+        readHeadLines: async () => ({ ok: true as const, lines: [JSON.stringify({ type: 'summary' })], truncated: false }),
         realpath: async (p) => p,
       }),
       '/home',
       ROOT,
     );
-    assert.deepEqual(
-      result.bindings.map((b) => [b.ctx.harnessSessionId, b.ctx.cwd]),
-      [['a', ROOT]],
+    assert.equal(result.bindings.length, 0, 'no cwd confirmed yet: withheld, not slug-trusted');
+    assert.equal(result.issues.length, 0, 'a not-yet-confirmed transcript is pending, not an issue');
+  });
+
+  it('discloses (never binds) a Claude transcript whose cwd lies beyond the truncated head', async () => {
+    // The head scan hit its budget before finding a cwd: a cwd may exist past the
+    // window, so membership cannot be confirmed. Slug-trusting here would admit a
+    // colliding sibling worktree and report it readable, so instead disclose the gap
+    // and withhold the binding.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: true }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0, 'unconfirmed membership is never slug-trusted');
+    assert.ok(
+      result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('membership unconfirmed')),
+      'the unconfirmable transcript is disclosed, not silently dropped',
     );
   });
 

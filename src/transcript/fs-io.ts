@@ -172,6 +172,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       const lines: string[] = [];
       let pos = 0;
       let sawByte = false;
+      let truncated = false; // stopped at a line/byte budget, not EOF: more may lie beyond
       let cur: Buffer[] = []; // the current line's bytes, across chunk boundaries
       let curLen = 0;
       let skip = false; // the current line exceeded the per-line cap: discard it
@@ -195,13 +196,16 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       outer: for (;;) {
         const buf = Buffer.allocUnsafe(FIRST_LINE_CHUNK);
         const { bytesRead } = await handle.read(buf, 0, FIRST_LINE_CHUNK, pos);
-        if (bytesRead === 0) break;
+        if (bytesRead === 0) break; // EOF: the whole file was read
         sawByte = true;
         pos += bytesRead;
         let start = 0;
         for (let i = 0; i < bytesRead; i += 1) {
           if (buf[i] !== 0x0a) continue;
-          if (finish(buf.subarray(start, i))) break outer;
+          if (finish(buf.subarray(start, i))) {
+            truncated = true; // hit the line budget with more file to read
+            break outer;
+          }
           start = i + 1;
         }
         if (start < bytesRead) {
@@ -214,10 +218,13 @@ export const nodeDiscoveryIO: DiscoveryIO = {
             cur.push(Buffer.from(seg));
           }
         }
-        if (pos >= HEAD_SCAN_BYTES) break;
+        if (pos >= HEAD_SCAN_BYTES) {
+          truncated = true; // hit the byte budget
+          break;
+        }
       }
       if (!sawByte) return { ok: false, reason: 'empty' };
-      return { ok: true, lines };
+      return { ok: true, lines, truncated };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {

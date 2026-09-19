@@ -50,12 +50,21 @@ function attributionsFor(recs: LoggedRecord[], changeSeq: string): ChangeAttribu
 /** Discovery + file IO that serve one Claude transcript from a MemTranscript. */
 function transcriptRuntime(root: string, path: string, mem: MemTranscript): TranscriptRuntime {
   const dir = `${HOME}/projects/${claudeSlug(root)}`;
+  // Membership is confirmed by a recorded cwd; the session's cwd is the worktree
+  // root. (Real transcripts carry it on an early user record, not the tool_use
+  // write, so discovery reports it independently of the evidence bytes.)
+  const cwdRecord = JSON.stringify({ type: 'user', cwd: root, message: { content: 'hi' } });
   const discoveryIO: DiscoveryIO = {
     listDir: async (d): Promise<ListResult> =>
       d === dir ? { ok: true, paths: [path] } : { ok: false, reason: 'missing' },
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
-    readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [] }),
+    readFirstLine: async () =>
+      mem.buf.length > 0 ? { ok: true, line: cwdRecord } : { ok: false, reason: 'empty' },
+    readHeadLines: async () => ({
+      ok: true,
+      lines: mem.buf.length > 0 ? [cwdRecord] : [],
+      truncated: false,
+    }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
   };

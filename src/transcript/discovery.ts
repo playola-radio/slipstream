@@ -49,9 +49,12 @@ export type FirstLineResult =
   | { ok: false; reason: 'inaccessible' | 'empty' | 'malformed' };
 
 /** A bounded, decoded set of a transcript's leading lines (oversized lines
- * skipped), for scanning past a cwd-less preamble to the first cwd-bearing line. */
+ * skipped), for scanning past a cwd-less preamble to the first cwd-bearing line.
+ * `truncated`: the scan stopped at a line/byte budget, so more lines may lie
+ * beyond it (a cwd could exist past the searched head); false means the whole file
+ * was read. */
 export type HeadLinesResult =
-  | { ok: true; lines: string[] }
+  | { ok: true; lines: string[]; truncated: boolean }
   | { ok: false; reason: 'inaccessible' | 'empty' };
 
 export interface DiscoveryIO {
@@ -228,28 +231,43 @@ function parseClaudeCwd(line: string): string | undefined {
   }
 }
 
+/** The outcome of searching a Claude transcript for its recorded working directory. */
+type ClaudeCwdResolution =
+  | { kind: 'found'; cwd: string } // a cwd-bearing record was read
+  | { kind: 'none' } // the whole head was read and carries no cwd yet (empty or a preamble)
+  | { kind: 'unconfirmed' }; // the head could not be fully searched, so a cwd may lie beyond it
+
 /**
- * The working directory a Claude transcript declares. A session's first records
- * are a cwd-less preamble (ai-title, queue-operation, attachments), so the first
- * line rarely carries the cwd; scan a bounded head for the first record that does.
- * Returns undefined when the head holds no cwd (an empty/not-yet-written transcript
- * or one still in its preamble), which the caller treats as a provisional binding
- * to be re-resolved once more of the transcript is written.
+ * Search a Claude transcript for the working directory it declares. A session's
+ * first records are a cwd-less preamble (ai-title, queue-operation, attachments),
+ * so the first line rarely carries the cwd; scan a bounded head for the first
+ * record that does.
+ *
+ * `none` means the searched head genuinely holds no cwd yet — an empty or
+ * still-preamble transcript — which the caller withholds (pending) and re-checks
+ * once more is written. `unconfirmed` means the head could NOT be fully searched
+ * (truncated at the scan budget, or unreadable), so a cwd may sit beyond it and
+ * membership cannot be trusted; the caller discloses it rather than slug-trust a
+ * candidate that could belong to a slug-colliding sibling worktree.
  */
 async function resolveClaudeCwd(
   io: DiscoveryIO,
   path: string,
   firstLine: string,
-): Promise<string | undefined> {
+): Promise<ClaudeCwdResolution> {
   const first = parseClaudeCwd(firstLine);
-  if (first !== undefined) return first;
+  if (first !== undefined) return { kind: 'found', cwd: first };
   const head = await io.readHeadLines(path);
-  if (!head.ok) return undefined;
+  // The first line already read, so the file is non-empty; an unreadable or
+  // raced-to-empty head here leaves membership unconfirmable.
+  if (!head.ok) return { kind: 'unconfirmed' };
   for (const line of head.lines) {
     const cwd = parseClaudeCwd(line);
-    if (cwd !== undefined) return cwd;
+    if (cwd !== undefined) return { kind: 'found', cwd };
   }
-  return undefined;
+  // No cwd in the searched head: a truncated head may hide one beyond the window;
+  // a fully-read head genuinely has none yet.
+  return head.truncated ? { kind: 'unconfirmed' } : { kind: 'none' };
 }
 
 export async function discoverClaude(
@@ -267,42 +285,38 @@ export async function discoverClaude(
   for (const path of listed.paths) {
     const sessionId = baseName(path).slice(0, -'.jsonl'.length);
     // The slug directory alone cannot establish membership: two distinct roots can
-    // collide onto one slug (e.g. /work/a-b and /work/a/b). Validate the transcript's
-    // recorded cwd (found by scanning past its cwd-less preamble) whenever it is
-    // readable; only fall back to trusting the slug when no cwd is recorded yet (an
-    // empty/not-yet-written transcript, or one still in its preamble), which keeps a
-    // provisional binding the watcher re-resolves once the cwd appears.
+    // collide onto one slug (e.g. /work/a-b and /work/a/b). So a transcript is bound
+    // ONLY once its recorded cwd has been read and confirmed in-root — it is never
+    // slug-trusted. Until confirmation:
+    //   - an empty or still-preamble transcript is withheld with no issue (pending
+    //     coverage); it is re-checked next tick once more is written, and no record
+    //     is ingested under an unconfirmed binding (so a colliding sibling's records
+    //     landing before confirmation can never be credited to this root);
+    //   - a transcript whose membership cannot be confirmed (unreadable/oversized or
+    //     truncated head, or an in-root cwd that will not resolve) is disclosed.
     const head = await io.readFirstLine(path);
-    if (!head.ok && head.reason !== 'empty') {
-      // A first line that exists but could not be read or validated (malformed,
-      // e.g. invalid UTF-8 or an unbounded line; or inaccessible): disclose the gap
-      // and withhold binding rather than slug-trust a candidate whose membership we
-      // could not confirm. An empty (not-yet-written) transcript is different — it
-      // has no line to contradict the slug — and falls through to the slug binding.
+    if (!head.ok) {
+      if (head.reason === 'empty') continue; // not yet written: withhold, stays pending
+      // A first line that exists but could not be read (malformed, e.g. invalid
+      // UTF-8 or an unbounded line; or inaccessible): disclose the gap.
       issues.push({ kind: head.reason, detail: `claude transcript ${path}` });
       continue;
     }
-    const recordedCwd = head.ok ? await resolveClaudeCwd(io, path, head.line) : undefined;
-    if (recordedCwd !== undefined) {
-      const cls = await classifyCwd(io, root, recordedCwd);
-      if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
-      if (cls.kind === 'unresolved-in-root') {
-        issues.push({
-          kind: 'inaccessible',
-          detail: `claude transcript ${path} cwd ${recordedCwd} could not be resolved`,
-        });
-        continue;
-      }
-      bindings.push({
-        path,
-        ctx: {
-          harness: 'claude-code',
-          harnessSessionId: sessionId,
-          root,
-          cwd: cls.cwd,
-          adapterVersion: CLAUDE_ADAPTER_VERSION,
-          ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
-        },
+    const resolution = await resolveClaudeCwd(io, path, head.line);
+    if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
+    if (resolution.kind === 'unconfirmed') {
+      issues.push({
+        kind: 'inaccessible',
+        detail: `claude transcript ${path} membership unconfirmed: no cwd within the searched head`,
+      });
+      continue;
+    }
+    const cls = await classifyCwd(io, root, resolution.cwd);
+    if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
+    if (cls.kind === 'unresolved-in-root') {
+      issues.push({
+        kind: 'inaccessible',
+        detail: `claude transcript ${path} cwd ${resolution.cwd} could not be resolved`,
       });
       continue;
     }
@@ -312,8 +326,9 @@ export async function discoverClaude(
         harness: 'claude-code',
         harnessSessionId: sessionId,
         root,
-        cwd: root,
+        cwd: cls.cwd,
         adapterVersion: CLAUDE_ADAPTER_VERSION,
+        ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
       },
     });
   }

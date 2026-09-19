@@ -51,7 +51,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [] }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -69,6 +69,11 @@ const RELATIVE_WRITE = JSON.stringify({
   timestamp: '2026-09-19T12:00:00.000Z',
   message: { content: [{ type: 'tool_use', id: 'toolu_rel', name: 'Write', input: { file_path: 'x.ts' } }] },
 });
+
+// A cwd-bearing record confirming the transcript belongs to the capture root.
+// Real transcripts carry the cwd on an early user record, not the tool_use write,
+// so discovery reports it independently of the evidence bytes fileIO serves.
+const CWD_RECORD = JSON.stringify({ type: 'user', cwd: ROOT, message: { content: 'hi' } });
 
 // An absolute write under a symlinked alias of the root. It only relativizes to an
 // in-root path ('a.ts') once discovery has derived the alias; against the bare root
@@ -164,6 +169,7 @@ describe('transcript watcher', () => {
       discoveryIO: discoveryIO({
         listDir: async (d): Promise<ListResult> =>
           d === dir ? { ok: true, paths: [`${dir}/sess-a.jsonl`] } : { ok: false, reason: 'missing' },
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -187,6 +193,7 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [`${dir}/sess-a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -211,6 +218,8 @@ describe('transcript watcher', () => {
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> =>
           present ? { ok: true, paths: [path] } : { ok: false, reason: 'missing' },
+        readFirstLine: async () =>
+          present ? { ok: true, line: CWD_RECORD } : { ok: false, reason: 'empty' },
       }),
       fileIO: fileIO(files),
       sink,
@@ -270,14 +279,13 @@ describe('transcript watcher', () => {
     );
   });
 
-  it('discloses a relative Claude write as unknown scope, never guessing a provisional cwd', async () => {
-    // Regression for the provisional-binding conflict: an empty transcript
-    // slug-trust binds cwd=root, then a relative write arrives before the real cwd
-    // is known. Claude's write tools declare absolute paths, so a relative one
-    // cannot be resolved without trusting a cwd that may be provisional or an alias
-    // of the root. The adapter discloses it as an unmapped possible writer — the
-    // same single unknown-scope record on every tick, so a re-read dedups and the
-    // invocation never splits into two conflicting scope variants.
+  it('discloses a relative Claude write as unknown scope, never guessing a cwd', async () => {
+    // Membership is confirmed by the transcript's recorded cwd (=root), so the
+    // session binds. But Claude's write tools declare absolute paths by design, so a
+    // relative write path is anomalous: the adapter refuses to resolve it against the
+    // cwd (which may be an alias of the root) and discloses it as an unmapped possible
+    // writer — the same single unknown-scope record on every tick, so a re-read dedups
+    // and the invocation never splits into two conflicting scope variants.
     const dir = '/home/projects/-work-proj';
     const path = `${dir}/sess-a.jsonl`;
     const file = new FakeFile();
@@ -289,16 +297,19 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
+        // The cwd record confirming membership appears only once the file is written.
+        readFirstLine: async () =>
+          files.has(path) ? { ok: true, line: CWD_RECORD } : { ok: false, reason: 'empty' },
       }),
       fileIO: fileIO(files),
       sink,
       publish,
     });
-    await watcher.tick(); // empty transcript: provisional cwd=root, nothing read
+    await watcher.tick(); // empty transcript: unconfirmed, withheld, nothing read
     assert.equal(sink.appended.length, 0);
     file.append(RELATIVE_WRITE + '\n');
     files.set(path, file);
-    await watcher.tick(); // relative write arrives
+    await watcher.tick(); // membership confirmed; relative write arrives
     await watcher.tick(); // a re-read must not add a second, differently-scoped variant
     const relStarts = sink.appended.filter(
       (e) => e.evidence_key.record_id === 'toolu_rel' && e.timestamp.basis === 'tool-start',
@@ -309,11 +320,12 @@ describe('transcript watcher', () => {
 
   it('captures an aliased absolute write after discovery derives the alias', async () => {
     // Regression for the dropped-alias P1: the first tick sees an empty transcript
-    // and slug-trust binds cwd=root with no aliases. An absolute write under a
-    // symlinked alias of the root then arrives; against the bare root it escapes
-    // scope. Once discovery head-scans the now-written transcript and derives the
-    // alias, the changed binding must recreate the reader so the write is re-read and
-    // scoped in-root — not left credited to the stale no-alias reader (silent drop).
+    // with no confirmed cwd, so the session is withheld (no binding, nothing read).
+    // The transcript then gets a cwd-less preamble followed by a cwd record naming a
+    // symlinked alias of the root; an absolute write under that alias arrives too.
+    // Once discovery head-scans the now-written transcript, confirms membership, and
+    // derives the alias, the binding appears and the write is read and scoped in-root
+    // — not escaped against the bare root (silent drop).
     const dir = '/home/projects/-work-proj';
     const path = `${dir}/sess-a.jsonl`;
     const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
@@ -328,24 +340,24 @@ describe('transcript watcher', () => {
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
         // The transcript's cwd lives past a cwd-less preamble and appears only once
-        // the file is written; before that the first line is empty (slug-trust).
+        // the file is written; before that the first line is empty (unconfirmed).
         readFirstLine: async () =>
           files.has(path) ? { ok: true as const, line: preamble } : { ok: false as const, reason: 'empty' as const },
         readHeadLines: async () =>
           files.has(path)
-            ? { ok: true as const, lines: [preamble, cwdRecord] }
-            : { ok: true as const, lines: [] },
+            ? { ok: true as const, lines: [preamble, cwdRecord], truncated: false as const }
+            : { ok: true as const, lines: [], truncated: false as const },
         realpath: async (p) => (p === '/alias/proj' ? ROOT : p),
       }),
       fileIO: fileIO(files),
       sink,
       publish,
     });
-    await watcher.tick(); // empty transcript: provisional cwd=root, no alias, nothing read
+    await watcher.tick(); // empty transcript: unconfirmed membership, nothing read
     assert.equal(sink.appended.length, 0);
     file.append(ALIASED_WRITE + '\n');
     files.set(path, file);
-    await watcher.tick(); // discovery derives the alias; reader recreated, write re-read
+    await watcher.tick(); // discovery confirms membership + derives the alias; write read
     const starts = sink.appended.filter(
       (e) => e.evidence_key.record_id === 'toolu_alias' && e.timestamp.basis === 'tool-start',
     );
