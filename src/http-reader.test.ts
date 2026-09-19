@@ -354,6 +354,23 @@ describe('http-reader clip projection', () => {
       assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 410);
     } finally { await srv.close(); }
   });
+
+  it('410s (not 404s) a clips request when delete races the boundary check', async () => {
+    // Simulate delete_session landing between the initial tombstone check and the
+    // boundary read: durable tombstone plus a boundary frozen to 0 makes every
+    // positive seq look "beyond" H. That is removal, not an unknown change.
+    const { dir } = await storeWithChange();
+    const health = createHealth(2n);
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, liveBoundary(health));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+      registry.freeze(UUID, 0n);
+      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+      assert.equal(res.status, 410);
+    } finally { await srv.close(); }
+  });
 });
 
 function sseEvents(text: string): { id: string; data: string }[] {

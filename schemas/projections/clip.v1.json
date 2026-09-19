@@ -100,7 +100,60 @@
           "type": "string",
           "$comment": "Present when the method needs one (e.g. `unavailable` carries the blob/snapshot reason)."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "absent"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "whole-file"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/span"
+              }
+            }
+          }
+        }
+      ]
     },
     "span": {
       "type": "object",

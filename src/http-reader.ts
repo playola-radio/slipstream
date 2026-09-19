@@ -234,7 +234,14 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     // no committed change (the same boundary the events feed serves).
     const seq = BigInt(seqStr);
     const H = (await boundaryFor(id)).current();
-    if (seq < 1n || seq > H) { send(res, 404, 'not found'); return; }
+    if (seq < 1n || seq > H) {
+      // A delete racing this request can publish the tombstone and freeze the
+      // boundary to 0 after the tombstone check above but before this read: any
+      // positive seq then looks "beyond" H. That is removal, not an unknown
+      // change: 410 if the marker is now durable, else the genuine 404.
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      send(res, 404, 'not found'); return;
+    }
 
     // Read exactly the record at `seq`. openLogCursor positions after seq-1 and
     // readThrough(seq) yields that single event; corruption in the scanned prefix

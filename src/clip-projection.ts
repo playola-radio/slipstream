@@ -150,8 +150,15 @@ export function projectClips(
       return asFallback([wholeFileClip('no-line-change')]);
     }
     const plans = hunks.map((h): ClipPlan => ({
-      before: { kind: 'range', range: h.before, method: 'changed-range' },
-      after: { kind: 'range', range: h.after, method: 'changed-range' },
+      // A raw-empty side (pure insertion/deletion) is null even though context
+      // padding makes the merged range non-empty: the contract requires no
+      // corresponding span there, never a context-only span.
+      before: h.beforeRawEmpty
+        ? { kind: 'null', method: 'changed-range' }
+        : { kind: 'range', range: h.before, method: 'changed-range' },
+      after: h.afterRawEmpty
+        ? { kind: 'null', method: 'changed-range' }
+        : { kind: 'range', range: h.after, method: 'changed-range' },
     }));
     return asFallback(plans);
   }
@@ -257,7 +264,16 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 // --- diff ------------------------------------------------------------------
 
 interface LineRange { s0: number; e0: number } // half-open, 0-based line indices
-interface Hunk { before: LineRange; after: LineRange }
+interface Hunk {
+  before: LineRange;
+  after: LineRange;
+  // Whether the RAW (pre-context) changed block was zero-length on that side —
+  // a pure insertion has an empty raw `before`, a pure deletion an empty raw
+  // `after`. Context padding must never turn that into a non-null span: the
+  // published contract requires `span: null` there (see materialize below).
+  beforeRawEmpty: boolean;
+  afterRawEmpty: boolean;
+}
 
 /** Line-level LCS diff grouped into hunks of changed lines +/- `context`
  *  unchanged lines. Hunks whose context windows would touch are merged. */
@@ -274,7 +290,7 @@ function diffHunks(before: string[], after: string[], context: number): Hunk[] {
     }
   }
   // Raw change blocks between matched (equal) line pairs.
-  const blocks: Hunk[] = [];
+  const blocks: { before: LineRange; after: LineRange }[] = [];
   let i = 0;
   let j = 0;
   let pi = 0;
@@ -292,19 +308,32 @@ function diffHunks(before: string[], after: string[], context: number): Hunk[] {
   if (pi < n || pj < m) blocks.push({ before: { s0: pi, e0: n }, after: { s0: pj, e0: m } });
 
   // Merge blocks separated by <= 2*context equal lines, then pad with context.
-  const merged: Hunk[] = [];
+  // Raw (pre-context) emptiness must survive the merge: a merged run is only
+  // "raw-empty" on a side if EVERY block it absorbed was empty on that side —
+  // one non-empty block anywhere in the run means real content is in play.
+  const merged: (Hunk & { beforeRaw: LineRange; afterRaw: LineRange })[] = [];
   for (const blk of blocks) {
+    const beforeEmpty = blk.before.s0 === blk.before.e0;
+    const afterEmpty = blk.after.s0 === blk.after.e0;
     const last = merged[merged.length - 1];
-    if (last && blk.before.s0 - last.before.e0 <= 2 * context) {
-      last.before.e0 = blk.before.e0;
-      last.after.e0 = blk.after.e0;
+    if (last && blk.before.s0 - last.beforeRaw.e0 <= 2 * context) {
+      last.beforeRaw.e0 = blk.before.e0;
+      last.afterRaw.e0 = blk.after.e0;
+      last.beforeRawEmpty = last.beforeRawEmpty && beforeEmpty;
+      last.afterRawEmpty = last.afterRawEmpty && afterEmpty;
     } else {
-      merged.push({ before: { ...blk.before }, after: { ...blk.after } });
+      merged.push({
+        before: { ...blk.before }, after: { ...blk.after },
+        beforeRaw: { ...blk.before }, afterRaw: { ...blk.after },
+        beforeRawEmpty: beforeEmpty, afterRawEmpty: afterEmpty,
+      });
     }
   }
   return merged.map((h) => ({
-    before: { s0: Math.max(0, h.before.s0 - context), e0: Math.min(n, h.before.e0 + context) },
-    after: { s0: Math.max(0, h.after.s0 - context), e0: Math.min(m, h.after.e0 + context) },
+    before: { s0: Math.max(0, h.beforeRaw.s0 - context), e0: Math.min(n, h.beforeRaw.e0 + context) },
+    after: { s0: Math.max(0, h.afterRaw.s0 - context), e0: Math.min(m, h.afterRaw.e0 + context) },
+    beforeRawEmpty: h.beforeRawEmpty,
+    afterRawEmpty: h.afterRawEmpty,
   }));
 }
 
@@ -314,7 +343,11 @@ type SidePlan =
   // `range: null` on a whole-file plan means "the entire side"; the exact range
   // is resolved from the side's line count at materialization.
   | { kind: 'range'; range: LineRange | null; method: 'changed-range' | 'whole-file'; reason?: string }
-  | { kind: 'null'; method: 'absent' | 'unavailable'; reason?: string };
+  // `changed-range` here is the pure-insertion/pure-deletion side of a hunk: the
+  // RAW (pre-context) block was zero-length, so this side has no corresponding
+  // span at all — never budget-clipped, distinct from `empty` materialization of
+  // a padded range that happens to net to zero.
+  | { kind: 'null'; method: 'absent' | 'unavailable' | 'changed-range'; reason?: string };
 interface ClipPlan { before: SidePlan; after: SidePlan }
 
 function nullSide(method: 'absent' | 'unavailable', reason?: string): SidePlan {
@@ -340,10 +373,23 @@ interface Budget { lines: number; bytes: number }
 type SideOutcome = 'ok' | 'empty' | 'partial' | 'dropped';
 interface Materialized { side: ClipSide; outcome: SideOutcome }
 
+/** Whether a plan carries actual content on the given side: a `range` plan with
+ *  a non-empty range, or a `whole-file` plan. A `null` plan (absent/unavailable)
+ *  or a zero-length `range` is NOT content — there is nothing there to omit. */
+function planHasContent(plan: SidePlan): boolean {
+  if (plan.kind === 'null') return false;
+  if (plan.method === 'whole-file') return true;
+  return plan.range === null || plan.range.e0 - plan.range.s0 > 0;
+}
+
 /** Materialize clip plans into clips, enforcing the per-side line/byte caps
  *  across the whole array. When a side's budget clips a span short, or prevents
  *  a later hunk from being emitted at all, the last emitted span on that side is
- *  marked `truncated` so the omission is disclosed rather than silent. */
+ *  marked `truncated` so the omission is disclosed rather than silent. Disclosure
+ *  is precise: a side is only marked truncated if some OMITTED plan (the one
+ *  that triggered the break, or a later one never reached) actually carries
+ *  content on that side — dropping past a plan with nothing on a given side must
+ *  not mark that side truncated. */
 function clipArray(plans: ClipPlan[], before: ResolvedSide, after: ResolvedSide, limits: {
   maxLines: number; maxBytes: number;
 }): Clip[] {
@@ -352,18 +398,31 @@ function clipArray(plans: ClipPlan[], before: ResolvedSide, after: ResolvedSide,
   const clips: Clip[] = [];
   let beforeTrunc = false;
   let afterTrunc = false;
-  for (const plan of plans) {
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i]!;
     const b = materialize(plan.before, before, beforeBudget);
     const a = materialize(plan.after, after, afterBudget);
     if (b.outcome === 'dropped' || a.outcome === 'dropped') {
-      if (b.outcome === 'dropped') beforeTrunc = true;
-      if (a.outcome === 'dropped') afterTrunc = true;
+      // Every omitted plan is the current one (whichever side dropped it discards
+      // the whole clip) plus every later plan never reached. Either side may
+      // carry content in the omitted set independent of which side triggered the
+      // break, so scan both sides across the full omitted range.
+      for (const omitted of plans.slice(i)) {
+        if (planHasContent(omitted.before)) beforeTrunc = true;
+        if (planHasContent(omitted.after)) afterTrunc = true;
+      }
       break;
     }
     clips.push({ before: b.side, after: a.side });
     if (b.outcome === 'partial') beforeTrunc = true;
     if (a.outcome === 'partial') afterTrunc = true;
-    if (b.outcome === 'partial' || a.outcome === 'partial') break;
+    if (b.outcome === 'partial' || a.outcome === 'partial') {
+      for (const omitted of plans.slice(i + 1)) {
+        if (planHasContent(omitted.before)) beforeTrunc = true;
+        if (planHasContent(omitted.after)) afterTrunc = true;
+      }
+      break;
+    }
   }
   if (beforeTrunc) markLastSpanTruncated(clips, 'before');
   if (afterTrunc) markLastSpanTruncated(clips, 'after');

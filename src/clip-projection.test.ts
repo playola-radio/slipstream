@@ -4,6 +4,8 @@ import {
   projectClips,
   CLIP_PROJECTION_VERSION,
   type SideInput,
+  type ClipSide,
+  type ClipProjection,
 } from './clip-projection.ts';
 
 const bytes = (s: string): SideInput => ({ kind: 'bytes', bytes: Buffer.from(s, 'utf8') });
@@ -228,6 +230,23 @@ test('a hunk dropped after a null-span insertion still discloses truncation', ()
   assert.equal(p.clips.some((c) => c.before.span?.truncated === true), true);
 });
 
+test('asymmetric budget exhaustion: an omitted after-side edit is not silently disclosed as clean', () => {
+  // Hunk 1 exactly exhausts the shared per-side line budget on BOTH sides (2
+  // lines each), so hunk 2's before outcome is 'dropped'. Hunk 2 also carries
+  // real after-side content (Z1/Z2), which must not vanish with
+  // truncated:false — only the before side triggered the break, but the after
+  // side omitted real content too.
+  const before = 'p1\np2\nMID1\nMID2\nMID3\nMID4\nMID5\nq1\nq2\n';
+  const after = 'y\nMID1\nMID2\nMID3\nMID4\nMID5\nZ1\nZ2\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 0, maxLinesPerSide: 2 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.length, 1);
+  // Every omitted side (before AND after) must be disclosed — no span reads
+  // truncated:false while content on that side was actually dropped.
+  assert.equal(p.clips[0]!.before.span!.truncated, true);
+  assert.equal(p.clips[0]!.after.span!.truncated, true);
+});
+
 test('before gone with an after too large to clip is unavailable, not a cacheable skip', () => {
   // A missing before forces a whole-file render of after; if after cannot be
   // clipped within budget, the disposition is availability-dependent (a restored
@@ -248,6 +267,35 @@ test('before present-but-oversize with an unclippable after stays a deterministi
   assert.equal(p.fallback_reason, 'clip-too-large');
 });
 
+test('pure insertion with non-zero context: before span is null, not a context-filled range', () => {
+  // Before this fix, context padding turned the raw-empty before side of a pure
+  // insertion into a non-null range of context-only lines, hiding the fact that
+  // nothing on the before side actually changed.
+  const before = 'a\nb\nc\n';
+  const after = 'a\nX\nb\nc\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 20 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.length, 1);
+  const clip = p.clips[0]!;
+  assert.equal(clip.before.method, 'changed-range');
+  assert.equal(clip.before.span, null);
+  assert.equal(clip.after.method, 'changed-range');
+  assert.notEqual(clip.after.span, null);
+});
+
+test('pure deletion with non-zero context: after span is null, not a context-filled range', () => {
+  const before = 'a\nb\nX\nc\n';
+  const after = 'a\nb\nc\n';
+  const p = projectClips(bytes(before), bytes(after), { changeSeq: SEQ, context: 20 });
+  assert.equal(p.status, 'fallback');
+  assert.equal(p.clips.length, 1);
+  const clip = p.clips[0]!;
+  assert.equal(clip.after.method, 'changed-range');
+  assert.equal(clip.after.span, null);
+  assert.equal(clip.before.method, 'changed-range');
+  assert.notEqual(clip.before.span, null);
+});
+
 test('an empty corresponding range (insertion) does not stop later hunks', () => {
   // Insert X at the top and edit d->D at the bottom. The insertion's before side
   // is an empty range (null span); it must not be mistaken for budget exhaustion
@@ -259,4 +307,49 @@ test('an empty corresponding range (insertion) does not stop later hunks', () =>
   assert.equal(p.clips.length, 2);
   assert.equal(p.clips[0]!.before.span, null); // insertion: nothing on the before side
   assert.equal(p.clips[1]!.after.span!.line_start, 5); // the D edit survived
+});
+
+// Method-dependent span rules published in schemas/projections/clip.v1.json's
+// `$defs/side`: `unavailable` forces span null + reason required, `absent`
+// forces span null, `whole-file` forces span non-null, `changed-range` allows
+// either. Every clip side this module ever produces must satisfy them.
+function assertSideConformsToSchema(side: ClipSide, where: string): void {
+  switch (side.method) {
+    case 'unavailable':
+      assert.equal(side.span, null, `${where}: unavailable must have a null span`);
+      assert.ok(side.reason && side.reason.length > 0, `${where}: unavailable must carry a reason`);
+      break;
+    case 'absent':
+      assert.equal(side.span, null, `${where}: absent must have a null span`);
+      break;
+    case 'whole-file':
+      assert.notEqual(side.span, null, `${where}: whole-file must have a non-null span`);
+      break;
+    case 'changed-range':
+      break; // span may be object or null
+  }
+}
+
+test('every produced clip side conforms to the published method/span schema rules', () => {
+  const scenarios: ClipProjection[] = [
+    projectClips({ kind: 'absent' }, bytes('line1\nline2\nline3\n'), { changeSeq: SEQ }),
+    projectClips(bytes('a\nb\n'), { kind: 'absent' }, { changeSeq: SEQ }),
+    projectClips(bytes('a\nb\nc\nd\ne\nf\ng\n'), bytes('a\nb\nc\nD\ne\nf\ng\n'), { changeSeq: SEQ, context: 1 }),
+    projectClips(bytes('a\nb\n'), bytes('c\nd\n'), { changeSeq: SEQ, maxCells: 1 }),
+    projectClips({ kind: 'missing', reason: 'blob-gone' }, bytes('a\nb\n'), { changeSeq: SEQ }),
+    projectClips(bytes('a\nb\nc\n'), bytes('a\nX\nb\nc\n'), { changeSeq: SEQ, context: 20 }),
+    projectClips(bytes('a\nb\nX\nc\n'), bytes('a\nb\nc\n'), { changeSeq: SEQ, context: 20 }),
+    projectClips(bytes('a\nb\nc\nd\n'), bytes('X\na\nb\nc\nD\n'), { changeSeq: SEQ, context: 0 }),
+    projectClips(
+      bytes('p1\np2\nMID1\nMID2\nMID3\nMID4\nMID5\nq1\nq2\n'),
+      bytes('y\nMID1\nMID2\nMID3\nMID4\nMID5\nZ1\nZ2\n'),
+      { changeSeq: SEQ, context: 0, maxLinesPerSide: 2 },
+    ),
+  ];
+  for (const [i, p] of scenarios.entries()) {
+    for (const [j, clip] of p.clips.entries()) {
+      assertSideConformsToSchema(clip.before, `scenario ${i} clip ${j} before`);
+      assertSideConformsToSchema(clip.after, `scenario ${i} clip ${j} after`);
+    }
+  }
 });
