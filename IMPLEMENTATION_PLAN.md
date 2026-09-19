@@ -456,7 +456,20 @@ sequence, not backdated; (b) late transcript arriving after restart → revises
 without duplicate evidence; (c) native-identity fixtures prove the `record_id` +
 file-scope mapping for BOTH harnesses.
 
-**Status**: In Progress.
+**Status**: Implementation complete; pending Codex adversarial review.
+- Adapters, discovery, incremental file reader, coverage watcher/runner, config
+  surface (file + CLI overrides), and session/daemon/CLI wiring landed.
+- All three required tests present: (a) `session.test.ts` append-order grouping;
+  (b) `transcript/restart-idempotence.test.ts` (fresh watcher rereads from
+  offset 0, ingestor log-derived dedup absorbs the replayed prefix, only the
+  late record appends); (c) `transcript/claude.test.ts` + `codex.test.ts`
+  native-identity fixtures. `npm run typecheck` + `npm test` (609) green.
+- **Flagged for Brian:** the coverage event is a *separate* durable
+  `slipstream.enrichment.coverage.v1` (Q1 above), replacing A1's unimplemented
+  `evidence_availability` sketch. Confirm this is the intended shape.
+- **Known benign tradeoff:** the watcher's `lastKey` is in-memory, so the first
+  tick after a restart may republish identical coverage. Harmless — coverage
+  folds highest-seq-wins and the fold is idempotent.
 
 ---
 
