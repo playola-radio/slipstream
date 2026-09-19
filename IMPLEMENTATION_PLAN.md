@@ -388,7 +388,21 @@ generation-fenced replay barrier (no double-attribution). The Stage-3 inline
 disclosed as a separate revisable event. Acceptance tests pass against FAKE
 evidence; real transcript adapters are A2. Track B
 clips (B1 clip-projection contract + bounded fallback → B2 tree-sitter extraction
-+ measured latency gate). D4 makes clips a **reader-derived public projection**
++ measured latency gate). **B1 built** on
+`briankeane/clip-projection-contract`: the pure work-capped core
+(`projectClips` over before/after bytes), the I/O-scoped reusable module
+(`computeClipProjection`, the direct-disk/TUI path), a worker-thread wrapper and
+pool, the on-demand service (bounded admission + queue, content-addressed
+disposable LRU, in-flight coalescing, revalidate-on-hit, 100 ms wall-clock
+deadline that cancels and replaces a stuck worker), the reader endpoint
+`GET /v1/sessions/:id/changes/:seq/clips`, and the published contract
+`schemas/projections/clip.v1.json` served at `/v1/schemas/projections/:version`.
+No log event, no persistence: clips are viewable exactly while the blobs are
+retained, and GC'd blobs yield an explicit `unavailable` projection with a
+reason. Byte/line rules and status/reason semantics are documented in
+`CLIP-PROJECTION.md`. Tree-sitter function extraction (the `ready` status) and
+the measured cold-cache latency gate remain B2. D4 makes clips a
+**reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
 rather than `change.clips` log events; attribution stays a log producer. See
 `STAGE-4-PLAN.md` for the D4 rationale, resolved schema forks, the D2

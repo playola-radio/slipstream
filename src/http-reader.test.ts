@@ -1,6 +1,6 @@
 import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, appendFile, symlink, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, symlink, access, rm } from 'node:fs/promises';
 import { ServerResponse } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -227,6 +227,149 @@ describe('http-reader blobs + schemas', () => {
     const body = (await res.json()) as { properties: { type: { const: string } } };
     assert.equal(body.properties.type.const, 'slipstream.file.changed.v1');
     assert.equal((await GET(srv, '/v1/schemas/nope.v1')).status, 404);
+  });
+});
+
+const ceLine = (seq: number, type: string, data: Record<string, unknown>): string =>
+  JSON.stringify({
+    specversion: '1.0', id: String(seq), source: `urn:slipstream:session:${UUID}`,
+    type, datacontenttype: 'application/json', seq: String(seq),
+    time: '2026-01-01T00:00:00.000Z', data: { session_id: UUID, ...data },
+  });
+
+// A store with one file.changed.v1 at seq 2 whose before/after reference real blobs.
+async function storeWithChange(): Promise<{ dir: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-clips-'));
+  const cas = await createCas(join(dir, 'blobs'));
+  const before = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
+  const after = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+  const lines = [
+    ceLine(1, 'slipstream.session.started.v1', { root: '/w', max_bytes: 1024, started_at_ms: 0 }),
+    ceLine(2, 'slipstream.file.changed.v1', {
+      path: 'x.txt',
+      before: { kind: 'content', sha256: before.sha256, size: before.size },
+      after: { kind: 'content', sha256: after.sha256, size: after.size },
+      observation: 'watcher', observed_at_ms: 0,
+    }),
+  ];
+  await writeFile(join(dir, 'sessions', UUID, 'events.jsonl'), lines.join('\n') + '\n', 'utf8');
+  return { dir };
+}
+
+describe('http-reader clip projection', () => {
+  it('returns a clip projection for a change', async () => {
+    const { dir } = await storeWithChange();
+    const srv = await startReaderServer({ storeDir: dir });
+    try {
+      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
+      const body = await res.json() as {
+        change_seq: string; projection_version: string; status: string; clips: unknown[];
+      };
+      assert.equal(body.change_seq, '2');
+      assert.equal(body.projection_version, 'clip.v1');
+      assert.equal(body.status, 'fallback');
+      assert.ok(body.clips.length >= 1);
+    } finally { await srv.close(); }
+  });
+
+  it('reports clips unavailable with a reason when the blobs were GC\'d', async () => {
+    const { dir } = await storeWithChange();
+    await rm(join(dir, 'blobs'), { recursive: true, force: true }); // GC dropped the content
+    const srv = await startReaderServer({ storeDir: dir });
+    try {
+      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+      assert.equal(res.status, 200); // the request succeeded; the projection carries availability
+      const body = await res.json() as { status: string; fallback_reason?: string };
+      assert.equal(body.status, 'unavailable');
+      assert.ok(body.fallback_reason && body.fallback_reason.length > 0); // explicit reason, never faked
+    } finally { await srv.close(); }
+  });
+
+  it('serves the published projection schema and 404s an unknown version', async () => {
+    // Schema lookup is static: it reads no session log or blobs, so an empty
+    // store is enough — no captured change needs fabricating.
+    const srv = await startReaderServer({ storeDir: await mkdtemp(join(tmpdir(), 'slip-http-')) });
+    try {
+      const res = await GET(srv, '/v1/schemas/projections/clip.v1');
+      assert.equal(res.status, 200);
+      const body = await res.json() as { title: string; $id: string };
+      assert.equal(body.title, 'clip.v1');
+      assert.match(body.$id, /projections\/clip\.v1\.json$/);
+      assert.equal((await GET(srv, '/v1/schemas/projections/nope.v1')).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('404s a seq that is not a file.changed event', async () => {
+    const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/1/clips`)).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('404s a seq beyond the durable high-water', async () => {
+    const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/99/clips`)).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('404s a non-canonical (leading-zero) seq rather than stamping it', async () => {
+    // "02" resolves to change 2 via BigInt but would be echoed verbatim into a
+    // schema-invalid change_seq; reject it instead.
+    const srv = await startReaderServer({ storeDir: (await storeWithChange()).dir });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/02/clips`)).status, 404);
+    } finally { await srv.close(); }
+  });
+
+  it('500s a record missing within the durable boundary (corruption, not 404)', async () => {
+    // The registry declares the high-water at 2, but the log holds only seq 1:
+    // disk is short of its declared boundary. That is corruption, never an
+    // ordinary unknown-change 404.
+    const dir = await mkdtemp(join(tmpdir(), 'slip-clips-'));
+    await mkdir(join(dir, 'sessions', UUID), { recursive: true });
+    await writeFile(
+      join(dir, 'sessions', UUID, 'events.jsonl'),
+      ceLine(1, 'slipstream.session.started.v1', { root: '/w', max_bytes: 1024, started_at_ms: 0 }) + '\n',
+      'utf8',
+    );
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, staticBoundary(2n));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 500);
+    } finally { await srv.close(); }
+  });
+
+  it('404s an unknown session and 410s a tombstoned one', async () => {
+    const { dir } = await storeWithChange();
+    const srv = await startReaderServer({ storeDir: dir });
+    try {
+      const other = '33333333-3333-4333-8333-333333333333';
+      assert.equal((await GET(srv, `/v1/sessions/${other}/changes/2/clips`)).status, 404);
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+      assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 410);
+    } finally { await srv.close(); }
+  });
+
+  it('410s (not 404s) a clips request when delete races the boundary check', async () => {
+    // Simulate delete_session landing between the initial tombstone check and the
+    // boundary read: durable tombstone plus a boundary frozen to 0 makes every
+    // positive seq look "beyond" H. That is removal, not an unknown change.
+    const { dir } = await storeWithChange();
+    const health = createHealth(2n);
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, liveBoundary(health));
+    const srv = await startReaderServer({ storeDir: dir, registry });
+    try {
+      await writeFile(join(dir, 'sessions', UUID, 'removed.json'), '{"version":1}', 'utf8');
+      registry.freeze(UUID, 0n);
+      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+      assert.equal(res.status, 410);
+    } finally { await srv.close(); }
   });
 });
 

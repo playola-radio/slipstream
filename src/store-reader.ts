@@ -13,6 +13,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const HEX_RE = /^[0-9a-f]{64}$/;
 const SEQ_RE = /^[1-9][0-9]*$/;
 const SCHEMAS_DIR = fileURLToPath(new URL('../schemas/', import.meta.url));
+const PROJECTIONS_DIR = fileURLToPath(new URL('../schemas/projections/', import.meta.url));
+
+/** The published projection schemas, by projection_version. Not gated to
+ *  EVENT_TYPES: a projection is a reader-derived view, not a log event. */
+const PROJECTION_SCHEMAS = new Set<string>(['clip.v1']);
 
 export function isValidSessionId(id: string): boolean { return UUID_RE.test(id); }
 export function isValidHex(hex: string): boolean { return HEX_RE.test(hex); }
@@ -108,6 +113,11 @@ export async function listSessions(storeDir: string): Promise<SessionInfo[]> {
 export async function schemaBytes(type: string): Promise<Buffer | null> {
   if (!(EVENT_TYPES as readonly string[]).includes(type)) return null;
   return readFile(join(SCHEMAS_DIR, `${type}.json`));
+}
+
+export async function projectionSchemaBytes(version: string): Promise<Buffer | null> {
+  if (!PROJECTION_SCHEMAS.has(version)) return null;
+  return readFile(join(PROJECTIONS_DIR, `${version}.json`));
 }
 
 export async function readRuntimeDescriptor(storeDir: string): Promise<RuntimeDescriptor | null> {
