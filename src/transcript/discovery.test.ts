@@ -172,6 +172,23 @@ describe('transcript discovery', () => {
     assert.deepEqual(result.bindings[0]!.ctx.rootAliases, ['/alias/proj']);
   });
 
+  it('discloses a malformed Claude first line and withholds the binding', async () => {
+    // A first line that exists but is unreadable (malformed/inaccessible) cannot
+    // confirm membership, so it is disclosed and NOT slug-trust bound — otherwise a
+    // corrupt or slug-colliding transcript would publish clean readable coverage.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/bad.jsonl`] }),
+        readFirstLine: async () => ({ ok: false as const, reason: 'malformed' as const }),
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('bad.jsonl')));
+  });
+
   it('falls back to the slug binding when a Claude first line carries no cwd', async () => {
     const dir = `/home/projects/${claudeSlug(ROOT)}`;
     const result = await discoverClaude(

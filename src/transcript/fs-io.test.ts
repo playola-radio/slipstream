@@ -88,6 +88,17 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
     assert.ok(result.ok && JSON.parse(result.line).cwd === '/work/proj', 'the complete line parses');
   });
 
+  it('reports an oversized first line as malformed even when a newline terminates it', async () => {
+    // The size bound must hold whether or not the line ends: a terminated giant
+    // line is as unusable as an unterminated one and must not slip through as ok.
+    const oversized = Buffer.concat([Buffer.alloc(16 * 1024 * 1024 + 1, 0x78), Buffer.from('\n')]);
+    await writeFile(join(dir, 'oversized.jsonl'), oversized);
+    assert.deepEqual(await nodeDiscoveryIO.readFirstLine(join(dir, 'oversized.jsonl')), {
+      ok: false,
+      reason: 'malformed',
+    });
+  });
+
   it('reports an invalid-UTF-8 first line as malformed, never a lossily-decoded string', async () => {
     // Lossy decoding would coin a "s�" id that JSON.parse accepts, fabricating a
     // session identity. A fatal decode reports the line malformed instead.

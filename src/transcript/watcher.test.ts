@@ -63,6 +63,12 @@ const WRITE_A = JSON.stringify({
   message: { content: [{ type: 'tool_use', id: 'toolu_a', name: 'Write', input: { file_path: '/work/proj/a.ts' } }] },
 });
 
+const RELATIVE_WRITE = JSON.stringify({
+  type: 'assistant',
+  timestamp: '2026-09-19T12:00:00.000Z',
+  message: { content: [{ type: 'tool_use', id: 'toolu_rel', name: 'Write', input: { file_path: 'x.ts' } }] },
+});
+
 describe('coverage aggregation', () => {
   it('is pending when configured but nothing is discovered yet', () => {
     assert.deepEqual(aggregateCoverage([], []), { state: 'pending', issues: [] });
@@ -250,6 +256,45 @@ describe('transcript watcher', () => {
         .sort(),
       ['thread-1', 'thread-2'],
     );
+  });
+
+  it('recreates a reader when a provisional cwd resolves, re-scoping relative writes', async () => {
+    // Tick 1: the transcript is empty, so discovery slug-trust binds cwd=root.
+    // Tick 2: the first line now records the real cwd (root/pkg), so discovery
+    // rebinds. The reader must be recreated for the new scope: a relative write
+    // then resolves to pkg/x.ts, not the root-relative x.ts a stale binding gives.
+    const dir = '/home/projects/-work-proj';
+    const path = `${dir}/sess-a.jsonl`;
+    const file = new FakeFile();
+    const files = new Map<string, FakeFile>();
+    let hasContent = false;
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
+        readFirstLine: async () =>
+          hasContent
+            ? { ok: true, line: JSON.stringify({ type: 'assistant', cwd: '/work/proj/pkg' }) }
+            : { ok: false, reason: 'empty' },
+        realpath: async (p) => p,
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick(); // empty transcript: provisional cwd=root, nothing read
+    assert.equal(sink.appended.length, 0);
+    hasContent = true;
+    file.append(RELATIVE_WRITE + '\n');
+    files.set(path, file);
+    await watcher.tick(); // cwd resolved to root/pkg: reader recreated, re-scoped
+    const scopes = sink.appended
+      .filter((e) => e.evidence_key.record_id === 'toolu_rel' && e.timestamp.basis === 'tool-start')
+      .map((e) => e.file_scope);
+    assert.deepEqual(scopes, [{ kind: 'paths', paths: ['pkg/x.ts'] }]);
   });
 
   it('reports unavailable when the transcript home is inaccessible', async () => {

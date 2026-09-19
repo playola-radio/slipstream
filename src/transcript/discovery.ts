@@ -239,6 +239,15 @@ export async function discoverClaude(
     // the first line is unreadable or carries no cwd (an empty/not-yet-written or
     // summary transcript), which keeps the prior binding without over-disclosing.
     const head = await io.readFirstLine(path);
+    if (!head.ok && head.reason !== 'empty') {
+      // A first line that exists but could not be read or validated (malformed,
+      // e.g. invalid UTF-8 or an unbounded line; or inaccessible): disclose the gap
+      // and withhold binding rather than slug-trust a candidate whose membership we
+      // could not confirm. An empty (not-yet-written) transcript is different — it
+      // has no line to contradict the slug — and falls through to the slug binding.
+      issues.push({ kind: head.reason, detail: `claude transcript ${path}` });
+      continue;
+    }
     const recordedCwd = head.ok ? parseClaudeCwd(head.line) : undefined;
     if (recordedCwd !== undefined) {
       const cls = await classifyCwd(io, root, recordedCwd);

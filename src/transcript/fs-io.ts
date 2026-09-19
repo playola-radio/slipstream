@@ -117,16 +117,15 @@ export const nodeDiscoveryIO: DiscoveryIO = {
         sawByte = true;
         pos += bytesRead;
         const nl = buf.subarray(0, bytesRead).indexOf(0x0a);
-        if (nl >= 0) {
-          chunks.push(buf.subarray(0, nl));
-          total += nl;
-          break;
-        }
-        chunks.push(buf.subarray(0, bytesRead));
-        total += bytesRead;
+        const lineLen = nl >= 0 ? nl : bytesRead;
         // A single line beyond this bound is pathological (not line-delimited
-        // JSONL); disclose it malformed rather than read unbounded memory.
-        if (total > MAX_FIRST_LINE) return { ok: false, reason: 'malformed' };
+        // JSONL); disclose it malformed rather than read unbounded memory. Checked
+        // whether or not the chunk ends the line, so a huge line terminated by a
+        // newline cannot slip past the bound an unterminated one is held to.
+        if (total + lineLen > MAX_FIRST_LINE) return { ok: false, reason: 'malformed' };
+        chunks.push(buf.subarray(0, lineLen));
+        total += lineLen;
+        if (nl >= 0) break;
       }
       if (!sawByte) return { ok: false, reason: 'empty' };
       let line: string;
