@@ -48,6 +48,12 @@ export type FirstLineResult =
   | { ok: true; line: string }
   | { ok: false; reason: 'inaccessible' | 'empty' | 'malformed' };
 
+/** A bounded, decoded set of a transcript's leading lines (oversized lines
+ * skipped), for scanning past a cwd-less preamble to the first cwd-bearing line. */
+export type HeadLinesResult =
+  | { ok: true; lines: string[] }
+  | { ok: false; reason: 'inaccessible' | 'empty' };
+
 export interface DiscoveryIO {
   /** Absolute paths of `*.jsonl` files directly in `dir` (Claude). */
   listDir(dir: string): Promise<ListResult>;
@@ -56,6 +62,10 @@ export interface DiscoveryIO {
   listTreeJsonl(dir: string, limit: number): Promise<TreeResult>;
   /** The first line of a file, for reading a Codex `session_meta`. */
   readFirstLine(path: string): Promise<FirstLineResult>;
+  /** A bounded set of a Claude transcript's leading lines, for scanning past its
+   * cwd-less preamble (ai-title, queue-operation, attachments) to the first record
+   * that declares the working directory. */
+  readHeadLines(path: string): Promise<HeadLinesResult>;
   /** Canonicalize a path, or undefined if it does not resolve. */
   realpath(path: string): Promise<string | undefined>;
   /** Inspect a single path component WITHOUT resolving it, so a dangling symlink,
@@ -208,8 +218,7 @@ async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<
   return { kind: 'in-root', cwd: canonicalCwd, ...(rootAliases !== undefined ? { rootAliases } : {}) };
 }
 
-/** The top-level `cwd` a Claude transcript record carries, if any (its first line
- * always records the session's working directory). */
+/** The top-level `cwd` a Claude transcript record carries, if any. */
 function parseClaudeCwd(line: string): string | undefined {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
@@ -217,6 +226,30 @@ function parseClaudeCwd(line: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The working directory a Claude transcript declares. A session's first records
+ * are a cwd-less preamble (ai-title, queue-operation, attachments), so the first
+ * line rarely carries the cwd; scan a bounded head for the first record that does.
+ * Returns undefined when the head holds no cwd (an empty/not-yet-written transcript
+ * or one still in its preamble), which the caller treats as a provisional binding
+ * to be re-resolved once more of the transcript is written.
+ */
+async function resolveClaudeCwd(
+  io: DiscoveryIO,
+  path: string,
+  firstLine: string,
+): Promise<string | undefined> {
+  const first = parseClaudeCwd(firstLine);
+  if (first !== undefined) return first;
+  const head = await io.readHeadLines(path);
+  if (!head.ok) return undefined;
+  for (const line of head.lines) {
+    const cwd = parseClaudeCwd(line);
+    if (cwd !== undefined) return cwd;
+  }
+  return undefined;
 }
 
 export async function discoverClaude(
@@ -235,9 +268,10 @@ export async function discoverClaude(
     const sessionId = baseName(path).slice(0, -'.jsonl'.length);
     // The slug directory alone cannot establish membership: two distinct roots can
     // collide onto one slug (e.g. /work/a-b and /work/a/b). Validate the transcript's
-    // recorded cwd whenever it is readable; only fall back to trusting the slug when
-    // the first line is unreadable or carries no cwd (an empty/not-yet-written or
-    // summary transcript), which keeps the prior binding without over-disclosing.
+    // recorded cwd (found by scanning past its cwd-less preamble) whenever it is
+    // readable; only fall back to trusting the slug when no cwd is recorded yet (an
+    // empty/not-yet-written transcript, or one still in its preamble), which keeps a
+    // provisional binding the watcher re-resolves once the cwd appears.
     const head = await io.readFirstLine(path);
     if (!head.ok && head.reason !== 'empty') {
       // A first line that exists but could not be read or validated (malformed,
@@ -248,7 +282,7 @@ export async function discoverClaude(
       issues.push({ kind: head.reason, detail: `claude transcript ${path}` });
       continue;
     }
-    const recordedCwd = head.ok ? parseClaudeCwd(head.line) : undefined;
+    const recordedCwd = head.ok ? await resolveClaudeCwd(io, path, head.line) : undefined;
     if (recordedCwd !== undefined) {
       const cls = await classifyCwd(io, root, recordedCwd);
       if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree

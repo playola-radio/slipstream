@@ -51,6 +51,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
+    readHeadLines: async () => ({ ok: true, lines: [] }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -67,6 +68,17 @@ const RELATIVE_WRITE = JSON.stringify({
   type: 'assistant',
   timestamp: '2026-09-19T12:00:00.000Z',
   message: { content: [{ type: 'tool_use', id: 'toolu_rel', name: 'Write', input: { file_path: 'x.ts' } }] },
+});
+
+// An absolute write under a symlinked alias of the root. It only relativizes to an
+// in-root path ('a.ts') once discovery has derived the alias; against the bare root
+// it escapes scope and would be dropped.
+const ALIASED_WRITE = JSON.stringify({
+  type: 'assistant',
+  timestamp: '2026-09-19T12:00:00.000Z',
+  message: {
+    content: [{ type: 'tool_use', id: 'toolu_alias', name: 'Write', input: { file_path: '/alias/proj/a.ts' } }],
+  },
 });
 
 describe('coverage aggregation', () => {
@@ -293,6 +305,52 @@ describe('transcript watcher', () => {
     );
     assert.equal(relStarts.length, 1, 'one record, no conflicting variant');
     assert.equal(relStarts[0]!.file_scope.kind, 'unknown');
+  });
+
+  it('captures an aliased absolute write after discovery derives the alias', async () => {
+    // Regression for the dropped-alias P1: the first tick sees an empty transcript
+    // and slug-trust binds cwd=root with no aliases. An absolute write under a
+    // symlinked alias of the root then arrives; against the bare root it escapes
+    // scope. Once discovery head-scans the now-written transcript and derives the
+    // alias, the changed binding must recreate the reader so the write is re-read and
+    // scoped in-root — not left credited to the stale no-alias reader (silent drop).
+    const dir = '/home/projects/-work-proj';
+    const path = `${dir}/sess-a.jsonl`;
+    const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
+    const cwdRecord = JSON.stringify({ type: 'user', cwd: '/alias/proj', message: { content: 'hi' } });
+    const file = new FakeFile();
+    const files = new Map<string, FakeFile>();
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
+        // The transcript's cwd lives past a cwd-less preamble and appears only once
+        // the file is written; before that the first line is empty (slug-trust).
+        readFirstLine: async () =>
+          files.has(path) ? { ok: true as const, line: preamble } : { ok: false as const, reason: 'empty' as const },
+        readHeadLines: async () =>
+          files.has(path)
+            ? { ok: true as const, lines: [preamble, cwdRecord] }
+            : { ok: true as const, lines: [] },
+        realpath: async (p) => (p === '/alias/proj' ? ROOT : p),
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick(); // empty transcript: provisional cwd=root, no alias, nothing read
+    assert.equal(sink.appended.length, 0);
+    file.append(ALIASED_WRITE + '\n');
+    files.set(path, file);
+    await watcher.tick(); // discovery derives the alias; reader recreated, write re-read
+    const starts = sink.appended.filter(
+      (e) => e.evidence_key.record_id === 'toolu_alias' && e.timestamp.basis === 'tool-start',
+    );
+    assert.equal(starts.length, 1, 'the aliased write is captured, not dropped');
+    assert.deepEqual(starts[0]!.file_scope, { kind: 'paths', paths: ['a.ts'] });
   });
 
   it('reports unavailable when the transcript home is inaccessible', async () => {

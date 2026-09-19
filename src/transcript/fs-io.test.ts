@@ -108,3 +108,60 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
     });
   });
 });
+
+describe('nodeDiscoveryIO.readHeadLines', () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ss-headlines-'));
+    await writeFile(
+      join(dir, 'preamble.jsonl'),
+      '{"type":"ai-title"}\n{"type":"user","cwd":"/work/proj"}\n{"type":"assistant"}\n',
+    );
+    await writeFile(join(dir, 'empty.jsonl'), '');
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('returns the head lines so a cwd past the preamble is reachable', async () => {
+    const result = await nodeDiscoveryIO.readHeadLines(join(dir, 'preamble.jsonl'));
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.lines, [
+      '{"type":"ai-title"}',
+      '{"type":"user","cwd":"/work/proj"}',
+      '{"type":"assistant"}',
+    ]);
+  });
+
+  it('skips an oversized line but keeps the cwd-bearing line around it', async () => {
+    // A large attachment line (over the per-line cap) is discarded, not accumulated
+    // unbounded; the smaller cwd-bearing records around it still come back so the
+    // cwd remains reachable.
+    const huge = 'x'.repeat(256 * 1024 + 1);
+    await writeFile(
+      join(dir, 'huge.jsonl'),
+      `{"type":"ai-title"}\n{"pad":"${huge}"}\n{"type":"user","cwd":"/work/proj"}\n`,
+    );
+    const result = await nodeDiscoveryIO.readHeadLines(join(dir, 'huge.jsonl'));
+    assert.equal(result.ok, true);
+    assert.ok(result.ok && result.lines.includes('{"type":"ai-title"}'));
+    assert.ok(result.ok && result.lines.includes('{"type":"user","cwd":"/work/proj"}'));
+    assert.ok(result.ok && !result.lines.some((l) => l.includes('x'.repeat(1000))), 'the oversized line is skipped');
+  });
+
+  it('reports an empty file distinctly', async () => {
+    assert.deepEqual(await nodeDiscoveryIO.readHeadLines(join(dir, 'empty.jsonl')), {
+      ok: false,
+      reason: 'empty',
+    });
+  });
+
+  it('reports a missing file as inaccessible', async () => {
+    assert.deepEqual(await nodeDiscoveryIO.readHeadLines(join(dir, 'nope.jsonl')), {
+      ok: false,
+      reason: 'inaccessible',
+    });
+  });
+});

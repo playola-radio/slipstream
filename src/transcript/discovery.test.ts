@@ -16,6 +16,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
+    readHeadLines: async () => ({ ok: true, lines: [] }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -170,6 +171,49 @@ describe('transcript discovery', () => {
     );
     assert.equal(result.bindings.length, 1);
     assert.deepEqual(result.bindings[0]!.ctx.rootAliases, ['/alias/proj']);
+  });
+
+  it('finds the cwd (with alias) past a cwd-less preamble by head-scanning', async () => {
+    // Real Claude transcripts open with cwd-less records (ai-title, queue-operation,
+    // attachments); the first cwd-bearing record appears only a few lines in. If the
+    // first line alone were trusted, the alias would never be derived and an aliased
+    // absolute write would be dropped. The head-scan must reach the record that
+    // carries the (aliased) cwd.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
+    const withCwd = JSON.stringify({ type: 'user', cwd: '/alias/proj', message: { content: 'hi' } });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd] }),
+        realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 1);
+    assert.deepEqual(result.bindings[0]!.ctx.rootAliases, ['/alias/proj']);
+  });
+
+  it('skips a slug-colliding worktree whose cwd only appears past the preamble', async () => {
+    // The out-of-root cwd must be found by the head-scan too, or a colliding sibling
+    // worktree would be slug-trusted and its evidence wrongly published for this root.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
+    const withCwd = JSON.stringify({ type: 'user', cwd: '/work/other', message: { content: 'hi' } });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd] }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0, 'the out-of-root sibling is skipped, not slug-trusted');
+    assert.equal(result.issues.length, 0);
   });
 
   it('discloses a malformed Claude first line and withholds the binding', async () => {

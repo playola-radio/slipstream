@@ -8,7 +8,14 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { StatResult, TranscriptFileIO } from './file-reader.ts';
-import type { DiscoveryIO, FirstLineResult, ListResult, MissingProbe, TreeResult } from './discovery.ts';
+import type {
+  DiscoveryIO,
+  FirstLineResult,
+  HeadLinesResult,
+  ListResult,
+  MissingProbe,
+  TreeResult,
+} from './discovery.ts';
 
 /** The real filesystem IO for transcript files. Missing → `missing`; any other
  * stat/read error → `inaccessible` (disclosed, never a silent empty read). */
@@ -40,6 +47,14 @@ const FIRST_LINE_CHUNK = 64 * 1024;
 /** A first line longer than this is not line-delimited JSONL; disclose it
  * malformed rather than accumulate unbounded memory. */
 const MAX_FIRST_LINE = 16 * 1024 * 1024;
+
+/** Head-scan bounds for finding a Claude transcript's first cwd-bearing record.
+ * Enough lines to clear a cwd-less preamble; a per-line cap skips a large
+ * attachment (its cwd, if any, recurs on the smaller records around it); a total
+ * cap bounds the read even when large lines are skipped. */
+const HEAD_SCAN_LINES = 64;
+const HEAD_LINE_CAP = 256 * 1024;
+const HEAD_SCAN_BYTES = 4 * 1024 * 1024;
 
 function classifyDirError(err: unknown): 'missing' | 'inaccessible' {
   return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'inaccessible';
@@ -139,6 +154,70 @@ export const nodeDiscoveryIO: DiscoveryIO = {
         return { ok: false, reason: 'malformed' };
       }
       return { ok: true, line };
+    } catch {
+      return { ok: false, reason: 'inaccessible' };
+    } finally {
+      await handle.close();
+    }
+  },
+
+  async readHeadLines(path: string): Promise<HeadLinesResult> {
+    let handle;
+    try {
+      handle = await open(path, 'r');
+    } catch {
+      return { ok: false, reason: 'inaccessible' };
+    }
+    try {
+      const lines: string[] = [];
+      let pos = 0;
+      let sawByte = false;
+      let cur: Buffer[] = []; // the current line's bytes, across chunk boundaries
+      let curLen = 0;
+      let skip = false; // the current line exceeded the per-line cap: discard it
+      const finish = (seg: Buffer): boolean => {
+        // Finalize the current line [.. seg]; return true when the line budget is hit.
+        if (!skip && curLen + seg.length <= HEAD_LINE_CAP) {
+          cur.push(Buffer.from(seg));
+          try {
+            // Fatal-decode the whole line at once so a multibyte char split across a
+            // chunk survives; an undecodable line is skipped, not fabricated.
+            lines.push(FATAL_UTF8.decode(Buffer.concat(cur)));
+          } catch {
+            /* skip an undecodable line */
+          }
+        }
+        cur = [];
+        curLen = 0;
+        skip = false;
+        return lines.length >= HEAD_SCAN_LINES;
+      };
+      outer: for (;;) {
+        const buf = Buffer.allocUnsafe(FIRST_LINE_CHUNK);
+        const { bytesRead } = await handle.read(buf, 0, FIRST_LINE_CHUNK, pos);
+        if (bytesRead === 0) break;
+        sawByte = true;
+        pos += bytesRead;
+        let start = 0;
+        for (let i = 0; i < bytesRead; i += 1) {
+          if (buf[i] !== 0x0a) continue;
+          if (finish(buf.subarray(start, i))) break outer;
+          start = i + 1;
+        }
+        if (start < bytesRead) {
+          const seg = buf.subarray(start, bytesRead);
+          curLen += seg.length;
+          if (curLen > HEAD_LINE_CAP) {
+            skip = true;
+            cur = [];
+          } else {
+            cur.push(Buffer.from(seg));
+          }
+        }
+        if (pos >= HEAD_SCAN_BYTES) break;
+      }
+      if (!sawByte) return { ok: false, reason: 'empty' };
+      return { ok: true, lines };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {

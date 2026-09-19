@@ -97,11 +97,21 @@ function makeStepper(harness: HarnessName, ctx: AdapterContext) {
   return harness === 'claude-code' ? claudeStepper(ctx) : codexStepper(ctx);
 }
 
+/** The bound-context identity that gates reader reuse: the harness session and the
+ * resolved scope (canonical cwd + root aliases). A change in any of them means the
+ * prior reader was reading under a scope discovery has since corrected — most often
+ * a provisional binding, made while the transcript was empty, whose real cwd/aliases
+ * discovery only learned once records (or a cwd-bearing record past a leading
+ * summary) appeared. */
+function bindingCtxKey(ctx: AdapterContext): string {
+  return `${ctx.harnessSessionId}\0${ctx.cwd}\0${(ctx.rootAliases ?? []).join(',')}`;
+}
+
 export function createTranscriptWatcher(opts: TranscriptWatcherOptions): TranscriptWatcher {
   const { harness, home, root, codexScanLimit, discoveryIO, fileIO, sink, publish } = opts;
   const readers = new Map<
     string,
-    { reader: ReturnType<typeof createTranscriptFileReader>; sessionId: string }
+    { reader: ReturnType<typeof createTranscriptFileReader>; ctxKey: string }
   >();
   let lastKey: string | undefined;
 
@@ -121,16 +131,20 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
       path: string;
     }> = [];
     for (const binding of bindings) {
-      // Recreate the reader only when the file name now belongs to a different
-      // harness session (a rotated transcript): the old reader's offset and join
-      // state no longer apply, so drop it and reread from zero; the ingestor's
-      // log-derived dedup absorbs the re-read. A provisional binding later
-      // resolving its cwd does NOT force a recreate — Claude writes are scoped by
-      // their absolute path (relative ones are disclosed unknown), so the emitted
-      // scope never depends on which cwd the binding settled on.
-      const sessionId = binding.ctx.harnessSessionId;
+      // Recreate the reader whenever its bound context changes: a changed session
+      // id is a rotated transcript (the same file name now belongs to a different
+      // harness session), and a changed cwd/aliases is a provisional binding (made
+      // while the transcript was empty, or before a cwd-bearing record appeared
+      // past a leading summary) that discovery has since resolved to the real
+      // scope. Either way the old reader read under a scope that no longer applies,
+      // so drop it and reread from zero; the ingestor's log-derived dedup absorbs
+      // the re-read. This never conflicts an invocation: a record already read
+      // under the prior binding implies its cwd was known then (aliases are derived
+      // from the transcript's own cwd), so its scope does not change on the reread;
+      // only records first seen after the resolution get the corrected scope.
+      const ctxKey = bindingCtxKey(binding.ctx);
       let entry = readers.get(binding.path);
-      if (!entry || entry.sessionId !== sessionId) {
+      if (!entry || entry.ctxKey !== ctxKey) {
         entry = {
           reader: createTranscriptFileReader({
             path: binding.path,
@@ -138,7 +152,7 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
             sink,
             stepper: makeStepper(harness, binding.ctx),
           }),
-          sessionId,
+          ctxKey,
         };
         readers.set(binding.path, entry);
       }
