@@ -128,4 +128,20 @@ describe('codex transcript adapter', () => {
     assert.equal(out.evidence.length, 0);
     assert.equal(out.diagnostics[0]!.kind, 'unsupported');
   });
+
+  it('reports a malformed response_item payload, keeping it distinct from a clean read', () => {
+    // A response_item always carries a typed payload; these do not, so each must
+    // yield a malformed diagnostic rather than passing as a clean read with no match.
+    const shapes: unknown[] = [
+      { type: 'response_item', timestamp: '2026-09-19T12:00:00.000Z', payload: null },
+      { type: 'response_item', timestamp: '2026-09-19T12:00:00.000Z' },
+      { type: 'response_item', timestamp: '2026-09-19T12:00:00.000Z', payload: {} },
+    ];
+    for (const record of shapes) {
+      const out = codexStep(initialCodexState(), record, CTX);
+      assert.equal(out.evidence.length, 0);
+      assert.equal(out.diagnostics.length, 1, `expected a diagnostic for ${JSON.stringify(record)}`);
+      assert.equal(out.diagnostics[0]!.kind, 'malformed');
+    }
+  });
 });

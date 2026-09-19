@@ -1,5 +1,5 @@
-import { open, readdir, realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { open, readdir, readlink as fsReadlink, realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import type { StatResult, TranscriptFileIO } from './file-reader.ts';
 import type { DiscoveryIO, FirstLineResult, ListResult, TreeResult } from './discovery.ts';
 
@@ -106,6 +106,17 @@ export const nodeDiscoveryIO: DiscoveryIO = {
   async realpath(path: string): Promise<string | undefined> {
     try {
       return await fsRealpath(path);
+    } catch {
+      return undefined;
+    }
+  },
+
+  async readlink(path: string): Promise<string | undefined> {
+    try {
+      const target = await fsReadlink(path);
+      // Resolve a relative target against the link's own directory so callers
+      // always receive an absolute path.
+      return resolve(dirname(path), target);
     } catch {
       return undefined;
     }

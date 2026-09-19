@@ -17,6 +17,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
+    readlink: async () => undefined,
     ...overrides,
   };
 }
@@ -238,6 +239,54 @@ describe('transcript discovery', () => {
     assert.equal(result.bindings.length, 0);
     assert.ok(
       result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/tmp/proj/deleted')),
+    );
+  });
+
+  it('does not disclose a dangling-symlink cwd whose target is outside the root', async () => {
+    // cwd /work/proj/link is a symlink to /other/deleted (now gone), so realpath
+    // fails though the symlink still exists. Its literal target is outside the
+    // root, so it is a different worktree's session and must not degrade coverage.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-dangle-out', cwd: '/work/proj/link' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/do.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === ROOT ? ROOT : p === '/other' ? '/other' : undefined),
+        readlink: async (p) => (p === '/work/proj/link' ? '/other/deleted' : undefined),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.equal(result.issues.length, 0);
+  });
+
+  it('discloses a dangling-symlink cwd whose target is inside the root', async () => {
+    // cwd /links/alias is a symlink to /work/proj/deleted (now gone). realpath
+    // fails, but the literal target places it inside the root — an in-root
+    // candidate we could not read, disclosed rather than dropped.
+    const meta = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-dangle-in', cwd: '/links/alias' },
+    });
+    const result = await discoverCodex(
+      io({
+        listTreeJsonl: async () => ({ paths: ['/c/di.jsonl'], truncated: false, incomplete: false }),
+        readFirstLine: async () => ({ ok: true as const, line: meta }),
+        realpath: async (p) => (p === '/links' ? '/links' : p === ROOT ? ROOT : undefined),
+        readlink: async (p) => (p === '/links/alias' ? '/work/proj/deleted' : undefined),
+      }),
+      '/home',
+      ROOT,
+      10,
+    );
+    assert.equal(result.bindings.length, 0);
+    assert.ok(
+      result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/links/alias')),
     );
   });
 

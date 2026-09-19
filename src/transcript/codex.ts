@@ -173,7 +173,11 @@ export function codexStep(
   }
   if (record.type !== 'response_item') return { state, evidence: [], diagnostics: [] };
   const payload = record.payload;
-  if (!isObject(payload) || typeof payload.type !== 'string') return { state, evidence: [], diagnostics: [] };
+  if (!isObject(payload) || typeof payload.type !== 'string') {
+    // A response_item always carries a typed payload; a null/absent/untyped one is
+    // a malformed envelope, disclosed so it stays distinct from a clean read.
+    return { state, evidence: [], diagnostics: [{ kind: 'malformed', detail: 'response_item without a typed payload' }] };
+  }
   const t = payload.type;
   if (t === 'function_call' || t === 'custom_tool_call') return stepCall(state, record, payload, ctx);
   if (t === 'function_call_output' || t === 'custom_tool_call_output') return stepOutput(state, record, payload, ctx);

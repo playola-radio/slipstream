@@ -52,6 +52,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     realpath: async (p) => p,
+    readlink: async () => undefined,
     ...overrides,
   };
 }

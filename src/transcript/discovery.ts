@@ -58,6 +58,9 @@ export interface DiscoveryIO {
   readFirstLine(path: string): Promise<FirstLineResult>;
   /** Canonicalize a path, or undefined if it does not resolve. */
   realpath(path: string): Promise<string | undefined>;
+  /** The absolute target of `path` if it is a symlink (even a dangling one),
+   * or undefined if `path` is not a symlink or does not exist. */
+  readlink(path: string): Promise<string | undefined>;
 }
 
 /** Claude's on-disk slug for a worktree: the absolute path with '/'→'-'. */
@@ -77,34 +80,60 @@ export function isWithinRoot(root: string, child: string): boolean {
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && rel[0] !== '/';
 }
 
+/** A generous bound on symlink hops while degrading a broken cwd, defeating a
+ * symlink cycle. Beyond it, a cwd is too pathological to place — treat it as a
+ * non-candidate rather than risk a wrong disclosure. */
+const MAX_UNRESOLVED_HOPS = 40;
+
 /**
  * True when an UNRESOLVABLE cwd could still sit inside the capture root, so it is
  * an in-root candidate we failed to read rather than a genuine non-candidate.
  *
- * A textual check is unreliable in both directions: the raw string may be in the
- * root's alias namespace (cwd `/tmp/proj/gone` for canonical root
- * `/private/tmp/proj`) yet be in-root, or it may be textually in-root yet escape
- * through an internal symlink (cwd `/work/proj/link/gone` where `link` points to
- * `/other/project`). The only sound test is the membership of the nearest ancestor
- * that DOES resolve: the deleted suffix hangs off that ancestor's canonical
- * location, and no non-existent suffix segment can itself be a symlink. A cwd
- * whose nearest living ancestor canonicalizes outside the root is a different
- * worktree's session, skipped silently so unrelated dead sessions never degrade
- * this root's coverage.
+ * A textual check is unreliable both ways: the raw string may be in the root's
+ * alias namespace (cwd `/tmp/proj/gone` for canonical root `/private/tmp/proj`)
+ * yet be in-root, or textually in-root yet escape through an internal symlink
+ * (`/work/proj/link/gone` where `link` -> `/other/project`). So we degrade the
+ * way `realpath` itself would: resolve the longest existing prefix, then decide
+ * membership from what remains. The first component that fails to resolve is
+ * either truly absent — the rest is plain names off the prefix's canonical
+ * location — or a DANGLING symlink, whose literal target (via readlink, since
+ * realpath cannot follow it) we re-resolve. A cwd that places outside the root is
+ * a different worktree's session, skipped silently so unrelated dead sessions
+ * never degrade this root's coverage.
  */
 async function unresolvedCwdMayBeInRoot(
   io: DiscoveryIO,
   root: string,
   cwd: string,
 ): Promise<boolean> {
-  let cur = cwd;
-  for (;;) {
-    const parent = dirname(cur);
-    if (parent === cur) return false;
-    const canonical = await io.realpath(parent);
-    if (canonical !== undefined) return isWithinRoot(root, canonical);
-    cur = parent;
+  let path = cwd;
+  for (let hop = 0; hop < MAX_UNRESOLVED_HOPS; hop += 1) {
+    // Walk up to the nearest ancestor that resolves (realpath follows any symlinks
+    // it contains, so its canonical form is exact).
+    let cur = path;
+    let canonical = await io.realpath(cur);
+    while (canonical === undefined) {
+      const parent = dirname(cur);
+      if (parent === cur) return false; // nothing on this path resolves
+      cur = parent;
+      canonical = await io.realpath(cur);
+    }
+    if (cur === path) return isWithinRoot(root, canonical);
+    // `cur` resolves; its child toward `path` is the first component that failed.
+    const suffix = relative(cur, path);
+    const firstChild = resolve(cur, suffix.split(sep)[0]!);
+    const linkTarget = await io.readlink(firstChild);
+    if (linkTarget === undefined) {
+      // Truly absent (not a symlink): the whole suffix is plain names off the
+      // prefix's canonical location.
+      return isWithinRoot(root, resolve(canonical, suffix));
+    }
+    // Dangling symlink: follow its literal target, re-appending whatever came
+    // after it, and resolve again from there.
+    const rest = relative(firstChild, path);
+    path = rest === '' ? linkTarget : resolve(linkTarget, rest);
   }
+  return false;
 }
 
 export async function discoverClaude(
