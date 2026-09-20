@@ -30,6 +30,10 @@ public projection (D4), that is an explicit ratified ruling.
   capture latency baseline-vs-saturation, throughput, skipped counts) and the
   numeric pass-bar is ratified from the measured baseline at B2 review time — not
   invented now, never declared passing with a failing gate.
+  **Resolved at B2 review (Brian, 2026-09-19):** each repetition’s overall,
+  scheduled and burst p50/p99 must be ≤1.20× paired baseline, throughput ≥0.95×,
+  zero missing writes and all load checks passing. The final-runtime measurement
+  passes; see `CLIP-LATENCY-PROTOCOL.md` and `B2-MEASUREMENT-REPORT.md`.
 - **D4 = A — clips are a reader-derived public projection, not a log producer.**
   Ratified via a second Codex consult (`gpt-6-astra`, 2026-09-19). Clips are a
   pure function of `(before-blob, after-blob, projection version)`, and both blobs
@@ -47,6 +51,15 @@ public projection (D4), that is an explicit ratified ruling.
   disappearing (a cold-cache feed can request dozens of parses at once and
   reproduce eager parsing's contention). Attribution is unaffected: its evidence
   is external and ephemeral, so it stays a daemon producer writing log events.
+
+## B2 implementation clarification (Brian, 2026-09-19)
+
+The closed language token may be added to projection inputs and the disposable
+cache key. This extends D4's input tuple to `(before blob, after blob, language,
+projection_version)` so identical bytes under TypeScript and TSX grammars cannot
+share an incorrect result. The reader selects the token from the public event
+path; direct-disk callers can supply it. The pool/admission architecture stays
+unchanged. This clarification does not change any latency or honesty gate.
 
 ## Accepted tradeoff (D1=B, logged)
 
@@ -272,7 +285,6 @@ latency within the ratified bar (measured).
 
 - Native `record_id` / file-scope field mappings for both transcript formats —
   proven with fixtures in **A2**, not guessed now.
-- The numeric capture-latency pass-bar — set from the measured baseline in **B2**.
 - Historical rescoring under a changed attribution policy — explicitly out of
   initial scope.
 - **Audit replay of clips** ("what clip was shown at seq N", preserved without

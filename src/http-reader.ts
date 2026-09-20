@@ -11,6 +11,7 @@ import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './
 import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
 import { parseClipSnapshot } from './clip-blob-reader.ts';
 import { createClipProjectionService } from './clip-projection-service.ts';
+import { languageForPath } from './clip-language.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
 
@@ -263,14 +264,16 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     const before = parseClipSnapshot(ev.data.before);
     const after = parseClipSnapshot(ev.data.after);
-    if (!before || !after) {
-      throw new LogCorruptError('file.changed record missing a before/after snapshot');
+    const path = ev.data.path;
+    if (!before || !after || typeof path !== 'string') {
+      throw new LogCorruptError('file.changed record missing a path or before/after snapshot');
     }
 
     // The projection itself carries availability: GC'd blobs yield an `unavailable`
     // status with a reason, served as a normal 200. The HTTP status reports whether
     // the request succeeded, not whether the content is still retained.
-    const projection = await clipService.get({ changeSeq: seqStr, before, after });
+    const projection = await clipService.get({ changeSeq: seqStr, before, after,
+      language: languageForPath(path) });
     sendJson(res, 200, projection);
   }
 

@@ -9,6 +9,7 @@ import { CLIP_PROJECTION_VERSION, type ClipProjection } from './clip-projection.
 import type { ClipCompute } from './clip-worker-pool.ts';
 import type { ClipSnapshot } from './clip-blob-reader.ts';
 import { withFakeSession, changesFor } from './test/helpers.ts';
+import { computeClipProjection } from './clip-blob-reader.ts';
 
 const sha = (i: number): string => String(i).padStart(64, '0');
 const contentReq = (seq: string, id: number): ClipRequest => ({
@@ -25,6 +26,67 @@ const fallback = (changeSeq: string): ClipProjection => ({
 });
 const alwaysPresent = async (): Promise<boolean> => true;
 const STORE = '/nonexistent-store';
+
+test('identical blobs under different languages do not share a cached extraction', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-language-cache-'));
+  const cas = await createCas(join(dir, 'blobs'));
+  const before = await cas.put(Buffer.from('function f(n: string) {\n  return 1;\n}\n'));
+  const after = await cas.put(Buffer.from('function f(n: string) {\n  return 2;\n}\n'));
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: dir, compute: job => {
+    computes++;
+    return { promise: computeClipProjection(job), cancel: () => {} };
+  } });
+  const req: ClipRequest = { changeSeq: '2', before: { kind: 'content', ...before }, after: { kind: 'content', ...after } };
+  try {
+    const js = await svc.get({ ...req, language: 'javascript' });
+    const ts = await svc.get({ ...req, language: 'typescript' });
+    assert.equal(js.status, 'fallback');
+    assert.equal(ts.status, 'ready');
+    assert.equal((await svc.get({ ...req, language: 'typescript' })).status, 'ready');
+    assert.equal(computes, 2);
+  } finally { await svc.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a version upgrade recomputes the same blobs after discarding the old process cache', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-version-cache-'));
+  const cas = await createCas(join(dir, 'blobs'));
+  const after = await cas.put(Buffer.from('function f() {\n  return 1;\n}\n'));
+  const req: ClipRequest = { changeSeq: '2', language: 'javascript', before: { kind: 'absent' }, after: { kind: 'content', ...after } };
+  // Model the prior deployment's warm in-memory cache. There is deliberately
+  // no persisted cache to migrate and no runtime algorithm-version switch.
+  const old = createClipProjectionService({ storeDir: dir, compute: job => ({
+    promise: Promise.resolve({ ...fallback(job.opts.changeSeq), projection_version: 'clip.v1' }), cancel: () => {},
+  }) });
+  assert.equal((await old.get(req)).projection_version, 'clip.v1');
+  await old.close();
+  // This tests cache/version behavior, not cold worker startup speed. The real
+  // I/O computation remains intact; worker/deadline behavior has separate tests.
+  let recomputes = 0;
+  const current = createClipProjectionService({ storeDir: dir, compute: job => {
+    recomputes++;
+    return { promise: computeClipProjection(job), cancel: () => {} };
+  } });
+  try {
+    const result = await current.get(req);
+    assert.equal(result.projection_version, 'clip.v3');
+    assert.equal(result.status, 'ready');
+    assert.equal(result.clips[0]!.after.method, 'function');
+    assert.equal(recomputes, 1);
+  } finally { await current.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a soft parser timeout with prepared fallback is never cached', async () => {
+  let calls = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    compute: job => ({ promise: Promise.resolve({ ...fallback(job.opts.changeSeq),
+      fallback_reason: ++calls === 1 ? 'timeout' : 'no-enclosing-function' }), cancel: () => {} }) });
+  try {
+    assert.equal((await svc.get(contentReq('1', 1))).fallback_reason, 'timeout');
+    assert.equal((await svc.get(contentReq('1', 1))).fallback_reason, 'no-enclosing-function');
+    assert.equal(calls, 2);
+  } finally { await svc.close(); }
+});
 
 test('cold request computes on demand, then serves from cache', async () => {
   let calls = 0;
@@ -104,6 +166,27 @@ test('burst beyond admission is skipped as overloaded, not stalled', async () =>
   assert.equal(rB.status, 'fallback');
   assert.equal(calls, 2);
   await svc.close();
+});
+
+test('the default deadline cancels at 100 ms', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let canceled = false;
+  let settled = false;
+  const svc = createClipProjectionService({ storeDir: STORE, compute: () => ({
+    promise: new Promise<ClipProjection>(() => {}),
+    cancel: () => { canceled = true; },
+  }) });
+  t.after(() => svc.close());
+  const result = svc.get(contentReq('1', 1)).then(value => { settled = true; return value; });
+  t.mock.timers.tick(99);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(canceled, false);
+  t.mock.timers.tick(1);
+  const value = await result;
+  assert.equal(value.status, 'skipped');
+  assert.equal(value.fallback_reason, 'timeout');
+  assert.equal(canceled, true);
 });
 
 test('a wall-clock overrun yields skipped/timeout and cancels the compute', async () => {
@@ -234,27 +317,26 @@ test('close settles queued work and rejects new requests', async () => {
   await pRun; // running task settles too, no dangling promise
 });
 
-test('default worker pool computes a real projection from on-disk blobs', async () => {
+test('default worker pool computes a real projection from on-disk blobs', { timeout: 15_000 }, async t => {
+  // Verify the result before its deadline, independently of host startup speed.
+  // Real-clock cancellation tests and the live benchmark cover the time budget.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const storeDir = await mkdtemp(join(tmpdir(), 'slip-clipsvc-'));
   const svc = createClipProjectionService({ storeDir });
-  try {
-    const cas = await createCas(join(storeDir, 'blobs'));
-    const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
-    const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
-    const before: ClipSnapshot = { kind: 'content', sha256: beforeRef.sha256, size: beforeRef.size };
-    const after: ClipSnapshot = { kind: 'content', sha256: afterRef.sha256, size: afterRef.size };
-    const r = await svc.get({ changeSeq: '5', before, after });
-    assert.equal(r.status, 'fallback');
-    assert.equal(r.change_seq, '5');
-    assert.ok(r.clips.length >= 1);
-    // second identical request is a cache hit (revalidated against the real store)
-    const r2 = await svc.get({ changeSeq: '6', before, after });
-    assert.equal(r2.change_seq, '6');
-    assert.equal(r2.status, 'fallback');
-  } finally {
-    await svc.close();
-    await rm(storeDir, { recursive: true, force: true });
-  }
+  t.after(async () => { await svc.close(); await rm(storeDir, { recursive: true, force: true }); });
+  const cas = await createCas(join(storeDir, 'blobs'));
+  const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
+  const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  const before: ClipSnapshot = { kind: 'content', sha256: beforeRef.sha256, size: beforeRef.size };
+  const after: ClipSnapshot = { kind: 'content', sha256: afterRef.sha256, size: afterRef.size };
+  const r = await svc.get({ changeSeq: '5', before, after });
+  assert.equal(r.status, 'fallback');
+  assert.equal(r.change_seq, '5');
+  assert.ok(r.clips.length >= 1);
+  // second identical request is a cache hit (revalidated against the real store)
+  const r2 = await svc.get({ changeSeq: '6', before, after });
+  assert.equal(r2.change_seq, '6');
+  assert.equal(r2.status, 'fallback');
 });
 
 test('capture proceeds while projection admission is saturated', async () => {

@@ -7,6 +7,14 @@ import { join } from 'node:path';
 import { createCas } from './cas.ts';
 import type { ClipSnapshot } from './clip-blob-reader.ts';
 import type { ClipWorkerRequest, ClipWorkerResponse } from './clip-projection-worker.ts';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+
+test('terminating and replacing active parser workers never aborts the host process', async () => {
+  await promisify(execFile)(process.execPath, [fileURLToPath(new URL('./test/clip-parser-cancellation.ts', import.meta.url))],
+    { timeout: 15_000 });
+});
 
 // Proves the projection genuinely computes on a separate thread against on-disk
 // blobs — the isolation the cold-cache protection relies on.

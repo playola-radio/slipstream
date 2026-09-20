@@ -17,10 +17,13 @@
     "bench": "node src/bench.ts",
     "slipstream": "node src/cli.ts",
     "live-feed": "node tools/live-feed/cli.ts",
-    "identity-probe": "node tools/identity-probe/server.ts"
+    "identity-probe": "node tools/identity-probe/server.ts",
+    "bench:clips": "node src/clip-bench.ts"
   },
   "dependencies": {
-    "@parcel/watcher": "^2.5.1"
+    "@parcel/watcher": "^2.5.1",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.25.10"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

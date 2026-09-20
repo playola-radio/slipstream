@@ -238,16 +238,16 @@ const ceLine = (seq: number, type: string, data: Record<string, unknown>): strin
   });
 
 // A store with one file.changed.v1 at seq 2 whose before/after reference real blobs.
-async function storeWithChange(): Promise<{ dir: string }> {
+async function storeWithChange(path = 'x.txt', beforeText = 'a\nb\nc\n', afterText = 'a\nB\nc\n'): Promise<{ dir: string }> {
   const dir = await mkdtemp(join(tmpdir(), 'slip-clips-'));
   const cas = await createCas(join(dir, 'blobs'));
-  const before = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
-  const after = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  const before = await cas.put(Buffer.from(beforeText, 'utf8'));
+  const after = await cas.put(Buffer.from(afterText, 'utf8'));
   await mkdir(join(dir, 'sessions', UUID), { recursive: true });
   const lines = [
     ceLine(1, 'slipstream.session.started.v1', { root: '/w', max_bytes: 1024, started_at_ms: 0 }),
     ceLine(2, 'slipstream.file.changed.v1', {
-      path: 'x.txt',
+      path,
       before: { kind: 'content', sha256: before.sha256, size: before.size },
       after: { kind: 'content', sha256: after.sha256, size: after.size },
       observation: 'watcher', observed_at_ms: 0,
@@ -258,34 +258,60 @@ async function storeWithChange(): Promise<{ dir: string }> {
 }
 
 describe('http-reader clip projection', () => {
-  it('returns a clip projection for a change', async () => {
+  it('serves the same function projection as a direct-disk client without appending to the log', { timeout: 15_000 }, async t => {
+    // Contract shape before deadline; real clocks are covered by service tests
+    // and the cold-load benchmark. Each server belongs only to this test.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const { computeClipProjection, parseClipSnapshot } = await import('./clip-blob-reader.ts');
+    const before = 'function f(n: string) {\n  return 1;\n}\n';
+    const { dir } = await storeWithChange('x.ts', before, before.replace('return 1', 'return 2'));
+    const logPath = join(dir, 'sessions', UUID, 'events.jsonl');
+    const { readFile } = await import('node:fs/promises');
+    const original = await readFile(logPath, 'utf8');
+    const event = JSON.parse(original.trim().split('\n')[1]!);
+    const direct = await computeClipProjection({ storeDir: dir, before: parseClipSnapshot(event.data.before)!,
+      after: parseClipSnapshot(event.data.after)!, opts: { changeSeq: '2', language: 'typescript' } });
+    const srv = await startReaderServer({ storeDir: dir });
+    t.after(async () => { await srv.close(); await rm(dir, { recursive: true, force: true }); });
+    const response = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), direct);
+    assert.equal(direct.status, 'ready');
+    assert.equal(direct.clips[0]!.after.method, 'function');
+    assert.equal(await readFile(logPath, 'utf8'), original);
+  });
+  it('returns a clip projection for a change', { timeout: 15_000 }, async t => {
+    // Contract shape before deadline; real clocks are covered by service tests
+    // and the cold-load benchmark. Each server belongs only to this test.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { dir } = await storeWithChange();
     const srv = await startReaderServer({ storeDir: dir });
-    try {
-      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
-      assert.equal(res.status, 200);
-      assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
-      const body = await res.json() as {
-        change_seq: string; projection_version: string; status: string; clips: unknown[];
-      };
-      assert.equal(body.change_seq, '2');
-      assert.equal(body.projection_version, 'clip.v1');
-      assert.equal(body.status, 'fallback');
-      assert.ok(body.clips.length >= 1);
-    } finally { await srv.close(); }
+    t.after(async () => { await srv.close(); await rm(dir, { recursive: true, force: true }); });
+    const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
+    const body = await res.json() as {
+      change_seq: string; projection_version: string; status: string; clips: unknown[];
+    };
+    assert.equal(body.change_seq, '2');
+    assert.equal(body.projection_version, 'clip.v3');
+    assert.equal(body.status, 'fallback');
+    assert.ok(body.clips.length >= 1);
   });
 
-  it('reports clips unavailable with a reason when the blobs were GC\'d', async () => {
+  it('reports clips unavailable with a reason when the blobs were GC\'d', { timeout: 15_000 }, async t => {
+    // Contract shape before deadline; real clocks are covered by service tests
+    // and the cold-load benchmark. Each server belongs only to this test.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { dir } = await storeWithChange();
     await rm(join(dir, 'blobs'), { recursive: true, force: true }); // GC dropped the content
     const srv = await startReaderServer({ storeDir: dir });
-    try {
-      const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
-      assert.equal(res.status, 200); // the request succeeded; the projection carries availability
-      const body = await res.json() as { status: string; fallback_reason?: string };
-      assert.equal(body.status, 'unavailable');
-      assert.ok(body.fallback_reason && body.fallback_reason.length > 0); // explicit reason, never faked
-    } finally { await srv.close(); }
+    t.after(async () => { await srv.close(); await rm(dir, { recursive: true, force: true }); });
+    const res = await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`);
+    assert.equal(res.status, 200); // the request succeeded; the projection carries availability
+    const body = await res.json() as { status: string; fallback_reason?: string };
+    assert.equal(body.status, 'unavailable');
+    assert.ok(body.fallback_reason && body.fallback_reason.length > 0); // explicit reason, never faked
   });
 
   it('serves the published projection schema and 404s an unknown version', async () => {
@@ -298,6 +324,12 @@ describe('http-reader clip projection', () => {
       const body = await res.json() as { title: string; $id: string };
       assert.equal(body.title, 'clip.v1');
       assert.match(body.$id, /projections\/clip\.v1\.json$/);
+      const v2 = await GET(srv, '/v1/schemas/projections/clip.v2');
+      assert.equal(v2.status, 200);
+      assert.equal((await v2.json() as { title: string }).title, 'clip.v2');
+      const v3 = await GET(srv, '/v1/schemas/projections/clip.v3');
+      assert.equal(v3.status, 200);
+      assert.equal((await v3.json() as { title: string }).title, 'clip.v3');
       assert.equal((await GET(srv, '/v1/schemas/projections/nope.v1')).status, 404);
     } finally { await srv.close(); }
   });
@@ -342,6 +374,22 @@ describe('http-reader clip projection', () => {
     try {
       assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 500);
     } finally { await srv.close(); }
+  });
+
+  it('500s malformed file.changed paths instead of projecting them as unsupported', async () => {
+    for (const path of [undefined, 42]) {
+      const { dir } = await storeWithChange();
+      const logPath = join(dir, 'sessions', UUID, 'events.jsonl');
+      const lines = (await (await import('node:fs/promises')).readFile(logPath, 'utf8')).trim().split('\n');
+      const change = JSON.parse(lines[1]!);
+      delete change.data.path;
+      if (path !== undefined) change.data.path = path;
+      await writeFile(logPath, `${lines[0]}\n${JSON.stringify(change)}\n`, 'utf8');
+      const srv = await startReaderServer({ storeDir: dir });
+      try {
+        assert.equal((await GET(srv, `/v1/sessions/${UUID}/changes/2/clips`)).status, 500);
+      } finally { await srv.close(); await rm(dir, { recursive: true, force: true }); }
+    }
   });
 
   it('404s an unknown session and 410s a tombstoned one', async () => {
