@@ -456,14 +456,20 @@ sequence, not backdated; (b) late transcript arriving after restart → revises
 without duplicate evidence; (c) native-identity fixtures prove the `record_id` +
 file-scope mapping for BOTH harnesses.
 
-**Status**: Implementation complete; pending Codex adversarial review.
+**Status**: Complete. Codex adversarial review PASSED (gate #18).
 - Adapters, discovery, incremental file reader, coverage watcher/runner, config
   surface (file + CLI overrides), and session/daemon/CLI wiring landed.
 - All three required tests present: (a) `session.test.ts` append-order grouping;
   (b) `transcript/restart-idempotence.test.ts` (fresh watcher rereads from
   offset 0, ingestor log-derived dedup absorbs the replayed prefix, only the
   late record appends); (c) `transcript/claude.test.ts` + `codex.test.ts`
-  native-identity fixtures. `npm run typecheck` + `npm test` (609) green.
+  native-identity fixtures. `npm run typecheck` + `npm test` (678) green.
+- Review hardening: a transcript reader is pinned to the (dev, ino) generation
+  discovery confirmed and refuses a same-path replacement (`unconfirmed`) rather
+  than crediting a foreign session's writes; identity and evidence bytes come from
+  one open handle (no stat→read TOCTOU); generation ids are 64-bit bigints (no
+  Number precision collapse); a bare `null` head line can no longer abort a
+  discovery tick.
 - **Flagged for Brian:** the coverage event is a *separate* durable
   `slipstream.enrichment.coverage.v1` (Q1 above), replacing A1's unimplemented
   `evidence_availability` sketch. Confirm this is the intended shape.
