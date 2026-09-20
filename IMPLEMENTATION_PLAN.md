@@ -374,7 +374,8 @@ demand from the immutable before/after blobs and served through the reader API
 - Concurrent cold-cache clip requests saturating the parse workers → raw capture
   latency within the ratified bar (measured; D3 protocol, D4 cold-cache load).
 
-**Status**: In Progress. PR graph designed via Codex consults and ratified
+**Status**: Complete — all four PRs merged to `develop` (#18 A1, #19 B1, #20 B2,
+#21 A2). PR graph designed via Codex consults and ratified
 (Brian D1–D4, 2026-09-19): a 4-PR / 2-track shape — Track A attribution
 (A1 engine+contracts with fake evidence → A2 real transcript adapters), Track B.
 **A1 built** on `feature/stage4-a1-attribution`: three event contracts
@@ -400,7 +401,7 @@ deadline that cancels and replaces a stuck worker), the reader endpoint
 No log event, no persistence: clips are viewable exactly while the blobs are
 retained, and GC'd blobs yield an explicit `unavailable` projection with a
 reason. Byte/line rules and status/reason semantics are documented in
-`CLIP-PROJECTION.md`. **B2 implementation and acceptance complete; PR #20 awaiting merge**: `clip.v3` provides WASM
+`CLIP-PROJECTION.md`. **B2 complete; PR #20 merged**: `clip.v3` provides WASM
 function extraction for JS/JSX/TS/TSX, paired spans, explicit mixed fallback and
 the approved closed language input/cache key. The native worker-cancellation
 crash was reproduced and replaced with WASM under the original design/budgets.
@@ -418,7 +419,8 @@ checks remain; production budgets and capture design are unchanged. Typecheck,
 648 main tests and 86 tool tests pass locally; Ubuntu and macOS CI are green at
 `7ea847f` and the subsequent documentation revision `33f111d`.
 See `B2-MEASUREMENT-REPORT.md` for all numbers, host conditions and history.
-Stage 4 as a whole remains in progress. D4 makes clips a
+Stage 4 as a whole is complete; the remaining watching UI + combined
+attribution-plus-clips acceptance run are Stage 5. D4 makes clips a
 **reader-derived public projection**
 over the immutable blobs (versioned, cached on demand, served via the reader API)
 rather than `change.clips` log events; attribution stays a log producer. See
@@ -426,7 +428,7 @@ rather than `change.clips` log events; attribution stays a log producer. See
 candidate-eligibility narrowing, and the D3 latency ruling (retained under
 D4 — parsing contention relocates to the reader).
 
-### A2 — Real Claude Code + Codex transcript adapters (in progress)
+### A2 — Real Claude Code + Codex transcript adapters (complete)
 
 **Goal**: replace A1's fake evidence with real transcript reads that produce
 `slipstream.harness.evidence.v1`, plus honest coverage disclosure and the Fork 4
@@ -505,11 +507,28 @@ file-scope mapping for BOTH harnesses.
   without inventing an issue (alone it stays pending); transcript reads drain in
   1 MiB chunks within a poll, expanding the window for an over-chunk line.
   Typecheck, all 114 transcript tests, and all 680 full-suite tests pass.
-  Same-inode truncate-and-regrow detection remains intentionally unchanged under
-  the append-only harness assumption; the review thread stays open for Brian.
-- **Flagged for Brian:** the coverage event is a *separate* durable
-  `slipstream.enrichment.coverage.v1` (Q1 above), replacing A1's unimplemented
-  `evidence_availability` sketch. Confirm this is the intended shape.
+- **Resolved (Brian, 2026-09-19) — append-only assumption confirmed.** Same-inode
+  truncate-and-regrow detection stays as shipped: Claude Code and Codex both write
+  append-only JSONL (grow, or atomic-replace → new inode caught by generation
+  pinning; in-place shrink caught by the size check). The one uncaught case — an
+  in-place shrink then regrow to at-or-above the last observed size within a poll
+  interval — does not occur for either supported harness, so the P2 regrow-skip is
+  a won't-fix, not a defect. The assumption is now documented at the shrink-detection
+  site in `src/transcript/file-reader.ts`; a non-append-only source is out of scope.
+- **Resolved (Brian, 2026-09-19) — coverage event shape confirmed intended.** The
+  coverage event is a *separate* durable `slipstream.enrichment.coverage.v1`
+  (Q1 above), replacing A1's unimplemented `evidence_availability` sketch. Shape
+  reviewed and accepted: `{session_id, harness, state, issues?}` with
+  `state ∈ {pending, readable, degraded, unavailable}` and typed `issues`, folded
+  highest-seq-wins per harness, absence = health-unknown. Honesty-consistent
+  (`readable` is explicitly not a claim of complete history; a readable sibling
+  never conceals an unreadable one). Stage-5 forward note: the event discloses
+  health but not the scanned scope size, so a UI cannot show "scanned N transcripts"
+  from this shape alone — revisit only if Stage 5 needs it.
+- **Deferred hardening (tracked) — inode-reuse residual.** Full robustness against
+  an OS reusing a `(dev, ino)` between polls for a different file at the same path
+  needs a long-lived fd per reader (distinct from the shipped bigint-precision
+  generation fix). Narrow window; accepted for Stage 4, revisit if it ever surfaces.
 - **Known benign tradeoff:** the watcher's `lastKey` is in-memory, so the first
   tick after a restart may republish identical coverage. Harmless — coverage
   folds highest-seq-wins and the fold is idempotent.
