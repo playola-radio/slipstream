@@ -151,6 +151,29 @@ describe('transcript file reader', () => {
     );
   });
 
+  it('distinguishes two 64-bit inodes that collapse to the same Number', async () => {
+    // 9007199254740992 (2^53) and 2^53+1 are distinct inodes that round to the SAME
+    // JavaScript Number. Held as Number, the replacement would falsely pass the
+    // generation check and be ingested under the prior binding. Held as bigint, the
+    // reader sees a different generation and refuses it.
+    const genA = 9_007_199_254_740_992n;
+    const genB = 9_007_199_254_740_993n;
+    assert.equal(Number(genA), Number(genB), 'precondition: the two inodes collapse under Number');
+    file.ino = genA;
+    file.append(WRITE_A + '\n');
+    const reader = makeReader({ dev: file.dev, ino: genA });
+    await reader.poll();
+    assert.equal(sink.appended.length, 1);
+    file.replace(WRITE_B + '\n', genB); // a distinct inode that Number()s to genA
+    const r = await reader.poll();
+    assert.equal(r.state, 'unconfirmed', 'a bigint comparison catches the replacement Number would miss');
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a'],
+      'the replacement is not ingested under the prior binding',
+    );
+  });
+
   it('reads a replaced generation once a fresh reader is pinned to the new inode', async () => {
     // The watcher recreates the reader against the re-confirmed new generation on the
     // next tick. That fresh reader reads the replacement from zero; nothing is lost.
