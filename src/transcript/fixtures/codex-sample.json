@@ -1,0 +1,59 @@
+[
+  {
+    "type": "session_meta",
+    "timestamp": "2026-09-19T12:00:00.000Z",
+    "payload": {
+      "id": "codex-thread-1",
+      "cwd": "/work/proj",
+      "originator": "codex-cli"
+    }
+  },
+  {
+    "type": "response_item",
+    "timestamp": "2026-09-19T12:00:01.000Z",
+    "payload": {
+      "type": "custom_tool_call",
+      "name": "apply_patch",
+      "call_id": "call_patch_1",
+      "input": "*** Begin Patch\n*** Add File: src/new.ts\n+export const n = 1;\n*** Update File: src/old.ts\n*** Move to: src/renamed.ts\n@@\n-export const o = 1;\n+export const o = 2;\n*** Delete File: src/gone.ts\n*** End Patch\n"
+    }
+  },
+  {
+    "type": "response_item",
+    "timestamp": "2026-09-19T12:00:01.800Z",
+    "payload": {
+      "type": "custom_tool_call_output",
+      "call_id": "call_patch_1",
+      "output": "Applied patch"
+    }
+  },
+  {
+    "type": "response_item",
+    "timestamp": "2026-09-19T12:00:02.000Z",
+    "payload": {
+      "type": "function_call",
+      "name": "shell",
+      "call_id": "call_shell_1",
+      "arguments": "{\"command\":[\"bash\",\"-lc\",\"npm test\"],\"workdir\":\"/work/proj\"}"
+    }
+  },
+  {
+    "type": "response_item",
+    "timestamp": "2026-09-19T12:00:03.000Z",
+    "payload": {
+      "type": "function_call_output",
+      "call_id": "call_shell_1",
+      "output": "{\"exit_code\":0}"
+    }
+  },
+  {
+    "type": "response_item",
+    "timestamp": "2026-09-19T12:00:04.000Z",
+    "payload": {
+      "type": "custom_tool_call",
+      "name": "apply_patch",
+      "call_id": "call_patch_outside",
+      "input": "*** Begin Patch\n*** Add File: ../other/x.ts\n+nope\n*** End Patch\n"
+    }
+  }
+]

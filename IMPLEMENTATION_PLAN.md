@@ -426,6 +426,94 @@ rather than `change.clips` log events; attribution stays a log producer. See
 candidate-eligibility narrowing, and the D3 latency ruling (retained under
 D4 — parsing contention relocates to the reader).
 
+### A2 — Real Claude Code + Codex transcript adapters (in progress)
+
+**Goal**: replace A1's fake evidence with real transcript reads that produce
+`slipstream.harness.evidence.v1`, plus honest coverage disclosure and the Fork 4
+config surface. A2 does **not** change A1 inference semantics.
+
+Design locked via Codex consult (`gpt-6-astra`, 2026-09-19; see
+`.context/a2-consult.md`). Key decisions:
+
+- **Q1 coverage (refinement of the A1 sketch — flagged for review).** The A1
+  plan sketched a per-source `evidence_availability` field on
+  `change.attribution.v1`; it was never implemented. A2 replaces it with a
+  **separate durable event `slipstream.enrichment.coverage.v1`** and keeps the
+  policy's `SourceCoverage` as declared config only (`'unconfigured' |
+  'configured'`). Rationale: the evaluator never reads `policy.sources`, and
+  Fork 4 binds policy prospectively by `policy_seq`, so putting *runtime* health
+  in the policy would freeze stale health onto old changes. Coverage health is
+  retrospective; it must fold highest-seq-wins, independent of policy. The
+  coverage event carries `harness`, `state` (`pending | readable | degraded |
+  unavailable`), and an `issues[]` list (`missing | inaccessible | malformed |
+  unsupported | discovery-limited`). `readable` = the declared scan scope was
+  processed, never "complete edit history". Absent coverage = unknown, never
+  successful reading. This satisfies the A2 criterion "failures distinguishable
+  from read-with-no-match; unknown ≠ human" more robustly than a policy field.
+- **Q2 discovery.** Multiple harness sessions per worktree are legitimate
+  candidates. Discover by configurable transcript roots + canonicalized
+  `session_meta.cwd`/validated Claude slug as a *discovery filter, not authorship
+  evidence*; mtime is **not** an eligibility boundary. Bounded scans disclose
+  `discovery-limited` rather than pretend completeness.
+- **Q3 tool taxonomy.** Read-only tools (Read/Grep/Glob/LS) emit nothing; known
+  writes emit `paths`; Bash/plain shell/unrecognized tools emit
+  `file_scope={kind:'unknown'}`; missing stable invocation id → unsupported,
+  never a fabricated key. Only a fixture-proven `apply_patch` envelope is parsed
+  for paths — arbitrary shell text with patch markers stays unknown-scope.
+- **Q4 incremental read.** In-memory per-file cursor (`dev/ino`, byte offset);
+  durable dedup (evidence_key + variant signature) is the only idempotence
+  mechanism — no second persisted cursor. Advance the processed offset only after
+  each record is durably appended or reported duplicate; honor the ingestor's
+  retryable queue-full rejection. Inode change / size shrink → reread from 0.
+- **Q5 adapter core.** Pure `step(state, record, ctx) => { state, evidence[],
+  diagnostics }` (Claude records hold multiple tool calls; results join the prior
+  call's metadata). Start evidence emitted immediately; a matched result emits an
+  end record under the **same** key/tool/scope (never a provisional unknown-scope
+  end later "corrected" — that is a same-basis conflict in the fold). Filesystem
+  canonicalization stays in the I/O layer; the core relativizes paths against the
+  already-canonical root exactly like the capture path (`relative(root, abs)`).
+
+**Success Criteria** (from the brief / STAGE-4-PLAN A2):
+- Both adapters produce `harness.evidence.v1` with fixture-proven native
+  `record_id` + `file_scope` mappings (sanitized fixtures committed as `.json` /
+  `.ts`, never `*.jsonl`).
+- Incremental reads, partial records, rotation/reread idempotence.
+- Public config surface (Fork 4 file + CLI overrides).
+- Coverage disclosure distinguishes missing/malformed/inaccessible/unsupported
+  from read-with-no-match; `unknown` ≠ `human`.
+
+**Tests**: (a) edits before their task is declared → grouped by declaration
+sequence, not backdated; (b) late transcript arriving after restart → revises
+without duplicate evidence; (c) native-identity fixtures prove the `record_id` +
+file-scope mapping for BOTH harnesses.
+
+**Status**: Complete. Codex adversarial review PASSED (gate #18).
+- Adapters, discovery, incremental file reader, coverage watcher/runner, config
+  surface (file + CLI overrides), and session/daemon/CLI wiring landed.
+- All three required tests present: (a) `session.test.ts` append-order grouping;
+  (b) `transcript/restart-idempotence.test.ts` (fresh watcher rereads from
+  offset 0, ingestor log-derived dedup absorbs the replayed prefix, only the
+  late record appends); (c) `transcript/claude.test.ts` + `codex.test.ts`
+  native-identity fixtures. `npm run typecheck` + `npm test` (678) green.
+- Review hardening: a transcript reader is pinned to the (dev, ino) generation
+  discovery confirmed and refuses a same-path replacement (`unconfirmed`) rather
+  than crediting a foreign session's writes; identity and evidence bytes come from
+  one open handle (no stat→read TOCTOU); generation ids are 64-bit bigints (no
+  Number precision collapse); a bare `null` head line can no longer abort a
+  discovery tick.
+- PR #21 review fixes: an unconfirmed replacement degrades a readable sibling
+  without inventing an issue (alone it stays pending); transcript reads drain in
+  1 MiB chunks within a poll, expanding the window for an over-chunk line.
+  Typecheck, all 114 transcript tests, and all 680 full-suite tests pass.
+  Same-inode truncate-and-regrow detection remains intentionally unchanged under
+  the append-only harness assumption; the review thread stays open for Brian.
+- **Flagged for Brian:** the coverage event is a *separate* durable
+  `slipstream.enrichment.coverage.v1` (Q1 above), replacing A1's unimplemented
+  `evidence_availability` sketch. Confirm this is the intended shape.
+- **Known benign tradeoff:** the watcher's `lastKey` is in-memory, so the first
+  tick after a restart may republish identical coverage. Harmless — coverage
+  folds highest-seq-wins and the fold is idempotent.
+
 ---
 
 ## Stage 5: Build the watching UI and run acceptance

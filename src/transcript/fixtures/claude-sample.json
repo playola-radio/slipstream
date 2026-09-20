@@ -1,0 +1,100 @@
+[
+  {
+    "type": "assistant",
+    "sessionId": "claude-sess-1",
+    "cwd": "/work/proj",
+    "uuid": "rec-1",
+    "timestamp": "2026-09-19T12:00:00.000Z",
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll edit the file and read another, then run a check."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_write_a",
+          "name": "Write",
+          "input": { "file_path": "/work/proj/src/a.ts", "content": "export const a = 1;\n" }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_read_b",
+          "name": "Read",
+          "input": { "file_path": "/work/proj/src/b.ts" }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "rec-2",
+    "timestamp": "2026-09-19T12:00:01.500Z",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_write_a",
+          "content": "File written"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_read_b",
+          "content": "export const b = 2;\n"
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant",
+    "sessionId": "claude-sess-1",
+    "cwd": "/work/proj",
+    "uuid": "rec-3",
+    "timestamp": "2026-09-19T12:00:02.000Z",
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_edit_notebook",
+          "name": "NotebookEdit",
+          "input": { "notebook_path": "/work/proj/notes/run.ipynb", "new_source": "print(1)" }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_bash_1",
+          "name": "Bash",
+          "input": { "command": "npm test" }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_write_outside",
+          "name": "Write",
+          "input": { "file_path": "/other/repo/x.ts", "content": "nope" }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "rec-4",
+    "timestamp": "2026-09-19T12:00:03.000Z",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bash_1",
+          "content": "tests passed"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_never_started",
+          "content": "orphan"
+        }
+      ]
+    }
+  }
+]

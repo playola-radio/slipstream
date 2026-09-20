@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.enrichment.coverage.v1.json",
+  "title": "slipstream.enrichment.coverage.v1",
+  "$comment": "Observed transcript-reading health for one harness source, so a client can distinguish 'read the scope and matched nothing' from 'could not read the scope'. Runtime health, NOT policy: folded highest-seq-wins per harness, independent of policy_seq. Absence of any coverage event means health is unknown, never a successful read. Never authorship, never a change. Unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.enrichment.coverage.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "harness",
+        "state"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "harness": {
+          "enum": [
+            "claude-code",
+            "codex"
+          ]
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "readable",
+            "degraded",
+            "unavailable"
+          ]
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "missing",
+                  "inaccessible",
+                  "malformed",
+                  "unsupported",
+                  "discovery-limited"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

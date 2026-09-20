@@ -90,8 +90,17 @@ const SAMPLES: Record<string, EventInput> = {
       policy: {
         window_ms: 2000,
         grace_ms: 5000,
-        sources: { 'claude-code': 'unconfigured', codex: 'unconfigured' },
+        sources: { 'claude-code': 'configured', codex: 'unconfigured' },
       },
+    },
+  },
+  'slipstream.enrichment.coverage.v1': {
+    type: 'slipstream.enrichment.coverage.v1',
+    occurred_at_ms: 1789657200123,
+    data: {
+      harness: 'codex',
+      state: 'degraded',
+      issues: [{ kind: 'malformed', detail: 'one transcript had a truncated trailing line' }],
     },
   },
 };
