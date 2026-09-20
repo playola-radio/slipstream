@@ -59,12 +59,15 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
       d === dir ? { ok: true, paths: [path] } : { ok: false, reason: 'missing' },
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () =>
-      mem.buf.length > 0 ? { ok: true, line: cwdRecord } : { ok: false, reason: 'empty' },
+      mem.buf.length > 0
+        ? { ok: true, line: cwdRecord, id: { dev: 1, ino: 42 } }
+        : { ok: false, reason: 'empty' },
     readHeadLines: async () => ({
       ok: true,
       lines: mem.buf.length > 0 ? [cwdRecord] : [],
       truncated: false,
       skipped: false,
+      id: { dev: 1, ino: 42 },
     }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),

@@ -65,11 +65,22 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('returns the first line of a readable file', async () => {
-    assert.deepEqual(await nodeDiscoveryIO.readFirstLine(join(dir, 'good.jsonl')), {
-      ok: true,
-      line: '{"type":"session_meta"}',
-    });
+  it('returns the first line of a readable file, with the file generation id', async () => {
+    const result = await nodeDiscoveryIO.readFirstLine(join(dir, 'good.jsonl'));
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.line, '{"type":"session_meta"}');
+    // The id is the (dev, ino) of the exact file read, captured on the same handle.
+    assert.equal(result.ok && typeof result.id.dev, 'number');
+    assert.equal(result.ok && typeof result.id.ino, 'number');
+  });
+
+  it('stamps the same generation id from readFirstLine and readHeadLines for one file', async () => {
+    // Both reads fstat the file they opened, so they agree on its identity — the
+    // property discovery relies on to pin a reader to the bytes that derived the ctx.
+    const first = await nodeDiscoveryIO.readFirstLine(join(dir, 'good.jsonl'));
+    const head = await nodeDiscoveryIO.readHeadLines(join(dir, 'good.jsonl'));
+    assert.ok(first.ok && head.ok);
+    assert.deepEqual(first.ok && first.id, head.ok && head.id);
   });
 
   it('reports an empty file distinctly', async () => {

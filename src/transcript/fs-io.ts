@@ -7,7 +7,7 @@ import {
   stat as fsStat,
 } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { StatResult, TranscriptFileIO } from './file-reader.ts';
+import type { FileId, StatResult, TranscriptFileIO } from './file-reader.ts';
 import type {
   DiscoveryIO,
   FirstLineResult,
@@ -118,6 +118,11 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       return { ok: false, reason: 'inaccessible' };
     }
     try {
+      // Identify the exact bytes about to be read, from the SAME open handle, so the
+      // generation stamped on the result is the file whose content derived the ctx —
+      // not a replacement swapped in between this read and the reader's later stat.
+      const idStat = await handle.stat();
+      const id: FileId = { dev: idStat.dev, ino: Number(idStat.ino) };
       // Read the COMPLETE first line: a Claude first record can exceed one chunk,
       // and a truncated prefix fails to parse, which would silently fall through to
       // slug-trust (mis-binding) or falsely split a multibyte char (false malformed).
@@ -153,7 +158,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       } catch {
         return { ok: false, reason: 'malformed' };
       }
-      return { ok: true, line };
+      return { ok: true, line, id };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {
@@ -169,6 +174,10 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       return { ok: false, reason: 'inaccessible' };
     }
     try {
+      // The generation of the exact bytes scanned, from the same open handle (see
+      // readFirstLine): the id stamped on the binding is the file this head derived.
+      const idStat = await handle.stat();
+      const id: FileId = { dev: idStat.dev, ino: Number(idStat.ino) };
       const lines: string[] = [];
       let pos = 0;
       let sawByte = false;
@@ -227,7 +236,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
         }
       }
       if (!sawByte) return { ok: false, reason: 'empty' };
-      return { ok: true, lines, truncated, skipped };
+      return { ok: true, lines, truncated, skipped, id };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {

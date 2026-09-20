@@ -11,11 +11,18 @@
  * landed. A blank or unparseable line advances (it must never wedge the reader);
  * only backpressure holds the offset.
  *
- * Rotation/rewrite (inode change, or a size below the last observed size) resets
- * the offset and the core's join state to a fresh generation and rereads from
- * zero. Tracking the last observed size, not just the offset, catches an in-place
- * rewrite that shrinks the file to at-or-above the line-boundary offset (a partial
- * tail replaced by shorter content) — a shrink an offset-only check would miss.
+ * The reader is pinned to ONE file generation: the (dev, ino) discovery read to
+ * confirm this binding's membership and scope. A poll that finds a different
+ * inode is a replacement discovery has not yet re-confirmed — ingesting it would
+ * credit the new file's records to the prior generation's session and scope — so
+ * the reader refuses it (`unconfirmed`) and defers to the next discovery tick,
+ * which re-derives the binding for the new generation and, if it too is a
+ * confirmed in-root member, recreates this reader against it. Within the pinned
+ * generation, a size below the last observed size is an in-place rewrite/truncation
+ * (a partial tail replaced by shorter content); the offset and join state reset and
+ * it rereads from zero. Tracking the last observed size, not just the offset,
+ * catches a shrink to at-or-above the line-boundary offset that an offset-only
+ * check would miss.
  */
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 import type { IngestOutcome } from '../evidence-ingest.ts';
@@ -25,6 +32,15 @@ import type { Diagnostic } from './types.ts';
 // to replacement characters (which could fabricate a path). Reused across polls;
 // safe because each call is a one-shot decode (no streaming state).
 const LINE_DECODER = new TextDecoder('utf8', { fatal: true });
+
+/** A file generation's identity: the (dev, ino) of the exact bytes discovery read
+ * to derive a binding's session and scope. An atomic replace yields a new inode,
+ * so a poll that finds a different {@link FileId} is reading content discovery has
+ * not confirmed belongs to this binding. */
+export interface FileId {
+  dev: number;
+  ino: number;
+}
 
 export type StatResult =
   | { ok: true; size: number; dev: number; ino: number }
@@ -46,7 +62,7 @@ export interface Stepper {
   step(record: unknown): { evidence: NormalizedEvidence[]; diagnostics: Diagnostic[] };
 }
 
-export type FileReadState = 'readable' | 'degraded' | 'missing' | 'inaccessible';
+export type FileReadState = 'readable' | 'degraded' | 'missing' | 'inaccessible' | 'unconfirmed';
 
 export interface FileReadResult {
   state: FileReadState;
@@ -61,20 +77,19 @@ export interface TranscriptFileReaderOptions {
   io: TranscriptFileIO;
   sink: EvidenceSink;
   stepper: Stepper;
+  /** The file generation discovery confirmed for this binding's session and scope.
+   * A poll that finds a different inode refuses to ingest it (`unconfirmed`). */
+  generation: FileId;
 }
 
 export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
-  const { path, io, sink, stepper } = opts;
+  const { path, io, sink, stepper, generation } = opts;
   let offset = 0;
   let lastSize = 0;
-  let dev: number | undefined;
-  let ino: number | undefined;
   let issues: Diagnostic[] = [];
 
-  const resetGeneration = (st: { dev: number; ino: number }): void => {
+  const rereadFromZero = (): void => {
     offset = 0;
-    dev = st.dev;
-    ino = st.ino;
     issues = [];
     stepper.reset();
   };
@@ -98,12 +113,21 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
     if (!st.ok) {
       return { state: st.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
     }
-    // A file smaller than we last saw it was truncated/rewritten in place, even when
-    // it still sits at or above the line-boundary offset (a partial tail replaced by
-    // shorter content). Reread from zero. (`size < lastSize` subsumes `size < offset`,
-    // since the offset never runs past the last observed size.)
-    if (dev === undefined || st.dev !== dev || st.ino !== ino || st.size < lastSize) {
-      resetGeneration(st);
+    // A different inode at this path is a replacement (an atomic rename-into-place)
+    // whose membership and scope discovery has NOT re-confirmed. Ingesting it would
+    // credit the new file's records to the prior generation's session and scope, so
+    // refuse it: report `unconfirmed` and leave the offset untouched. The next
+    // discovery tick re-derives the binding for the new generation and, if it too is
+    // a confirmed in-root member, recreates this reader against it.
+    if (st.dev !== generation.dev || st.ino !== generation.ino) {
+      return { state: 'unconfirmed', issues, backpressured: false };
+    }
+    // A file smaller than we last saw it was truncated/rewritten in place within the
+    // pinned generation, even when it still sits at or above the line-boundary offset
+    // (a partial tail replaced by shorter content). Reread from zero. (`size < lastSize`
+    // subsumes `size < offset`, since the offset never runs past the last observed size.)
+    if (st.size < lastSize) {
+      rereadFromZero();
     }
     lastSize = st.size;
     let backpressured = false;

@@ -10,6 +10,11 @@ import type { EnrichmentCoverageData } from '../event.ts';
 
 const ROOT = '/work/proj';
 
+// The default generation of a FakeFile: discovery fakes stamp this on their reads so
+// the id matches fileIO's stat and the reader confirms the binding (a mismatch is the
+// replacement path, exercised by its own test).
+const GEN = { dev: 1, ino: 100 };
+
 class FakeFile {
   buf = Buffer.alloc(0);
   dev = 1;
@@ -51,7 +56,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: GEN }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -132,6 +137,24 @@ describe('coverage aggregation', () => {
     assert.equal(r.issues.some((i) => i.kind === 'inaccessible'), true);
   });
 
+  it('withholds an unconfirmed (replaced) transcript without inventing an issue', () => {
+    // A reader that found a replaced inode returns `unconfirmed`: it is neither read
+    // nor a hard failure, so it must not count as coverage nor push an issue. With no
+    // other signal it stays pending, so a one-tick self-healing replacement race never
+    // flaps coverage to unavailable.
+    const r = aggregateCoverage([], [{ state: 'unconfirmed', issues: [] }]);
+    assert.deepEqual(r, { state: 'pending', issues: [] });
+  });
+
+  it('an unconfirmed file does not conceal a readable sibling nor add an issue', () => {
+    const r = aggregateCoverage([], [
+      { state: 'readable', issues: [] },
+      { state: 'unconfirmed', issues: [] },
+    ]);
+    assert.equal(r.state, 'readable');
+    assert.equal(r.issues.length, 0);
+  });
+
   it('is degraded, not readable, while a file still has backpressured evidence', () => {
     // The file read cleanly (no content issue) but some evidence was held back by
     // ingestion backpressure, so coverage must not claim the scope is fully recorded.
@@ -169,7 +192,7 @@ describe('transcript watcher', () => {
       discoveryIO: discoveryIO({
         listDir: async (d): Promise<ListResult> =>
           d === dir ? { ok: true, paths: [`${dir}/sess-a.jsonl`] } : { ok: false, reason: 'missing' },
-        readFirstLine: async () => ({ ok: true, line: CWD_RECORD }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: GEN }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -193,7 +216,7 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [`${dir}/sess-a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true, line: CWD_RECORD }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: GEN }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -219,7 +242,7 @@ describe('transcript watcher', () => {
         listDir: async (): Promise<ListResult> =>
           present ? { ok: true, paths: [path] } : { ok: false, reason: 'missing' },
         readFirstLine: async () =>
-          present ? { ok: true, line: CWD_RECORD } : { ok: false, reason: 'empty' },
+          present ? { ok: true, line: CWD_RECORD, id: GEN } : { ok: false, reason: 'empty' },
       }),
       fileIO: fileIO(files),
       sink,
@@ -260,7 +283,7 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listTreeJsonl: async () => ({ paths: [path], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true, line: metaLine(sessionId) }),
+        readFirstLine: async () => ({ ok: true, line: metaLine(sessionId), id: GEN }),
         realpath: async (p) => p,
       }),
       fileIO: fileIO(files),
@@ -299,7 +322,7 @@ describe('transcript watcher', () => {
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
         // The cwd record confirming membership appears only once the file is written.
         readFirstLine: async () =>
-          files.has(path) ? { ok: true, line: CWD_RECORD } : { ok: false, reason: 'empty' },
+          files.has(path) ? { ok: true, line: CWD_RECORD, id: GEN } : { ok: false, reason: 'empty' },
       }),
       fileIO: fileIO(files),
       sink,
@@ -342,11 +365,11 @@ describe('transcript watcher', () => {
         // The transcript's cwd lives past a cwd-less preamble and appears only once
         // the file is written; before that the first line is empty (unconfirmed).
         readFirstLine: async () =>
-          files.has(path) ? { ok: true as const, line: preamble } : { ok: false as const, reason: 'empty' as const },
+          files.has(path) ? { ok: true as const, line: preamble, id: GEN } : { ok: false as const, reason: 'empty' as const },
         readHeadLines: async () =>
           files.has(path)
-            ? { ok: true as const, lines: [preamble, cwdRecord], truncated: false as const, skipped: false as const }
-            : { ok: true as const, lines: [], truncated: false as const, skipped: false as const },
+            ? { ok: true as const, lines: [preamble, cwdRecord], truncated: false as const, skipped: false as const, id: GEN }
+            : { ok: true as const, lines: [], truncated: false as const, skipped: false as const, id: GEN },
         realpath: async (p) => (p === '/alias/proj' ? ROOT : p),
       }),
       fileIO: fileIO(files),
@@ -363,6 +386,71 @@ describe('transcript watcher', () => {
     );
     assert.equal(starts.length, 1, 'the aliased write is captured, not dropped');
     assert.deepEqual(starts[0]!.file_scope, { kind: 'paths', paths: ['a.ts'] });
+  });
+
+  it('refuses a transcript replaced (new inode) between discovery and the read', async () => {
+    // Intra-tick TOCTOU: discovery head-reads generation ino=100 and confirms it
+    // in-root, but the file is atomically replaced (ino=200) before the reader stats
+    // it. The replacement's membership and scope are unconfirmed — for a content-derived
+    // ctx (Codex, or a slug-colliding Claude root) it could be a foreign session — so
+    // the reader refuses to ingest it under the just-derived binding, and coverage
+    // stays pending rather than falsely claiming readable over the replacement's bytes.
+    const dir = '/home/projects/-work-proj';
+    const path = `${dir}/sess-a.jsonl`;
+    const file = new FakeFile();
+    file.ino = 200; // the file on disk NOW is the post-replace generation
+    file.append(WRITE_A + '\n');
+    const files = new Map([[path, file]]);
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
+        // Discovery read the PRIOR generation (ino=100), before the atomic replace.
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1, ino: 100 } }),
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick();
+    assert.equal(sink.appended.length, 0, 'the unconfirmed replacement is not ingested');
+    assert.deepEqual(published, ['pending'], 'coverage withholds rather than claiming readable');
+  });
+
+  it('ingests a replacement once discovery re-confirms it on the next tick', async () => {
+    // The self-heal: after the refused tick, the next discovery read observes the new
+    // generation (ino=200) itself, re-derives the binding against it, and the watcher
+    // recreates the reader pinned to ino=200 — which reads the replacement from zero.
+    const dir = '/home/projects/-work-proj';
+    const path = `${dir}/sess-a.jsonl`;
+    const file = new FakeFile();
+    file.ino = 200;
+    file.append(WRITE_A + '\n');
+    const files = new Map([[path, file]]);
+    let discoveredIno = 100; // lags one tick behind the on-disk inode
+    const watcher = createTranscriptWatcher({
+      harness: 'claude-code',
+      home: '/home',
+      root: ROOT,
+      codexScanLimit: 1000,
+      discoveryIO: discoveryIO({
+        listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1, ino: discoveredIno } }),
+      }),
+      fileIO: fileIO(files),
+      sink,
+      publish,
+    });
+    await watcher.tick(); // discovery lags at ino=100; reader refuses the ino=200 file
+    assert.equal(sink.appended.length, 0);
+    discoveredIno = 200; // discovery catches up to the replacement
+    await watcher.tick();
+    assert.equal(sink.appended.length, 1, 'the re-confirmed replacement is read from zero');
+    assert.equal(sink.appended[0]!.evidence_key.record_id, 'toolu_a');
+    assert.equal(published.at(-1), 'readable');
   });
 
   it('reports unavailable when the transcript home is inaccessible', async () => {

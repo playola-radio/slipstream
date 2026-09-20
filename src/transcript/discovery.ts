@@ -17,6 +17,7 @@
  */
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { CoverageIssue, HarnessName } from '../event.ts';
+import type { FileId } from './file-reader.ts';
 import type { AdapterContext } from './types.ts';
 
 export const CLAUDE_ADAPTER_VERSION = 'claude-code/1';
@@ -25,6 +26,9 @@ export const CODEX_ADAPTER_VERSION = 'codex/1';
 export interface TranscriptBinding {
   path: string;
   ctx: AdapterContext;
+  /** The file generation whose bytes discovery read to derive this binding's ctx.
+   * The reader is pinned to it and refuses a replacement it has not re-confirmed. */
+  generation: FileId;
 }
 
 export interface DiscoveryResult {
@@ -45,7 +49,7 @@ export type TreeResult =
 /** The first line of a transcript, or why it could not be produced (so discovery
  * can disclose an unreadable/empty candidate instead of silently skipping it). */
 export type FirstLineResult =
-  | { ok: true; line: string }
+  | { ok: true; line: string; id: FileId }
   | { ok: false; reason: 'inaccessible' | 'empty' | 'malformed' };
 
 /** A bounded, decoded set of a transcript's leading lines, for scanning past a
@@ -57,7 +61,7 @@ export type FirstLineResult =
  * the per-line cap, or was not valid UTF-8), so a cwd could have sat on a line we
  * never examined — the caller must not read "no cwd found" as a clean preamble. */
 export type HeadLinesResult =
-  | { ok: true; lines: string[]; truncated: boolean; skipped: boolean }
+  | { ok: true; lines: string[]; truncated: boolean; skipped: boolean; id: FileId }
   | { ok: false; reason: 'inaccessible' | 'empty' };
 
 export interface DiscoveryIO {
@@ -240,9 +244,12 @@ function readLineCwd(line: string): LineCwd {
   return typeof obj.cwd === 'string' && obj.cwd.length > 0 ? { kind: 'cwd', cwd: obj.cwd } : { kind: 'no-cwd' };
 }
 
-/** The outcome of searching a Claude transcript for its recorded working directory. */
+/** The outcome of searching a Claude transcript for its recorded working directory.
+ * `found` carries the generation ({@link FileId}) of the exact bytes the cwd was
+ * read from, so the reader can be pinned to the file whose content established
+ * membership. */
 type ClaudeCwdResolution =
-  | { kind: 'found'; cwd: string } // a cwd-bearing record was read
+  | { kind: 'found'; cwd: string; id: FileId } // a cwd-bearing record was read
   | { kind: 'none' } // the whole head was read cleanly and carries no cwd yet (empty or a preamble)
   | { kind: 'unconfirmed'; reason: 'inaccessible' | 'malformed'; detail: string }; // a cwd may exist but the head could not be searched through
 
@@ -265,9 +272,11 @@ async function resolveClaudeCwd(
   io: DiscoveryIO,
   path: string,
   firstLine: string,
+  firstId: FileId,
 ): Promise<ClaudeCwdResolution> {
   const first = readLineCwd(firstLine);
-  if (first.kind === 'cwd') return { kind: 'found', cwd: first.cwd };
+  // The cwd came off the first line: pin to that read's generation (`firstId`).
+  if (first.kind === 'cwd') return { kind: 'found', cwd: first.cwd, id: firstId };
   let sawMalformed = first.kind === 'malformed';
   const head = await io.readHeadLines(path);
   // The first line already read, so the file is non-empty; an unreadable or
@@ -275,7 +284,10 @@ async function resolveClaudeCwd(
   if (!head.ok) return { kind: 'unconfirmed', reason: 'inaccessible', detail: 'the head could not be read' };
   for (const line of head.lines) {
     const parsed = readLineCwd(line);
-    if (parsed.kind === 'cwd') return { kind: 'found', cwd: parsed.cwd };
+    // The cwd came off the head scan: pin to the head read's generation, the exact
+    // bytes this cwd was decoded from (not the earlier first-line read, which may
+    // predate a replacement the head then read through).
+    if (parsed.kind === 'cwd') return { kind: 'found', cwd: parsed.cwd, id: head.id };
     if (parsed.kind === 'malformed') sawMalformed = true;
   }
   // No cwd in the searched head. Only a head that was read through cleanly (every
@@ -326,7 +338,7 @@ export async function discoverClaude(
       issues.push({ kind: head.reason, detail: `claude transcript ${path}` });
       continue;
     }
-    const resolution = await resolveClaudeCwd(io, path, head.line);
+    const resolution = await resolveClaudeCwd(io, path, head.line, head.id);
     if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
     if (resolution.kind === 'unconfirmed') {
       issues.push({
@@ -354,6 +366,7 @@ export async function discoverClaude(
         adapterVersion: CLAUDE_ADAPTER_VERSION,
         ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
       },
+      generation: resolution.id,
     });
   }
   return { bindings, issues };
@@ -443,6 +456,9 @@ export async function discoverCodex(
         adapterVersion: CODEX_ADAPTER_VERSION,
         ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
       },
+      // The Codex ctx derives entirely from line 1 (session_meta), so the generation
+      // is the first-line read that produced it.
+      generation: head.id,
     });
   }
   return { bindings, issues };

@@ -89,8 +89,8 @@ describe('transcript file reader', () => {
   let file: FakeFile;
   let sink: FakeSink;
 
-  const makeReader = () =>
-    createTranscriptFileReader({ path: '/t.jsonl', io: fakeIO(files), sink, stepper: claudeStepper(CTX) });
+  const makeReader = (generation = { dev: file.dev, ino: file.ino }) =>
+    createTranscriptFileReader({ path: '/t.jsonl', io: fakeIO(files), sink, stepper: claudeStepper(CTX), generation });
 
   beforeEach(() => {
     file = new FakeFile();
@@ -128,16 +128,41 @@ describe('transcript file reader', () => {
     assert.equal(sink.appended.length, 1);
   });
 
-  it('rereads from zero after inode rotation, dedup absorbing the overlap', async () => {
+  it('refuses a replaced generation (new inode) instead of ingesting it under the stale binding', async () => {
+    // A same-path atomic replace yields a new inode. Because a Codex ctx (and a
+    // slug-colliding Claude ctx) is derived from the file's own content, ingesting
+    // the replacement under this reader's pinned binding would credit its records to
+    // the prior generation's session and scope. The reader refuses it (`unconfirmed`)
+    // and defers to the next discovery tick, which re-derives the binding for the new
+    // inode and, only if it too is a confirmed in-root member, recreates the reader.
     file.append(WRITE_A + '\n');
     const reader = makeReader();
     await reader.poll();
-    file.replace(WRITE_A + '\n' + WRITE_B + '\n', 200); // rotated: new inode, same prefix
-    await reader.poll();
+    assert.equal(sink.appended.length, 1);
+    file.replace(WRITE_A + '\n' + WRITE_B + '\n', 200); // atomic replace: new inode
+    const r = await reader.poll();
+    assert.equal(r.state, 'unconfirmed', 'a new inode is a replacement discovery has not re-confirmed');
+    assert.deepEqual(
+      sink.appended.map((e) => e.evidence_key.record_id),
+      ['toolu_a'],
+      'the replacement is not ingested under the prior binding',
+    );
+  });
+
+  it('reads a replaced generation once a fresh reader is pinned to the new inode', async () => {
+    // The watcher recreates the reader against the re-confirmed new generation on the
+    // next tick. That fresh reader reads the replacement from zero; nothing is lost.
+    file.append(WRITE_A + '\n');
+    const stale = makeReader();
+    await stale.poll();
+    file.replace(WRITE_B + '\n', 200); // atomic replace: new inode, new content
+    assert.equal((await stale.poll()).state, 'unconfirmed', 'the stale reader refuses it');
+    const fresh = makeReader({ dev: file.dev, ino: file.ino });
+    assert.equal((await fresh.poll()).state, 'readable');
     assert.deepEqual(
       sink.appended.map((e) => e.evidence_key.record_id),
       ['toolu_a', 'toolu_b'],
-      'the rotated prefix dedups; only the new record is appended',
+      'the fresh reader pinned to the new generation reads the replacement',
     );
   });
 
