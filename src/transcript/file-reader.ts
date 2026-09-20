@@ -23,6 +23,14 @@
  * it rereads from zero. Tracking the last observed size, not just the offset,
  * catches a shrink to at-or-above the line-boundary offset that an offset-only
  * check would miss.
+ *
+ * These checks assume an append-only writer: the transcript only grows or is
+ * atomically replaced (new inode, refused above), never shrinks and regrows in
+ * place within a single poll interval. Claude Code and Codex both write
+ * append-only JSONL, so the one case a size comparison cannot see — an in-place
+ * shrink then regrow back to at-or-above the last observed size between two polls
+ * — does not arise for either supported harness. A non-append-only source could
+ * slip a rewrite past the size check; that residual is accepted, not fixed.
  */
 import type { NormalizedEvidence } from '../evidence-ingest.ts';
 import type { IngestOutcome } from '../evidence-ingest.ts';
