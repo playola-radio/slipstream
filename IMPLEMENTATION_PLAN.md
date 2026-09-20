@@ -470,6 +470,12 @@ file-scope mapping for BOTH harnesses.
   one open handle (no stat→read TOCTOU); generation ids are 64-bit bigints (no
   Number precision collapse); a bare `null` head line can no longer abort a
   discovery tick.
+- PR #21 review fixes: an unconfirmed replacement degrades a readable sibling
+  without inventing an issue (alone it stays pending); transcript reads drain in
+  1 MiB chunks within a poll, expanding the window for an over-chunk line.
+  Typecheck, all 114 transcript tests, and all 680 full-suite tests pass.
+  Same-inode truncate-and-regrow detection remains intentionally unchanged under
+  the append-only harness assumption; the review thread stays open for Brian.
 - **Flagged for Brian:** the coverage event is a *separate* durable
   `slipstream.enrichment.coverage.v1` (Q1 above), replacing A1's unimplemented
   `evidence_availability` sketch. Confirm this is the intended shape.

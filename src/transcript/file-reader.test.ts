@@ -30,7 +30,7 @@ class FakeFile {
 
 function fakeIO(files: Map<string, FakeFile>): TranscriptFileIO {
   return {
-    async readFrom(path, start) {
+    async readFrom(path, start, maxBytes) {
       const f = files.get(path);
       if (!f) return { ok: false, reason: 'missing' };
       // The id, size, and bytes all come from the one snapshot, like a single open
@@ -39,7 +39,7 @@ function fakeIO(files: Map<string, FakeFile>): TranscriptFileIO {
         ok: true,
         id: { dev: f.dev, ino: f.ino },
         size: f.buf.length,
-        bytes: f.buf.subarray(start, f.buf.length),
+        bytes: f.buf.subarray(start, Math.min(f.buf.length, start + maxBytes)),
       };
     },
   };
@@ -107,6 +107,44 @@ describe('transcript file reader', () => {
     assert.equal(r.state, 'readable');
     assert.equal(sink.appended.length, 1);
     assert.equal(sink.appended[0]!.evidence_key.record_id, 'toolu_a');
+  });
+
+  it('drains bounded chunks and an over-chunk record in one poll', { timeout: 1000 }, async () => {
+    const records = ['a', 'b', 'a record longer than the chunk', 'c'];
+    file.append(records.map((record) => JSON.stringify(record) + '\n').join(''));
+    const calls: Array<{ start: number; maxBytes: number }> = [];
+    const adapter = claudeStepper(CTX);
+    const reader = createTranscriptFileReader({
+      path: '/t.jsonl',
+      io: {
+        async readFrom(_path, start, maxBytes) {
+          calls.push({ start, maxBytes });
+          return {
+            ok: true,
+            id: { dev: file.dev, ino: file.ino },
+            size: file.buf.length,
+            bytes: file.buf.subarray(start, Math.min(file.buf.length, start + maxBytes)),
+          };
+        },
+      },
+      sink,
+      stepper: {
+        reset: () => adapter.reset(),
+        step(record) {
+          const native = JSON.parse(WRITE_A);
+          native.message.content[0].id = record;
+          return adapter.step(native);
+        },
+      },
+      generation: { dev: file.dev, ino: file.ino },
+      readChunkBytes: 16,
+    });
+    const result = await reader.poll();
+    assert.deepEqual(sink.appended.map((e) => e.evidence_key.record_id), records);
+    assert.equal(result.state, 'readable');
+    assert.ok(calls.some((call) => call.maxBytes === 16));
+    assert.ok(calls.length > 1);
+    assert.ok(calls.some((call) => call.maxBytes > 16), 'an over-chunk line grows the read window');
   });
 
   it('holds a partial trailing line until its newline arrives', async () => {

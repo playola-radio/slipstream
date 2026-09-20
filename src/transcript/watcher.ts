@@ -50,7 +50,8 @@ export interface TranscriptWatcher {
  * successful read to `degraded`, so one readable transcript never conceals an
  * unreadable sibling and `readable` never claims a scope whose evidence has not
  * yet been recorded. With nothing read, a hard failure is `unavailable` while a
- * merely-not-yet-written home stays `pending`.
+ * merely-not-yet-written home stays `pending`. An unconfirmed replacement degrades
+ * a readable aggregate but stays pending when alone.
  */
 export function aggregateCoverage(
   discoveryIssues: readonly CoverageIssue[],
@@ -64,12 +65,14 @@ export function aggregateCoverage(
   const issues: CoverageIssue[] = [...discoveryIssues];
   let readCount = 0;
   let backpressured = false;
+  let withheld = false;
   for (const f of files) {
     if (f.state === 'readable' || f.state === 'degraded') {
       readCount += 1;
       if (f.backpressured) backpressured = true;
       for (const d of f.issues) issues.push({ kind: d.kind, detail: d.detail });
     } else if (f.state === 'unconfirmed') {
+      withheld = true;
       // The file at this path was replaced (a new inode) and discovery has not yet
       // re-confirmed the replacement's membership/scope. It is neither read nor a
       // failure: withhold it (pending-compatible, no issue) so a one-tick self-healing
@@ -86,7 +89,7 @@ export function aggregateCoverage(
   }
   let state: CoverageState;
   if (readCount > 0) {
-    state = issues.length > 0 || backpressured ? 'degraded' : 'readable';
+    state = issues.length > 0 || backpressured || withheld ? 'degraded' : 'readable';
   } else {
     const hardFailure = issues.some((i) => i.kind !== 'missing');
     state = hardFailure ? 'unavailable' : 'pending';

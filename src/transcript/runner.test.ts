@@ -18,7 +18,7 @@ class FakeSink implements EvidenceSink {
 }
 
 const emptyFileIO: TranscriptFileIO = {
-  async readFrom(): Promise<TranscriptReadResult> {
+  async readFrom(_path: string, _start: number, _maxBytes: number): Promise<TranscriptReadResult> {
     return { ok: false, reason: 'missing' };
   },
 };

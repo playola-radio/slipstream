@@ -73,13 +73,13 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
     probe: async () => ({ kind: 'absent' }),
   };
   const fileIO: TranscriptFileIO = {
-    async readFrom(p, start) {
+    async readFrom(p, start, maxBytes) {
       if (p !== path) return { ok: false, reason: 'missing' };
       return {
         ok: true,
         id: { dev: 1n, ino: 42n },
         size: mem.buf.length,
-        bytes: mem.buf.subarray(start, mem.buf.length),
+        bytes: mem.buf.subarray(start, Math.min(mem.buf.length, start + maxBytes)),
       };
     },
   };

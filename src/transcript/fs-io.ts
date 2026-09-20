@@ -21,7 +21,7 @@ import type {
  * identity, size, and bytes all come from ONE open handle so a concurrent replace
  * cannot supply a different generation's bytes than the id reports. */
 export const nodeTranscriptFileIO: TranscriptFileIO = {
-  async readFrom(path: string, start: number): Promise<TranscriptReadResult> {
+  async readFrom(path: string, start: number, maxBytes: number): Promise<TranscriptReadResult> {
     let handle;
     try {
       handle = await open(path, 'r');
@@ -34,7 +34,7 @@ export const nodeTranscriptFileIO: TranscriptFileIO = {
       const id: FileId = { dev: s.dev, ino: s.ino };
       const size = Number(s.size);
       if (size <= start) return { ok: true, id, size, bytes: Buffer.alloc(0) };
-      const length = size - start;
+      const length = Math.min(size - start, maxBytes);
       const buf = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(buf, 0, length, start);
       return { ok: true, id, size, bytes: buf.subarray(0, bytesRead) };

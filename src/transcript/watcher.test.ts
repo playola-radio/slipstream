@@ -26,7 +26,7 @@ class FakeFile {
 
 function fileIO(files: Map<string, FakeFile>): TranscriptFileIO {
   return {
-    async readFrom(path, start) {
+    async readFrom(path, start, maxBytes) {
       const f = files.get(path);
       if (!f) return { ok: false, reason: 'missing' };
       // id, size, and bytes from one snapshot, like a single open handle.
@@ -34,7 +34,7 @@ function fileIO(files: Map<string, FakeFile>): TranscriptFileIO {
         ok: true,
         id: { dev: f.dev, ino: f.ino },
         size: f.buf.length,
-        bytes: f.buf.subarray(start, f.buf.length),
+        bytes: f.buf.subarray(start, Math.min(f.buf.length, start + maxBytes)),
       };
     },
   };
@@ -147,12 +147,12 @@ describe('coverage aggregation', () => {
     assert.deepEqual(r, { state: 'pending', issues: [] });
   });
 
-  it('an unconfirmed file does not conceal a readable sibling nor add an issue', () => {
+  it('an unconfirmed file degrades a readable sibling without adding an issue', () => {
     const r = aggregateCoverage([], [
       { state: 'readable', issues: [] },
       { state: 'unconfirmed', issues: [] },
     ]);
-    assert.equal(r.state, 'readable');
+    assert.equal(r.state, 'degraded');
     assert.equal(r.issues.length, 0);
   });
 

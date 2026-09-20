@@ -3,8 +3,8 @@
  *
  * Idempotence comes entirely from the ingestor's log-derived dedup, so there is
  * no durable read cursor: an in-memory byte offset that always sits on a line
- * boundary is enough. Each poll re-reads only `[offset, size)`; complete lines
- * are stepped through the core, and the offset advances past a line ONLY after
+ * boundary is enough. Each poll drains from `offset` in bounded chunks up to EOF.
+ * Complete lines are stepped through the core; the offset advances ONLY after
  * every record it produced is durably appended or reported duplicate. A retryable
  * queue-full rejection (or an append failure) stops advancement so the line is
  * retried next poll — reprocessing is safe because dedup drops what already
@@ -28,6 +28,8 @@ import type { NormalizedEvidence } from '../evidence-ingest.ts';
 import type { IngestOutcome } from '../evidence-ingest.ts';
 import type { Diagnostic } from './types.ts';
 
+const READ_CHUNK_BYTES = 1 << 20; // 1 MiB
+
 // A fatal decoder so an invalid-UTF-8 line is rejected rather than silently decoded
 // to replacement characters (which could fabricate a path). Reused across polls;
 // safe because each call is a one-shot decode (no streaming state).
@@ -44,9 +46,9 @@ export interface FileId {
   ino: bigint;
 }
 
-/** One atomic read: the file's generation ({@link FileId}), its size, and the bytes
- * `[start, size)` — ALL taken from a single open handle. Deriving the id and the
- * bytes from the same handle is what makes the generation check trustworthy: a stat
+/** One atomic read: the file's generation ({@link FileId}), its full size, and the bytes
+ * `[start, min(size, start + maxBytes))` — ALL taken from a single open handle.
+ * Deriving the id and bytes from the same handle makes the generation check trustworthy: a stat
  * on a separate handle could validate one generation while a concurrent replace
  * supplies another generation's bytes to a second handle. */
 export type TranscriptReadResult =
@@ -54,10 +56,11 @@ export type TranscriptReadResult =
   | { ok: false; reason: 'missing' | 'inaccessible' };
 
 export interface TranscriptFileIO {
-  /** Open the file once, fstat it for its identity and size, and read `[start, size)`
-   * from that SAME handle (empty bytes when `start >= size`). Rejects → the ok:false
-   * reason, never a partial read attributed to the wrong generation. */
-  readFrom(path: string, start: number): Promise<TranscriptReadResult>;
+  /** Open the file once, fstat it for its identity and full size, and read
+   * `[start, min(size, start + maxBytes))` from that SAME handle (empty bytes when
+   * `start >= size`). Rejects → the ok:false reason, never a partial read attributed
+   * to the wrong generation. */
+  readFrom(path: string, start: number, maxBytes: number): Promise<TranscriptReadResult>;
 }
 
 export interface EvidenceSink {
@@ -88,10 +91,13 @@ export interface TranscriptFileReaderOptions {
   /** The file generation discovery confirmed for this binding's session and scope.
    * A poll that finds a different inode refuses to ingest it (`unconfirmed`). */
   generation: FileId;
+  /** Testability seam for exercising chunk boundaries with small fixtures. */
+  readChunkBytes?: number;
 }
 
 export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
   const { path, io, sink, stepper, generation } = opts;
+  const readChunkBytes = opts.readChunkBytes ?? READ_CHUNK_BYTES;
   let offset = 0;
   let lastSize = 0;
   let issues: Diagnostic[] = [];
@@ -128,76 +134,77 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
   const isPinned = (rd: { id: FileId }): boolean =>
     rd.id.dev === generation.dev && rd.id.ino === generation.ino;
 
+  // Returns true if backpressure held the offset at a line (retry next poll).
+  const ingestBuffer = async (buf: Buffer): Promise<boolean> => {
+    // Split on newline BYTES, not decoded characters: invalid UTF-8 decodes to
+    // a 3-byte replacement char, so measuring a decoded line's length would
+    // advance the cursor past bytes that were never there and skip live records.
+    // Bytes after the last newline are an incomplete line, left for a later poll.
+    let lineStart = 0;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 0x0a) continue;
+      const lineBytes = i - lineStart + 1; // through the newline
+      const slice = buf.subarray(lineStart, i);
+      lineStart = i + 1;
+      let decoded: string;
+      try {
+        decoded = LINE_DECODER.decode(slice);
+      } catch {
+        // Invalid UTF-8: decoding it lossily would coin replacement characters and
+        // could fabricate a path, so disclose it malformed and advance past it.
+        issues.push({ kind: 'malformed', detail: 'transcript line was not valid UTF-8' });
+        offset += lineBytes;
+        continue;
+      }
+      const trimmed = decoded.trim();
+      if (trimmed.length > 0) {
+        let record: unknown;
+        try {
+          record = JSON.parse(trimmed);
+        } catch {
+          issues.push({ kind: 'malformed', detail: 'transcript line was not valid JSON' });
+          offset += lineBytes;
+          continue;
+        }
+        const out = stepper.step(record);
+        if (out.diagnostics.length > 0) issues.push(...out.diagnostics);
+        if (out.evidence.length > 0) {
+          const ok = await ingestLine(out.evidence);
+          if (!ok) return true; // backpressure: hold offset at this line
+        }
+      }
+      offset += lineBytes;
+    }
+    return false;
+  };
+
   const poll = async (): Promise<FileReadResult> => {
-    let rd = await io.readFrom(path, offset);
-    if (!rd.ok) {
-      return { state: rd.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
-    }
-    if (!isPinned(rd)) {
-      return { state: 'unconfirmed', issues, backpressured: false };
-    }
-    // A file smaller than we last saw it was truncated/rewritten in place within the
-    // pinned generation, even when it still sits at or above the line-boundary offset
-    // (a partial tail replaced by shorter content). Reread from zero, re-reading from a
-    // fresh handle so the bytes read from offset 0 are re-validated against the pinned
-    // generation. (`size < lastSize` subsumes `size < offset`, since the offset never
-    // runs past the last observed size.)
-    if (rd.size < lastSize) {
-      rereadFromZero();
-      rd = await io.readFrom(path, 0);
+    let backpressured = false;
+    let readSize = readChunkBytes;
+    for (;;) {
+      const rd = await io.readFrom(path, offset, readSize);
       if (!rd.ok) {
-        return { state: rd.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
+        return { state: rd.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured };
       }
       if (!isPinned(rd)) {
         return { state: 'unconfirmed', issues, backpressured: false };
       }
-    }
-    lastSize = rd.size;
-    let backpressured = false;
-    {
-      const buf = rd.bytes;
-      // Split on newline BYTES, not decoded characters: invalid UTF-8 decodes to
-      // a 3-byte replacement char, so measuring a decoded line's length would
-      // advance the cursor past bytes that were never there and skip live records.
-      // Bytes after the last newline are an incomplete line, left for a later poll.
-      let lineStart = 0;
-      for (let i = 0; i < buf.length; i++) {
-        if (buf[i] !== 0x0a) continue;
-        const lineBytes = i - lineStart + 1; // through the newline
-        const slice = buf.subarray(lineStart, i);
-        lineStart = i + 1;
-        let decoded: string;
-        try {
-          decoded = LINE_DECODER.decode(slice);
-        } catch {
-          // Invalid UTF-8: decoding it lossily would coin replacement characters and
-          // could fabricate a path, so disclose it malformed and advance past it.
-          issues.push({ kind: 'malformed', detail: 'transcript line was not valid UTF-8' });
-          offset += lineBytes;
-          continue;
-        }
-        const trimmed = decoded.trim();
-        if (trimmed.length > 0) {
-          let record: unknown;
-          try {
-            record = JSON.parse(trimmed);
-          } catch {
-            issues.push({ kind: 'malformed', detail: 'transcript line was not valid JSON' });
-            offset += lineBytes;
-            continue;
-          }
-          const out = stepper.step(record);
-          if (out.diagnostics.length > 0) issues.push(...out.diagnostics);
-          if (out.evidence.length > 0) {
-            const ok = await ingestLine(out.evidence);
-            if (!ok) {
-              backpressured = true;
-              break; // hold the offset at this line; retry next poll
-            }
-          }
-        }
-        offset += lineBytes;
+      if (rd.size < lastSize) {
+        rereadFromZero();
+        lastSize = 0;
+        readSize = readChunkBytes;
+        continue;
       }
+      lastSize = rd.size;
+
+      const chunkStart = offset;
+      if (await ingestBuffer(rd.bytes)) { backpressured = true; break; }
+
+      if (offset >= rd.size) break; // drained to EOF
+      if (offset > chunkStart) { readSize = readChunkBytes; continue; }
+      // No complete line consumed this read (offset === chunkStart).
+      if (chunkStart + rd.bytes.length >= rd.size) break; // unterminated tail: hold
+      readSize = rd.size - offset; // one line exceeds the window: read it whole next
     }
     const state: FileReadState = issues.length > 0 ? 'degraded' : 'readable';
     return { state, issues, backpressured };
