@@ -235,13 +235,18 @@ async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<
 type LineCwd = { kind: 'cwd'; cwd: string } | { kind: 'no-cwd' } | { kind: 'malformed' };
 
 function readLineCwd(line: string): LineCwd {
-  let obj: Record<string, unknown>;
+  let obj: unknown;
   try {
-    obj = JSON.parse(line) as Record<string, unknown>;
+    obj = JSON.parse(line);
   } catch {
     return { kind: 'malformed' };
   }
-  return typeof obj.cwd === 'string' && obj.cwd.length > 0 ? { kind: 'cwd', cwd: obj.cwd } : { kind: 'no-cwd' };
+  // A valid JSON scalar or `null` parses cleanly but is not a cwd-bearing record;
+  // it carries no cwd, it is not malformed. Guard before property access so a bare
+  // `null` line cannot throw past the catch and abort the whole discovery tick.
+  if (typeof obj !== 'object' || obj === null) return { kind: 'no-cwd' };
+  const cwd = (obj as Record<string, unknown>).cwd;
+  return typeof cwd === 'string' && cwd.length > 0 ? { kind: 'cwd', cwd } : { kind: 'no-cwd' };
 }
 
 /** The outcome of searching a Claude transcript for its recorded working directory.

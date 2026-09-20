@@ -28,7 +28,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: false, reason: 'missing' }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,

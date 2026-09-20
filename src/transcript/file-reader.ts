@@ -36,10 +36,12 @@ const LINE_DECODER = new TextDecoder('utf8', { fatal: true });
 /** A file generation's identity: the (dev, ino) of the exact bytes discovery read
  * to derive a binding's session and scope. An atomic replace yields a new inode,
  * so a poll that finds a different {@link FileId} is reading content discovery has
- * not confirmed belongs to this binding. */
+ * not confirmed belongs to this binding. Held as `bigint` because a 64-bit inode
+ * exceeds `Number`'s 2^53 exact range: two distinct high inodes collapsed to one
+ * `Number` would let a replacement falsely pass the generation check. */
 export interface FileId {
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 /** One atomic read: the file's generation ({@link FileId}), its size, and the bytes
@@ -123,7 +125,7 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
   // generation's session and scope, so refuse: report `unconfirmed`, offset untouched.
   // The next discovery tick re-derives the binding for the new generation and, if it
   // too is a confirmed in-root member, recreates this reader against it.
-  const isPinned = (rd: { id: { dev: number; ino: number } }): boolean =>
+  const isPinned = (rd: { id: FileId }): boolean =>
     rd.id.dev === generation.dev && rd.id.ino === generation.ino;
 
   const poll = async (): Promise<FileReadResult> => {

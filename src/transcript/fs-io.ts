@@ -4,7 +4,6 @@ import {
   readdir,
   readlink as fsReadlink,
   realpath as fsRealpath,
-  stat as fsStat,
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FileId, TranscriptFileIO, TranscriptReadResult } from './file-reader.ts';
@@ -31,9 +30,9 @@ export const nodeTranscriptFileIO: TranscriptFileIO = {
       return { ok: false, reason: 'inaccessible' };
     }
     try {
-      const s = await handle.stat();
-      const id: FileId = { dev: s.dev, ino: Number(s.ino) };
-      const size = s.size;
+      const s = await handle.stat({ bigint: true });
+      const id: FileId = { dev: s.dev, ino: s.ino };
+      const size = Number(s.size);
       if (size <= start) return { ok: true, id, size, bytes: Buffer.alloc(0) };
       const length = size - start;
       const buf = Buffer.allocUnsafe(length);
@@ -126,8 +125,8 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       // Identify the exact bytes about to be read, from the SAME open handle, so the
       // generation stamped on the result is the file whose content derived the ctx —
       // not a replacement swapped in between this read and the reader's later stat.
-      const idStat = await handle.stat();
-      const id: FileId = { dev: idStat.dev, ino: Number(idStat.ino) };
+      const idStat = await handle.stat({ bigint: true });
+      const id: FileId = { dev: idStat.dev, ino: idStat.ino };
       // Read the COMPLETE first line: a Claude first record can exceed one chunk,
       // and a truncated prefix fails to parse, which would silently fall through to
       // slug-trust (mis-binding) or falsely split a multibyte char (false malformed).
@@ -181,8 +180,8 @@ export const nodeDiscoveryIO: DiscoveryIO = {
     try {
       // The generation of the exact bytes scanned, from the same open handle (see
       // readFirstLine): the id stamped on the binding is the file this head derived.
-      const idStat = await handle.stat();
-      const id: FileId = { dev: idStat.dev, ino: Number(idStat.ino) };
+      const idStat = await handle.stat({ bigint: true });
+      const id: FileId = { dev: idStat.dev, ino: idStat.ino };
       const lines: string[] = [];
       let pos = 0;
       let sawByte = false;

@@ -17,12 +17,12 @@ const CTX: AdapterContext = {
 /** A single writable transcript file with a stable/settable identity. */
 class FakeFile {
   buf: Buffer = Buffer.alloc(0);
-  dev = 1;
-  ino = 100;
+  dev = 1n;
+  ino = 100n;
   append(text: string): void {
     this.buf = Buffer.concat([this.buf, Buffer.from(text, 'utf8')]);
   }
-  replace(text: string, ino: number): void {
+  replace(text: string, ino: bigint): void {
     this.buf = Buffer.from(text, 'utf8');
     this.ino = ino;
   }
@@ -141,7 +141,7 @@ describe('transcript file reader', () => {
     const reader = makeReader();
     await reader.poll();
     assert.equal(sink.appended.length, 1);
-    file.replace(WRITE_A + '\n' + WRITE_B + '\n', 200); // atomic replace: new inode
+    file.replace(WRITE_A + '\n' + WRITE_B + '\n', 200n); // atomic replace: new inode
     const r = await reader.poll();
     assert.equal(r.state, 'unconfirmed', 'a new inode is a replacement discovery has not re-confirmed');
     assert.deepEqual(
@@ -157,7 +157,7 @@ describe('transcript file reader', () => {
     file.append(WRITE_A + '\n');
     const stale = makeReader();
     await stale.poll();
-    file.replace(WRITE_B + '\n', 200); // atomic replace: new inode, new content
+    file.replace(WRITE_B + '\n', 200n); // atomic replace: new inode, new content
     assert.equal((await stale.poll()).state, 'unconfirmed', 'the stale reader refuses it');
     const fresh = makeReader({ dev: file.dev, ino: file.ino });
     assert.equal((await fresh.poll()).state, 'readable');

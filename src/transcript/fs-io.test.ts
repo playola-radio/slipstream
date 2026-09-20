@@ -70,8 +70,9 @@ describe('nodeDiscoveryIO.readFirstLine', () => {
     assert.equal(result.ok, true);
     assert.equal(result.ok && result.line, '{"type":"session_meta"}');
     // The id is the (dev, ino) of the exact file read, captured on the same handle.
-    assert.equal(result.ok && typeof result.id.dev, 'number');
-    assert.equal(result.ok && typeof result.id.ino, 'number');
+    // Held as bigint so a 64-bit inode beyond 2^53 keeps its exact value.
+    assert.equal(result.ok && typeof result.id.dev, 'bigint');
+    assert.equal(result.ok && typeof result.id.ino, 'bigint');
   });
 
   it('stamps the same generation id from readFirstLine and readHeadLines for one file', async () => {

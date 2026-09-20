@@ -13,12 +13,12 @@ const ROOT = '/work/proj';
 // The default generation of a FakeFile: discovery fakes stamp this on their reads so
 // the id matches fileIO's stat and the reader confirms the binding (a mismatch is the
 // replacement path, exercised by its own test).
-const GEN = { dev: 1, ino: 100 };
+const GEN = { dev: 1n, ino: 100n };
 
 class FakeFile {
   buf = Buffer.alloc(0);
-  dev = 1;
-  ino = 100;
+  dev = 1n;
+  ino = 100n;
   append(text: string): void {
     this.buf = Buffer.concat([this.buf, Buffer.from(text, 'utf8')]);
   }
@@ -399,7 +399,7 @@ describe('transcript watcher', () => {
     const dir = '/home/projects/-work-proj';
     const path = `${dir}/sess-a.jsonl`;
     const file = new FakeFile();
-    file.ino = 200; // the file on disk NOW is the post-replace generation
+    file.ino = 200n; // the file on disk NOW is the post-replace generation
     file.append(WRITE_A + '\n');
     const files = new Map([[path, file]]);
     const watcher = createTranscriptWatcher({
@@ -410,7 +410,7 @@ describe('transcript watcher', () => {
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
         // Discovery read the PRIOR generation (ino=100), before the atomic replace.
-        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1, ino: 100 } }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1n, ino: 100n } }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -428,10 +428,10 @@ describe('transcript watcher', () => {
     const dir = '/home/projects/-work-proj';
     const path = `${dir}/sess-a.jsonl`;
     const file = new FakeFile();
-    file.ino = 200;
+    file.ino = 200n;
     file.append(WRITE_A + '\n');
     const files = new Map([[path, file]]);
-    let discoveredIno = 100; // lags one tick behind the on-disk inode
+    let discoveredIno = 100n; // lags one tick behind the on-disk inode
     const watcher = createTranscriptWatcher({
       harness: 'claude-code',
       home: '/home',
@@ -439,7 +439,7 @@ describe('transcript watcher', () => {
       codexScanLimit: 1000,
       discoveryIO: discoveryIO({
         listDir: async (): Promise<ListResult> => ({ ok: true, paths: [path] }),
-        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1, ino: discoveredIno } }),
+        readFirstLine: async () => ({ ok: true, line: CWD_RECORD, id: { dev: 1n, ino: discoveredIno } }),
       }),
       fileIO: fileIO(files),
       sink,
@@ -447,7 +447,7 @@ describe('transcript watcher', () => {
     });
     await watcher.tick(); // discovery lags at ino=100; reader refuses the ino=200 file
     assert.equal(sink.appended.length, 0);
-    discoveredIno = 200; // discovery catches up to the replacement
+    discoveredIno = 200n; // discovery catches up to the replacement
     await watcher.tick();
     assert.equal(sink.appended.length, 1, 'the re-confirmed replacement is read from zero');
     assert.equal(sink.appended[0]!.evidence_key.record_id, 'toolu_a');

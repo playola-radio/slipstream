@@ -60,14 +60,14 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () =>
       mem.buf.length > 0
-        ? { ok: true, line: cwdRecord, id: { dev: 1, ino: 42 } }
+        ? { ok: true, line: cwdRecord, id: { dev: 1n, ino: 42n } }
         : { ok: false, reason: 'empty' },
     readHeadLines: async () => ({
       ok: true,
       lines: mem.buf.length > 0 ? [cwdRecord] : [],
       truncated: false,
       skipped: false,
-      id: { dev: 1, ino: 42 },
+      id: { dev: 1n, ino: 42n },
     }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
@@ -77,7 +77,7 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
       if (p !== path) return { ok: false, reason: 'missing' };
       return {
         ok: true,
-        id: { dev: 1, ino: 42 },
+        id: { dev: 1n, ino: 42n },
         size: mem.buf.length,
         bytes: mem.buf.subarray(start, mem.buf.length),
       };

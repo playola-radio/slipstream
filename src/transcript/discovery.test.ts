@@ -16,7 +16,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -45,7 +45,7 @@ describe('transcript discovery', () => {
           d === dir
             ? { ok: true, paths: [`${dir}/sess-a.jsonl`, `${dir}/sess-b.jsonl`] }
             : { ok: false, reason: 'missing' },
-        readFirstLine: async () => ({ ok: true as const, line: record, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: record, id: { dev: 1n, ino: 1n } }),
       }),
       '/home',
       ROOT,
@@ -82,7 +82,7 @@ describe('transcript discovery', () => {
         readFirstLine: async (p) => {
           const line = heads.get(p);
           return line !== undefined
-            ? { ok: true as const, line, id: { dev: 1, ino: 1 } }
+            ? { ok: true as const, line, id: { dev: 1n, ino: 1n } }
             : { ok: false as const, reason: 'empty' as const };
         },
         realpath: async (p) => p,
@@ -109,7 +109,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/a.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -146,8 +146,8 @@ describe('transcript discovery', () => {
         listDir: async () => ({ ok: true, paths: [`${dir}/in.jsonl`, `${dir}/out.jsonl`] }),
         readFirstLine: async (p) =>
           p.endsWith('in.jsonl')
-            ? { ok: true as const, line: record('/work/proj/pkg'), id: { dev: 1, ino: 1 } }
-            : { ok: true as const, line: record('/work/other'), id: { dev: 1, ino: 1 } },
+            ? { ok: true as const, line: record('/work/proj/pkg'), id: { dev: 1n, ino: 1n } }
+            : { ok: true as const, line: record('/work/other'), id: { dev: 1n, ino: 1n } },
         realpath: async (p) => p,
       }),
       '/home',
@@ -167,7 +167,7 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: record, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: record, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
       }),
       '/home',
@@ -189,8 +189,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
       }),
       '/home',
@@ -209,8 +209,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -245,8 +245,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: JSON.stringify({ type: 'summary' }), id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: [JSON.stringify({ type: 'summary' })], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: JSON.stringify({ type: 'summary' }), id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: [JSON.stringify({ type: 'summary' })], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -266,8 +266,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: true, skipped: false, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: true, skipped: false, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -290,8 +290,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: false, skipped: true, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble, id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: false, skipped: true, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -313,8 +313,8 @@ describe('transcript discovery', () => {
     const result = await discoverClaude(
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
-        readFirstLine: async () => ({ ok: true as const, line: 'not-json', id: { dev: 1, ino: 1 } }),
-        readHeadLines: async () => ({ ok: true as const, lines: ['not-json'], truncated: false, skipped: false, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: 'not-json', id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: ['not-json'], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -324,6 +324,31 @@ describe('transcript discovery', () => {
     assert.ok(
       result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('membership unconfirmed')),
       'the malformed head is disclosed as malformed, not silently pending',
+    );
+  });
+
+  it('treats a bare JSON null head line as cwd-less, never throwing past the parse guard', async () => {
+    // `JSON.parse("null")` succeeds but yields null; reading `.cwd` off it would throw
+    // OUTSIDE readLineCwd's try/catch and abort the whole discovery tick (no readers
+    // polled, coverage left stale). A null (or any scalar) line is valid JSON with no
+    // cwd — a clean cwd-less record — so discovery completes and simply withholds this
+    // still-preamble transcript rather than crashing.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: 'null', id: { dev: 1n, ino: 1n } }),
+        readHeadLines: async () => ({ ok: true as const, lines: ['null'], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0, 'a cwd-less head yields no binding, withheld as pending');
+    assert.equal(
+      result.issues.some((i) => i.kind === 'malformed'),
+      false,
+      'valid JSON with no cwd is not malformed',
     );
   });
 
@@ -372,7 +397,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/z.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/alias/proj' ? ROOT : p),
       }),
       '/home',
@@ -389,7 +414,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/dead.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         // Only the filesystem root still resolves; /gone is a plain deleted dir.
         realpath: async (p) => (p === '/' ? '/' : undefined),
       }),
@@ -413,7 +438,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/v.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         // The root remains captured; only the pkg subdir was deleted.
         realpath: async (p) => (p === ROOT ? ROOT : undefined),
       }),
@@ -439,7 +464,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/esc.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/work/proj/link' ? '/other/project' : p === ROOT ? ROOT : undefined),
         probe: async (p) =>
           p === '/work/proj/link' ? { kind: 'symlink', target: '/other/project' } : { kind: 'absent' },
@@ -463,7 +488,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/ag.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async () => undefined,
         probe: async (p) => (p === '/tmp/proj' ? { kind: 'symlink', target: ROOT } : { kind: 'absent' }),
       }),
@@ -488,7 +513,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/do.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === ROOT ? ROOT : p === '/other' ? '/other' : undefined),
         probe: async (p) =>
           p === '/work/proj/link' ? { kind: 'symlink', target: '/other/deleted' } : { kind: 'absent' },
@@ -512,7 +537,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/di.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/links' ? '/links' : p === ROOT ? ROOT : undefined),
         probe: async (p) =>
           p === '/links/alias' ? { kind: 'symlink', target: '/work/proj/deleted' } : { kind: 'absent' },
@@ -540,7 +565,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/bi.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async () => undefined,
         probe: async (p) =>
           p === '/entry'
@@ -568,7 +593,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/bo.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async () => undefined,
         probe: async (p) =>
           p === '/entry'
@@ -596,7 +621,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/ea.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         // /links resolves normally; only inspecting /links/alias hits the wall.
         realpath: async (p) => (p === '/links' ? '/links' : undefined),
         probe: async (p) => (p === '/links/alias' ? { kind: 'error' } : { kind: 'absent' }),
@@ -620,7 +645,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/chain.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/' ? '/' : p === '/other' ? '/other' : undefined),
         probe: async (p) => {
           const m = /^\/l(\d+)$/.exec(p);
@@ -647,7 +672,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/cyc.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/' ? '/' : undefined),
         probe: async (p) =>
           p === '/a'
@@ -676,7 +701,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/leaf.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         realpath: async (p) => (p === '/links/alias' ? '/work/proj/pkg' : p),
       }),
       '/home',
@@ -701,7 +726,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/case.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         // The kernel folds case per living component; `gone` is deleted.
         realpath: async (p) =>
           p === '/WORK' ? '/work' : p === '/work/PROJ' || p === '/WORK/PROJ' ? ROOT : undefined,
@@ -728,7 +753,7 @@ describe('transcript discovery', () => {
     const result = await discoverCodex(
       io({
         listTreeJsonl: async () => ({ paths: ['/c/nd.jsonl'], truncated: false, incomplete: false }),
-        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1, ino: 1 } }),
+        readFirstLine: async () => ({ ok: true as const, line: meta, id: { dev: 1n, ino: 1n } }),
         // pkg is a file (realpath resolves it); below it, realpath fails with ENOTDIR.
         realpath: async (p) =>
           p === '/other' || p === '/other/project' || p === '/other/project/pkg' ? p : undefined,
