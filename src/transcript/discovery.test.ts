@@ -16,7 +16,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [], truncated: false }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -188,7 +188,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: preamble }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false }),
         realpath: async (p) => (p === '/alias/proj' ? '/work/proj' : p),
       }),
       '/home',
@@ -208,7 +208,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: preamble }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble, withCwd], truncated: false, skipped: false }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -244,7 +244,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: JSON.stringify({ type: 'summary' }) }),
-        readHeadLines: async () => ({ ok: true as const, lines: [JSON.stringify({ type: 'summary' })], truncated: false }),
+        readHeadLines: async () => ({ ok: true as const, lines: [JSON.stringify({ type: 'summary' })], truncated: false, skipped: false }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -265,7 +265,7 @@ describe('transcript discovery', () => {
       io({
         listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
         readFirstLine: async () => ({ ok: true as const, line: preamble }),
-        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: true }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: true, skipped: false }),
         realpath: async (p) => p,
       }),
       '/home',
@@ -275,6 +275,53 @@ describe('transcript discovery', () => {
     assert.ok(
       result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('membership unconfirmed')),
       'the unconfirmable transcript is disclosed, not silently dropped',
+    );
+  });
+
+  it('discloses (never withholds silently) when an oversized head line may carry the cwd', async () => {
+    // The head scan dropped a line that exceeded the per-line cap. No cwd was found in
+    // what remained, but the skipped line could have been the cwd record — so this is
+    // not a clean preamble. It must be disclosed as unconfirmed, not silently withheld
+    // as pending, which would hide it behind a readable sibling.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const preamble = JSON.stringify({ type: 'ai-title', title: 'x' });
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: preamble }),
+        readHeadLines: async () => ({ ok: true as const, lines: [preamble], truncated: false, skipped: true }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0, 'a skipped-line gap is never slug-trusted');
+    assert.ok(
+      result.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('membership unconfirmed')),
+      'the skipped-line gap is disclosed, not treated as a clean preamble',
+    );
+  });
+
+  it('discloses (never withholds silently) a Claude transcript with a malformed head line', async () => {
+    // A head line that will not parse as JSON is not a clean cwd-less record: a cwd
+    // record always parses, so a malformed line is a gap we cannot read the cwd
+    // through. With no cwd found, disclose it malformed rather than mistake it for a
+    // still-preamble transcript that is merely pending.
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const result = await discoverClaude(
+      io({
+        listDir: async () => ({ ok: true, paths: [`${dir}/a.jsonl`] }),
+        readFirstLine: async () => ({ ok: true as const, line: 'not-json' }),
+        readHeadLines: async () => ({ ok: true as const, lines: ['not-json'], truncated: false, skipped: false }),
+        realpath: async (p) => p,
+      }),
+      '/home',
+      ROOT,
+    );
+    assert.equal(result.bindings.length, 0, 'a malformed-head transcript is never slug-trusted');
+    assert.ok(
+      result.issues.some((i) => i.kind === 'malformed' && i.detail.includes('membership unconfirmed')),
+      'the malformed head is disclosed as malformed, not silently pending',
     );
   });
 

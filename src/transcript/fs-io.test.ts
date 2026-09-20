@@ -133,6 +133,8 @@ describe('nodeDiscoveryIO.readHeadLines', () => {
       '{"type":"user","cwd":"/work/proj"}',
       '{"type":"assistant"}',
     ]);
+    assert.equal(result.ok && result.truncated, false, 'the whole file was read');
+    assert.equal(result.ok && result.skipped, false, 'no line was dropped');
   });
 
   it('skips an oversized line but keeps the cwd-bearing line around it', async () => {
@@ -149,6 +151,7 @@ describe('nodeDiscoveryIO.readHeadLines', () => {
     assert.ok(result.ok && result.lines.includes('{"type":"ai-title"}'));
     assert.ok(result.ok && result.lines.includes('{"type":"user","cwd":"/work/proj"}'));
     assert.ok(result.ok && !result.lines.some((l) => l.includes('x'.repeat(1000))), 'the oversized line is skipped');
+    assert.equal(result.ok && result.skipped, true, 'dropping the oversized line is disclosed, not silent');
   });
 
   it('reports an empty file distinctly', async () => {

@@ -51,7 +51,7 @@ function discoveryIO(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listDir: async (): Promise<ListResult> => ({ ok: true, paths: [] }),
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
-    readHeadLines: async () => ({ ok: true, lines: [], truncated: false }),
+    readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -345,8 +345,8 @@ describe('transcript watcher', () => {
           files.has(path) ? { ok: true as const, line: preamble } : { ok: false as const, reason: 'empty' as const },
         readHeadLines: async () =>
           files.has(path)
-            ? { ok: true as const, lines: [preamble, cwdRecord], truncated: false as const }
-            : { ok: true as const, lines: [], truncated: false as const },
+            ? { ok: true as const, lines: [preamble, cwdRecord], truncated: false as const, skipped: false as const }
+            : { ok: true as const, lines: [], truncated: false as const, skipped: false as const },
         realpath: async (p) => (p === '/alias/proj' ? ROOT : p),
       }),
       fileIO: fileIO(files),

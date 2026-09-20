@@ -173,6 +173,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       let pos = 0;
       let sawByte = false;
       let truncated = false; // stopped at a line/byte budget, not EOF: more may lie beyond
+      let skipped = false; // at least one line was dropped (oversized/undecodable): a gap
       let cur: Buffer[] = []; // the current line's bytes, across chunk boundaries
       let curLen = 0;
       let skip = false; // the current line exceeded the per-line cap: discard it
@@ -185,8 +186,10 @@ export const nodeDiscoveryIO: DiscoveryIO = {
             // chunk survives; an undecodable line is skipped, not fabricated.
             lines.push(FATAL_UTF8.decode(Buffer.concat(cur)));
           } catch {
-            /* skip an undecodable line */
+            skipped = true; // an undecodable line dropped: a cwd could have been here
           }
+        } else {
+          skipped = true; // an oversized line dropped: a cwd could have been here
         }
         cur = [];
         curLen = 0;
@@ -224,7 +227,7 @@ export const nodeDiscoveryIO: DiscoveryIO = {
         }
       }
       if (!sawByte) return { ok: false, reason: 'empty' };
-      return { ok: true, lines, truncated };
+      return { ok: true, lines, truncated, skipped };
     } catch {
       return { ok: false, reason: 'inaccessible' };
     } finally {

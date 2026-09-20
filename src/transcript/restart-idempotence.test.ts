@@ -64,6 +64,7 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
       ok: true,
       lines: mem.buf.length > 0 ? [cwdRecord] : [],
       truncated: false,
+      skipped: false,
     }),
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),

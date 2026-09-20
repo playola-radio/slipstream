@@ -48,13 +48,16 @@ export type FirstLineResult =
   | { ok: true; line: string }
   | { ok: false; reason: 'inaccessible' | 'empty' | 'malformed' };
 
-/** A bounded, decoded set of a transcript's leading lines (oversized lines
- * skipped), for scanning past a cwd-less preamble to the first cwd-bearing line.
+/** A bounded, decoded set of a transcript's leading lines, for scanning past a
+ * cwd-less preamble to the first cwd-bearing line.
  * `truncated`: the scan stopped at a line/byte budget, so more lines may lie
  * beyond it (a cwd could exist past the searched head); false means the whole file
- * was read. */
+ * was read.
+ * `skipped`: at least one line within the scanned head was dropped (it exceeded
+ * the per-line cap, or was not valid UTF-8), so a cwd could have sat on a line we
+ * never examined — the caller must not read "no cwd found" as a clean preamble. */
 export type HeadLinesResult =
-  | { ok: true; lines: string[]; truncated: boolean }
+  | { ok: true; lines: string[]; truncated: boolean; skipped: boolean }
   | { ok: false; reason: 'inaccessible' | 'empty' };
 
 export interface DiscoveryIO {
@@ -221,21 +224,27 @@ async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<
   return { kind: 'in-root', cwd: canonicalCwd, ...(rootAliases !== undefined ? { rootAliases } : {}) };
 }
 
-/** The top-level `cwd` a Claude transcript record carries, if any. */
-function parseClaudeCwd(line: string): string | undefined {
+/** What one transcript line yields about the working directory: a cwd, a clean
+ * record without one, or a line that would not parse (which a cwd record always
+ * does, so a malformed line is a gap we cannot read the cwd through, not proof of
+ * absence). */
+type LineCwd = { kind: 'cwd'; cwd: string } | { kind: 'no-cwd' } | { kind: 'malformed' };
+
+function readLineCwd(line: string): LineCwd {
+  let obj: Record<string, unknown>;
   try {
-    const obj = JSON.parse(line) as Record<string, unknown>;
-    return typeof obj.cwd === 'string' && obj.cwd.length > 0 ? obj.cwd : undefined;
+    obj = JSON.parse(line) as Record<string, unknown>;
   } catch {
-    return undefined;
+    return { kind: 'malformed' };
   }
+  return typeof obj.cwd === 'string' && obj.cwd.length > 0 ? { kind: 'cwd', cwd: obj.cwd } : { kind: 'no-cwd' };
 }
 
 /** The outcome of searching a Claude transcript for its recorded working directory. */
 type ClaudeCwdResolution =
   | { kind: 'found'; cwd: string } // a cwd-bearing record was read
-  | { kind: 'none' } // the whole head was read and carries no cwd yet (empty or a preamble)
-  | { kind: 'unconfirmed' }; // the head could not be fully searched, so a cwd may lie beyond it
+  | { kind: 'none' } // the whole head was read cleanly and carries no cwd yet (empty or a preamble)
+  | { kind: 'unconfirmed'; reason: 'inaccessible' | 'malformed'; detail: string }; // a cwd may exist but the head could not be searched through
 
 /**
  * Search a Claude transcript for the working directory it declares. A session's
@@ -243,31 +252,46 @@ type ClaudeCwdResolution =
  * so the first line rarely carries the cwd; scan a bounded head for the first
  * record that does.
  *
- * `none` means the searched head genuinely holds no cwd yet — an empty or
- * still-preamble transcript — which the caller withholds (pending) and re-checks
- * once more is written. `unconfirmed` means the head could NOT be fully searched
- * (truncated at the scan budget, or unreadable), so a cwd may sit beyond it and
- * membership cannot be trusted; the caller discloses it rather than slug-trust a
- * candidate that could belong to a slug-colliding sibling worktree.
+ * `none` means the searched head was read cleanly and genuinely holds no cwd yet —
+ * an empty or still-preamble transcript — which the caller withholds (pending) and
+ * re-checks once more is written. `unconfirmed` means a cwd could exist but the
+ * head could NOT be searched through to rule it out — the scan hit its budget
+ * (truncated), a line was skipped (oversized/undecodable) or malformed, or the head
+ * was unreadable — so membership cannot be trusted; the caller discloses it rather
+ * than treat it as a clean preamble or slug-trust a candidate that could belong to
+ * a slug-colliding sibling worktree.
  */
 async function resolveClaudeCwd(
   io: DiscoveryIO,
   path: string,
   firstLine: string,
 ): Promise<ClaudeCwdResolution> {
-  const first = parseClaudeCwd(firstLine);
-  if (first !== undefined) return { kind: 'found', cwd: first };
+  const first = readLineCwd(firstLine);
+  if (first.kind === 'cwd') return { kind: 'found', cwd: first.cwd };
+  let sawMalformed = first.kind === 'malformed';
   const head = await io.readHeadLines(path);
   // The first line already read, so the file is non-empty; an unreadable or
   // raced-to-empty head here leaves membership unconfirmable.
-  if (!head.ok) return { kind: 'unconfirmed' };
+  if (!head.ok) return { kind: 'unconfirmed', reason: 'inaccessible', detail: 'the head could not be read' };
   for (const line of head.lines) {
-    const cwd = parseClaudeCwd(line);
-    if (cwd !== undefined) return { kind: 'found', cwd };
+    const parsed = readLineCwd(line);
+    if (parsed.kind === 'cwd') return { kind: 'found', cwd: parsed.cwd };
+    if (parsed.kind === 'malformed') sawMalformed = true;
   }
-  // No cwd in the searched head: a truncated head may hide one beyond the window;
-  // a fully-read head genuinely has none yet.
-  return head.truncated ? { kind: 'unconfirmed' } : { kind: 'none' };
+  // No cwd in the searched head. Only a head that was read through cleanly (every
+  // line examined, none skipped, none malformed, nothing beyond the window) is a
+  // genuine still-preamble transcript; anything else is a gap we must disclose so a
+  // cwd we could not read is never mistaken for a cwd that is not there yet.
+  if (head.truncated) {
+    return { kind: 'unconfirmed', reason: 'inaccessible', detail: 'a cwd may lie beyond the truncated head' };
+  }
+  if (head.skipped) {
+    return { kind: 'unconfirmed', reason: 'inaccessible', detail: 'an oversized or undecodable head line may carry the cwd' };
+  }
+  if (sawMalformed) {
+    return { kind: 'unconfirmed', reason: 'malformed', detail: 'a malformed head line may carry the cwd' };
+  }
+  return { kind: 'none' };
 }
 
 export async function discoverClaude(
@@ -306,8 +330,8 @@ export async function discoverClaude(
     if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
     if (resolution.kind === 'unconfirmed') {
       issues.push({
-        kind: 'inaccessible',
-        detail: `claude transcript ${path} membership unconfirmed: no cwd within the searched head`,
+        kind: resolution.reason,
+        detail: `claude transcript ${path} membership unconfirmed: ${resolution.detail}`,
       });
       continue;
     }
