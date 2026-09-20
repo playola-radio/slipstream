@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createCoverageRunner } from './runner.ts';
 import type { DiscoveryIO, ListResult } from './discovery.ts';
-import type { EvidenceSink, StatResult, TranscriptFileIO } from './file-reader.ts';
+import type { EvidenceSink, TranscriptFileIO, TranscriptReadResult } from './file-reader.ts';
 import type { HarnessName, EnrichmentCoverageData } from '../event.ts';
 import type { IngestOutcome, NormalizedEvidence } from '../evidence-ingest.ts';
 
@@ -18,11 +18,8 @@ class FakeSink implements EvidenceSink {
 }
 
 const emptyFileIO: TranscriptFileIO = {
-  async stat(): Promise<StatResult> {
+  async readFrom(): Promise<TranscriptReadResult> {
     return { ok: false, reason: 'missing' };
-  },
-  async read(): Promise<Buffer> {
-    return Buffer.alloc(0);
   },
 };
 

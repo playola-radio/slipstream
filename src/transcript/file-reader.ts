@@ -42,14 +42,20 @@ export interface FileId {
   ino: number;
 }
 
-export type StatResult =
-  | { ok: true; size: number; dev: number; ino: number }
+/** One atomic read: the file's generation ({@link FileId}), its size, and the bytes
+ * `[start, size)` — ALL taken from a single open handle. Deriving the id and the
+ * bytes from the same handle is what makes the generation check trustworthy: a stat
+ * on a separate handle could validate one generation while a concurrent replace
+ * supplies another generation's bytes to a second handle. */
+export type TranscriptReadResult =
+  | { ok: true; id: FileId; size: number; bytes: Buffer }
   | { ok: false; reason: 'missing' | 'inaccessible' };
 
 export interface TranscriptFileIO {
-  stat(path: string): Promise<StatResult>;
-  /** Read bytes `[start, end)`. Rejects if the file cannot be read. */
-  read(path: string, start: number, end: number): Promise<Buffer>;
+  /** Open the file once, fstat it for its identity and size, and read `[start, size)`
+   * from that SAME handle (empty bytes when `start >= size`). Rejects → the ok:false
+   * reason, never a partial read attributed to the wrong generation. */
+  readFrom(path: string, start: number): Promise<TranscriptReadResult>;
 }
 
 export interface EvidenceSink {
@@ -108,36 +114,46 @@ export function createTranscriptFileReader(opts: TranscriptFileReaderOptions) {
     return true;
   };
 
+  // The (dev, ino) of the bytes `rd` supplied is not the pinned generation: the file
+  // at this path was replaced (an atomic rename-into-place) with content discovery has
+  // NOT re-confirmed. Because the id and the bytes came from the SAME handle, this
+  // catches a replace at any instant up to the read — there is no stat-then-open window
+  // through which a replacement's bytes could be read while a prior generation's id was
+  // validated. Ingesting them would credit the new file's records to the prior
+  // generation's session and scope, so refuse: report `unconfirmed`, offset untouched.
+  // The next discovery tick re-derives the binding for the new generation and, if it
+  // too is a confirmed in-root member, recreates this reader against it.
+  const isPinned = (rd: { id: { dev: number; ino: number } }): boolean =>
+    rd.id.dev === generation.dev && rd.id.ino === generation.ino;
+
   const poll = async (): Promise<FileReadResult> => {
-    const st = await io.stat(path);
-    if (!st.ok) {
-      return { state: st.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
+    let rd = await io.readFrom(path, offset);
+    if (!rd.ok) {
+      return { state: rd.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
     }
-    // A different inode at this path is a replacement (an atomic rename-into-place)
-    // whose membership and scope discovery has NOT re-confirmed. Ingesting it would
-    // credit the new file's records to the prior generation's session and scope, so
-    // refuse it: report `unconfirmed` and leave the offset untouched. The next
-    // discovery tick re-derives the binding for the new generation and, if it too is
-    // a confirmed in-root member, recreates this reader against it.
-    if (st.dev !== generation.dev || st.ino !== generation.ino) {
+    if (!isPinned(rd)) {
       return { state: 'unconfirmed', issues, backpressured: false };
     }
     // A file smaller than we last saw it was truncated/rewritten in place within the
     // pinned generation, even when it still sits at or above the line-boundary offset
-    // (a partial tail replaced by shorter content). Reread from zero. (`size < lastSize`
-    // subsumes `size < offset`, since the offset never runs past the last observed size.)
-    if (st.size < lastSize) {
+    // (a partial tail replaced by shorter content). Reread from zero, re-reading from a
+    // fresh handle so the bytes read from offset 0 are re-validated against the pinned
+    // generation. (`size < lastSize` subsumes `size < offset`, since the offset never
+    // runs past the last observed size.)
+    if (rd.size < lastSize) {
       rereadFromZero();
-    }
-    lastSize = st.size;
-    let backpressured = false;
-    if (st.size > offset) {
-      let buf: Buffer;
-      try {
-        buf = await io.read(path, offset, st.size);
-      } catch {
-        return { state: 'inaccessible', issues, backpressured: false };
+      rd = await io.readFrom(path, 0);
+      if (!rd.ok) {
+        return { state: rd.reason === 'missing' ? 'missing' : 'inaccessible', issues, backpressured: false };
       }
+      if (!isPinned(rd)) {
+        return { state: 'unconfirmed', issues, backpressured: false };
+      }
+    }
+    lastSize = rd.size;
+    let backpressured = false;
+    {
+      const buf = rd.bytes;
       // Split on newline BYTES, not decoded characters: invalid UTF-8 decodes to
       // a 3-byte replacement char, so measuring a decoded line's length would
       // advance the cursor past bytes that were never there and skip live records.

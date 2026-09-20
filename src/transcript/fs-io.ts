@@ -7,7 +7,7 @@ import {
   stat as fsStat,
 } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { FileId, StatResult, TranscriptFileIO } from './file-reader.ts';
+import type { FileId, TranscriptFileIO, TranscriptReadResult } from './file-reader.ts';
 import type {
   DiscoveryIO,
   FirstLineResult,
@@ -18,24 +18,29 @@ import type {
 } from './discovery.ts';
 
 /** The real filesystem IO for transcript files. Missing → `missing`; any other
- * stat/read error → `inaccessible` (disclosed, never a silent empty read). */
+ * open/read error → `inaccessible` (disclosed, never a silent empty read). The
+ * identity, size, and bytes all come from ONE open handle so a concurrent replace
+ * cannot supply a different generation's bytes than the id reports. */
 export const nodeTranscriptFileIO: TranscriptFileIO = {
-  async stat(path: string): Promise<StatResult> {
+  async readFrom(path: string, start: number): Promise<TranscriptReadResult> {
+    let handle;
     try {
-      const s = await fsStat(path);
-      return { ok: true, size: s.size, dev: s.dev, ino: Number(s.ino) };
+      handle = await open(path, 'r');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: false, reason: 'missing' };
       return { ok: false, reason: 'inaccessible' };
     }
-  },
-  async read(path: string, start: number, end: number): Promise<Buffer> {
-    const handle = await open(path, 'r');
     try {
-      const length = end - start;
+      const s = await handle.stat();
+      const id: FileId = { dev: s.dev, ino: Number(s.ino) };
+      const size = s.size;
+      if (size <= start) return { ok: true, id, size, bytes: Buffer.alloc(0) };
+      const length = size - start;
       const buf = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(buf, 0, length, start);
-      return buf.subarray(0, bytesRead);
+      return { ok: true, id, size, bytes: buf.subarray(0, bytesRead) };
+    } catch {
+      return { ok: false, reason: 'inaccessible' };
     } finally {
       await handle.close();
     }

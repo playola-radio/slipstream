@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { createTranscriptFileReader, type EvidenceSink, type StatResult, type TranscriptFileIO } from './file-reader.ts';
+import { createTranscriptFileReader, type EvidenceSink, type TranscriptFileIO } from './file-reader.ts';
 import { claudeStepper } from './steppers.ts';
 import { evidenceKeyString, variantSignature } from '../attribution.ts';
 import type { NormalizedEvidence, IngestOutcome } from '../evidence-ingest.ts';
@@ -30,15 +30,17 @@ class FakeFile {
 
 function fakeIO(files: Map<string, FakeFile>): TranscriptFileIO {
   return {
-    async stat(path): Promise<StatResult> {
+    async readFrom(path, start) {
       const f = files.get(path);
       if (!f) return { ok: false, reason: 'missing' };
-      return { ok: true, size: f.buf.length, dev: f.dev, ino: f.ino };
-    },
-    async read(path, start, end): Promise<Buffer> {
-      const f = files.get(path);
-      if (!f) throw new Error('missing');
-      return f.buf.subarray(start, end);
+      // The id, size, and bytes all come from the one snapshot, like a single open
+      // handle: a caller cannot observe one generation's size against another's bytes.
+      return {
+        ok: true,
+        id: { dev: f.dev, ino: f.ino },
+        size: f.buf.length,
+        bytes: f.buf.subarray(start, f.buf.length),
+      };
     },
   };
 }

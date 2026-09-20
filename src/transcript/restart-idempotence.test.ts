@@ -7,7 +7,7 @@ import { startCapture, type TranscriptRuntime } from '../session.ts';
 import { createFakePlatform } from '../test/fake-platform.ts';
 import { changesFor, readRecords, waitForRecords, type LoggedRecord } from '../test/helpers.ts';
 import { claudeSlug, type DiscoveryIO, type ListResult } from './discovery.ts';
-import type { StatResult, TranscriptFileIO } from './file-reader.ts';
+import type { TranscriptFileIO } from './file-reader.ts';
 import type { ChangeAttributionData, EnrichmentPolicy, HarnessName } from '../event.ts';
 
 const HOME = '/fake-home';
@@ -73,13 +73,14 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
     probe: async () => ({ kind: 'absent' }),
   };
   const fileIO: TranscriptFileIO = {
-    async stat(p): Promise<StatResult> {
+    async readFrom(p, start) {
       if (p !== path) return { ok: false, reason: 'missing' };
-      return { ok: true, size: mem.buf.length, dev: 1, ino: 42 };
-    },
-    async read(p, start, end): Promise<Buffer> {
-      if (p !== path) throw new Error('missing');
-      return mem.buf.subarray(start, end);
+      return {
+        ok: true,
+        id: { dev: 1, ino: 42 },
+        size: mem.buf.length,
+        bytes: mem.buf.subarray(start, mem.buf.length),
+      };
     },
   };
   const homes: Record<HarnessName, string> = { 'claude-code': HOME, codex: HOME };
