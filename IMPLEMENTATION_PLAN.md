@@ -535,34 +535,191 @@ file-scope mapping for BOTH harnesses.
 
 ---
 
-## Stage 5: Build the watching UI and run acceptance
+## Stage 5 pivot (Brian, 2026-09-20)
 
-**Goal**: The three-column workspace from the canvas, consuming only public APIs,
-plus the Q14 acceptance run.
+The prior Stage 5 (a **React/browser** three-column client + Monaco) is
+**CANCELLED**. Two directives replace it:
 
-**Deliverable**: React client — explorer (segmented `Changed · N` | `All files`,
-Changed active by default) → change stream (sticky non-stacking task headings,
-whole-function clips with gutter markers) → editor panes (Monaco diff,
-Diff/Plain toggle, collapsed unchanged ranges).
+1. The Stage 5 watching UI must be a **native application** — not browser, not
+   Electron, not a web view.
+2. **First** build a pre-Stage-5 **terminal proving ground** ("Stage T"): a rich
+   TUI (live feed + live function-interface-change list + focused diff) consuming
+   **only** the public reader API and reusing the pure fold, so the fold + API are
+   proven before any native-GUI investment. Stage T is also a first-class client
+   the "delete the front-end and reproduce it" invariant already requires.
 
-**Success Criteria**
-- The client consumes **only** the published reader API and schemas. It holds no
-  privileged access to the daemon's internals.
-- Uncertainty is visible: ambiguous and unknown attribution render as such;
-  coverage gaps render as gaps.
-- Change stream uses lightweight rendered diffs; Monaco is instantiated for the
-  focused pane only, never per card.
-- Design tokens pulled from the canvas `GetVariables()`, not re-derived.
-- **Acceptance run (this is Q14's bar):** live Conductor sessions for both
-  harnesses; task grouping visible; daemon killed and readers reconnected
-  mid-session; measured capture latency reported; known coverage gaps documented;
-  then the bundled UI is **stopped entirely** and the Stage 2 TUI reproduces the
-  same session state.
+Design driven by a Codex `gpt-6-astra` architecture consult (2026-09-20; capture
+in `.context/terminal-stage-proposal.md`). Language/framework research +
+adversarial consult captured in `.context/native-language-decision-brief.md` —
+**the native language is NOT locked; it awaits Brian's sign-off.**
+
+### Cross-cutting facts settled by the consult
+- A watching client **displays committed attribution**, it does not produce it.
+  Reuse `foldAttributions` (highest-seq valid *published* attribution per
+  `(source, change_seq)`) and `foldEvidence` for evidence display; a client that
+  is missing a published result renders `pending`. It must **not** run its own
+  clock or `evaluateChange` — recomputing inference could disagree with the
+  durable record (honesty violation).
+- The **runtime descriptor** (loopback URL + bearer token) is a public
+  *connection bootstrap*, not privileged session data. The "consume only the
+  public API" rule holds **with this one explicit bootstrap exception**; a client
+  must never silently fall back to reading session state off disk.
+- A colocated native client holds the token and hits loopback directly — the
+  browser-era forwarding proxy is **moot for a colocated topology** (keep auth +
+  host/origin checks; token in the OS secret store; 127.0.0.1 only). A *remote*
+  daemon is a separate, undecided transport scope.
+- `change-view.ts` renders **marked after-content, not a two-sided diff**, and
+  does not consume clips. The focused diff view is **new** rendering over the clip
+  projection + blobs, not a reuse-wiring task.
+- Public event timestamps do **not** expose durable-commit latency
+  (`CLIP-LATENCY-PROTOCOL.md` forbids using them as a proxy). Acceptance latency
+  must come from instrumented measurement, not `receipt − event_time`. A live
+  capture-latency meter would need a separately defined public telemetry source.
+
+---
+
+## Stage T: Terminal proving ground (pre-Stage-5)
+
+**Goal**: A rich TUI over the public reader API — a live event/change feed, a
+live-updating function-interface-change list, and a focused two-sided diff —
+proving the fold + API before native-GUI work, and standing as an independent
+client. TypeScript on Node 24 (no stack exception needed).
+
+**Deliverable & dependency-ordered PR graph** (each PR is a boundary that may hold
+several small passing TDD commits; ordering + splits per the Codex consult):
+
+- **T0 — Contracts & amendments (gate).** Ratify: the function-interface-change
+  semantics (a decision for Brian, below), the public *bootstrap exception*
+  wording, and the canonical **parity definition** (a named session-state at a
+  `(session, seq)` prefix, with hand-specified expected states — two clients
+  calling the same fold are **not** an independent oracle).
+- **T1a — Public read client (finite).** Typed decoding of the public CloudEvent
+  envelope (preserve `source`/full envelope, not just `{type,seq,data}`),
+  `GET /v1/sessions` + high-water, finite NDJSON replay (`after=`), and error
+  mapping (`409` exposes the advertised durable high-water + an explicit recovery
+  choice — never a silent reset; `410` = removed, stop). Depends on T0.
+- **T1b — Public read client (follow).** SSE follow with an **applied-event**
+  cursor (advance only after the model applies an event, not on receipt/render;
+  unknown event types still advance; malformed events / sequence discontinuities
+  are surfaced, never dropped), cancellation, backpressure (event consumption
+  independent of blob/diff work — no unbounded queue), reconnect with **descriptor
+  refresh** (a daemon restart mints a new token + ephemeral port — rediscovery
+  must refresh credentials for *all* clients incl. blob/projection). Depends T1a.
+- **T2a — Pure session-state fold.** Baseline, observed changes, immutable task
+  hints/grouping, gaps, sequence identity. Pure reducer; expected-state fixtures.
+  Depends T0.
+- **T2b — Attribution + coverage display.** Fold **published** attribution
+  revisions via `foldAttributions` (preserve reason, policy reference, evidence
+  references, excluded conflicts — not just `{status,reason}`); coverage per
+  harness (absent = health-unknown; `readable` ≠ complete); evidence disclosure
+  via `foldEvidence`. Measure re-fold cost; do not refold the whole session per
+  event unboundedly. Depends T2a.
+- **T3a — TUI shell.** Terminal lifecycle, session picker, navigation, a *visible*
+  connection state (a disconnect is a reader interruption, **not** a capture gap).
+  Depends T1b, T2b.
+- **T3b — Live feed.** Task grouping (declarations + immutable `task_hint_id`, not
+  authorship/completion; baselines are not edits); all honesty states rendered
+  distinctly (`pending`, "possibly agent" = heuristic, `ambiguous`, `unknown` ≠
+  human; revisions update the original change in place without changing chronology;
+  gaps preserve reason + scope). Sanitize paths/titles/reasons for the terminal.
+  Depends T3a.
+- **T4a — Blob/clip access.** HTTP blob + clip-projection client, projection
+  version handling, a bounded demand queue (coordinate admission with the reader's
+  clip pool — do not double contention), cancellation, transient retry. Depends
+  T1a.
+- **T4b — Focused two-sided diff.** New rendering over paired clips: both sides,
+  original line offsets, deletion + null-span + `unavailable` + binary + display-
+  limit distinguished; preserve `fallback_reason`, per-side `method`/`reason`,
+  `truncated` (`ready` ≠ untruncated); slice raw bytes before decode; collapsed
+  unchanged context labeled differently from missing capture history; clip-pair
+  adjacency must not imply semantic function identity. Depends T3a, T4a.
+- **T5a — Interface-change contract + core.** Versioned contract and pure
+  extraction/matching, starting from adversarial fixtures. **Gated on Brian's
+  semantics decision.** (See "Decisions for Brian".)
+- **T5b — Interface projection surface.** If route (a): the public endpoint +
+  schema, bounded worker execution, disposable caching + retention behavior,
+  reproducible from immutable before/after inputs (not merely the bounded clip
+  array — that can omit functions). A reader projection is **not** a second
+  capture source and emits no log events. Depends T5a.
+- **T5c — Interface-change list view.** Live list distinguishing "no changes
+  found" from pending/unsupported/incomplete/timed-out/overloaded/unavailable
+  (partial extraction can't justify an exhaustive zero; a failed parse is not a
+  removal; an unavailable before-side is not an addition); every row links to its
+  originating change and inherits that change's revisable attribution + gap
+  context. Depends T3b, T4a, T5b.
+- **T6a — Combined-load + parity rehearsal.** Restart/reconnect + both projection
+  workloads under load; compare clients through the same `(session, seq)` prefix
+  against hand-specified expected states, controlling projection version + blob
+  retention + transient failures separately.
+- **T6b — Report.** Instrumented acceptance report; update Status only against
+  gates actually satisfied.
+
+**Honesty is not deferrable to a later pass** — every view above ships its honesty
+contract when it ships.
+
+**Status**: Not Started (design complete, pending T0 decisions).
+
+---
+
+## Stage 5: Build the **native** watching UI and run acceptance
+
+**Goal**: The native watching workspace, consuming **only** the public reader API
+(plus the bootstrap-descriptor exception), building on Stage T, plus the Q14
+acceptance run.
+
+**Deliverable** (native, language TBD — pending Brian, see decision brief). A
+dependency-ordered, **language-agnostic** graph that mirrors Stage T:
+- **S5.0 (gate).** Brian locks: language/framework; an explicit client-scoped
+  exception to "TypeScript throughout" if the language is not TS; and the
+  fold-reproduction strategy (embed a JS engine / Node sidecar / reimplement the
+  *small display fold*) — all gated on cross-language conformance fixtures over
+  published events + a versioned fold contract + an applied-through-seq boundary.
+- **S5.1** app skeleton **split from** transport/reconnect parity (both reuse
+  Stage T's language-neutral fixtures).
+- **S5.2** session-state parity against the shared expected-state fixtures.
+- **S5.3** native live feed — uncertainty, coverage and gap rendering complete on
+  arrival.
+- **S5.4** native focused diff renderer (the "Monaco-diff equivalent" — a native
+  replacement whose exact bar Brian must approve; preserve the underlying
+  requirement: lightweight feed rendering + one expensive focused renderer).
+- **S5.5** native interface-change list (independent of S5.4 once the shared
+  selection/state contracts exist).
+- **S5.6** an honesty/uncertainty **audit**, not the first honesty implementation.
+- **S5.7** the Q14 acceptance run (below).
+
+**Success Criteria** (substance preserved from the cancelled Stage 5; changes the
+pivot forces are marked ⚠ **pending Brian's ratification** — not enacted here):
+- The client consumes **only** the published reader API + schemas (plus the
+  bootstrap descriptor); no privileged access to daemon internals.
+- Uncertainty is visible: `ambiguous`/`unknown` render as such; coverage gaps
+  render as gaps; `unknown` ≠ human; a stale view must disclose it is behind.
+- Feed uses lightweight rendered diffs; the expensive focused renderer is
+  instantiated for the focused pane only, never per card.
+- **Acceptance run (Q14's bar):** live Conductor sessions for both harnesses; task
+  grouping visible; daemon killed and readers reconnected mid-session; measured
+  capture latency reported (instrumented, not inferred from event timestamps);
+  known coverage gaps documented; then the bundled native UI is **stopped
+  entirely** and an independent client reproduces the same session state.
+- ⚠ **Reproduction client:** the cancelled criterion named "the Stage 2 TUI".
+  Substituting Stage T's rich TUI is a criterion **amendment** for Brian.
+- ⚠ **Native replacement for "Monaco diff" / "Diff/Plain toggle" / "collapsed
+  unchanged ranges"** — needs a Brian-approved native bar.
+- ⚠ **Carried-over browser deliverables not yet reassigned:** the
+  `Changed · N | All files` explorer (where "All files" = the captured inventory
+  with disclosed exclusions/unknown scopes, **never** new worktree filesystem
+  access), the three-column interaction, sticky non-stacking headings,
+  whole-function stream cards, and design tokens (the canvas `GetVariables()`
+  source no longer applies to a native UI). Each needs a PR or an explicit scope
+  amendment.
+
+**Prerequisite gap (flag):** Q14 requires live real-harness sessions, but **Stage
+3 is still In Progress** (P4 real-session acceptance + PR and P5's PR to `develop`
+remain). Stage T / Stage 5 must not silently discharge those.
 
 **Explicitly not in this MVP**: question/answer loop, review or approval
 workflow, automatic installer, launcher replacement, historical content import.
 
-**Status**: Not Started
+**Status**: Not Started (reshaped; gated on S5.0 + the ⚠ ratifications).
 
 ---
 
