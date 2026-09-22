@@ -1,7 +1,8 @@
 # Stage T upstream prerequisites — design spec
 
-**Status:** design complete, **pending Brian's ratification** of the T0 decisions in
-Part 4. No production code in this PR. Architected via Codex consult against the
+**Status:** design complete; the four shaping decisions (DA-1…DA-4) **RATIFIED by Brian
+2026-09-22** — see Part 4. The deeper T0-gate semantics remain to be ratified when the
+T0-gate PR lands. No production code in this PR. Architected via Codex consult against the
 `briankeane/vienna` tree; captured and adjudicated here.
 
 ## Purpose
@@ -290,17 +291,23 @@ rates need Brian's approval.**
 
 ## Part 4 — T0 gate: decisions for Brian
 
-### The four decisions that shape this spec (ratify to unblock the PR graph)
+### The four decisions that shape this spec — RATIFIED 2026-09-22
 
-- **DA-1 — Fold scope.** Bring all four components (attribution, evidence, coverage,
-  gaps) under `display-fold.v1`. *Recommend: yes.*
-- **DA-2 — History binding.** **Response-bound** interpretation of immutable history vs.
-  capture-time-preserved interpretation. *Recommend: response-bound* (capture-time is a
-  large upstream scope increase the client does not need). **The consequential call.**
-- **DA-3 — Interface v1 partial policy.** `incomplete` → **emit no rows** vs. best-effort
-  partial rows. *Recommend: no-rows for v1;* partial rows a later, separate capability.
-- **DA-4 — Swift sequencing.** TS lands first; **Swift is a required follow-up**, not
-  optional; TS-only ≠ done. *Recommend: confirm.*
+- **DA-1 — Fold scope. RESOLVED → all four.** All four components (attribution, evidence,
+  coverage, gaps) are versioned under one `display-fold.v1`. Coverage/gaps are not left
+  outside the compatibility guarantee.
+- **DA-2 — History binding. RESOLVED → response-bound.** The contract version means
+  "interpret *this* history (`session`, events through `H`) with *these* published fold
+  rules," mirroring the clip precedent. Capture-time-preserved interpretation — which
+  would require durable contract provenance + historical dispatch in the daemon — is
+  explicitly **out of scope**. A new contract must define how it reads supported
+  historical event versions; unsupported inputs stay visibly unsupported.
+- **DA-3 — Interface v1 partial policy. RESOLVED → no rows.** When extraction is
+  incomplete on either side, the endpoint returns `incomplete` and emits **no** change
+  rows. Reliable partial rows are a later, separately-specified capability, not v1.
+- **DA-4 — Swift sequencing. RESOLVED → Swift required.** TypeScript may land first;
+  Swift is a **required follow-up dependency for completion**, not optional. TS-only does
+  **not** satisfy the ratified "Swift + TypeScript" criterion.
 
 ### Deeper semantics — ratified when the T0-gate PR lands (enumerated, not resolved here)
 
