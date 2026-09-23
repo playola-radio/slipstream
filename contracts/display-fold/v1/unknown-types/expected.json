@@ -1,0 +1,12 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [],
+    "coverage": [],
+    "gaps": [
+      { "source": "urn:slipstream:session:a", "seq": "5", "reason": "restart", "scope": { "kind": "session" } }
+    ]
+  }
+}

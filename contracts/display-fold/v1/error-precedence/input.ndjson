@@ -1,0 +1,4 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"restart"}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"storage"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.file.changed.v2","data":{}}
+{"source":"urn:slipstream:session:b","seq":"9","type":"slipstream.enrichment.coverage.v1","data":{"harness":"gemini","state":"readable"}}

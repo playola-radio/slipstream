@@ -1,0 +1,5 @@
+{
+  "contract": "display-fold.v1",
+  "result": "invalid",
+  "error": { "reason": "timestamp-out-of-range", "source": "urn:slipstream:session:a", "seq": "1" }
+}

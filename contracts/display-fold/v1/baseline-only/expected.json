@@ -1,0 +1,5 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": { "attributions": [], "evidence": [], "coverage": [], "gaps": [] }
+}

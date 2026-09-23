@@ -1,0 +1,5 @@
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"coalesced"}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.file.changed.v1","data":{"path":"a.ts"}}
+{"source":"urn:slipstream:session:a","seq":"3","time":"2026-09-23T00:00:00.000Z","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"coalesced"}}
+{"source":"urn:slipstream:session:a","seq":"3","time":"2026-09-23T00:00:00.001Z","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"coalesced"}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.session.started.v1","data":{}}

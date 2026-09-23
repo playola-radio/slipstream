@@ -1,0 +1,5 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.session.started.v1","data":{"session_id":"a"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.enrichment.configured.v1","data":{"session_id":"a","policy":{"window_ms":2000,"grace_ms":5000,"sources":{"claude-code":"configured","codex":"configured"}}}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.file.changed.v1","data":{"session_id":"a","path":"src/a.ts","before":{"kind":"absent"},"after":{"kind":"absent"},"observation":"watcher","observed_at_ms":1200}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.harness.evidence.v1","data":{"session_id":"a","evidence_key":{"harness":"claude-code","harness_session_id":"hs-1","record_id":"r1"},"adapter_version":"test/1","tool_name":"Write","timestamp":{"at_ms":1000,"basis":"record-time"},"file_scope":{"kind":"paths","paths":["src/a.ts"]}}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.change.attribution.v1","data":{"session_id":"a","change_seq":"3","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":["4"]}}

@@ -1,0 +1,10 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.enrichment.configured.v1","data":{"policy":{"window_ms":2000}}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.file.changed.v1","data":{"path":"a.ts"}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.harness.evidence.v1","data":{"evidence_key":{"harness":"claude-code","harness_session_id":"hs","record_id":"r1"},"adapter_version":"test/1","tool_name":"Write","timestamp":{"at_ms":1000,"basis":"record-time"},"file_scope":{"kind":"paths","paths":["a.ts"]}}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"coalesced","observed_at_ms":1500}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.change.attribution.v1","data":{"change_seq":"2","policy_seq":"1","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
+{"data":{"file_scope":{"paths":["a.ts"],"kind":"paths"},"timestamp":{"basis":"record-time","at_ms":1.0e3},"tool_name":"Write","adapter_version":"test/1","evidence_key":{"record_id":"r1","harness_session_id":"hs","harness":"claude-code"}},"type":"slipstream.harness.evidence.v1","seq":"3","source":"urn:slipstream:session:a"}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.capture.gap.v1","data":{"reason":"coalesced","observed_at_ms":1500,"scope":{"kind":"session"}}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.enrichment.configured.v1","data":{"policy":{"window_ms":2000}}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.file.changed.v1","data":{"path":"a.ts"}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.change.attribution.v1","data":{"change_seq":"2","policy_seq":"1","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
