@@ -43,6 +43,18 @@ describe('T0.1 prefix claim', () => {
     await assert.rejects(() => prefixClaim(ctxWith(reader)), /did not deliver every identity/);
   });
 
+  it('stops a stalled finite replay when the runner cancels', async () => {
+    const stalled: ReaderClient = {
+      ...fakeReader([], 0n, []),
+      finite: (_sid, _after, signal) =>
+        new Promise((_, reject) => signal?.addEventListener('abort', () => reject(new Error('cancelled')))),
+    };
+    const ctl = new AbortController();
+    const pending = prefixClaim({ ...ctxWith(stalled), signal: ctl.signal });
+    ctl.abort();
+    await assert.rejects(pending, /cancelled/);
+  });
+
   it('fails when SSE delivers a seq under a different source', async () => {
     const reader = fakeReader(three, 3n, [record(1n, { source: 'WRONG' }), record(2n), record(3n)]);
     await assert.rejects(() => prefixClaim(ctxWith(reader)), /did not deliver every identity/);

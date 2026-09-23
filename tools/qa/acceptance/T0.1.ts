@@ -56,7 +56,7 @@ export function historyBeforeAttribution(events: AnyRecord[]): AnyRecord[] {
  * fold the history published before the first attribution. */
 async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; changeSeqs: string[] }> {
   const deadline = { deadlineMs: 20_000, signal: ctx.signal };
-  let cursor = (await ctx.reader.finite(ctx.sessionId, 0n)).durableSeq;
+  let cursor = (await ctx.reader.finite(ctx.sessionId, 0n, ctx.signal)).durableSeq;
   const changeSeqs: string[] = [];
   for (const body of ['first display-fold change\n', 'second display-fold change\n']) {
     const rel = `display-fold-${randomUUID()}.txt`;
@@ -66,7 +66,7 @@ async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; 
       { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes } }, cursor, deadline)).seq;
     changeSeqs.push(cursor.toString());
   }
-  const history = historyBeforeAttribution((await ctx.reader.finite(ctx.sessionId, 0n)).events);
+  const history = historyBeforeAttribution((await ctx.reader.finite(ctx.sessionId, 0n, ctx.signal)).events);
   const changed = history.filter((e) => e.type === FILE_CHANGED_TYPE).length;
   const baselined = history.filter((e) => e.type === BASELINED_TYPE).length;
   if (baselined < 2) fail(`expected at least 2 live file.baselined records, saw ${baselined}`);
@@ -176,7 +176,7 @@ function identitiesThrough(h: bigint): string[] {
 }
 
 export async function prefixClaim(ctx: AcceptanceContext): Promise<Assertion> {
-  const { events, durableSeq: H } = await ctx.reader.finite(ctx.sessionId, 0n);
+  const { events, durableSeq: H } = await ctx.reader.finite(ctx.sessionId, 0n, ctx.signal);
   if (H === 0n) fail('finite replay has no durable records; a prefix comparison would be vacuous');
   const expected = identitiesThrough(H);
   const finiteSeqs = events.map((e) => e.seq as string);
@@ -238,7 +238,7 @@ export async function corpusClaim(): Promise<Assertion> {
 }
 
 async function noNewSurfaceClaim(ctx: AcceptanceContext, events: AnyRecord[]): Promise<Assertion> {
-  const res = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`);
+  const res = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`, { signal: ctx.signal });
   if (res.status !== 200) fail(`finite replay returned ${res.status}`);
   const headers = [...res.headers.keys()].sort();
   const unexpected = headers.filter((h) => !PRE_EXISTING_HEADERS.has(h));
@@ -288,7 +288,7 @@ export const t01: AcceptanceModule = {
     const live = await withBaselinedSession(ctx.signal, async (session) => {
       const { assertion: d1, changeSeqs } = await d1Claim(session);
       const attributions = await liveAttributionClaim(session, changeSeqs);
-      const { events } = await session.reader.finite(session.sessionId, 0n);
+      const { events } = await session.reader.finite(session.sessionId, 0n, session.signal);
       return [
         d1,
         attributions,
