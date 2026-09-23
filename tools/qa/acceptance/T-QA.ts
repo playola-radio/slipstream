@@ -10,8 +10,7 @@
  * Every claim that fails throws with actual-vs-expected detail; the runner turns
  * that into a failed check. The bearer token is never placed in evidence.
  */
-import { writeFile, rm, mkdtemp, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -19,6 +18,8 @@ import {
   awaitObservedChange,
   DurabilityTimeoutError,
   FILE_CHANGED_TYPE,
+  mkdtempRoot,
+  rmMkdtempRoot,
   type ReaderClient,
   type Assertion,
 } from '../../qa-support.ts';
@@ -162,7 +163,10 @@ export async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
 
   // Reconnect after a mid-stream cursor; the stream must deliver the FULL suffix —
   // every finite identity greater than the cursor — and nothing at or below it.
-  const cursor = finiteSeqs[0]!;
+  // An INTERIOR cursor (not the earliest event) actually exercises a mid-stream
+  // reconnect; falling back to the earliest event is required only when too few
+  // identities exist for an interior choice to be meaningful.
+  const cursor = finiteSeqs.length >= 3 ? finiteSeqs[Math.floor(finiteSeqs.length / 2)]! : finiteSeqs[0]!;
   const resumed = await collectSseSeqs(ctx.reader, ctx.sessionId, cursor, H, 8_000, ctx.signal);
   if (resumed.some((s) => s <= cursor)) {
     fail(`SSE reconnect after cursor ${cursor} delivered a seq at or below the cursor: ${resumed.join(',')}`);
@@ -250,7 +254,7 @@ async function criterion5(): Promise<Assertion> {
     };
   } finally {
     if (handle) await handle.stop().catch(() => {});
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    await rmMkdtempRoot(root).catch(() => {});
   }
 }
 
@@ -287,7 +291,7 @@ async function criterion6(): Promise<Assertion> {
       await b.stop();
     }
   } finally {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    await rmMkdtempRoot(root).catch(() => {});
   }
 }
 
@@ -310,7 +314,7 @@ async function criterion7(): Promise<Assertion> {
     };
   } finally {
     if (first) await first.stop().catch(() => {});
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    await rmMkdtempRoot(root).catch(() => {});
   }
 }
 
@@ -348,7 +352,7 @@ function seqArraysEqual(a: bigint[], b: bigint[]): boolean {
 }
 
 async function freshRoot(): Promise<string> {
-  return join(await mkdtemp(join(tmpdir(), 'slipstream-qa-tqa-')), 'root');
+  return mkdtempRoot('slipstream-qa-tqa-');
 }
 
 /** True if the reader URL now refuses connections (daemon stopped). */
