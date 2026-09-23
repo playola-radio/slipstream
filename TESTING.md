@@ -182,11 +182,20 @@ case, write both files and run `npm run test:tools`. The corpus test picks up ev
 case directory automatically.
 
 `npm run qa:check -- --pr T0.1` runs the live claims against a real session that
-baselined files and then captured changes: the D1 empty fold, determinism, the
-prefix/SSE agreement, the negative control, and no new headers or event types. A
-live QA session has no evidence, attributions, coverage, or gaps. The four non-empty
-components are therefore proven only by the FIXTURE corpus claim, and the report
-labels each claim LIVE or FIXTURE.
+baselined files and then captured changes:
+
+- the D1 empty fold of the history before the first attribution;
+- the published attributions reproduced exactly (they arrive after the grace
+  window);
+- determinism;
+- prefix/SSE agreement through the durable seq;
+- the negative control;
+- no new headers or event types.
+
+A live QA session publishes only `unknown` attributions and never publishes
+evidence, coverage, or gaps. Those three components, plus attribution revisions and
+rejections, are therefore proven only by the FIXTURE corpus claim. The report labels
+each claim LIVE or FIXTURE.
 
 ### Cleanup
 

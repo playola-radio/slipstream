@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { prefixClaim, negativeControlClaim, corpusClaim } from './T0.1.ts';
+import { prefixClaim, negativeControlClaim, corpusClaim, historyBeforeAttribution, liveAttributionClaim } from './T0.1.ts';
 import type { AcceptanceContext } from './types.ts';
 import type { ReaderClient, FiniteEvents, SseFrame, AnyRecord } from '../../qa-support.ts';
 
@@ -51,6 +51,42 @@ describe('T0.1 prefix claim', () => {
   it('fails when SSE carries different content at a shared identity', async () => {
     const reader = fakeReader(three, 3n, [record(1n), record(2n, { time: 'other' }), record(3n)]);
     await assert.rejects(() => prefixClaim(ctxWith(reader)), /conflicting-records/);
+  });
+});
+
+function attribution(seq: bigint, changeSeq: string): AnyRecord {
+  return {
+    source: SOURCE,
+    seq: seq.toString(),
+    type: 'slipstream.change.attribution.v1',
+    data: { change_seq: changeSeq, policy_seq: '1', status: 'unknown', reason: 'no-matching-evidence', evidence_seqs: [] },
+  };
+}
+
+describe('T0.1 history before attribution', () => {
+  it('keeps only the records published before the first attribution', () => {
+    const events = [record(1n), record(2n), attribution(3n, '1'), record(4n)];
+    assert.deepEqual(historyBeforeAttribution(events).map((e) => e.seq), ['1', '2']);
+  });
+
+  it('keeps everything when no attribution has been published', () => {
+    assert.equal(historyBeforeAttribution([record(1n), record(2n)]).length, 2);
+  });
+});
+
+describe('T0.1 live attribution claim', () => {
+  it('passes when the fold reproduces the published attribution for every change', async () => {
+    const events = [record(1n), record(2n), attribution(3n, '1'), attribution(4n, '2')];
+    const a = await liveAttributionClaim(ctxWith(fakeReader(events, 4n, events)), ['1', '2']);
+    assert.deepEqual((a.evidence as { rows: number }).rows, 2);
+  });
+
+  it('fails at the deadline when a change never receives an attribution', async () => {
+    const events = [record(1n), record(2n), attribution(3n, '1')];
+    await assert.rejects(
+      () => liveAttributionClaim(ctxWith(fakeReader(events, 3n, events)), ['1', '2'], 300),
+      /no attribution for change 2/,
+    );
   });
 });
 

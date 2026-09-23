@@ -2,9 +2,10 @@
  * T0.1 acceptance: the `display-fold.v1` contract and oracle (DISPLAY-FOLD.md).
  *
  * LIVE claims drive real files through live qa-daemons and fold what the PUBLIC
- * reader serves; they can only exercise the D1 boundary (a live QA session has
- * no harness evidence, attribution, coverage, or gaps without a `src/` change),
- * so the four non-empty components are proven by the FIXTURE corpus claim alone.
+ * reader serves. A live QA session publishes baselines, changes, and (after the
+ * grace window) `unknown` attributions, so the D1 boundary and the attributions
+ * component are proven live. It has no harness evidence, coverage, or gaps without
+ * a `src/` change, so those three components are proven by the FIXTURE corpus only.
  */
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +18,7 @@ import {
   FILE_CHANGED_TYPE,
   mkdtempRoot,
   rmMkdtempRoot,
+  sleep,
   type AnyRecord,
   type Assertion,
   type ReaderClient,
@@ -27,6 +29,7 @@ import type { AcceptanceContext, AcceptanceModule } from './types.ts';
 
 const EMPTY_FOLD = '{"contract":"display-fold.v1","result":"ok","state":{"attributions":[],"coverage":[],"evidence":[],"gaps":[]}}';
 const BASELINED_TYPE = 'slipstream.file.baselined.v1';
+const ATTRIBUTION_TYPE = 'slipstream.change.attribution.v1';
 const SCHEMAS_DIR = fileURLToPath(new URL('../../../schemas/', import.meta.url));
 /** Headers the finite replay sent before T0.1 (plus what node:http adds itself). */
 const PRE_EXISTING_HEADERS = new Set([
@@ -42,39 +45,86 @@ function fold(records: readonly unknown[]): string {
   return canonicalJson(foldDisplay(records));
 }
 
-/** `ctx` is a session that baselined pre-existing files; add two real changes. */
-async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; events: AnyRecord[] }> {
+/** The session's history before any attribution was published: exactly what a
+ * client holding only baselines and file changes would fold. */
+export function historyBeforeAttribution(events: AnyRecord[]): AnyRecord[] {
+  const cut = events.findIndex((e) => e.type === ATTRIBUTION_TYPE);
+  return cut === -1 ? events : events.slice(0, cut);
+}
+
+/** `ctx` is a session that baselined pre-existing files; add two real changes and
+ * fold the history published before the first attribution. */
+async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; changeSeqs: string[] }> {
   const deadline = { deadlineMs: 20_000, signal: ctx.signal };
   let cursor = (await ctx.reader.finite(ctx.sessionId, 0n)).durableSeq;
+  const changeSeqs: string[] = [];
   for (const body of ['first display-fold change\n', 'second display-fold change\n']) {
     const rel = `display-fold-${randomUUID()}.txt`;
     const bytes = Buffer.from(body, 'utf8');
     await writeFile(join(ctx.worktree, rel), bytes);
     cursor = (await awaitObservedChange(ctx.reader, ctx.sessionId,
       { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes } }, cursor, deadline)).seq;
+    changeSeqs.push(cursor.toString());
   }
-  const { events, durableSeq } = await ctx.reader.finite(ctx.sessionId, 0n);
-  const changed = events.filter((e) => e.type === FILE_CHANGED_TYPE).length;
-  const baselined = events.filter((e) => e.type === BASELINED_TYPE).length;
+  const history = historyBeforeAttribution((await ctx.reader.finite(ctx.sessionId, 0n)).events);
+  const changed = history.filter((e) => e.type === FILE_CHANGED_TYPE).length;
+  const baselined = history.filter((e) => e.type === BASELINED_TYPE).length;
   if (baselined < 2) fail(`expected at least 2 live file.baselined records, saw ${baselined}`);
-  if (changed < 2) fail(`expected at least 2 live file.changed records, saw ${changed}`);
-  const actual = fold(events);
-  if (actual !== EMPTY_FOLD) fail(`a baseline/file-change-only session did not fold to the empty D1 state: ${actual}`);
+  if (changed < 2) fail(`expected at least 2 live file.changed records before any attribution, saw ${changed}`);
+  const actual = fold(history);
+  if (actual !== EMPTY_FOLD) fail(`a baseline/file-change-only history did not fold to the empty D1 state: ${actual}`);
   return {
-    events,
+    changeSeqs,
     assertion: {
       id: 'd1-baseline-only',
-      claim: 'LIVE: a session of real baselined and changed sandbox files, read through the public finite replay, folds to exactly the four empty D1 components with the contract id',
+      claim: 'LIVE: a session of real baselined and changed sandbox files, read through the public finite replay up to its first attribution, folds to exactly the four empty D1 components with the contract id',
       evidence: {
-        durable_seq: durableSeq.toString(),
-        records: events.length,
+        through_seq: String(history.at(-1)?.seq),
+        records: history.length,
         file_baselined: baselined,
         file_changed: changed,
-        event_types: [...new Set(events.map((e) => e.type))].sort(),
+        event_types: [...new Set(history.map((e) => e.type))].sort(),
         fold: actual,
       },
     },
   };
+}
+
+/** Wait for the daemon to publish an attribution for every change, then require
+ * the fold's attribution rows to equal rows re-derived by hand from those records. */
+export async function liveAttributionClaim(ctx: AcceptanceContext, changeSeqs: string[], deadlineMs = 20_000): Promise<Assertion> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const { events } = await ctx.reader.finite(ctx.sessionId, 0n);
+    const published = changeSeqs.map((c) => events.filter((e) => e.type === ATTRIBUTION_TYPE && e.data?.change_seq === c));
+    const missing = changeSeqs.find((_, i) => published[i]!.length === 0);
+    if (missing === undefined) {
+      const expected = published.map((records, i) => {
+        if (records.length !== 1) fail(`expected one attribution for change ${changeSeqs[i]}, saw ${records.length}`);
+        const { source, seq, data } = records[0]!;
+        return {
+          source,
+          change_seq: changeSeqs[i],
+          attribution_seq: seq,
+          policy_seq: data!.policy_seq,
+          status: data!.status,
+          reason: data!.reason,
+          evidence_seqs: data!.evidence_seqs,
+        };
+      });
+      const result = foldDisplay(events);
+      if (result.result !== 'ok') fail(`live session did not fold: ${canonicalJson(result)}`);
+      const actual = canonicalJson(result.state.attributions);
+      if (actual !== canonicalJson(expected)) fail(`attribution rows ${actual} differ from the published records ${canonicalJson(expected)}`);
+      return {
+        id: 'live-attributions',
+        claim: 'LIVE: once the daemon publishes attributions for the real changes, the fold\'s attribution rows equal the published records exactly',
+        evidence: { rows: expected.length, statuses: expected.map((r) => `${String(r.status)}/${String(r.reason)}`) },
+      };
+    }
+    if (Date.now() >= deadline) fail(`no attribution for change ${missing} within ${deadlineMs}ms`);
+    await sleep(250);
+  }
 }
 
 function determinismClaim(events: AnyRecord[]): Assertion {
@@ -172,7 +222,7 @@ export async function corpusClaim(): Promise<Assertion> {
   }
   return {
     id: 'fold-corpus',
-    claim: 'FIXTURE: every hand-written contracts/display-fold/v1 case folds to its expected envelope (the only proof of non-empty attributions, evidence, coverage, and gaps)',
+    claim: 'FIXTURE: every hand-written contracts/display-fold/v1 case folds to its expected envelope (the only proof of non-empty evidence, coverage, and gaps, and of attribution revisions and rejections)',
     evidence: { cases: names.length, names },
   };
 }
@@ -226,9 +276,12 @@ export const t01: AcceptanceModule = {
   requiresPlatform: 'darwin',
   async run(ctx) {
     const live = await withBaselinedSession(ctx.signal, async (session) => {
-      const { assertion: d1, events } = await d1Claim(session);
+      const { assertion: d1, changeSeqs } = await d1Claim(session);
+      const attributions = await liveAttributionClaim(session, changeSeqs);
+      const { events } = await session.reader.finite(session.sessionId, 0n);
       return [
         d1,
+        attributions,
         determinismClaim(events),
         await prefixClaim(session),
         negativeControlClaim(events),
