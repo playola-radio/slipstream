@@ -238,76 +238,87 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     }
   }
 
-  daemon = await startDaemon({ storeDir: store });
+  // From here on, a thrown failure must still tear down whatever startDaemon
+  // and the following steps created — a live daemon, an attached session, an
+  // env file — or it leaks exactly like an unhandled signal would, minus the
+  // cleanup. Only the explicit `return` paths above (which already call
+  // performCleanup themselves) are exempt; everything else funnels through
+  // this catch so there is exactly one cleanup per failure.
+  try {
+    daemon = await startDaemon({ storeDir: store });
 
-  // Attach the sandbox worktree with an explicitly synthetic identity. `qa` is a
-  // capture SCOPE marker, never a claim of authorship.
-  const attach = await sendControlRequest({
-    socketPath: daemon.socketPath,
-    request: { v: 1, verb: 'attach', worktree, harness: 'qa', harness_session_id: `qa:${runId}` },
-  });
-  if (!attach.ok) {
-    io.stderr(`qa-daemon: attach failed (${attach.code}): ${attach.message}`);
-    await performCleanup();
-    return 1;
-  }
-  const sessionId = attach.session_id as string;
-
-  const descriptor = await bootstrapReader(store);
-  const descriptorPath = (await readRuntimeDescriptorPath(store)) ?? join(store, 'runtime');
-  const reader = createReaderClient(descriptor.url, descriptor.token);
-
-  // Ready = the attached session's baseline is durably published.
-  const baseline = await awaitEventType(reader, sessionId, BASELINE_COMPLETED_TYPE, 0n);
-  let readyThroughSeq = baseline.durableSeq;
-
-  if (args.scenario !== null) {
-    const scenario = getScenario(args.scenario)!;
-    io.stderr(`qa-daemon: seeding scenario ${scenario.name}…`);
-    readyThroughSeq = await scenario.seed({
-      worktree, sessionId, reader, signal: controller.signal, after: baseline.seq,
+    // Attach the sandbox worktree with an explicitly synthetic identity. `qa` is a
+    // capture SCOPE marker, never a claim of authorship.
+    const attach = await sendControlRequest({
+      socketPath: daemon.socketPath,
+      request: { v: 1, verb: 'attach', worktree, harness: 'qa', harness_session_id: `qa:${runId}` },
     });
+    if (!attach.ok) {
+      io.stderr(`qa-daemon: attach failed (${attach.code}): ${attach.message}`);
+      await performCleanup();
+      return 1;
+    }
+    const sessionId = attach.session_id as string;
+
+    const descriptor = await bootstrapReader(store);
+    const descriptorPath = (await readRuntimeDescriptorPath(store)) ?? join(store, 'runtime');
+    const reader = createReaderClient(descriptor.url, descriptor.token);
+
+    // Ready = the attached session's baseline is durably published.
+    const baseline = await awaitEventType(reader, sessionId, BASELINE_COMPLETED_TYPE, 0n);
+    let readyThroughSeq = baseline.durableSeq;
+
+    if (args.scenario !== null) {
+      const scenario = getScenario(args.scenario)!;
+      io.stderr(`qa-daemon: seeding scenario ${scenario.name}…`);
+      readyThroughSeq = await scenario.seed({
+        worktree, sessionId, reader, signal: controller.signal, after: baseline.seq,
+      });
+    }
+
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT,
+      state: 'ready',
+      run_id: runId,
+      daemon_commit: daemonCommit,
+      store,
+      worktree,
+      descriptor_path: descriptorPath,
+      url: descriptor.url,
+      token: descriptor.token,
+      session_id: sessionId,
+      ready_through_seq: readyThroughSeq.toString(),
+      scenario: args.scenario,
+    };
+    await writeQaEnv(envPath, env);
+
+    io.stdout(`slipstream qa daemon ready`);
+    io.stdout(`  store       ${store}`);
+    io.stdout(`  worktree    ${worktree}`);
+    io.stdout(`  descriptor  ${descriptorPath}`);
+    io.stdout(`  reader url  ${descriptor.url}`);
+    io.stdout(`  token       ${descriptor.token}`);
+    io.stdout(`  session     ${sessionId}`);
+    io.stdout(`  ready seq   ${readyThroughSeq.toString()}`);
+    io.stdout(`  env file    ${envPath}`);
+    io.stdout(`  scenario    ${args.scenario ?? '(none)'}`);
+    io.stdout(``);
+    io.stdout(`try:`);
+    for (const cmd of curlCommands({ url: descriptor.url, token: descriptor.token, sessionId })) {
+      io.stdout(`  ${cmd}`);
+    }
+    io.stderr(`qa-daemon: press Ctrl-C to stop`);
+
+    // Success path: keep the daemon alive until a signal fires the shared shutdown,
+    // which cleans up and releases this waiter. The exit code reflects whether
+    // teardown succeeded — a failed shutdown reports non-zero, never a false 0.
+    if (stopping) return exitCode; // a signal already arrived during startup
+    await new Promise<void>((resolvePromise) => { readyResolve = resolvePromise; });
+    return exitCode;
+  } catch (err) {
+    await performCleanup().catch(() => {});
+    throw err;
   }
-
-  const env: QaEnv = {
-    format: QA_ENV_FORMAT,
-    state: 'ready',
-    run_id: runId,
-    daemon_commit: daemonCommit,
-    store,
-    worktree,
-    descriptor_path: descriptorPath,
-    url: descriptor.url,
-    token: descriptor.token,
-    session_id: sessionId,
-    ready_through_seq: readyThroughSeq.toString(),
-    scenario: args.scenario,
-  };
-  await writeQaEnv(envPath, env);
-
-  io.stdout(`slipstream qa daemon ready`);
-  io.stdout(`  store       ${store}`);
-  io.stdout(`  worktree    ${worktree}`);
-  io.stdout(`  descriptor  ${descriptorPath}`);
-  io.stdout(`  reader url  ${descriptor.url}`);
-  io.stdout(`  token       ${descriptor.token}`);
-  io.stdout(`  session     ${sessionId}`);
-  io.stdout(`  ready seq   ${readyThroughSeq.toString()}`);
-  io.stdout(`  env file    ${envPath}`);
-  io.stdout(`  scenario    ${args.scenario ?? '(none)'}`);
-  io.stdout(``);
-  io.stdout(`try:`);
-  for (const cmd of curlCommands({ url: descriptor.url, token: descriptor.token, sessionId })) {
-    io.stdout(`  ${cmd}`);
-  }
-  io.stderr(`qa-daemon: press Ctrl-C to stop`);
-
-  // Success path: keep the daemon alive until a signal fires the shared shutdown,
-  // which cleans up and releases this waiter. The exit code reflects whether
-  // teardown succeeded — a failed shutdown reports non-zero, never a false 0.
-  if (stopping) return exitCode; // a signal already arrived during startup
-  await new Promise<void>((resolvePromise) => { readyResolve = resolvePromise; });
-  return exitCode;
 }
 
 /** The concrete path of the newest runtime descriptor, for the env file / display. */

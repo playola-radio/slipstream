@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join, resolve } from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { parseArgs, curlCommands, probeStoreLiveness, ArgError } from './qa-daemon.ts';
+import { randomUUID } from 'node:crypto';
+import { parseArgs, curlCommands, probeStoreLiveness, runQaDaemon, ArgError } from './qa-daemon.ts';
+import { prepareRoot } from './qa/safety.ts';
 
 describe('qa-daemon parseArgs', () => {
   const home = '/home/u';
@@ -59,5 +61,50 @@ describe('qa-daemon curlCommands', () => {
     assert.ok(cmds[0]!.includes('/v1/sessions'));
     assert.ok(cmds[1]!.includes('/v1/sessions/qa:1/events?after=0'));
     assert.ok(cmds[2]!.includes('follow=true') && cmds[2]!.includes('curl -N'));
+  });
+});
+
+describe('runQaDaemon startup-failure cleanup', () => {
+  it('stops the daemon it started when a step AFTER startDaemon throws (scenario seeding)', async () => {
+    // Keep the prefix short: the control socket path must stay under macOS's
+    // ~104-byte UNIX_PATH_MAX, or connect() fails with ENAMETOOLONG, which
+    // probeSocket maps to 'ambiguous' — a false refusal unrelated to this test.
+    const root = join(await mkdtemp(join(tmpdir(), 'ss-qa-d-')), 'root');
+    const runId = randomUUID();
+    // --reuse requires a pre-existing owned root, so build the real layout
+    // ourselves via the same prepareRoot production uses, then sabotage the
+    // worktree so the REAL T-QA scenario's writeFile throws during seeding — a
+    // genuine failure strictly after startDaemon and well before the keep-alive
+    // await. (Fresh mode can't be used here: it requires an absent/empty root,
+    // and asserting root-deletion afterward is meaningless under --reuse, which
+    // deliberately retains the root — so this test's signal is "the daemon this
+    // call started got stopped", not "the root is gone".)
+    const { store, worktree } = await prepareRoot(root, runId);
+    await chmod(worktree, 0o500);
+    try {
+      const sink = { out: [] as string[], err: [] as string[] };
+      // The sabotaged write throws inside scenario.seed, well past startDaemon;
+      // runQaDaemon propagates it as a rejection (matching the top-level
+      // `.then(_, err => process.exit(1))` fatal handler), not a return value.
+      await assert.rejects(
+        () => runQaDaemon({
+          home: tmpdir(),
+          argv: ['--root', root, '--reuse', '--scenario', 'T-QA', '--run-id', runId],
+          stdout: (l) => sink.out.push(l),
+          stderr: (l) => sink.err.push(l),
+          cwd: process.cwd(),
+        }),
+        /EACCES/,
+        'the seeding failure must still propagate so the fatal handler reports non-zero',
+      );
+      assert.equal(
+        await probeStoreLiveness(store),
+        'none',
+        'the daemon started before the failure must be stopped by cleanup, not left running',
+      );
+    } finally {
+      await chmod(worktree, 0o700).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });
