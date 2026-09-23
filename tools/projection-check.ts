@@ -88,16 +88,23 @@ function selectedModules(selection: Selection, stderr: (l: string) => void): Acc
 }
 
 /** Run one module against a live reader/session, enforcing a deadline and mapping
- * any throw to a failed check. Never throws. */
-async function runModule(
+ * any throw to a failed check. Never throws. Exported for the cleanup test. */
+export async function runModule(
   mod: AcceptanceModule,
   ctx: AcceptanceContext,
   stderr: (l: string) => void,
 ): Promise<CheckResult> {
   stderr(`qa-check: running ${mod.id}…`);
+  // Hoisted so the finally can clear the timer and drop the abort listener on
+  // every path — a module that WINS the race (the common case) must not leak a
+  // 180s timer that keeps the loop alive, nor an abort listener that accumulates
+  // on the shared signal across modules.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    const t = setTimeout(() => reject(new Error(`check ${mod.id} exceeded ${PER_MODULE_DEADLINE_MS}ms`)), PER_MODULE_DEADLINE_MS);
-    ctx.signal.addEventListener('abort', () => { clearTimeout(t); reject(new Error('interrupted')); }, { once: true });
+    timer = setTimeout(() => reject(new Error(`check ${mod.id} exceeded ${PER_MODULE_DEADLINE_MS}ms`)), PER_MODULE_DEADLINE_MS);
+    onAbort = (): void => reject(new Error('interrupted'));
+    ctx.signal.addEventListener('abort', onAbort, { once: true });
   });
   try {
     const { assertions } = await Promise.race([mod.run(ctx), timeout]);
@@ -107,6 +114,9 @@ async function runModule(
     const message = (err as Error).message;
     stderr(`qa-check: ${mod.id} FAILED: ${message}`);
     return { id: mod.id, result: 'failed', assertions: [], error: message };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) ctx.signal.removeEventListener('abort', onAbort);
   }
 }
 

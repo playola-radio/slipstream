@@ -1,12 +1,27 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import {
   parseAcceptanceArgs,
   runAcceptance,
+  runModule,
   main,
   EXIT,
   ArgError,
 } from './projection-check.ts';
+import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
+
+describe('runModule resource cleanup', () => {
+  it('clears its timer and drops its abort listener after a module succeeds', async () => {
+    const ac = new AbortController();
+    const ctx = { signal: ac.signal } as AcceptanceContext;
+    const mod: AcceptanceModule = { id: 'fake', run: async () => ({ assertions: [] }) };
+    const res = await runModule(mod, ctx, () => {});
+    assert.equal(res.result, 'passed');
+    // A leaked abort listener would remain registered on the shared signal.
+    assert.equal(getEventListeners(ac.signal, 'abort').length, 0);
+  });
+});
 
 describe('parseAcceptanceArgs', () => {
   it('accepts --all', () => {

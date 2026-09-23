@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -150,6 +150,18 @@ describe('qa-support', () => {
       const path = join(base, 'bad.json');
       await writeQaEnv(path, { format: 'nope' as typeof QA_ENV_FORMAT, state: 'ready', run_id: '', daemon_commit: '', store: '', worktree: '', descriptor_path: '', url: '', token: '', session_id: '', ready_through_seq: '0', scenario: null });
       await assert.rejects(() => readQaEnv(path), /not a slipstream-qa\.v1/);
+    });
+
+    it('rejects malformed JSON without echoing the file bytes (which may hold the token)', async () => {
+      const path = join(base, 'malformed.json');
+      // A garbled env whose unquoted token sits right at the syntax error. V8's
+      // JSON.parse SyntaxError message quotes a snippet of the input, so a naive
+      // parse would splice these secret bytes into stderr and the JSON report.
+      await writeFile(path, '{"format":"slipstream-qa.v1","token":sup3r-s3cr3t-t0ken}');
+      await assert.rejects(
+        () => readQaEnv(path),
+        (err: Error) => /malformed/i.test(err.message) && !/sup3r/.test(err.message),
+      );
     });
 
     it('rejects an env whose token carries a header-injecting newline', async () => {

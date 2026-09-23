@@ -105,13 +105,31 @@ export async function runQaDaemonToExit(opts: { root: string }): Promise<QaDaemo
 }
 
 /** SIGTERM the child and await its exit; if it does not exit within the grace
- * window, SIGKILL it and await again. A wedged daemon never hangs the caller. */
-function stopProc(proc: ChildProcess): Promise<void> {
-  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
-  return new Promise<void>((resolvePromise) => {
-    const onExit = (): void => { clearTimeout(timer); resolvePromise(); };
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); }, STOP_GRACE_MS);
-    proc.once('exit', onExit);
+ * window, SIGKILL it and await again. A wedged daemon never hangs the caller.
+ *
+ * Resolves ONLY on a clean exit (code 0). An unclean teardown — a non-zero exit
+ * code, or termination by signal (including our own SIGKILL escalation) — rejects,
+ * so a daemon whose shutdown/cleanup failed surfaces as a check failure instead of
+ * being silently reported as a healthy stop. Exported for the harness-proc tests. */
+export function stopProc(proc: ChildProcess): Promise<void> {
+  return new Promise<void>((resolvePromise, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (signal !== null) {
+        reject(new Error(`qa-daemon terminated by signal ${signal} during stop (unclean teardown)`));
+      } else if (code !== 0) {
+        reject(new Error(`qa-daemon exited ${code} during stop (unclean teardown)`));
+      } else {
+        resolvePromise();
+      }
+    };
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      settle(proc.exitCode, proc.signalCode);
+      return;
+    }
+    timer = setTimeout(() => { proc.kill('SIGKILL'); }, STOP_GRACE_MS);
+    proc.once('exit', settle);
     proc.kill('SIGTERM');
   });
 }

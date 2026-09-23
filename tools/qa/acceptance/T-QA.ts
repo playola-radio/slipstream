@@ -60,7 +60,14 @@ async function collectSseSeqs(
   const timer = setTimeout(() => ctl.abort(), deadlineMs);
   try {
     await reader.follow(sessionId, after, ctl.signal, (frame) => {
-      if (frame.id === undefined) return;
+      // Every event frame MUST advertise its seq as the SSE id — that id is the
+      // resume token. A data-carrying frame with no id is a protocol violation,
+      // not something to silently skip.
+      if (frame.id === undefined) {
+        mismatch = `SSE data frame carried no id (data.seq=${(JSON.parse(frame.data) as { seq?: string }).seq ?? 'none'})`;
+        ctl.abort();
+        return;
+      }
       const id = BigInt(frame.id);
       const payloadSeq = (JSON.parse(frame.data) as { seq?: string }).seq;
       if (payloadSeq === undefined || BigInt(payloadSeq) !== id) {
@@ -133,7 +140,7 @@ async function criterion2(ctx: AcceptanceContext): Promise<Assertion> {
   };
 }
 
-async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
+export async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
   const finite = await ctx.reader.finite(ctx.sessionId, 0n);
   const H = finite.durableSeq;
   const finiteSeqs = finite.events.map((e) => BigInt(e.seq as string)).sort(cmp);
@@ -144,10 +151,13 @@ async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
   const sse = await collectSseSeqs(ctx.reader, ctx.sessionId, 0n, H, 8_000, ctx.signal);
   const sseMax = maxOf(sse) ?? 0n;
   if (sseMax < H) fail(`SSE stream did not reach the durable high-water ${H}; it stopped at ${sseMax}`);
+  // Compare SSE AS DELIVERED — no dedup, no re-sort. The stream must deliver the
+  // identities up to H in ascending order with no repeats; deduping or sorting
+  // here would let a duplicated ([1,2,2,3]) or reordered ([2,1,3]) stream pass.
   const finiteUpToH = finiteSeqs.filter((s) => s <= H);
-  const sseUpToH = [...new Set(sse.filter((s) => s <= H))].sort(cmp);
+  const sseUpToH = sse.filter((s) => s <= H);
   if (!seqArraysEqual(finiteUpToH, sseUpToH)) {
-    fail(`finite replay and SSE disagree up to durable high-water ${H}: finite=${finiteUpToH.join(',')} sse=${sseUpToH.join(',')}`);
+    fail(`finite replay and SSE disagree up to durable high-water ${H} (delivery order): finite=${finiteUpToH.join(',')} sse=${sseUpToH.join(',')}`);
   }
 
   // Reconnect after a mid-stream cursor; the stream must deliver the FULL suffix —
@@ -158,7 +168,7 @@ async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
     fail(`SSE reconnect after cursor ${cursor} delivered a seq at or below the cursor: ${resumed.join(',')}`);
   }
   const expectedSuffix = finiteSeqs.filter((s) => s > cursor && s <= H);
-  const resumedSuffix = [...new Set(resumed.filter((s) => s <= H))].sort(cmp);
+  const resumedSuffix = resumed.filter((s) => s <= H);
   if (!seqArraysEqual(expectedSuffix, resumedSuffix)) {
     fail(`SSE reconnect did not deliver the full suffix after cursor ${cursor}: expected=${expectedSuffix.join(',')} got=${resumedSuffix.join(',')}`);
   }

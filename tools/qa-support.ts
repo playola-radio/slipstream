@@ -442,7 +442,16 @@ export async function writeQaEnv(path: string, env: QaEnv): Promise<void> {
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 export async function readQaEnv(path: string): Promise<QaEnv> {
-  const parsed = JSON.parse(await readFile(path, 'utf8')) as QaEnv;
+  const raw = await readFile(path, 'utf8');
+  let parsed: QaEnv;
+  try {
+    parsed = JSON.parse(raw) as QaEnv;
+  } catch {
+    // V8's SyntaxError message quotes a snippet of the input, which for a
+    // malformed env could be the token itself. Swallow it and report a fixed,
+    // secret-free message — the token must never reach a log line or report.
+    throw new Error(`${path} is malformed JSON; refusing to use it`);
+  }
   if (parsed.format !== QA_ENV_FORMAT) {
     throw new Error(`${path} is not a ${QA_ENV_FORMAT} env file`);
   }
