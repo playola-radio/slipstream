@@ -1,0 +1,9 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.file.changed.v1","data":{"path":"a.ts"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.enrichment.configured.v1","data":{}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.change.attribution.v1","data":{"change_seq":"1","policy_seq":"2","status":"unknown","reason":"no-matching-evidence","evidence_seqs":[],"excluded_conflicts":[]}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.change.attribution.v1","data":{"change_seq":"99","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
+{"source":"urn:slipstream:session:a","seq":"6","type":"slipstream.change.attribution.v1","data":{"change_seq":"2","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
+{"source":"urn:slipstream:session:a","seq":"7","type":"slipstream.change.attribution.v1","data":{"change_seq":"8","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
+{"source":"urn:slipstream:session:a","seq":"8","type":"slipstream.file.changed.v1","data":{"path":"b.ts"}}
+{"source":"urn:slipstream:session:b","seq":"9","type":"slipstream.change.attribution.v1","data":{"change_seq":"1","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":["3"]}}
+{"source":"urn:slipstream:session:a","seq":"10","type":"slipstream.change.attribution.v1","data":{"change_seq":"8","policy_seq":"2","status":"unknown","reason":"observation-interval-unavailable","evidence_seqs":[]}}

@@ -1,0 +1,15 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "hs", "record_id": "r1",
+        "evidence_seqs": ["1", "2"], "min_at_ms": 1000, "max_at_ms": 1200, "known_paths": ["src/a.ts", "src/b.ts"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "hs", "record_id": "r2",
+        "evidence_seqs": ["5"], "min_at_ms": 900, "max_at_ms": 900, "known_paths": [], "conflicted": false }
+    ],
+    "coverage": [],
+    "gaps": []
+  }
+}

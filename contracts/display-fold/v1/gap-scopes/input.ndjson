@@ -1,0 +1,5 @@
+{"source":"urn:slipstream:session:b","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"coalesced","observed_at_ms":7}}
+{"source":"urn:slipstream:session:a","seq":"10","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"path","path":"src/a.ts"},"reason":"storage","observed_at_ms":40}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"directory","path":"src"},"reason":"watcher-error","episode_id":"e1","observed_at_ms":20}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session","extra":1},"reason":"restart","observed_at_ms":10,"future_field":"ignored"}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"path","path":"src/a.ts"},"reason":"baseline-unreadable"}}

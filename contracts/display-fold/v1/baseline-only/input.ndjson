@@ -1,0 +1,5 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.session.started.v1","data":{"session_id":"a","root":"/tmp/w"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.file.baselined.v1","data":{"session_id":"a","path":"a.ts","snapshot":{"kind":"content","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":14}}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.capture.baseline.completed.v1","data":{"session_id":"a","file_count":1}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.task.started.v1","data":{"session_id":"a","task_id":"t1","title":"Edit f"}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.file.changed.v1","data":{"session_id":"a","path":"a.ts","before":{"kind":"content","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":14},"after":{"kind":"absent"},"observation":"watcher","observed_at_ms":1000}}

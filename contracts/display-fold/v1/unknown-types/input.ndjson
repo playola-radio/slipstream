@@ -1,0 +1,5 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"com.example.thing.v1","data":{"anything":[1.5,null,true]}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.session.started.v2","data":{}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.future.event.v1","data":{"x":1}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.task.started.v9","data":{}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"restart"}}

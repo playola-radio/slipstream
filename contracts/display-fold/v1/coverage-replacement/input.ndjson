@@ -1,0 +1,4 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.enrichment.coverage.v1","data":{"harness":"claude-code","state":"pending"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.enrichment.coverage.v1","data":{"harness":"codex","state":"degraded","issues":[{"kind":"missing","detail":"b"},{"kind":"malformed","detail":"line 9"},{"kind":"missing","detail":"b"},{"kind":"malformed","detail":"line 10"}]}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.enrichment.coverage.v1","data":{"harness":"claude-code","state":"readable","issues":[]}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.enrichment.coverage.v1","data":{"harness":"claude-code","state":"unavailable","issues":[{"kind":"inaccessible","detail":"EACCES"}]}}

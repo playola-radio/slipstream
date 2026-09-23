@@ -1,0 +1,5 @@
+{
+  "contract": "display-fold.v1",
+  "result": "invalid",
+  "error": { "reason": "invalid-record", "source": "urn:slipstream:session:a", "seq": "2" }
+}

@@ -1,0 +1,19 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [],
+    "coverage": [],
+    "gaps": [
+      { "source": "urn:slipstream:session:a", "seq": "1", "reason": "restart", "scope": { "kind": "session" } },
+      { "source": "urn:slipstream:session:a", "seq": "2", "reason": "watcher-error",
+        "scope": { "kind": "directory", "path": "src" }, "episode_id": "e1" },
+      { "source": "urn:slipstream:session:a", "seq": "3", "reason": "baseline-unreadable",
+        "scope": { "kind": "path", "path": "src/a.ts" } },
+      { "source": "urn:slipstream:session:a", "seq": "10", "reason": "storage",
+        "scope": { "kind": "path", "path": "src/a.ts" } },
+      { "source": "urn:slipstream:session:b", "seq": "1", "reason": "coalesced", "scope": { "kind": "session" } }
+    ]
+  }
+}

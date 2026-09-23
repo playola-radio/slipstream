@@ -1,0 +1,16 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [
+      { "source": "urn:slipstream:session:a", "change_seq": "3", "attribution_seq": "5", "policy_seq": "2",
+        "status": "heuristic", "reason": "single-candidate", "evidence_seqs": ["4"] }
+    ],
+    "evidence": [
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "hs-1", "record_id": "r1",
+        "evidence_seqs": ["4"], "min_at_ms": 1000, "max_at_ms": 1000, "known_paths": ["src/a.ts"], "conflicted": false }
+    ],
+    "coverage": [],
+    "gaps": []
+  }
+}

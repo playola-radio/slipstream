@@ -1,9 +1,15 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. This PR implements only the
- * `acceptance` subcommand: a registry + runner that proves each PR did what it
- * claims by driving a LIVE daemon and asserting on its public reader output.
+ * `npm run qa:check` — the Part 5 QA command surface. Two subcommands:
  *
- * Contract (kept deliberately narrow):
+ *  - `acceptance`: a registry + runner that proves each PR did what it claims by
+ *    driving a LIVE daemon and asserting on its public reader output.
+ *  - `fold`: the `display-fold.v1` oracle (DISPLAY-FOLD.md). `fold --fixture <name>`
+ *    or `fold --events <path|->` prints exactly one canonical JSON envelope. Exit
+ *    0 = `ok`; 1 = the fold refused (invalid / corrupt / unsupported; the envelope
+ *    is still printed); 2 = bad args, missing fixture, unreadable input, invalid
+ *    UTF-8, or malformed NDJSON (diagnostic on stderr, nothing on stdout).
+ *
+ * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
  *    progress goes to stderr, and the bearer token is never printed anywhere.
  *  - Exit 0 = every selected assertion passed; 1 = a check ran and failed (assertion,
@@ -11,6 +17,8 @@
  *    runtime / wrong daemon revision (a skipped check never counts as passing);
  *    130 = interrupted.
  */
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
   createReaderClient,
@@ -24,6 +32,7 @@ import {
 } from './qa-support.ts';
 import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
 import { MODULES } from './qa/acceptance/registry.ts';
+import { corpusCasePath, FoldInputError, foldToLine, parseFoldInput } from './display-fold-oracle.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 export type Selection = { all: true } | { pr: string };
@@ -225,10 +234,69 @@ export async function runAcceptance(io: RunIO): Promise<number> {
   return sawFailure || report.result === 'failed' ? EXIT.FAIL : EXIT.PASS;
 }
 
+export interface FoldIO {
+  argv: readonly string[];
+  stdout: (line: string) => void;
+  stderr: (line: string) => void;
+  cwd: string;
+  readStdin: () => Promise<Uint8Array>;
+}
+
+type FoldInput = { fixture: string } | { events: string };
+
+function parseFoldArgs(argv: readonly string[]): FoldInput {
+  let input: FoldInput | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (flag !== '--fixture' && flag !== '--events') throw new ArgError(`unknown fold argument '${flag}'`);
+    const value = argv[++i];
+    if (value === undefined) throw new ArgError(`${flag} requires a value`);
+    if (input) throw new ArgError('fold takes exactly one of --fixture <name> / --events <path|->');
+    input = flag === '--fixture' ? { fixture: value } : { events: value };
+  }
+  if (!input) throw new ArgError('fold requires --fixture <name> or --events <path|->');
+  return input;
+}
+
+/** `qa:check fold`: the display-fold.v1 oracle. All input is read and parsed
+ * before folding, so an exit-2 run never prints a partial envelope. */
+export async function runFold(io: FoldIO): Promise<number> {
+  let records: unknown[];
+  try {
+    const input = parseFoldArgs(io.argv);
+    let bytes: Uint8Array;
+    if ('fixture' in input) {
+      const path = corpusCasePath(input.fixture, 'input.ndjson');
+      bytes = await readFile(path).catch(() => { throw new FoldInputError(`no fixture named '${input.fixture}'`); });
+    } else if (input.events === '-') {
+      bytes = await io.readStdin();
+    } else {
+      bytes = await readFile(resolve(io.cwd, input.events)).catch((err: NodeJS.ErrnoException) => {
+        throw new FoldInputError(`cannot read events file: ${err.code ?? err.message}`);
+      });
+    }
+    records = parseFoldInput(bytes);
+  } catch (err) {
+    if (!(err instanceof ArgError) && !(err instanceof FoldInputError)) throw err;
+    io.stderr(`qa-check fold: ${err.message}`);
+    return EXIT.USAGE;
+  }
+  const { line, exit } = foldToLine(records);
+  io.stdout(line);
+  return exit === 0 ? EXIT.PASS : EXIT.FAIL;
+}
+
+async function readAllStdin(): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
 export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly string[] }): Promise<number> {
   const [sub, ...rest] = io.argv;
+  if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub !== 'acceptance') {
-    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; only 'acceptance' is supported in this PR`);
+    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance' or 'fold'`);
     return EXIT.USAGE;
   }
   const controller = new AbortController();
@@ -250,7 +318,9 @@ if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {
     stderr: (l) => console.error(l),
     cwd: process.cwd(),
   }).then(
-    (code) => process.exit(code),
+    // process.exit discards stdout still queued for an async pipe (macOS), so a
+    // large fold envelope would be truncated; exit only once it has flushed.
+    (code) => process.stdout.write('', () => process.exit(code)),
     (err) => { console.error(`qa-check: fatal: ${(err as Error).stack ?? err}`); process.exit(EXIT.USAGE); },
   );
 }

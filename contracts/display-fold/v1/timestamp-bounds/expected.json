@@ -1,0 +1,13 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [
+      { "source": "urn:slipstream:session:a", "harness": "codex", "harness_session_id": "cx", "record_id": "r1",
+        "evidence_seqs": ["1", "2"], "min_at_ms": 0, "max_at_ms": 9007199254740991, "known_paths": ["a.ts"], "conflicted": false }
+    ],
+    "coverage": [],
+    "gaps": []
+  }
+}

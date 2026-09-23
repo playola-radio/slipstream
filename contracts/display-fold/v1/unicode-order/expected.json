@@ -1,0 +1,27 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "a\"",
+        "evidence_seqs": ["8"], "min_at_ms": 800, "max_at_ms": 800, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "a#",
+        "evidence_seqs": ["7"], "min_at_ms": 700, "max_at_ms": 700, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "a\\",
+        "evidence_seqs": ["6"], "min_at_ms": 600, "max_at_ms": 600, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "e\u0301",
+        "evidence_seqs": ["4"], "min_at_ms": 400, "max_at_ms": 400, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "\u00e9",
+        "evidence_seqs": ["3"], "min_at_ms": 300, "max_at_ms": 300, "known_paths": ["cafe\u0301", "caf\u00e9"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "\ud800",
+        "evidence_seqs": ["5"], "min_at_ms": 500, "max_at_ms": 500, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "\ud83d\ude00",
+        "evidence_seqs": ["2"], "min_at_ms": 200, "max_at_ms": 200, "known_paths": ["p"], "conflicted": false },
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "harness_session_id": "h", "record_id": "\uff5e",
+        "evidence_seqs": ["1"], "min_at_ms": 100, "max_at_ms": 100, "known_paths": ["p"], "conflicted": false }
+    ],
+    "coverage": [],
+    "gaps": []
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [],
+    "evidence": [],
+    "coverage": [
+      { "source": "urn:slipstream:session:a", "harness": "claude-code", "seq": "4", "state": "readable", "issues": [] },
+      { "source": "urn:slipstream:session:a", "harness": "codex", "seq": "2", "state": "degraded",
+        "issues": [
+          { "kind": "malformed", "detail": "line 10" },
+          { "kind": "malformed", "detail": "line 9" },
+          { "kind": "missing", "detail": "b" },
+          { "kind": "missing", "detail": "b" }
+        ] }
+    ],
+    "gaps": []
+  }
+}
