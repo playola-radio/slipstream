@@ -157,6 +157,37 @@ served blob to compare exact bytes. A rising high-water alone proves nothing; a
 timeout FAILS. The `T-QA` negative-control assertion exercises exactly this: an
 intentionally wrong expected hash must hit the deadline rather than report ready.
 
+### Display fold oracle (`fold`) and the `T0.1` check
+
+`node tools/projection-check.ts fold` is the `display-fold.v1` oracle
+(`DISPLAY-FOLD.md`). It prints one canonical JSON envelope. Exit codes:
+
+- `0`: the fold is `ok`.
+- `1`: the fold refused. The envelope is still printed.
+- `2`: unusable input or arguments. Nothing goes to stdout.
+
+```
+node tools/projection-check.ts fold --fixture revision-and-gap   # a corpus case
+node tools/projection-check.ts fold --events events.ndjson       # an NDJSON file
+ENV=~/.slipstream-qa/local/qa-env.json                            # a live qa:daemon session
+curl -s -H "authorization: Bearer $(node -p "require('$ENV').token")" \
+  "$(node -p "require('$ENV').url")/v1/sessions/$(node -p "require('$ENV').session_id")/events?after=0" \
+  | node tools/projection-check.ts fold --events -
+```
+
+The corpus is `contracts/display-fold/v1/<case>/{input.ndjson,expected.json}`.
+Every `expected.json` is **written by hand**. Never regenerate one by running the
+fold: a generated expectation would only prove the code agrees with itself. To add a
+case, write both files and run `npm run test:tools`. The corpus test picks up every
+case directory automatically.
+
+`npm run qa:check -- --pr T0.1` runs the live claims against a real session that
+baselined files and then captured changes: the D1 empty fold, determinism, the
+prefix/SSE agreement, the negative control, and no new headers or event types. A
+live QA session has no evidence, attributions, coverage, or gaps. The four non-empty
+components are therefore proven only by the FIXTURE corpus claim, and the report
+labels each claim LIVE or FIXTURE.
+
 ### Cleanup
 
 `qa:daemon` removes its owned root on a clean default shutdown (retained under

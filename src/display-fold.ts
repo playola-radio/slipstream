@@ -368,7 +368,10 @@ export function foldDisplay(records: readonly unknown[]): DisplayFoldResult {
   const conflict = first(conflicts, compareIdentity);
   if (conflict) return { contract, result: 'corrupt', error: { reason: 'conflicting-records', ...conflict } };
   const unsupported = first(
-    unique.filter((r) => CONSUMED_FAMILY.exec(r.type)?.[1] !== undefined && CONSUMED_FAMILY.exec(r.type)![1] !== '1'),
+    unique.filter((r) => {
+      const version = CONSUMED_FAMILY.exec(r.type)?.[1];
+      return version !== undefined && version !== '1';
+    }),
     compareIdentity,
   );
   if (unsupported) {

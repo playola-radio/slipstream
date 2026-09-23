@@ -657,7 +657,7 @@ several small passing TDD commits; ordering + splits per the Codex consult):
 **Honesty is not deferrable to a later pass** — every view above ships its honesty
 contract when it ships.
 
-**Status**: Not Started (design complete, pending T0 decisions).
+**Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
 
 ---
 
