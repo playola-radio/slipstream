@@ -1,7 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join, resolve } from 'node:path';
-import { parseArgs, defaultRoot, curlCommands, ArgError } from './qa-daemon.ts';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { parseArgs, curlCommands, probeStoreLiveness, ArgError } from './qa-daemon.ts';
 
 describe('qa-daemon parseArgs', () => {
   const home = '/home/u';
@@ -31,8 +33,21 @@ describe('qa-daemon parseArgs', () => {
     assert.throws(() => parseArgs(['--nope'], home), ArgError);
   });
 
-  it('defaultRoot honors the passed home', () => {
-    assert.equal(defaultRoot('/tmp/x'), join('/tmp/x', '.slipstream-qa', 'local'));
+  it('reads an explicit --run-id launch nonce (defaults to null → generated)', () => {
+    assert.equal(parseArgs([], home).runId, null);
+    assert.equal(parseArgs(['--run-id', 'nonce-42'], home).runId, 'nonce-42');
+    assert.throws(() => parseArgs(['--run-id'], home), ArgError);
+  });
+});
+
+describe('qa-daemon probeStoreLiveness', () => {
+  it('maps a store that never ran a daemon (no socket) to none', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-probe-'));
+    try {
+      assert.equal(await probeStoreLiveness(dir), 'none');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

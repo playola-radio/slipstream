@@ -25,7 +25,7 @@ import {
   checkRootAgainstRealStore,
   evaluateRoot,
   prepareRoot,
-  readOwnerMarker,
+  mayDeleteRoot,
   type DaemonLiveness,
 } from './qa/safety.ts';
 import { getScenario, scenarioNames } from './qa/scenarios.ts';
@@ -47,6 +47,10 @@ export interface QaDaemonArgs {
   scenario: string | null;
   keep: boolean;
   reuse: boolean;
+  /** Launch nonce from a parent process (harness-proc). When set it becomes the
+   * run_id and is stamped into qa-env.json, so the parent can require the env it
+   * reads back was published by THIS child and not a stale/dead predecessor. */
+  runId: string | null;
 }
 
 export const DEFAULT_ROOT_REL = join('.slipstream-qa', 'local');
@@ -64,6 +68,7 @@ export function parseArgs(argv: readonly string[], home: string = homedir()): Qa
   let scenario: string | null = null;
   let keep = false;
   let reuse = false;
+  let runId: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     switch (arg) {
@@ -79,13 +84,19 @@ export function parseArgs(argv: readonly string[], home: string = homedir()): Qa
         scenario = v;
         break;
       }
+      case '--run-id': {
+        const v = argv[++i];
+        if (v === undefined) throw new ArgError('--run-id requires a value');
+        runId = v;
+        break;
+      }
       case '--keep': keep = true; break;
       case '--reuse': reuse = true; break;
       default:
         throw new ArgError(`unknown argument: ${arg}`);
     }
   }
-  return { root: root ?? defaultRoot(home), scenario, keep, reuse };
+  return { root: root ?? defaultRoot(home), scenario, keep, reuse, runId };
 }
 
 /** Probe whether a daemon is live in a store, mapping a missing control socket to
@@ -94,8 +105,12 @@ export async function probeStoreLiveness(storeDir: string): Promise<DaemonLivene
   const sock = controlSocketPath(storeDir);
   try {
     await stat(sock);
-  } catch {
-    return 'none';
+  } catch (err) {
+    // Only a genuinely absent socket means "no daemon ever ran here". Any other
+    // stat error (a permission wall, an I/O fault) is ambiguous and must fail
+    // closed — never fail open to 'none' and risk disturbing a live daemon.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'none';
+    return 'ambiguous';
   }
   return probeSocket(sock, PROBE_TIMEOUT_MS);
 }
@@ -156,12 +171,74 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     return 2;
   }
 
-  const runId = randomUUID();
+  // The launch nonce (if a parent supplied one) IS the run_id, so the env this
+  // child publishes can be told apart from any stale predecessor's env.
+  const runId = args.runId ?? randomUUID();
   const { store, worktree } = await prepareRoot(args.root, runId);
   const daemonCommit = await gitHead(io.cwd).catch(() => 'unknown');
+  const envPath = join(args.root, QA_ENV_NAME);
 
   const controller = new AbortController();
-  const daemon = await startDaemon({ storeDir: store });
+  let daemon: Awaited<ReturnType<typeof startDaemon>> | null = null;
+  let stopping = false;
+  let readyResolve: (() => void) | null = null;
+  let exitCode = 0;
+
+  // Tear down whatever has been created so far. Safe to call at any point in
+  // startup: `daemon` may be null, the env file may not exist yet, and the root
+  // is deleted only when it still carries THIS run's marker. Returns whether any
+  // teardown step failed (a failure retains the root and is reported honestly).
+  const performCleanup = async (): Promise<boolean> => {
+    controller.abort();
+    let teardownFailed = false;
+    if (daemon !== null) {
+      try {
+        await daemon.stop();
+      } catch (err) {
+        teardownFailed = true;
+        io.stderr(`qa-daemon: shutdown failed: ${(err as Error).message}; retaining ${args.root}`);
+      }
+    }
+    await markStopped(envPath).catch(() => {});
+    if (!args.keep && !args.reuse && !teardownFailed) {
+      try {
+        if (await mayDeleteRoot(args.root, runId)) await rm(args.root, { recursive: true, force: true });
+      } catch (err) {
+        teardownFailed = true;
+        io.stderr(`qa-daemon: cleanup failed: ${(err as Error).message}; retaining ${args.root}`);
+      }
+    }
+    return teardownFailed;
+  };
+
+  // Install signal handlers BEFORE the slow startup steps so a Ctrl-C during
+  // attach/baseline/seeding still runs managed cleanup rather than orphaning the
+  // daemon and leaving the sandbox behind.
+  const shutdown = (): void => {
+    if (stopping) return;
+    stopping = true;
+    void performCleanup().then((teardownFailed) => {
+      exitCode = teardownFailed ? 1 : 0;
+      if (readyResolve !== null) readyResolve();
+      else process.exit(exitCode); // signalled before ready: no keep-alive waiter to release
+    });
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Defense in depth: after creating the layout, prove the real store/worktree
+  // (symlinks already refused by prepareRoot) still do not overlap the real store,
+  // in case a symlinked ancestor was planted between the first gate and now.
+  for (const dir of [store, worktree]) {
+    const reCheck = await checkRootAgainstRealStore(dir);
+    if (reCheck) {
+      io.stderr(`qa-daemon: ${reCheck.message}`);
+      await performCleanup();
+      return 2;
+    }
+  }
+
+  daemon = await startDaemon({ storeDir: store });
 
   // Attach the sandbox worktree with an explicitly synthetic identity. `qa` is a
   // capture SCOPE marker, never a claim of authorship.
@@ -171,8 +248,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   });
   if (!attach.ok) {
     io.stderr(`qa-daemon: attach failed (${attach.code}): ${attach.message}`);
-    await daemon.stop();
-    if (!args.keep && !args.reuse) await removeOwnedRoot(args.root);
+    await performCleanup();
     return 1;
   }
   const sessionId = attach.session_id as string;
@@ -207,7 +283,6 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     ready_through_seq: readyThroughSeq.toString(),
     scenario: args.scenario,
   };
-  const envPath = join(args.root, QA_ENV_NAME);
   await writeQaEnv(envPath, env);
 
   io.stdout(`slipstream qa daemon ready`);
@@ -227,34 +302,12 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   }
   io.stderr(`qa-daemon: press Ctrl-C to stop`);
 
-  // Success path: keep the daemon alive until a signal, then clean up.
-  await new Promise<void>((resolvePromise) => {
-    let stopping = false;
-    const shutdown = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      controller.abort();
-      let stopFailed = false;
-      try {
-        await daemon.stop();
-      } catch (err) {
-        stopFailed = true;
-        io.stderr(`qa-daemon: shutdown failed: ${(err as Error).message}; retaining ${args.root}`);
-      }
-      await markStopped(envPath).catch(() => {});
-      // Remove the owned root only on a clean default shutdown.
-      if (!args.keep && !args.reuse && !stopFailed) {
-        await removeOwnedRoot(args.root).catch((err) => {
-          io.stderr(`qa-daemon: cleanup failed: ${(err as Error).message}`);
-        });
-      }
-      resolvePromise();
-      process.exit(0);
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-  });
-  return 0;
+  // Success path: keep the daemon alive until a signal fires the shared shutdown,
+  // which cleans up and releases this waiter. The exit code reflects whether
+  // teardown succeeded — a failed shutdown reports non-zero, never a false 0.
+  if (stopping) return exitCode; // a signal already arrived during startup
+  await new Promise<void>((resolvePromise) => { readyResolve = resolvePromise; });
+  return exitCode;
 }
 
 /** The concrete path of the newest runtime descriptor, for the env file / display. */
@@ -283,12 +336,6 @@ async function readRuntimeDescriptorPath(store: string): Promise<string | null> 
 async function markStopped(envPath: string): Promise<void> {
   const env = await readQaEnv(envPath);
   await writeQaEnv(envPath, { ...env, state: 'stopped' });
-}
-
-/** Delete the root only if it still carries our ownership marker. */
-async function removeOwnedRoot(root: string): Promise<void> {
-  if ((await readOwnerMarker(root)) === null) return; // not harness-owned; never delete
-  await rm(root, { recursive: true, force: true });
 }
 
 if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {

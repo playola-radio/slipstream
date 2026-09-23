@@ -7,13 +7,18 @@ import {
   sha256Hex,
   parseNdjson,
   createSseDecoder,
+  createSseByteDecoder,
   snapshotMatches,
   buildReport,
   writeQaEnv,
   readQaEnv,
+  awaitEventType,
+  DurabilityTimeoutError,
   QA_ENV_FORMAT,
   QA_REPORT_FORMAT,
   type QaEnv,
+  type FiniteEvents,
+  type ReaderClient,
 } from './qa-support.ts';
 import type { Snapshot } from '../src/snapshot.ts';
 
@@ -68,6 +73,19 @@ describe('qa-support', () => {
     });
   });
 
+  describe('createSseByteDecoder', () => {
+    it('decodes a multibyte character split across byte chunks without corruption', () => {
+      const dec = createSseByteDecoder();
+      // "data: é\n\n" where é is 0xC3 0xA9, split between the two UTF-8 bytes.
+      const full = Buffer.from('data: é\n\n', 'utf8');
+      const cut = full.indexOf(0xa9); // split mid-character
+      assert.deepEqual(dec.push(full.subarray(0, cut)), []);
+      const frames = dec.push(full.subarray(cut));
+      assert.equal(frames.length, 1);
+      assert.equal(frames[0]!.data, 'é');
+    });
+  });
+
   describe('snapshotMatches', () => {
     const content = (bytes: Buffer): Snapshot => ({ kind: 'content', sha256: sha256Hex(bytes), size: bytes.length });
     it('matches absent to absent only', () => {
@@ -98,9 +116,6 @@ describe('qa-support', () => {
         { id: 'B', result: 'failed', assertions: [] },
       ]);
       assert.equal(mixed.result, 'failed');
-    });
-    it('an empty check list is vacuously passed', () => {
-      assert.equal(buildReport('abc', []).result, 'passed');
     });
   });
 
@@ -135,6 +150,40 @@ describe('qa-support', () => {
       const path = join(base, 'bad.json');
       await writeQaEnv(path, { format: 'nope' as typeof QA_ENV_FORMAT, state: 'ready', run_id: '', daemon_commit: '', store: '', worktree: '', descriptor_path: '', url: '', token: '', session_id: '', ready_through_seq: '0', scenario: null });
       await assert.rejects(() => readQaEnv(path), /not a slipstream-qa\.v1/);
+    });
+
+    it('rejects an env whose token carries a header-injecting newline', async () => {
+      const path = join(base, 'evil-token.json');
+      const env: QaEnv = {
+        format: QA_ENV_FORMAT, state: 'ready', run_id: 'r', daemon_commit: 'c',
+        store: '/x/store', worktree: '/x/worktree', descriptor_path: '/x/store/runtime/a.json',
+        url: 'http://127.0.0.1:1', token: 'Bearer sentinel\nX-Secret: leak', session_id: 'qa:r',
+        ready_through_seq: '0', scenario: null,
+      };
+      await writeQaEnv(path, env);
+      // The rejection must NOT reflect the secret token back in its message.
+      await assert.rejects(() => readQaEnv(path), (err: Error) => /token/.test(err.message) && !/sentinel/.test(err.message));
+    });
+  });
+
+  describe('awaitEventType deadline bounding', () => {
+    it('hits the durability deadline even when each request hangs (bounded per-request)', async () => {
+      // A reader whose finite() never resolves unless its request signal aborts.
+      // Without a per-request bound a hung request would prevent the deadline from
+      // ever being checked; with one, the poll loop reaches its deadline and fails.
+      const reader = {
+        finite(_sessionId: string, _after: bigint, signal?: AbortSignal): Promise<FiniteEvents> {
+          return new Promise<FiniteEvents>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('request aborted')), { once: true });
+          });
+        },
+      } as unknown as ReaderClient;
+      const start = Date.now();
+      await assert.rejects(
+        () => awaitEventType(reader, 'qa:1', 'never.happens', 0n, { deadlineMs: 300, pollMs: 10 }),
+        DurabilityTimeoutError,
+      );
+      assert.ok(Date.now() - start < 5_000, 'must fail near the deadline, not hang');
     });
   });
 });

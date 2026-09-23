@@ -13,6 +13,8 @@ import {
   writeOwnerMarker,
   readOwnerMarker,
   evaluateRoot,
+  prepareRoot,
+  mayDeleteRoot,
 } from './safety.ts';
 
 describe('safety', () => {
@@ -26,6 +28,14 @@ describe('safety', () => {
       // The QA default root is a *sibling* whose name shares a prefix — must NOT be under.
       assert.equal(isUnder('/home/u/.slipstream-qa', '/home/u/.slipstream'), false);
       assert.equal(isUnder('/home/u/.slipstream', '/home/u/.slipstream'), false);
+    });
+
+    it('treats a child whose name starts with ".." as under (not a sibling)', () => {
+      // Regression: a literal `..qa` child was excluded by a naive startsWith('..'),
+      // letting `--root ~/.slipstream/..qa` bypass the real-store overlap guard.
+      assert.equal(isUnder('/home/u/.slipstream/..qa', '/home/u/.slipstream'), true);
+      assert.equal(isUnder('/home/u/.slipstream/..', '/home/u/.slipstream'), false);
+      assert.equal(pathsOverlap('/home/u/.slipstream/..qa', '/home/u/.slipstream'), true);
     });
 
     it('detects overlap in either direction, including equality', () => {
@@ -96,7 +106,6 @@ describe('safety', () => {
       const root = join(base, 'fresh-new');
       const v = await evaluateRoot(root, { reuse: false, probe: noDaemon });
       assert.ok(v.ok);
-      assert.equal(v.existed, false);
     });
 
     it('refuses an existing non-empty root in fresh mode', async () => {
@@ -136,7 +145,6 @@ describe('safety', () => {
       await writeOwnerMarker(root, 'run-x');
       const v = await evaluateRoot(root, { reuse: true, probe: noDaemon });
       assert.ok(v.ok);
-      assert.equal(v.owned, true);
     });
 
     it('refuses when a daemon is live in the root store, regardless of mode', async () => {
@@ -157,6 +165,41 @@ describe('safety', () => {
       const v = await evaluateRoot(root, { reuse: true, probe: ambiguousProbe });
       assert.ok(!v.ok);
       assert.equal(v.code, 'ROOT_DAEMON_LIVE');
+    });
+  });
+
+  describe('prepareRoot', () => {
+    it('creates the marker, store and worktree under a fresh root', async () => {
+      const root = join(base, 'prep-fresh');
+      const { store, worktree } = await prepareRoot(root, 'run-p');
+      assert.equal(store, join(root, 'store'));
+      assert.equal(worktree, join(root, 'worktree'));
+      assert.ok(await readOwnerMarker(root));
+    });
+
+    it('refuses a symlinked store or worktree (no writes escape via a planted link)', async () => {
+      const root = join(base, 'prep-symlink');
+      await mkdir(root, { recursive: true });
+      const elsewhere = join(base, 'prep-symlink-target');
+      await mkdir(elsewhere, { recursive: true });
+      await symlink(elsewhere, join(root, 'worktree'));
+      await assert.rejects(prepareRoot(root, 'run-p'), /symlink/i);
+    });
+  });
+
+  describe('mayDeleteRoot', () => {
+    it('permits deletion only when the marker names this run', async () => {
+      const root = join(base, 'delete-scope');
+      await mkdir(root);
+      await writeOwnerMarker(root, 'run-mine');
+      assert.equal(await mayDeleteRoot(root, 'run-mine'), true);
+      assert.equal(await mayDeleteRoot(root, 'run-other'), false);
+    });
+
+    it('refuses deletion when there is no marker', async () => {
+      const root = join(base, 'delete-unmarked');
+      await mkdir(root);
+      assert.equal(await mayDeleteRoot(root, 'run-mine'), false);
     });
   });
 });

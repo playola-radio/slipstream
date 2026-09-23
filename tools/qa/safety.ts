@@ -12,7 +12,7 @@
  *    is ambiguous, and never deletes a root it did not create.
  */
 import { lstat, mkdir, open, readFile, readdir, realpath, rename } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { defaultDaemonStore } from '../../src/daemon-location.ts';
 import { FILE_MODE } from '../../src/storage.ts';
 
@@ -28,10 +28,13 @@ export interface OwnerMarker {
 
 /** A path-segment-aware "is `child` strictly inside `parent`". A shared string
  * prefix (`.slipstream-qa` vs `.slipstream`) is NOT containment: `relative`
- * yields a `..`-leading path for a sibling, so only a genuine descendant passes. */
+ * yields a `..`-leading path for a sibling. We test containment by SEGMENT, not
+ * by a naive `startsWith('..')` — a legitimate child named `..qa` yields the
+ * relative path `..qa`, which is a descendant, not an ascent. */
 export function isUnder(child: string, parent: string): boolean {
   const rel = relative(parent, child);
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+  if (rel === '' || isAbsolute(rel)) return false;
+  return rel !== '..' && !rel.startsWith('..' + sep);
 }
 
 /** Two paths overlap when they are equal or one contains the other. */
@@ -129,7 +132,7 @@ export async function readOwnerMarker(root: string): Promise<OwnerMarker | null>
 export type DaemonLiveness = 'live' | 'stale' | 'ambiguous' | 'none';
 
 export type RootVerdict =
-  | { ok: true; existed: boolean; owned: boolean }
+  | { ok: true }
   | { ok: false; code: string; message: string };
 
 async function isEmptyDir(dir: string): Promise<boolean> {
@@ -157,7 +160,7 @@ export async function evaluateRoot(
     if (opts.reuse) {
       return { ok: false, code: 'ROOT_NOT_OWNED', message: `--reuse requires an existing harness-owned root; ${root} does not exist` };
     }
-    return { ok: true, existed: false, owned: false };
+    return { ok: true };
   }
 
   if (!st.isDirectory()) {
@@ -177,22 +180,54 @@ export async function evaluateRoot(
     if (!owned) {
       return { ok: false, code: 'ROOT_NOT_OWNED', message: `--reuse refuses ${root}: no harness ownership marker (ambiguous ownership)` };
     }
-    return { ok: true, existed: true, owned: true };
+    return { ok: true };
   }
 
   // Fresh mode: an empty directory is fine; anything with contents is not.
-  if (await isEmptyDir(root)) return { ok: true, existed: true, owned };
+  if (await isEmptyDir(root)) return { ok: true };
   return { ok: false, code: 'ROOT_NOT_FRESH', message: `${root} already exists and is not empty; use --reuse or choose a fresh --root` };
 }
 
+/** Refuse a layout directory that is a symlink. `mkdir(..., {recursive:true})`
+ * silently follows a pre-planted `store`/`worktree` symlink, so writes (and later
+ * a recursive delete) could escape the sandbox into whatever it points at. A real
+ * directory is required; a symlink is a refusal, never a follow. */
+async function assertRealDir(path: string): Promise<void> {
+  let st;
+  try {
+    st = await lstat(path);
+  } catch {
+    return; // absent — mkdir will create a real directory
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing QA layout dir ${path}: it is a symlink; writes must not escape the sandbox`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`refusing QA layout dir ${path}: it exists and is not a directory`);
+  }
+}
+
 /** Create the sandbox layout under an approved root: the marker, the store dir,
- * and the worktree dir. Idempotent for `--reuse` (dirs may already exist). */
+ * and the worktree dir. Idempotent for `--reuse` (dirs may already exist). The
+ * store and worktree must be real directories — a symlinked one is refused so
+ * neither a write nor the later cleanup can escape the sandbox. */
 export async function prepareRoot(root: string, runId: string): Promise<{ store: string; worktree: string }> {
   await mkdir(root, { recursive: true, mode: 0o700 });
   if ((await readOwnerMarker(root)) === null) await writeOwnerMarker(root, runId);
   const store = join(root, 'store');
   const worktree = join(root, 'worktree');
+  await assertRealDir(store);
+  await assertRealDir(worktree);
   await mkdir(store, { recursive: true, mode: 0o700 });
   await mkdir(worktree, { recursive: true, mode: 0o700 });
   return { store, worktree };
+}
+
+/** Whether the harness may delete `root`: only when it still carries THIS run's
+ * ownership marker. A missing marker, or one written by another run (a root that
+ * was replaced or re-claimed since we created it), refuses deletion — the harness
+ * never deletes a directory it does not currently own. */
+export async function mayDeleteRoot(root: string, runId: string): Promise<boolean> {
+  const marker = await readOwnerMarker(root);
+  return marker !== null && marker.run_id === runId;
 }

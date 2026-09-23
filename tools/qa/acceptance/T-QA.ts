@@ -13,6 +13,7 @@
 import { writeFile, rm, mkdtemp, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   createReaderClient,
   awaitObservedChange,
@@ -39,26 +40,42 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /** Collect SSE seqs from `after`, stopping when a seq ≥ `target` arrives or the
- * deadline elapses. */
+ * deadline elapses. Every frame's SSE `id` must equal the `seq` inside its own
+ * data payload — the id is a resume token, so a stream that advertised a resume
+ * position different from the event it carried would corrupt reconnection; a
+ * disagreement fails the check. Aborts with the runner's `outer` signal too. */
 async function collectSseSeqs(
   reader: ReaderClient,
   sessionId: string,
   after: bigint,
   target: bigint,
   deadlineMs: number,
+  outer: AbortSignal,
 ): Promise<bigint[]> {
   const ctl = new AbortController();
+  const onOuter = (): void => ctl.abort();
+  outer.addEventListener('abort', onOuter, { once: true });
   const seqs: bigint[] = [];
+  let mismatch: string | null = null;
   const timer = setTimeout(() => ctl.abort(), deadlineMs);
   try {
     await reader.follow(sessionId, after, ctl.signal, (frame) => {
       if (frame.id === undefined) return;
-      seqs.push(BigInt(frame.id));
-      if (seqs.some((s) => s >= target)) ctl.abort();
+      const id = BigInt(frame.id);
+      const payloadSeq = (JSON.parse(frame.data) as { seq?: string }).seq;
+      if (payloadSeq === undefined || BigInt(payloadSeq) !== id) {
+        mismatch = `SSE frame id ${frame.id} disagreed with its data.seq ${String(payloadSeq)}`;
+        ctl.abort();
+        return;
+      }
+      seqs.push(id);
+      if (id >= target) ctl.abort();
     });
   } finally {
     clearTimeout(timer);
+    outer.removeEventListener('abort', onOuter);
   }
+  if (mismatch !== null) fail(mismatch);
   return seqs;
 }
 
@@ -79,15 +96,21 @@ async function criterion1(ctx: AcceptanceContext): Promise<Assertion> {
 }
 
 async function criterion2(ctx: AcceptanceContext): Promise<Assertion> {
-  const rel = 'lifecycle.txt';
+  // A unique name per run makes the check safe under `--reuse`, where a fixed
+  // name would already carry history and the `absent → content` create could
+  // never be observed.
+  const rel = `lifecycle-${randomUUID()}.txt`;
   const abs = join(ctx.worktree, rel);
   const v1 = Buffer.from('one\n', 'utf8');
   const v2 = Buffer.from('one two three\n', 'utf8');
-  const short = { deadlineMs: 20_000 };
+  const short = { deadlineMs: 20_000, signal: ctx.signal };
+  // Anchor on the durable high-water BEFORE the first write so the create match
+  // cannot bind to a stale earlier record.
+  const start = (await ctx.reader.finite(ctx.sessionId, 0n)).durableSeq;
 
   await writeFile(abs, v1);
   const created = await awaitObservedChange(ctx.reader, ctx.sessionId,
-    { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes: v1 } }, 0n, short);
+    { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes: v1 } }, start, short);
 
   await writeFile(abs, v2);
   const modified = await awaitObservedChange(ctx.reader, ctx.sessionId,
@@ -116,48 +139,65 @@ async function criterion3(ctx: AcceptanceContext): Promise<Assertion> {
   const finiteSeqs = finite.events.map((e) => BigInt(e.seq as string)).sort(cmp);
   if (finiteSeqs.length === 0) fail('finite replay returned no events to compare against SSE');
 
-  const sse = await collectSseSeqs(ctx.reader, ctx.sessionId, 0n, H, 8_000);
-  const commonMax = min(maxOf(sse) ?? 0n, H);
-  const finitePrefix = finiteSeqs.filter((s) => s <= commonMax);
-  const ssePrefix = [...new Set(sse.filter((s) => s <= commonMax))].sort(cmp);
-  if (!seqArraysEqual(finitePrefix, ssePrefix)) {
-    fail(`finite replay and SSE disagree on event identities up to seq ${commonMax}: finite=${finitePrefix.join(',')} sse=${ssePrefix.join(',')}`);
+  // Full parity: SSE from 0 must REACH the durable high-water H and carry exactly
+  // the finite identities up to H — not merely agree on whatever prefix it managed.
+  const sse = await collectSseSeqs(ctx.reader, ctx.sessionId, 0n, H, 8_000, ctx.signal);
+  const sseMax = maxOf(sse) ?? 0n;
+  if (sseMax < H) fail(`SSE stream did not reach the durable high-water ${H}; it stopped at ${sseMax}`);
+  const finiteUpToH = finiteSeqs.filter((s) => s <= H);
+  const sseUpToH = [...new Set(sse.filter((s) => s <= H))].sort(cmp);
+  if (!seqArraysEqual(finiteUpToH, sseUpToH)) {
+    fail(`finite replay and SSE disagree up to durable high-water ${H}: finite=${finiteUpToH.join(',')} sse=${sseUpToH.join(',')}`);
   }
 
-  // Reconnect after a mid-stream cursor; the stream must resume strictly after it.
+  // Reconnect after a mid-stream cursor; the stream must deliver the FULL suffix —
+  // every finite identity greater than the cursor — and nothing at or below it.
   const cursor = finiteSeqs[0]!;
-  const resumed = await collectSseSeqs(ctx.reader, ctx.sessionId, cursor, H, 8_000);
-  const firstResumed = resumed[0];
-  if (firstResumed === undefined) fail(`SSE reconnect after cursor ${cursor} produced no events`);
-  if (firstResumed <= cursor) fail(`SSE reconnect after cursor ${cursor} resumed at ${firstResumed}, expected a seq greater than the cursor`);
+  const resumed = await collectSseSeqs(ctx.reader, ctx.sessionId, cursor, H, 8_000, ctx.signal);
+  if (resumed.some((s) => s <= cursor)) {
+    fail(`SSE reconnect after cursor ${cursor} delivered a seq at or below the cursor: ${resumed.join(',')}`);
+  }
+  const expectedSuffix = finiteSeqs.filter((s) => s > cursor && s <= H);
+  const resumedSuffix = [...new Set(resumed.filter((s) => s <= H))].sort(cmp);
+  if (!seqArraysEqual(expectedSuffix, resumedSuffix)) {
+    fail(`SSE reconnect did not deliver the full suffix after cursor ${cursor}: expected=${expectedSuffix.join(',')} got=${resumedSuffix.join(',')}`);
+  }
   return {
     id: 'finite-sse-agreement',
-    claim: 'finite replay and SSE agree on observed event identities, and an SSE reconnect resumes strictly after the applied cursor',
+    claim: 'finite replay and SSE agree on every observed identity up to the durable high-water, and an SSE reconnect delivers the full suffix strictly after the applied cursor',
     evidence: {
       durable_seq: H.toString(),
-      compared_up_to: commonMax.toString(),
-      identities: finitePrefix.length,
+      identities: finiteUpToH.length,
       reconnect_after: cursor.toString(),
-      first_resumed_seq: firstResumed.toString(),
+      suffix_delivered: resumedSuffix.length,
     },
   };
 }
 
 async function criterion4(ctx: AcceptanceContext): Promise<Assertion> {
-  const rel = 'negative-control.txt';
+  const rel = `negative-control-${randomUUID()}.txt`;
   const abs = join(ctx.worktree, rel);
   const real = Buffer.from('the real bytes\n', 'utf8');
   const wrong = Buffer.from('bytes that were never written\n', 'utf8');
   const cursor = (await ctx.reader.finite(ctx.sessionId, 0n)).durableSeq;
 
   await writeFile(abs, real);
+
+  // Positive control first: the write IS captured with its REAL bytes. Without
+  // this, a timeout could mean "wrong hash" OR "watcher is dead" — and a dead
+  // watcher would make the negative control pass vacuously. Proving the real
+  // change is durable establishes that the later timeout is the wrong hash alone.
+  await awaitObservedChange(ctx.reader, ctx.sessionId,
+    { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes: real } },
+    cursor, { deadlineMs: 20_000, signal: ctx.signal });
+
   let timedOut = false;
   try {
-    // The file IS captured (with its real hash), but we assert a WRONG expected
-    // after-hash, so the matcher must never match — it must hit the deadline.
+    // Same durable change, but assert a WRONG expected after-hash: the matcher
+    // must never match — it must hit the deadline.
     await awaitObservedChange(ctx.reader, ctx.sessionId,
       { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes: wrong } },
-      cursor, { deadlineMs: 3_000 });
+      cursor, { deadlineMs: 3_000, signal: ctx.signal });
   } catch (err) {
     if (err instanceof DurabilityTimeoutError) timedOut = true;
     else throw err;
@@ -165,8 +205,8 @@ async function criterion4(ctx: AcceptanceContext): Promise<Assertion> {
   if (!timedOut) fail('negative control did NOT time out: the checker matched a state it should not have — the proof is unsound');
   return {
     id: 'negative-control',
-    claim: 'an intentionally unmatched expected hash hits the deadline and FAILS rather than reporting ready',
-    evidence: { timed_out: true, deadline_ms: 3_000 },
+    claim: 'with capture proven live, an intentionally unmatched expected hash hits the deadline and FAILS rather than reporting ready',
+    evidence: { positive_ack: true, timed_out: true, deadline_ms: 3_000 },
   };
 }
 
@@ -174,14 +214,16 @@ async function criterion4(ctx: AcceptanceContext): Promise<Assertion> {
 
 async function criterion5(): Promise<Assertion> {
   const root = await freshRoot();
+  let handle: Awaited<ReturnType<typeof startQaDaemon>> | null = null;
   try {
-    const handle = await startQaDaemon({ root });
+    handle = await startQaDaemon({ root });
     const { store, url, token, session_id, descriptor_path } = handle.env;
     const reader = createReaderClient(url, token);
     if ((await reader.raw('/v1/sessions')).status !== 200) fail('daemon reader was not live before shutdown');
     const socket = controlSocketPath(store);
 
     await handle.stop();
+    handle = null; // stopped as the check intends; nothing left for finally to kill
 
     const rootGone = !(await exists(root));
     const descriptorGone = !(await exists(descriptor_path));
@@ -197,6 +239,7 @@ async function criterion5(): Promise<Assertion> {
       evidence: { root_removed: rootGone, descriptor_removed: descriptorGone, socket_removed: socketGone, reader_closed: readerClosed },
     };
   } finally {
+    if (handle) await handle.stop().catch(() => {});
     await rm(root, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -240,8 +283,9 @@ async function criterion6(): Promise<Assertion> {
 
 async function criterion7(): Promise<Assertion> {
   const root = await freshRoot();
-  const first = await startQaDaemon({ root });
+  let first: Awaited<ReturnType<typeof startQaDaemon>> | null = null;
   try {
+    first = await startQaDaemon({ root });
     // A second invocation against the active root must be refused, non-zero.
     const second = await runQaDaemonToExit({ root });
     if (second.code === 0) fail('a second invocation against the active QA root exited 0; it should have been refused');
@@ -255,7 +299,7 @@ async function criterion7(): Promise<Assertion> {
       evidence: { second_exit_code: second.code, first_still_live: true },
     };
   } finally {
-    await first.stop();
+    if (first) await first.stop().catch(() => {});
     await rm(root, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -288,7 +332,6 @@ async function criterion8(): Promise<Assertion> {
 // --- helpers ----------------------------------------------------------------
 
 function cmp(a: bigint, b: bigint): number { return a < b ? -1 : a > b ? 1 : 0; }
-function min(a: bigint, b: bigint): bigint { return a < b ? a : b; }
 function maxOf(xs: bigint[]): bigint | null { return xs.length ? xs.reduce((m, x) => (x > m ? x : m)) : null; }
 function seqArraysEqual(a: bigint[], b: bigint[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);

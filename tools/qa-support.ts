@@ -38,12 +38,9 @@ export function gitHead(cwd: string): Promise<string> {
 /** Read the reader's runtime descriptor the same way the native client does:
  * from `<store>/runtime/*.json`, never from daemon internals. Retries briefly
  * because the descriptor is published as the reader comes up. */
-export async function bootstrapReader(
-  storeDir: string,
-  opts: { deadlineMs?: number; pollMs?: number } = {},
-): Promise<RuntimeDescriptor> {
-  const deadlineMs = opts.deadlineMs ?? 5000;
-  const pollMs = opts.pollMs ?? 50;
+export async function bootstrapReader(storeDir: string): Promise<RuntimeDescriptor> {
+  const deadlineMs = 5000;
+  const pollMs = 50;
   const deadline = Date.now() + deadlineMs;
   for (;;) {
     const descriptor = await readRuntimeDescriptor(storeDir);
@@ -68,12 +65,11 @@ export type AnyRecord = { type?: string; seq?: string; data?: Record<string, unk
 export interface RawResponse { status: number; headers: Headers; body: Buffer }
 
 export interface ReaderClient {
-  url: string;
   /** GET a path. With `auth: false`, omit the bearer token (used to prove 401). */
   raw(path: string, opts?: { auth?: boolean; signal?: AbortSignal }): Promise<RawResponse>;
   sessions(): Promise<SessionEntry[]>;
-  finite(sessionId: string, after: bigint): Promise<FiniteEvents>;
-  blob(sha256: string): Promise<Buffer>;
+  finite(sessionId: string, after: bigint, signal?: AbortSignal): Promise<FiniteEvents>;
+  blob(sha256: string, signal?: AbortSignal): Promise<Buffer>;
   /** Follow the SSE stream, invoking `onEvent` per frame until `signal` aborts
    * or the stream ends. Resolves when it stops. */
   follow(
@@ -102,16 +98,16 @@ export function createReaderClient(url: string, token: string): ReaderClient {
     return JSON.parse(r.body.toString('utf8')) as SessionEntry[];
   }
 
-  async function finite(sessionId: string, after: bigint): Promise<FiniteEvents> {
-    const r = await raw(`/v1/sessions/${sessionId}/events?after=${after.toString()}`);
+  async function finite(sessionId: string, after: bigint, signal?: AbortSignal): Promise<FiniteEvents> {
+    const r = await raw(`/v1/sessions/${sessionId}/events?after=${after.toString()}`, signal ? { signal } : {});
     if (r.status !== 200) throw new Error(`GET finite events → ${r.status}`);
     const durableHeader = r.headers.get('slipstream-durable-seq');
     if (durableHeader === null) throw new Error('finite events response missing slipstream-durable-seq header');
     return { events: parseNdjson(r.body.toString('utf8')), durableSeq: BigInt(durableHeader) };
   }
 
-  async function blob(sha256: string): Promise<Buffer> {
-    const r = await raw(`/v1/blobs/sha256/${sha256}`);
+  async function blob(sha256: string, signal?: AbortSignal): Promise<Buffer> {
+    const r = await raw(`/v1/blobs/sha256/${sha256}`, signal ? { signal } : {});
     if (r.status !== 200) throw new Error(`GET blob ${sha256} → ${r.status}`);
     return r.body;
   }
@@ -127,17 +123,17 @@ export function createReaderClient(url: string, token: string): ReaderClient {
       signal,
     });
     if (res.status !== 200 || !res.body) throw new Error(`SSE follow → ${res.status}`);
-    const decoder = createSseDecoder();
+    const decoder = createSseByteDecoder();
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-        for (const frame of decoder.push(Buffer.from(chunk).toString('utf8'))) onEvent(frame);
+        for (const frame of decoder.push(chunk)) onEvent(frame);
       }
     } catch (err) {
       if (!signal.aborted) throw err;
     }
   }
 
-  return { url, raw, sessions, finite, blob, follow };
+  return { raw, sessions, finite, blob, follow };
 }
 
 export function parseNdjson(text: string): AnyRecord[] {
@@ -190,6 +186,22 @@ export function createSseDecoder(): { push(text: string): SseFrame[] } {
   };
 }
 
+/** A byte-oriented SSE decoder for the raw response stream. A single UTF-8
+ * character can straddle two network chunks; decoding each chunk in isolation
+ * with `Buffer.toString('utf8')` would emit two replacement characters and
+ * corrupt the frame. A streaming {@link TextDecoder} (`stream: true`) holds a
+ * partial multibyte sequence across `push` calls, so the text handed to the
+ * inner {@link createSseDecoder} is always well-formed. */
+export function createSseByteDecoder(): { push(chunk: Uint8Array): SseFrame[] } {
+  const utf8 = new TextDecoder('utf-8');
+  const inner = createSseDecoder();
+  return {
+    push(chunk: Uint8Array): SseFrame[] {
+      return inner.push(utf8.decode(chunk, { stream: true }));
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Durability core — write a real file, await its exact public observation
 // ---------------------------------------------------------------------------
@@ -212,13 +224,12 @@ export interface StateExpectation {
 }
 
 export interface ObservedChange {
+  /** The commit seq of the matched, byte-verified change — the new ready-through
+   * cursor a caller threads into its next await. */
   seq: bigint;
-  path: string;
-  before: Snapshot;
+  /** The observed after-snapshot, so a caller can assert the final state (e.g. a
+   * delete lands as `absent`). */
   after: Snapshot;
-  observation: string;
-  /** The `slipstream-durable-seq` high-water of the response that carried it. */
-  durableSeq: bigint;
 }
 
 /** True when an actual public snapshot matches the caller's expectation. Content
@@ -234,7 +245,28 @@ export class DurabilityTimeoutError extends Error {
   constructor(message: string) { super(message); this.name = 'DurabilityTimeoutError'; }
 }
 
-export interface PollOpts { deadlineMs?: number; pollMs?: number }
+export interface PollOpts { deadlineMs?: number; pollMs?: number; signal?: AbortSignal }
+
+/** A per-request AbortSignal that fires at `deadline` OR when `outer` aborts.
+ * Bounding every reader request with one guarantees a hung HTTP call can never
+ * outlive the poll deadline — without it, a request that never resolves would
+ * prevent the loop from ever reaching its {@link DurabilityTimeoutError}. */
+function deadlineSignal(deadline: number, outer?: AbortSignal): { signal: AbortSignal; dispose(): void } {
+  const ctl = new AbortController();
+  const onOuter = (): void => ctl.abort();
+  if (outer) {
+    if (outer.aborted) ctl.abort();
+    else outer.addEventListener('abort', onOuter, { once: true });
+  }
+  const timer = setTimeout(() => ctl.abort(), Math.max(0, deadline - Date.now()));
+  return {
+    signal: ctl.signal,
+    dispose(): void {
+      clearTimeout(timer);
+      if (outer) outer.removeEventListener('abort', onOuter);
+    },
+  };
+}
 
 /** Poll finite `/events` from `after` until a record of `type` appears; return
  * its seq and the durable high-water. Throws {@link DurabilityTimeoutError} on
@@ -250,16 +282,43 @@ export async function awaitEventType(
   const pollMs = opts.pollMs ?? 50;
   const deadline = Date.now() + deadlineMs;
   let cursor = after;
+  let lastDurable = after;
   for (;;) {
-    const { events, durableSeq } = await reader.finite(sessionId, cursor);
-    for (const ev of events) {
-      if (ev.type === type) return { seq: BigInt(ev.seq as string), durableSeq };
+    const result = await boundedFinite(reader, sessionId, cursor, deadline, opts.signal);
+    if (result) {
+      for (const ev of result.events) {
+        if (ev.type === type) return { seq: BigInt(ev.seq as string), durableSeq: result.durableSeq };
+      }
+      if (result.durableSeq > cursor) cursor = result.durableSeq;
+      lastDurable = result.durableSeq;
     }
-    if (durableSeq > cursor) cursor = durableSeq;
     if (Date.now() >= deadline) {
-      throw new DurabilityTimeoutError(`no ${type} record within ${deadlineMs}ms (durable high-water ${durableSeq})`);
+      throw new DurabilityTimeoutError(`no ${type} record within ${deadlineMs}ms (durable high-water ${lastDurable})`);
     }
     await sleep(pollMs);
+  }
+}
+
+/** Run one finite request bounded by the poll deadline and outer signal.
+ * Returns the events on success, or `null` when the request was aborted by the
+ * deadline timer (so the caller's loop reaches its own deadline check and fails
+ * honestly). A real outer cancellation, or any non-abort error, propagates. */
+async function boundedFinite(
+  reader: ReaderClient,
+  sessionId: string,
+  cursor: bigint,
+  deadline: number,
+  outer: AbortSignal | undefined,
+): Promise<FiniteEvents | null> {
+  const req = deadlineSignal(deadline, outer);
+  try {
+    return await reader.finite(sessionId, cursor, req.signal);
+  } catch (err) {
+    if (outer?.aborted) throw err; // a real cancellation propagates
+    if (req.signal.aborted) return null; // our deadline timer fired — let the loop fail
+    throw err;
+  } finally {
+    req.dispose();
   }
 }
 
@@ -284,31 +343,36 @@ export async function awaitObservedChange(
   const pollMs = opts.pollMs ?? 50;
   const deadline = Date.now() + deadlineMs;
   let cursor = after;
+  let lastDurable = after;
   for (;;) {
-    const { events, durableSeq } = await reader.finite(sessionId, cursor);
-    for (const ev of events) {
-      if (ev.type !== FILE_CHANGED_TYPE) continue;
-      const data = ev.data ?? {};
-      if (data.path !== expect.relPath) continue;
-      const before = data.before as Snapshot | undefined;
-      const after2 = data.after as Snapshot | undefined;
-      if (!before || !after2) continue;
-      if (!snapshotMatches(before, expect.before) || !snapshotMatches(after2, expect.after)) continue;
-      const seq = BigInt(ev.seq as string);
-      if (seq > durableSeq) {
-        throw new Error(`matched change seq ${seq} exceeds durable high-water ${durableSeq}`);
+    const result = await boundedFinite(reader, sessionId, cursor, deadline, opts.signal);
+    if (result) {
+      const { events, durableSeq } = result;
+      for (const ev of events) {
+        if (ev.type !== FILE_CHANGED_TYPE) continue;
+        const data = ev.data ?? {};
+        if (data.path !== expect.relPath) continue;
+        const before = data.before as Snapshot | undefined;
+        const after2 = data.after as Snapshot | undefined;
+        if (!before || !after2) continue;
+        if (!snapshotMatches(before, expect.before) || !snapshotMatches(after2, expect.after)) continue;
+        const seq = BigInt(ev.seq as string);
+        if (seq > durableSeq) {
+          throw new Error(`matched change seq ${seq} exceeds durable high-water ${durableSeq}`);
+        }
+        if (data.observation !== 'watcher') {
+          throw new Error(`change ${seq} carried observation ${String(data.observation)}, expected watcher`);
+        }
+        await verifyBlobBytes(reader, before, expect.before, deadline, opts.signal);
+        await verifyBlobBytes(reader, after2, expect.after, deadline, opts.signal);
+        return { seq, after: after2 };
       }
-      if (data.observation !== 'watcher') {
-        throw new Error(`change ${seq} carried observation ${String(data.observation)}, expected watcher`);
-      }
-      await verifyBlobBytes(reader, before, expect.before);
-      await verifyBlobBytes(reader, after2, expect.after);
-      return { seq, path: expect.relPath, before, after: after2, observation: 'watcher', durableSeq };
+      if (durableSeq > cursor) cursor = durableSeq;
+      lastDurable = durableSeq;
     }
-    if (durableSeq > cursor) cursor = durableSeq;
     if (Date.now() >= deadline) {
       throw new DurabilityTimeoutError(
-        `no durable ${FILE_CHANGED_TYPE} matching ${expect.relPath} within ${deadlineMs}ms (durable high-water ${durableSeq})`,
+        `no durable ${FILE_CHANGED_TYPE} matching ${expect.relPath} within ${deadlineMs}ms (durable high-water ${lastDurable})`,
       );
     }
     await sleep(pollMs);
@@ -318,9 +382,21 @@ export async function awaitObservedChange(
 /** For a content snapshot whose expected bytes are known, fetch the served blob
  * and require exact byte equality; the SHA-256 identity was already checked by
  * {@link snapshotMatches}. Absent snapshots have no blob to verify. */
-async function verifyBlobBytes(reader: ReaderClient, actual: Snapshot, expect: ExpectSnap): Promise<void> {
+async function verifyBlobBytes(
+  reader: ReaderClient,
+  actual: Snapshot,
+  expect: ExpectSnap,
+  deadline: number,
+  outer: AbortSignal | undefined,
+): Promise<void> {
   if (expect.kind !== 'content' || actual.kind !== 'content') return;
-  const bytes = await reader.blob(actual.sha256);
+  const req = deadlineSignal(deadline, outer);
+  let bytes: Buffer;
+  try {
+    bytes = await reader.blob(actual.sha256, req.signal);
+  } finally {
+    req.dispose();
+  }
   if (!bytes.equals(expect.bytes)) {
     throw new Error(`blob ${actual.sha256} bytes (${bytes.length}) did not match the ${expect.bytes.length} bytes written`);
   }
@@ -361,10 +437,24 @@ export async function writeQaEnv(path: string, env: QaEnv): Promise<void> {
   await rename(tmp, path);
 }
 
+/** Control characters (incl. CR/LF) that must never appear in a value we splice
+ * into an HTTP request line or header. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
 export async function readQaEnv(path: string): Promise<QaEnv> {
   const parsed = JSON.parse(await readFile(path, 'utf8')) as QaEnv;
   if (parsed.format !== QA_ENV_FORMAT) {
     throw new Error(`${path} is not a ${QA_ENV_FORMAT} env file`);
+  }
+  // The url and token are spliced into request URLs and the Authorization
+  // header; a smuggled newline could inject a second header. Reject control
+  // characters WITHOUT reflecting the value back — the token is a secret and
+  // must never land in a log line or error message.
+  for (const field of ['url', 'token'] as const) {
+    const value = parsed[field];
+    if (typeof value !== 'string' || CONTROL_CHARS.test(value)) {
+      throw new Error(`${path} has an invalid ${field} (control characters not allowed); refusing to use it`);
+    }
   }
   return parsed;
 }

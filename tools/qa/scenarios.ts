@@ -7,6 +7,7 @@
  */
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { awaitObservedChange, type ReaderClient } from '../qa-support.ts';
 
 export interface SeedContext {
@@ -16,7 +17,6 @@ export interface SeedContext {
   signal: AbortSignal;
   /** Await states appearing AFTER this seq (the session's baseline high-water). */
   after: bigint;
-  deadlineMs?: number;
 }
 
 export interface SeedScenario {
@@ -26,25 +26,24 @@ export interface SeedScenario {
   seed(ctx: SeedContext): Promise<bigint>;
 }
 
-function pollOpts(ctx: SeedContext): { deadlineMs?: number } {
-  return ctx.deadlineMs !== undefined ? { deadlineMs: ctx.deadlineMs } : {};
-}
-
 /** The T-QA seed: create then modify one file, so the operator sees two distinct
  * content states with real hashes. Deletion is exercised by the T-QA acceptance
- * module, not seeded here (a present file is more useful to curl). */
+ * module, not seeded here (a present file is more useful to curl). A unique name
+ * per invocation keeps `--reuse` seeding sound — a fixed name would already exist
+ * and its `absent → content` create could never be observed. */
 const tqa: SeedScenario = {
   name: 'T-QA',
   async seed(ctx) {
-    const rel = 'hello.txt';
+    const rel = `hello-${randomUUID()}.txt`;
     const abs = join(ctx.worktree, rel);
+    const opts = { signal: ctx.signal };
 
     const v1 = Buffer.from('hello from slipstream qa\n', 'utf8');
     await writeFile(abs, v1);
     const created = await awaitObservedChange(
       ctx.reader, ctx.sessionId,
       { relPath: rel, before: { kind: 'absent' }, after: { kind: 'content', bytes: v1 } },
-      ctx.after, pollOpts(ctx),
+      ctx.after, opts,
     );
 
     const v2 = Buffer.from('hello from slipstream qa — edited\n', 'utf8');
@@ -52,7 +51,7 @@ const tqa: SeedScenario = {
     const modified = await awaitObservedChange(
       ctx.reader, ctx.sessionId,
       { relPath: rel, before: { kind: 'content', bytes: v1 }, after: { kind: 'content', bytes: v2 } },
-      created.seq, pollOpts(ctx),
+      created.seq, opts,
     );
 
     return modified.seq;

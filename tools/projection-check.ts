@@ -24,7 +24,7 @@ import {
   type ReaderClient,
 } from './qa-support.ts';
 import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
-import { getModule, moduleIds, MODULES } from './qa/acceptance/registry.ts';
+import { MODULES } from './qa/acceptance/registry.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 export type Selection = { all: true } | { pr: string };
@@ -78,9 +78,10 @@ export interface RunIO {
 
 function selectedModules(selection: Selection, stderr: (l: string) => void): AcceptanceModule[] | null {
   if ('all' in selection) return [...MODULES];
-  const mod = getModule(selection.pr);
+  const mod = MODULES.find((m) => m.id === selection.pr);
   if (mod === undefined) {
-    stderr(`qa-check: no acceptance check registered for '${selection.pr}'; known: ${moduleIds().join(', ') || '(none)'}`);
+    const known = MODULES.map((m) => m.id).join(', ') || '(none)';
+    stderr(`qa-check: no acceptance check registered for '${selection.pr}'; known: ${known}`);
     return null;
   }
   return [mod];
@@ -182,12 +183,19 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     checks.push(result);
     if (result.result === 'failed') sawFailure = true;
 
-    // Teardown the harness we started; a teardown failure is itself a check failure.
+    // Teardown the harness we started; a teardown failure is itself a check
+    // failure, and must be recorded IN THE REPORT — not just in the exit code —
+    // or the JSON would claim `passed` while the process exits non-zero. Mutating
+    // the pushed result (buildReport recomputes the overall verdict) keeps the two
+    // honest in lockstep.
     if (handle) {
       try {
         await handle.stop();
       } catch (err) {
+        const message = `cleanup: ${(err as Error).message}`;
         io.stderr(`qa-check: ${mod.id} cleanup failed: ${(err as Error).message}`);
+        result.result = 'failed';
+        result.error = result.error ? `${result.error}; ${message}` : message;
         sawFailure = true;
       }
     }
