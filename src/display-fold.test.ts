@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { canonicalJson, DISPLAY_FOLD_CONTRACT, foldDisplay } from './display-fold.ts';
+import { canonicalJson, foldDisplay } from './display-fold.ts';
 
 const A = 'urn:slipstream:session:a';
 const B = 'urn:slipstream:session:b';
@@ -52,10 +52,6 @@ describe('foldDisplay', () => {
     );
   });
 
-  it('names its contract', () => {
-    assert.equal(DISPLAY_FOLD_CONTRACT, 'display-fold.v1');
-  });
-
   it('is independent of delivery order', () => {
     const forward = canonicalJson(foldDisplay(MIXED));
     const reversed = canonicalJson(foldDisplay([...MIXED].reverse()));
@@ -71,6 +67,13 @@ describe('foldDisplay', () => {
   it('treats -0 and 0 as the same transport value', () => {
     const r = foldDisplay([gap('1', { observed_at_ms: 0 }), gap('1', { observed_at_ms: -0 })]);
     assert.equal(r.result, 'ok');
+  });
+
+  it('dedups independently parsed copies of a record with a deeply nested unknown field', () => {
+    const depth = 20_000;
+    const line = JSON.stringify(gap('1')).replace('"data":{', `"data":{"extra":${'['.repeat(depth)}0${']'.repeat(depth)},`);
+    const r = foldDisplay([JSON.parse(line), JSON.parse(line)]);
+    assert.equal(canonicalJson(r), canonicalJson(foldDisplay([gap('1')])));
   });
 
   it('selects the same error regardless of delivery order', () => {

@@ -75,7 +75,6 @@ export type DisplayFoldResult =
       error: { reason: 'unsupported-event-version'; source: string; seq: string; type: string };
     };
 
-const FILE_CHANGED = 'slipstream.file.changed.v1';
 const ATTRIBUTION = 'slipstream.change.attribution.v1';
 const EVIDENCE = 'slipstream.harness.evidence.v1';
 const COVERAGE = 'slipstream.enrichment.coverage.v1';
@@ -145,13 +144,25 @@ function isEvidenceKey(v: unknown): boolean {
   );
 }
 
-/** Structural JSON-value equality: object key order is irrelevant, array order is not. */
+/** Structural JSON-value equality: object key order is irrelevant, array order is not.
+ * Iterative, so a deeply nested field the fold never reads cannot overflow the stack. */
 function jsonEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((v, i) => jsonEqual(v, b[i]));
-  if (!isObj(a) || !isObj(b)) return false;
-  const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length && keys.every((k) => Object.hasOwn(b, k) && jsonEqual(a[k], b[k]));
+  const pending: [unknown, unknown][] = [[a, b]];
+  for (let pair = pending.pop(); pair; pair = pending.pop()) {
+    const [x, y] = pair;
+    if (x === y) continue;
+    if (Array.isArray(x)) {
+      if (!Array.isArray(y) || x.length !== y.length) return false;
+      x.forEach((v, i) => pending.push([v, y[i]]));
+    } else if (isObj(x) && isObj(y)) {
+      const keys = Object.keys(x);
+      if (keys.length !== Object.keys(y).length || !keys.every((k) => Object.hasOwn(y, k))) return false;
+      for (const k of keys) pending.push([x[k], y[k]]);
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 function identityOf(r: unknown): Identity | undefined {
