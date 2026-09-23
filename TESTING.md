@@ -122,6 +122,15 @@ npm run qa:check -- --pr T-QA                    # run one check
 npm run qa:check -- --pr T-QA --env <qa-env.json> # run against an already-running qa:daemon
 ```
 
+The tool writes exactly one JSON report to its own stdout, but `npm run` prepends
+a run banner to stdout. To parse the report, run with `--silent` or invoke the
+tool directly:
+
+```
+npm run --silent qa:check -- --all        # clean JSON on stdout
+node tools/projection-check.ts acceptance --all
+```
+
 Without `--env`, the runner starts its own isolated daemon from the current
 checkout. With `--env`, it runs against the daemon that wrote that env file and
 **rejects it if `daemon_commit` differs from the checked-out HEAD**. Exit codes:
