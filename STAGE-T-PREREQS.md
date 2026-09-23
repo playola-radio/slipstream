@@ -1,9 +1,9 @@
 # Stage T upstream prerequisites — design spec
 
-**Status:** design complete; the four shaping decisions (DA-1…DA-4) **RATIFIED by Brian
-2026-09-22** — see Part 4. The deeper T0-gate semantics remain to be ratified when the
-T0-gate PR lands. No production code in this PR. Architected via Codex consult against the
-`briankeane/vienna` tree; captured and adjudicated here.
+**Status:** design complete; the four shaping decisions (DA-1…DA-4) and all T0 decisions
+(D1…D11) are **RATIFIED by Brian 2026-09-23** — see Part 4. No production code in this
+PR. Architected via Codex consult against the `briankeane/vienna` tree; captured and
+adjudicated here.
 
 ## Purpose
 
@@ -129,8 +129,8 @@ Reconnect behavior:
 - An SSE response has **one** contract for its lifetime; a restart makes a new response
   and another compatibility check.
 
-**Brian must ratify this.** The alternative — preserving the interpretation selected *at
-capture time* forever — requires durable contract provenance and historical dispatch, a
+**Ratified in DA-2.** The alternative — preserving the interpretation selected *at capture
+time* forever — requires durable contract provenance and historical dispatch, a
 substantially larger upstream scope that a response header cannot provide. A new contract
 must define how it interprets supported historical event versions; unsupported inputs
 stay visibly unsupported. Never silently relabel incompatible historical semantics.
@@ -235,7 +235,7 @@ A third language adds **one module + registration + fixtures**. It must not add 
 branches to HTTP routing or worker scheduling, and language identifiers must **not** be a
 schema enum that needs redesign per module.
 
-**Proposed conservative v1 semantics (subject to Brian, decision DA-3):**
+**Ratified conservative v1 semantics (DA-3):**
 
 - Syntactic function interfaces, **not** typechecked public API.
 - No cross-file matching, no inferred rename detection.
@@ -245,8 +245,8 @@ schema enum that needs redesign per module.
   rows** (rather than risk false additions/removals). Reliable partial rows can be a
   later, separately specified capability.
 
-The last point needs ratification: it trades useful partial output for a much smaller,
-honest matching contract.
+The last point is ratified: it trades useful partial output for a much smaller, honest
+matching contract.
 
 ### 3.3 Swift grammar — credible candidate, compatibility unproven
 
@@ -309,17 +309,166 @@ rates need Brian's approval.**
   Swift is a **required follow-up dependency for completion**, not optional. TS-only does
   **not** satisfy the ratified "Swift + TypeScript" criterion.
 
-### Deeper semantics — ratified when the T0-gate PR lands (enumerated, not resolved here)
+### Ratified T0 decisions (2026-09-23)
 
-- Fold scope boundary with T2a session/inventory/task-grouping semantics.
-- Function-interface scope: visibility, declaration kinds, TSX, Swift
-  extensions/protocol requirements, conditional compilation.
-- Identity across renames, moves, overloads, duplicate declarations.
-- Signature treatment of defaults, annotations, modifiers, generics, constraints,
-  parameter labels, inferred types, formatting.
-- Partial-extraction policy detail and the precise meaning of "complete."
-- Per-language version compatibility rules.
-- Interface resource budgets + combined-load acceptance thresholds.
+The following records Brian's ratified choices. These are decisions for implementation,
+not claims that the corresponding interfaces already exist.
+
+#### D1 — Fold boundary. RESOLVED → A
+
+`display-fold.v1` covers exactly attribution, evidence, coverage, and gaps. Baselines /
+inventory and task grouping belong to T2a under a separately specified future contract;
+four-component parity must never be described as whole-session parity.
+
+**Rationale:** the four display components can be versioned now without inventing T2a
+inventory or grouping semantics. **Example:** a session containing only a baseline for
+`a.ts` (`function f(){}`) and a task folds to:
+
+```json
+{"attributions":[],"evidence":[],"coverage":[],"gaps":[]}
+```
+
+#### D2 — Declaration scope. RESOLVED → A+
+
+Include named syntactic functions at every visibility level: TypeScript function
+declarations, overload signatures, methods, named function-valued bindings (including
+TSX `const Card = (...) => ...`); Swift `func`s, methods, extension members, and protocol
+requirements. Include TypeScript constructors and Swift `init`. Traverse every `#if`
+branch and record syntactic guards in identity (for example `["DEBUG"]` and
+`["!(DEBUG)"]`), never evaluate build settings. Exclude anonymous callbacks, local /
+nested declarations, accessors (`get` / `set`), subscripts, and generated declarations;
+each language module's metadata states that exclusion list.
+
+**Rationale:** the interface is a syntactic outline, not a restricted public-API view.
+**Examples:** `export const Card = (p: {title: string}) => <h1>{p.title}</h1>;` produces
+`[add(K(Card), A(Card))]`; `protocol P { func read(_ x: Int) -> String }` plus
+`extension Box { func read(_ x: Int) -> String { "" } }` produces additions for
+`P.read` and `Box.read`; the two `trace` declarations in `#if DEBUG` / `#else` both
+produce additions with guards `["DEBUG"]` and `["!(DEBUG)"]`.
+
+#### D3 — Correspondence. RESOLVED → A
+
+First match exact signatures. Then emit one `signatureChanged` only when exactly one
+unmatched declaration remains on each side of the same kind / scope / name group. A
+rename is removed plus added; a move within the same scope emits no rows; ambiguous
+overloads return `incomplete`, `"ambiguous-correspondence"`, and no rows; duplicate
+declarations return `incomplete`, `"duplicate-declaration"`, and no rows. No similarity
+scoring is permitted.
+
+**Rationale:** this yields useful signature changes without claiming identity that the
+syntax cannot prove. **Examples:** `oldName` → `newName` is
+`[remove(K(oldName),B), add(K(newName),A)]`; reordering `function a(){}` and
+`function b(){}` is `[]`; two changed overloads for `f` are incomplete rather than paired.
+
+#### D4 — Signature equality. RESOLVED → A
+
+A signature is its written header syntax: defaults including values, annotations,
+modifiers, generics, constraints, parameter names / Swift labels, and explicit return
+types. Strip trivia and bodies. A default `1` → `2` and a Swift label `from` → `at` are
+`signatureChanged`; body-only edits, inferred-return changes, and formatting-only edits
+emit no rows.
+
+**Rationale:** preserve what the author wrote without evaluating code or inferring types.
+**Examples:** `function f(x:number = 1):number` → `function f(x:number = 2):number`
+emits `[change(K(f),B,A)]`; `function value() { return 1; }` →
+`function value() { return "one"; }` emits `[]`.
+
+#### D5 — Completeness. RESOLVED → A
+
+Completeness is whole-file syntactic completeness: any ERROR or missing node produces
+`incomplete` with `"before-parse-error"` or `"after-parse-error"` and no rows. An absent
+before-file produces additions; a missing CAS blob is `unavailable`,
+`"before-blob-missing"`; an empty successfully parsed before-file is ready with additions.
+
+**Rationale:** an unrelated parse error can conceal an eligible declaration, so partial
+rows would overstate certainty. **Examples:** `function f(x: {` before a valid after-file
+is `incomplete`, `"before-parse-error"`, `[]`; an explicitly absent or empty before-file
+and valid `function f(){}` after-file produces an added `f` (except a missing blob, which
+is unavailable).
+
+#### D6 — Versioning. RESOLVED → A
+
+Each language has a conservative implementation fingerprint covering its grammar artifact,
+extraction, normalization, correspondence, ordering, offset mapping, and limits. Any
+change bumps that language's version (for example `typescript.v2`); TypeScript and Swift
+version independently. Shared envelope changes bump `projection_version`, and clients
+match exact tuples.
+
+**Rationale:** a conservative bump is preferable to silently changing a client-visible
+projection. **Example:** a parser refactor that leaves
+`function f():number { return 1; }` → `return 2;` with no rows still changes reported
+`typescript.v1` to `typescript.v2`, while `interface.v1` remains unchanged.
+
+#### D7 — Admission measurements. RESOLVED → A
+
+Ratify the measurement method now, and the numbers later. Clip and interface work share
+one bounded admission budget: concurrency `C`, queue `Q`, waiter bound `W`, and deadline
+`D`, where `D` includes queue wait. Do not copy the clip service's deadline-starts-in-
+`runTask` behavior. Measure baseline, clip-only, interface-only, and combined arms over
+representative TS / TSX / Swift sizes plus malformed and Unicode inputs, cold and warm
+runs. Report thresholds per language; crashes and missing data are failures and are never
+discarded. Brian approves numbers at T5b.1 from measurements after T5a.2 and T5a.4 exist.
+
+**Rationale:** shared work must be measured under the combined load that could affect
+capture. **Examples:** admitted `f(number)` → `f(string)` returns `ready` with
+`[change(K(f),B,A)]`; a full queue returns HTTP 200, `skipped`, `"overloaded"`, `[]`; an
+expired queued or running request returns HTTP 200, `skipped`, `"timeout"`, `[]`.
+
+#### D8 — Fold ground rules. RESOLVED → A
+
+Canonical fold output is plain JSON with sorted arrays and decimal-string sequences.
+Strings compare exactly, without Unicode normalization, ordered by UTF-16 code units.
+Deduplicate identical transport records; conflicting records with the same `(source, seq)`
+identity are corruption, never newest-wins. Distinguish unknown from unsupported event
+versions; fold evidence per source and preserve its source; accept numeric timestamps only
+within the safe-integer range. Every released contract version has an immutable manifest
+and CI rejects edits to it. On every new SSE response, a missing or invalid
+`Slipstream-Fold-Contract` header stops application, retains the cursor, marks derived
+state stale / unsupported, and never inherits the previous response's header.
+
+**Rationale:** canonical interpretation must be deterministic and response-bound across
+Node and Swift. **Examples:** identical duplicate delivery yields one gap, while a
+different record for the same `(source, seq)` is corruption; composed and decomposed
+Unicode strings remain distinct; a reconnect with no valid header applies no events.
+
+#### D9 — Fold fingerprint boundary. RESOLVED → A
+
+T0.1 moves scoring code out of `src/attribution.ts` so the fold fingerprint covers display
+code only; the full pre-existing test suite must pass for that move.
+
+**Rationale:** scoring is explicitly outside the display contract, so it must not cause
+unrelated fold-version churn. **Example:** changing scoring after the move does not alter
+the display-code fingerprint; changing `foldAttributions` does.
+
+#### D10 — Interface envelope. RESOLVED → A
+
+Status precedence is fixed: genuine extraction incompleteness wins first and returns
+`incomplete` with no rows; then comparison ambiguity returns `incomplete` with no rows;
+then unavailable; then unsupported; then admission rejection or cancellation returns
+`skipped`. Add coverage side `notEvaluated` for admission-rejected or cancelled work.
+Use `language_version:null` when no language module exists. Spans are whole-declaration,
+UTF-8-byte, half-open ranges. Order rows removed, then signatureChanged, then added.
+
+**Rationale:** a disposition must never imply a successful extraction or comparison that
+did not occur. **Examples:** malformed before input is `incomplete`,
+`"before-parse-error"`, `[]` even if another problem is present; ambiguous complete
+overloads are `incomplete`, `"ambiguous-correspondence"`, `[]`; an overloaded request has
+`coverage.before` and `coverage.after` of `notEvaluated`.
+
+#### D11 — PR graph. RESOLVED → A
+
+Add T-QA first: the QA harness and one-command local daemon (`tools/qa-daemon.ts` plus
+`tools/projection-check.ts` acceptance). Split T0 into a fold gate (D1, D8, D9) and an
+interface gate (D2–D7, D10), so T0.1 depends only on the fold gate plus T-QA. T5b.1 code
+may land early, but its budget approval depends on T5a.2 and T5a.4 measurements. Every
+code PR ships an executable live-daemon acceptance check under
+`tools/qa/acceptance/<ID>.ts`.
+
+**Rationale:** the harness proves real daemon behavior before contracts depend on it, and
+budget approval requires both real language implementations. **Examples:**
+`npm run qa:daemon -- --scenario T-QA --keep` starts the local harness; `npm run qa:check
+-- --pr T0.1` runs its registered acceptance; synthetic admission tests alone cannot
+approve Swift budgets.
 
 ---
 
@@ -332,14 +481,16 @@ inspectable JSON) plus authenticated `curl` for the HTTP PRs. The commands below
 
 | PR / gate | Depends | Red → Green | Independent human QA |
 |---|---|---|---|
-| **T0 — contract ratification (gate)** | this design | Unresolved history binding + interface semantics → recorded decisions + example outputs | Review concrete input/output examples, incl. ambiguous-overload and malformed-before cases. |
-| **T0.1 — display contract + oracle** | T0 | Coverage/gap/prefix/rejection fixtures fail → four canonical components pass | `node tools/projection-check.ts fold --fixture revision-and-gap` prints normalized state + contract id. |
+| **T-QA — QA harness + local daemon** | this design | Live capture/bootstrap/lifecycle acceptance absent → one-command daemon + acceptance pass | `npm run qa:daemon -- --scenario T-QA --keep`; `npm run qa:check -- --pr T-QA`. |
+| **T0-fold — fold contract ratification (gate)** | this design | D1/D8/D9 → recorded fold decisions + example outputs | Review four-component, duplicate/conflict, Unicode, and reconnect examples. |
+| **T0-interface — interface contract ratification (gate)** | this design | D2–D7/D10 → recorded interface decisions + example outputs | Review declaration, correspondence, completeness, status, and admission examples. |
+| **T0.1 — display contract + oracle** | T-QA, T0-fold | Coverage/gap/prefix/rejection fixtures fail → four canonical components pass | `node tools/projection-check.ts fold --fixture revision-and-gap` prints normalized state + contract id. |
 | **T0.2 — reader header + release gate** | T0.1 | Missing finite/SSE headers; unchanged-version mutation accepted → headers + CI rejection verified | Authenticated `curl -i` for empty replay and SSE; checker rejects a deliberately altered fold fixture. |
-| **T5a.1 — response contract + comparison core** | T0 | Synthetic declaration matching/status fixtures fail → approved matching + schema examples pass | Checker prints added/removed/changed, ambiguous, incomplete examples — no parser. |
+| **T5a.1 — response contract + comparison core** | T-QA, T0-interface | Synthetic declaration matching/status fixtures fail → approved matching + schema examples pass | Checker prints added/removed/changed, ambiguous, incomplete examples — no parser. |
 | **T5a.2 — TypeScript language module** | T5a.1 | Whole-blob TS extraction fixtures fail → approved signatures + coverage | Checker compares synthetic TS before/after, incl. body-only edits + overloads. |
-| **T5a.3 — Swift WASM feasibility** | T0 | Exact artifact/runtime compatibility unproven → load, parse, cancellation demonstrated | Checker prints Swift syntax/diagnostics + the exact grammar artifact. No comparison claim yet. |
+| **T5a.3 — Swift WASM feasibility** | T-QA, T0-interface | Exact artifact/runtime compatibility unproven → load, parse, cancellation demonstrated | Checker prints Swift syntax/diagnostics + the exact grammar artifact. No comparison claim yet. |
 | **T5a.4 — Swift language module** | T5a.1, T5a.3 | Swift declaration fixtures fail → approved identity/signature/partial outcomes | Same interface checker as TS, selecting Swift. |
-| **T5b.1 — shared bounded admission** | T0 | Combined clip/interface demand exceeds bound → shared limit + shutdown tests pass; clip regression suite passes | Checker saturates synthetic jobs, prints admitted/overloaded + active-work max. |
+| **T5b.1 — shared bounded admission** | T-QA, T0-interface; budget approval after T5a.2 + T5a.4 measurements | Combined clip/interface demand exceeds bound → shared limit + shutdown tests pass; clip regression suite passes | Checker saturates synthetic jobs, prints admitted/overloaded + active-work max; approval records TS + Swift measurements. |
 | **T5b.2 — interface worker/service** | T5a.2, T5b.1 | Timeout/missing-blob/cache-eviction/GC-hit fixtures fail → explicit dispositions | Checker runs the service over a temp synthetic store; demonstrates cache-hit-then-GC. |
 | **T5b.3 — public endpoint + schema discovery** | T5b.2 | Route/auth/boundary/tombstone/schema tests fail → public API passes | Authenticated curl against a synthetic committed TS change; inspect success/unavailable/error. |
 | **T5b.4 — Swift endpoint acceptance** | T5b.3, T5a.4 | Swift HTTP corpus fails → both required languages pass through the public endpoint | Same curl workflow with Swift changes; verify language version + incomplete states. |
@@ -377,5 +528,5 @@ comparison — not a semantic API-analysis system.**
 
 ---
 
-*End of design. No production code in this PR. Await ratification of Part 4 (DA-1…DA-4)
-before the T0-gate PR opens.*
+*End of design. No production code in this PR. Part 4, including DA-1…DA-4 and D1…D11,
+is fully ratified.*
