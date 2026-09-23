@@ -172,7 +172,7 @@ function identityOf(r: unknown): Identity | undefined {
 
 function attributionValid(d: Obj): boolean {
   return (
-    typeof d.change_seq === 'string' &&
+    isSeq(d.change_seq) &&
     isSeq(d.policy_seq) &&
     oneOf(d.status, STATUSES) &&
     oneOf(d.reason, ATTRIBUTION_REASONS) &&

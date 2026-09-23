@@ -47,6 +47,10 @@ replay, an SSE stream, or a mix, with or without transport duplicates.
   For the last four, the fields the fold reads must have the shape their schema gives
   them (enums, strings, seq strings). Fields the fold does not read are not checked.
   A file change is used only as an attribution target.
+- **Attribution `change_seq`.** An attribution's `change_seq` is a seq string,
+  validated the same way as `policy_seq`: it must match `^[1-9][0-9]*$`. A
+  non-canonical `change_seq` makes the attribution record itself invalid, before
+  target rejection is considered.
 - **Timestamps.** The only timestamp the fold reads is evidence `timestamp.at_ms`. It
   must be an integer. Outside `0..Number.MAX_SAFE_INTEGER` it is
   `timestamp-out-of-range`. Timestamps the fold does not read (gap and change
@@ -96,7 +100,6 @@ The two cases are handled differently:
 **Attributions** use the existing `foldAttributions` (`src/attribution.ts`), which
 already defines valid targets:
 
-- The target `change_seq` is canonical.
 - The target exists as a `file.changed.v1` in the same source.
 - The target precedes the attribution.
 - The highest valid attribution seq replaces the earlier ones wholesale.

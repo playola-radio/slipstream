@@ -1,0 +1,2 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.file.changed.v1","data":{"path":"a.ts"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.change.attribution.v1","data":{"change_seq":"01","policy_seq":"2","status":"heuristic","reason":"single-candidate","evidence_seqs":[]}}

@@ -135,6 +135,7 @@ describe('foldDisplay', () => {
       ['null data', { source: A, seq: '1', type: 't', data: null }],
       ['array data', { source: A, seq: '1', type: 't', data: [] }],
       ['attribution numeric change_seq', attribution('1', { change_seq: 1 })],
+      ['attribution leading-zero change_seq', attribution('1', { change_seq: '01' })],
       ['attribution bad policy_seq', attribution('1', { policy_seq: '0' })],
       ['attribution bad status', attribution('1', { status: 'verified' })],
       ['attribution bad reason', attribution('1', { reason: 'because' })],
