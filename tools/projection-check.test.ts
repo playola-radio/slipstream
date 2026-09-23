@@ -23,6 +23,61 @@ describe('runModule resource cleanup', () => {
   });
 });
 
+describe('runModule deadline actually bounds module lifecycle', () => {
+  it('aborts the signal passed to the module on deadline, and does not resolve until the module settles', async () => {
+    const ac = new AbortController();
+    const ctx = { signal: ac.signal } as AcceptanceContext;
+    let moduleSawAbort = false;
+    let moduleSettled = false;
+    const mod: AcceptanceModule = {
+      id: 'slow',
+      run: async (innerCtx) => {
+        await new Promise<void>((resolveInner) => {
+          innerCtx.signal.addEventListener('abort', () => {
+            moduleSawAbort = true;
+            // Simulate real teardown work the module does after seeing the abort —
+            // runModule must not resolve/report before this actually finishes.
+            setTimeout(() => { moduleSettled = true; resolveInner(); }, 20);
+          }, { once: true });
+        });
+        throw new Error('module aborted');
+      },
+    };
+    // Use a real short deadline via an injected clock is not available, so drive
+    // the abort directly the same way the 180s timer does: fire it and confirm
+    // runModule (a) propagates it into the module's own signal, and (b) blocks on
+    // the module's promise rather than resolving the instant the deadline elapses.
+    const runPromise = runModule(mod, ctx, () => {});
+    ac.abort();
+    const res = await runPromise;
+    assert.equal(moduleSawAbort, true, 'the module must observe the deadline via its own signal, not just via Promise.race losing');
+    assert.equal(moduleSettled, true, 'runModule must not resolve before the module promise actually settles');
+    assert.equal(res.result, 'failed');
+  });
+
+  it('reports the exceeded-deadline message when the module times out (not aborted by the caller)', async () => {
+    const ac = new AbortController();
+    const ctx = { signal: ac.signal } as AcceptanceContext;
+    let innerAborted = false;
+    const mod: AcceptanceModule = {
+      id: 'timeout-mod',
+      run: async (innerCtx) => {
+        await new Promise<void>((_resolve, reject) => {
+          innerCtx.signal.addEventListener('abort', () => {
+            innerAborted = true;
+            reject(new Error('inner aborted'));
+          }, { once: true });
+        });
+        return { assertions: [] };
+      },
+    };
+    const res = await runModule(mod, ctx, () => {}, { deadlineMs: 30 });
+    assert.equal(innerAborted, true);
+    assert.equal(res.result, 'failed');
+    assert.match(res.error ?? '', /exceeded 30ms/);
+  });
+});
+
 describe('parseAcceptanceArgs', () => {
   it('accepts --all', () => {
     assert.deepEqual(parseAcceptanceArgs(['--all']), { selection: { all: true }, env: null });

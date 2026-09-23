@@ -61,4 +61,35 @@ describe('criterion3 SSE parity is delivery-order strict', () => {
     };
     await assert.rejects(() => criterion3(ctxWith(reader)), /carried no id/);
   });
+
+  it('reconnects from an INTERIOR cursor, not the earliest event, when enough events exist', async () => {
+    // 5 finite identities: an interior cursor (index 2 of 5 → seq 3) must be used,
+    // not finiteSeqs[0]. A reader that only tolerates resuming from the true
+    // interior cursor (and fails any other `after`) proves which one was used.
+    const finiteAll = [1n, 2n, 3n, 4n, 5n];
+    const expectedCursor = 3n; // finiteSeqs[Math.floor(5 / 2)] = finiteSeqs[2]
+    const reader: ReaderClient = {
+      ...fakeReader(5n, () => finiteAll),
+      follow: async (_sid, after, signal, onEvent): Promise<void> => {
+        if (signal.aborted) return;
+        if (after !== 0n && after !== expectedCursor) {
+          throw new Error(`reconnect used cursor ${after}, expected interior cursor ${expectedCursor}`);
+        }
+        for (const seq of finiteAll.filter((s) => s > after)) {
+          onEvent({ id: seq.toString(), event: 'slipstream', data: JSON.stringify({ seq: seq.toString() }) });
+        }
+      },
+    };
+    const a = await criterion3(ctxWith(reader));
+    assert.equal(a.id, 'finite-sse-agreement');
+    assert.equal((a.evidence as { reconnect_after: string }).reconnect_after, expectedCursor.toString());
+  });
+
+  it('falls back to the earliest cursor when too few events exist for an interior one', async () => {
+    // With only 2 finite identities there is no meaningful interior cursor;
+    // finiteSeqs[0] remains correct and must still be used.
+    const reader = fakeReader(2n, () => [1n, 2n]);
+    const a = await criterion3(ctxWith(reader));
+    assert.equal((a.evidence as { reconnect_after: string }).reconnect_after, '1');
+  });
 });
