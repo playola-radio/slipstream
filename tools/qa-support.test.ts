@@ -1,0 +1,140 @@
+import { describe, it, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  sha256Hex,
+  parseNdjson,
+  createSseDecoder,
+  snapshotMatches,
+  buildReport,
+  writeQaEnv,
+  readQaEnv,
+  QA_ENV_FORMAT,
+  QA_REPORT_FORMAT,
+  type QaEnv,
+} from './qa-support.ts';
+import type { Snapshot } from '../src/snapshot.ts';
+
+describe('qa-support', () => {
+  describe('sha256Hex', () => {
+    it('is the plain SHA-256 of the bytes', () => {
+      // Independently known digest of the empty string.
+      assert.equal(sha256Hex(Buffer.alloc(0)), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+      assert.equal(
+        sha256Hex(Buffer.from('abc', 'utf8')),
+        'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      );
+    });
+  });
+
+  describe('parseNdjson', () => {
+    it('parses non-empty lines and ignores blank ones', () => {
+      const rows = parseNdjson('{"seq":"1"}\n{"seq":"2"}\n\n');
+      assert.deepEqual(rows.map((r) => r.seq), ['1', '2']);
+    });
+    it('returns [] for an empty body', () => {
+      assert.deepEqual(parseNdjson(''), []);
+    });
+  });
+
+  describe('createSseDecoder', () => {
+    it('emits a frame per blank-line-terminated block, carrying id and data', () => {
+      const dec = createSseDecoder();
+      const frames = dec.push('id: 5\nevent: message\ndata: {"seq":"5"}\n\n');
+      assert.equal(frames.length, 1);
+      assert.equal(frames[0]!.id, '5');
+      assert.equal(frames[0]!.event, 'message');
+      assert.equal(frames[0]!.data, '{"seq":"5"}');
+    });
+    it('handles a frame split across pushes', () => {
+      const dec = createSseDecoder();
+      assert.deepEqual(dec.push('data: hel'), []);
+      assert.deepEqual(dec.push('lo\n'), []); // no blank line yet
+      const frames = dec.push('\n');
+      assert.equal(frames.length, 1);
+      assert.equal(frames[0]!.data, 'hello');
+    });
+    it('ignores heartbeat comment lines and dataless frames', () => {
+      const dec = createSseDecoder();
+      const frames = dec.push(': keep-alive\n\nid: 9\n\n');
+      assert.deepEqual(frames, []);
+    });
+    it('joins multi-line data with newlines', () => {
+      const dec = createSseDecoder();
+      const frames = dec.push('data: a\ndata: b\n\n');
+      assert.equal(frames[0]!.data, 'a\nb');
+    });
+  });
+
+  describe('snapshotMatches', () => {
+    const content = (bytes: Buffer): Snapshot => ({ kind: 'content', sha256: sha256Hex(bytes), size: bytes.length });
+    it('matches absent to absent only', () => {
+      assert.equal(snapshotMatches({ kind: 'absent' }, { kind: 'absent' }), true);
+      assert.equal(snapshotMatches(content(Buffer.from('x')), { kind: 'absent' }), false);
+    });
+    it('matches content on identical sha256 and size', () => {
+      const bytes = Buffer.from('hello world', 'utf8');
+      assert.equal(snapshotMatches(content(bytes), { kind: 'content', bytes }), true);
+    });
+    it('rejects a wrong hash (the negative control)', () => {
+      const bytes = Buffer.from('hello world', 'utf8');
+      const wrong: Snapshot = { kind: 'content', sha256: sha256Hex(Buffer.from('different')), size: bytes.length };
+      assert.equal(snapshotMatches(wrong, { kind: 'content', bytes }), false);
+    });
+    it('rejects unavailable content', () => {
+      assert.equal(snapshotMatches({ kind: 'unavailable', reason: 'unreadable' }, { kind: 'content', bytes: Buffer.from('x') }), false);
+    });
+  });
+
+  describe('buildReport', () => {
+    it('is passed only when every check passed', () => {
+      const passed = buildReport('abc', [{ id: 'A', result: 'passed', assertions: [] }]);
+      assert.equal(passed.format, QA_REPORT_FORMAT);
+      assert.equal(passed.result, 'passed');
+      const mixed = buildReport('abc', [
+        { id: 'A', result: 'passed', assertions: [] },
+        { id: 'B', result: 'failed', assertions: [] },
+      ]);
+      assert.equal(mixed.result, 'failed');
+    });
+    it('an empty check list is vacuously passed', () => {
+      assert.equal(buildReport('abc', []).result, 'passed');
+    });
+  });
+
+  describe('qa-env round-trip', () => {
+    let base: string;
+    before(async () => { base = await mkdtemp(join(tmpdir(), 'slipstream-qa-env-')); });
+    after(async () => { await rm(base, { recursive: true, force: true }); });
+
+    it('writes owner-only and reads back the same env', async () => {
+      const env: QaEnv = {
+        format: QA_ENV_FORMAT,
+        state: 'ready',
+        run_id: 'run-1',
+        daemon_commit: 'deadbeef',
+        store: '/x/store',
+        worktree: '/x/worktree',
+        descriptor_path: '/x/store/runtime/abc.json',
+        url: 'http://127.0.0.1:1234',
+        token: 'secret',
+        session_id: 'qa:run-1',
+        ready_through_seq: '7',
+        scenario: null,
+      };
+      const path = join(base, 'qa-env.json');
+      await writeQaEnv(path, env);
+      const mode = (await stat(path)).mode & 0o777;
+      assert.equal(mode, 0o600);
+      assert.deepEqual(await readQaEnv(path), env);
+    });
+
+    it('rejects a file with the wrong format', async () => {
+      const path = join(base, 'bad.json');
+      await writeQaEnv(path, { format: 'nope' as typeof QA_ENV_FORMAT, state: 'ready', run_id: '', daemon_commit: '', store: '', worktree: '', descriptor_path: '', url: '', token: '', session_id: '', ready_through_seq: '0', scenario: null });
+      await assert.rejects(() => readQaEnv(path), /not a slipstream-qa\.v1/);
+    });
+  });
+});
