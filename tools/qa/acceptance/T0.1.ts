@@ -70,7 +70,11 @@ async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; 
   const changed = history.filter((e) => e.type === FILE_CHANGED_TYPE).length;
   const baselined = history.filter((e) => e.type === BASELINED_TYPE).length;
   if (baselined < 2) fail(`expected at least 2 live file.baselined records, saw ${baselined}`);
-  if (changed < 2) fail(`expected at least 2 live file.changed records before any attribution, saw ${changed}`);
+  // Only the first change is guaranteed to precede every attribution: the second
+  // may land after the first change's grace window has already expired.
+  if (!history.some((e) => e.type === FILE_CHANGED_TYPE && e.seq === changeSeqs[0])) {
+    fail(`first live change ${changeSeqs[0]} is missing from the history before the first attribution`);
+  }
   const actual = fold(history);
   if (actual !== EMPTY_FOLD) fail(`a baseline/file-change-only history did not fold to the empty D1 state: ${actual}`);
   return {
@@ -95,7 +99,11 @@ async function d1Claim(ctx: AcceptanceContext): Promise<{ assertion: Assertion; 
 export async function liveAttributionClaim(ctx: AcceptanceContext, changeSeqs: string[], deadlineMs = 20_000): Promise<Assertion> {
   const deadline = Date.now() + deadlineMs;
   for (;;) {
-    const { events } = await ctx.reader.finite(ctx.sessionId, 0n);
+    const timeout = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
+    const { events } = await ctx.reader.finite(ctx.sessionId, 0n, AbortSignal.any([ctx.signal, timeout])).catch((err: unknown) => {
+      if (timeout.aborted && !ctx.signal.aborted) fail(`reader did not answer the attribution poll within ${deadlineMs}ms`);
+      throw err;
+    });
     const published = changeSeqs.map((c) => events.filter((e) => e.type === ATTRIBUTION_TYPE && e.data?.change_seq === c));
     const missing = changeSeqs.find((_, i) => published[i]!.length === 0);
     if (missing === undefined) {
@@ -175,9 +183,11 @@ export async function prefixClaim(ctx: AcceptanceContext): Promise<Assertion> {
   if (finiteSeqs.join(',') !== expected.join(',')) fail(`finite replay through ${H} is not contiguous from 1: ${finiteSeqs.join(',')}`);
 
   const sse = (await collectSse(ctx.reader, ctx.sessionId, H, ctx.signal)).filter((r) => BigInt(r.seq as string) <= H);
-  const received = [...new Set(sse.map((r) => r.seq as string))].sort((a, b) => Number(BigInt(a) - BigInt(b)));
-  if (received.join(',') !== expected.join(',')) {
-    fail(`SSE did not deliver every identity through durable seq ${H}: got ${received.join(',')}`);
+  const identity = (r: AnyRecord): string => JSON.stringify([r.source, r.seq]);
+  const finiteIds = new Set(events.map(identity));
+  const received = new Set(sse.map(identity));
+  if (received.size !== finiteIds.size || ![...received].every((id) => finiteIds.has(id))) {
+    fail(`SSE did not deliver every identity (source, seq) through durable seq ${H}: got ${[...received].join(',')}`);
   }
 
   // Equal folds alone prove little when both are empty, so also require that
@@ -191,7 +201,7 @@ export async function prefixClaim(ctx: AcceptanceContext): Promise<Assertion> {
   return {
     id: 'fold-prefix-agreement',
     claim: 'LIVE: SSE delivered every identity 1..H (H = slipstream-durable-seq) with records identical to the finite replay, and its fold truncated at H equals the finite fold byte-for-byte',
-    evidence: { durable_seq: H.toString(), identities_received: received.length, sse_records_through_h: sse.length, fold: finiteFold },
+    evidence: { durable_seq: H.toString(), identities_received: received.size, sse_records_through_h: sse.length, fold: finiteFold },
   };
 }
 

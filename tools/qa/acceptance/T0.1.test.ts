@@ -43,6 +43,11 @@ describe('T0.1 prefix claim', () => {
     await assert.rejects(() => prefixClaim(ctxWith(reader)), /did not deliver every identity/);
   });
 
+  it('fails when SSE delivers a seq under a different source', async () => {
+    const reader = fakeReader(three, 3n, [record(1n, { source: 'WRONG' }), record(2n), record(3n)]);
+    await assert.rejects(() => prefixClaim(ctxWith(reader)), /did not deliver every identity/);
+  });
+
   it('fails when the finite replay itself is missing an identity below H', async () => {
     const reader = fakeReader([record(1n), record(3n)], 3n, three);
     await assert.rejects(() => prefixClaim(ctxWith(reader)), /not contiguous/);
@@ -87,6 +92,15 @@ describe('T0.1 live attribution claim', () => {
       () => liveAttributionClaim(ctxWith(fakeReader(events, 3n, events)), ['1', '2'], 300),
       /no attribution for change 2/,
     );
+  });
+
+  it('fails at the deadline when the reader request itself never answers', async () => {
+    const stalled: ReaderClient = {
+      ...fakeReader([], 0n, []),
+      finite: (_sid, _after, signal) =>
+        new Promise((_, reject) => signal?.addEventListener('abort', () => reject(new Error('aborted')))),
+    };
+    await assert.rejects(() => liveAttributionClaim(ctxWith(stalled), ['1'], 300), /within 300ms/);
   });
 });
 
