@@ -21,7 +21,8 @@
  * Clock and timers are injected so tests drive them deterministically. A single
  * timer is armed for the nearest pending deadline.
  */
-import { foldEvidence, evaluateChange, attributionResultsEqual } from './attribution.ts';
+import { foldEvidence } from './attribution.ts';
+import { evaluateChange, attributionResultsEqual } from './attribution-scoring.ts';
 import type { AnyEvent, ChangeAttributionData, EnrichmentPolicy, ObservedInterval } from './event.ts';
 
 export type TimerHandle = unknown;
