@@ -11,15 +11,14 @@
  *    runtime / wrong daemon revision (a skipped check never counts as passing);
  *    130 = interrupted.
  */
-import { rm, mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
   createReaderClient,
   readQaEnv,
   gitHead,
   buildReport,
+  mkdtempRoot,
+  rmMkdtempRoot,
   type CheckResult,
   type ReaderClient,
 } from './qa-support.ts';
@@ -88,35 +87,42 @@ function selectedModules(selection: Selection, stderr: (l: string) => void): Acc
 }
 
 /** Run one module against a live reader/session, enforcing a deadline and mapping
- * any throw to a failed check. Never throws. Exported for the cleanup test. */
+ * any throw to a failed check. Never throws. Exported for the cleanup test.
+ *
+ * The deadline ABORTS the module's own signal rather than racing a bare timer:
+ * `Promise.race` only stops runModule from *waiting* on `mod.run` — the module
+ * promise itself keeps executing, so it can still make requests, write files, or
+ * manage child daemons while the runner reports failure and tears down. Deriving
+ * a per-module `AbortController` and passing it in `moduleCtx.signal` gives a
+ * well-behaved module (which awaits `ctx.signal`, per the {@link AcceptanceContext}
+ * contract) a real signal to stop on, and runModule awaits `mod.run` directly so
+ * it cannot resolve — and teardown cannot start — before the module actually
+ * settles. */
 export async function runModule(
   mod: AcceptanceModule,
   ctx: AcceptanceContext,
   stderr: (l: string) => void,
+  opts?: { deadlineMs?: number },
 ): Promise<CheckResult> {
   stderr(`qa-check: running ${mod.id}…`);
-  // Hoisted so the finally can clear the timer and drop the abort listener on
-  // every path — a module that WINS the race (the common case) must not leak a
-  // 180s timer that keeps the loop alive, nor an abort listener that accumulates
-  // on the shared signal across modules.
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`check ${mod.id} exceeded ${PER_MODULE_DEADLINE_MS}ms`)), PER_MODULE_DEADLINE_MS);
-    onAbort = (): void => reject(new Error('interrupted'));
-    ctx.signal.addEventListener('abort', onAbort, { once: true });
-  });
+  const deadlineMs = opts?.deadlineMs ?? PER_MODULE_DEADLINE_MS;
+  const mc = new AbortController();
+  let timedOut = false;
+  const onOuterAbort = (): void => mc.abort();
+  ctx.signal.addEventListener('abort', onOuterAbort, { once: true });
+  const timer = setTimeout(() => { timedOut = true; mc.abort(); }, deadlineMs);
   try {
-    const { assertions } = await Promise.race([mod.run(ctx), timeout]);
+    const moduleCtx: AcceptanceContext = { ...ctx, signal: mc.signal };
+    const { assertions } = await mod.run(moduleCtx);
     stderr(`qa-check: ${mod.id} passed (${assertions.length} assertions)`);
     return { id: mod.id, result: 'passed', assertions };
   } catch (err) {
-    const message = (err as Error).message;
+    const message = timedOut ? `check ${mod.id} exceeded ${deadlineMs}ms` : (err as Error).message;
     stderr(`qa-check: ${mod.id} FAILED: ${message}`);
     return { id: mod.id, result: 'failed', assertions: [], error: message };
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    if (onAbort !== undefined) ctx.signal.removeEventListener('abort', onAbort);
+    clearTimeout(timer);
+    ctx.signal.removeEventListener('abort', onOuterAbort);
   }
 }
 
@@ -172,7 +178,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         sessionId = env.session_id;
       } else {
         // Isolated harness: spawn our own daemon from the current checkout.
-        ephemeralRoot = join(await mkdtemp(join(tmpdir(), 'slipstream-qa-check-')), 'root');
+        ephemeralRoot = await mkdtempRoot('slipstream-qa-check-');
         handle = await startQaDaemon({ root: ephemeralRoot, ...(mod.scenario ? { scenario: mod.scenario } : {}) });
         reader = createReaderClient(handle.env.url, handle.env.token);
         worktree = handle.env.worktree;
@@ -184,7 +190,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
       checks.push({ id: mod.id, result: 'failed', assertions: [], error: `setup: ${(err as Error).message}` });
       sawFailure = true;
       if (handle) await handle.stop().catch(() => {});
-      if (ephemeralRoot) await rm(ephemeralRoot, { recursive: true, force: true }).catch(() => {});
+      if (ephemeralRoot) await rmMkdtempRoot(ephemeralRoot).catch(() => {});
       continue;
     }
 
@@ -209,7 +215,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         sawFailure = true;
       }
     }
-    if (ephemeralRoot) await rm(ephemeralRoot, { recursive: true, force: true }).catch(() => {});
+    if (ephemeralRoot) await rmMkdtempRoot(ephemeralRoot).catch(() => {});
   }
 
   if (io.signal.aborted) return EXIT.INTERRUPTED;
