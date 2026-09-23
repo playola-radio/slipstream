@@ -16,6 +16,8 @@ import {
   DurabilityTimeoutError,
   QA_ENV_FORMAT,
   QA_REPORT_FORMAT,
+  mkdtempRoot,
+  rmMkdtempRoot,
   type QaEnv,
   type FiniteEvents,
   type ReaderClient,
@@ -196,6 +198,28 @@ describe('qa-support', () => {
         DurabilityTimeoutError,
       );
       assert.ok(Date.now() - start < 5_000, 'must fail near the deadline, not hang');
+    });
+  });
+
+  describe('mkdtempRoot / rmMkdtempRoot', () => {
+    it('returns a not-yet-existing root nested one level under a fresh mkdtemp parent', async () => {
+      const root = await mkdtempRoot('slipstream-qa-support-test-');
+      const parent = join(root, '..');
+      try {
+        await assert.rejects(() => stat(root), 'the nested root must not pre-exist (callers create it)');
+        assert.ok((await stat(parent)).isDirectory());
+      } finally {
+        await rmMkdtempRoot(root);
+      }
+    });
+
+    it('removes the mkdtemp PARENT, not just the nested root', async () => {
+      const root = await mkdtempRoot('slipstream-qa-support-test-');
+      const parent = join(root, '..');
+      await writeFile(join(parent, 'marker'), 'x'); // simulate the daemon having created `root` + siblings
+      await rmMkdtempRoot(root);
+      await assert.rejects(() => stat(root));
+      await assert.rejects(() => stat(parent), 'the mkdtemp parent directory must also be removed, not left behind');
     });
   });
 });

@@ -9,8 +9,9 @@
  * could reach every fact this file reads.
  */
 import { createHash } from 'node:crypto';
-import { open, rename, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { open, rename, readFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { readRuntimeDescriptor, type RuntimeDescriptor } from '../src/store-reader.ts';
 import type { Snapshot } from '../src/snapshot.ts';
@@ -490,4 +491,18 @@ export function buildReport(commit: string, checks: CheckResult[]): QaReport {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Create an ephemeral QA root nested one level under a fresh `mkdtemp` parent
+ * (`<mkdtemp parent>/root`), so a daemon's own directory-creation checks always
+ * see a not-yet-existing target. Pair with {@link rmMkdtempRoot}, which removes
+ * the mkdtemp PARENT — removing only the nested `root` leaks the parent. */
+export async function mkdtempRoot(prefix: string): Promise<string> {
+  return join(await mkdtemp(join(tmpdir(), prefix)), 'root');
+}
+
+/** Remove a root created by {@link mkdtempRoot}, deleting its mkdtemp parent
+ * (which also removes the nested root) rather than just the nested directory. */
+export async function rmMkdtempRoot(root: string): Promise<void> {
+  await rm(dirname(root), { recursive: true, force: true });
 }
