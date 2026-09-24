@@ -251,8 +251,18 @@ describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
       cwd: process.cwd(),
       signal: new AbortController().signal,
     });
-    assert.equal(code, EXIT.FAIL, 'a valid sandbox reaches the unavailable-daemon check rather than failing validation');
-    assert.ok(!sink.err.some((l) => /ownership marker/.test(l)));
+    // The proof is that the reused env clears sandbox validation: it is never
+    // refused for a missing/foreign ownership marker. What it reaches NEXT is
+    // platform-dependent — on darwin T-QA runs and the fake daemon URL fails
+    // (EXIT.FAIL); off darwin the platform gate refuses T-QA (EXIT.USAGE). Both
+    // return codes are past validation; only the ownership refusal would not be.
+    assert.ok(!sink.err.some((l) => /ownership marker/.test(l)), 'a reused env with a fresh nonce must clear sandbox validation');
+    if (process.platform === 'darwin') {
+      assert.equal(code, EXIT.FAIL, 'on darwin a valid sandbox reaches the unavailable-daemon check, not a validation refusal');
+    } else {
+      assert.equal(code, EXIT.USAGE);
+      assert.ok(sink.err.some((l) => /requires platform/.test(l)), 'off darwin a valid sandbox reaches the platform gate, not a validation refusal');
+    }
   });
 
   it('refuses a missing or malformed --env file with USAGE and a message, not a stack trace or lost report', async () => {
