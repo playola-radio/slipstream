@@ -8,6 +8,11 @@
  *    0 = `ok`; 1 = the fold refused (invalid / corrupt / unsupported; the envelope
  *    is still printed); 2 = bad args, missing fixture, unreadable input, invalid
  *    UTF-8, or malformed NDJSON (diagnostic on stderr, nothing on stdout).
+ *  - `interface`: the `interface.v1` oracle (INTERFACE-PROJECTION.md).
+ *    `interface --fixture <name> [--check]` or `interface --input <path|->` prints
+ *    exactly one canonical envelope. Exit 0 = envelope produced (with --check it
+ *    matched the fixture's expected.json); 1 = --check mismatch (envelope still
+ *    printed); 2 = bad args, missing fixture, unreadable/malformed input.
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -36,6 +41,13 @@ import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
 import { checkExistingRealDir, checkRootAgainstRealStore, readOwnerMarker } from './qa/safety.ts';
 import { MODULES } from './qa/acceptance/registry.ts';
 import { corpusCasePath, FoldInputError, foldToLine, parseFoldInput } from './display-fold-oracle.ts';
+import { canonicalJson } from '../src/display-fold.ts';
+import {
+  InterfaceInputError,
+  corpusCasePath as interfaceCasePath,
+  interfaceToLine,
+  parseInterfaceInput,
+} from './interface-projection-oracle.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -364,6 +376,94 @@ export async function runFold(io: FoldIO): Promise<number> {
   return exit === 0 ? EXIT.PASS : EXIT.FAIL;
 }
 
+export interface InterfaceIO {
+  argv: readonly string[];
+  stdout: (line: string) => void;
+  stderr: (line: string) => void;
+  cwd: string;
+  readStdin: () => Promise<Uint8Array>;
+}
+
+type InterfaceArgs = { fixture: string; check: boolean } | { input: string };
+
+function parseInterfaceArgs(argv: readonly string[]): InterfaceArgs {
+  let fixture: string | null = null;
+  let input: string | null = null;
+  let check = false;
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (flag === '--check') {
+      check = true;
+      continue;
+    }
+    if (flag !== '--fixture' && flag !== '--input') throw new ArgError(`unknown interface argument '${flag}'`);
+    const value = argv[++i];
+    if (value === undefined) throw new ArgError(`${flag} requires a value`);
+    if (fixture !== null || input !== null) {
+      throw new ArgError('interface takes exactly one of --fixture <name> / --input <path|->');
+    }
+    if (flag === '--fixture') fixture = value;
+    else input = value;
+  }
+  if (fixture === null && input === null) throw new ArgError('interface requires --fixture <name> or --input <path|->');
+  if (input !== null) {
+    if (check) throw new ArgError('--check compares against a fixture; use it with --fixture <name>');
+    return { input };
+  }
+  return { fixture: fixture!, check };
+}
+
+/**
+ * `qa:check interface`: the interface.v1 oracle. Reads and validates the whole
+ * input before building, so an exit-2 run never prints a partial envelope.
+ * Exit 0 = a valid envelope was produced (any status; with --check it matched
+ * the fixture's expected.json); 1 = --check mismatch (the actual envelope is
+ * still printed for diffing); 2 = bad args / unreadable / malformed input
+ * (diagnostic on stderr, nothing on stdout).
+ */
+export async function runInterface(io: InterfaceIO): Promise<number> {
+  let line: string;
+  let expectedPath: string | null = null;
+  try {
+    const args = parseInterfaceArgs(io.argv);
+    let bytes: Uint8Array;
+    if ('fixture' in args) {
+      const path = interfaceCasePath(args.fixture, 'input.json');
+      bytes = await readFile(path).catch(() => {
+        throw new InterfaceInputError(`no fixture named '${args.fixture}'`);
+      });
+      if (args.check) expectedPath = interfaceCasePath(args.fixture, 'expected.json');
+    } else if (args.input === '-') {
+      bytes = await io.readStdin();
+    } else {
+      bytes = await readFile(resolve(io.cwd, args.input)).catch((err: NodeJS.ErrnoException) => {
+        throw new InterfaceInputError(`cannot read input file: ${err.code ?? err.message}`);
+      });
+    }
+    line = interfaceToLine(parseInterfaceInput(bytes));
+  } catch (err) {
+    if (!(err instanceof ArgError) && !(err instanceof InterfaceInputError)) throw err;
+    io.stderr(`qa-check interface: ${err.message}`);
+    return EXIT.USAGE;
+  }
+
+  if (expectedPath !== null) {
+    let expected: string;
+    try {
+      const bytes = await readFile(expectedPath);
+      expected = canonicalJson(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
+    } catch (err) {
+      io.stderr(`qa-check interface: cannot read expected.json: ${(err as Error).message}`);
+      return EXIT.USAGE;
+    }
+    io.stdout(line);
+    return line === expected ? EXIT.PASS : EXIT.FAIL;
+  }
+
+  io.stdout(line);
+  return EXIT.PASS;
+}
+
 async function readAllStdin(): Promise<Uint8Array> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -373,8 +473,9 @@ async function readAllStdin(): Promise<Uint8Array> {
 export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly string[] }): Promise<number> {
   const [sub, ...rest] = io.argv;
   if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
+  if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub !== 'acceptance') {
-    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance' or 'fold'`);
+    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', or 'interface'`);
     return EXIT.USAGE;
   }
   const controller = new AbortController();

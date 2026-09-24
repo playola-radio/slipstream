@@ -1,0 +1,12 @@
+{
+  "change_seq": "5",
+  "language": null,
+  "language_version": null,
+  "before": {
+    "status": "unavailable",
+    "reason": "before-blob-missing"
+  },
+  "after": {
+    "status": "notEvaluated"
+  }
+}

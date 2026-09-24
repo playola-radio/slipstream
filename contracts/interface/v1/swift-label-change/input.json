@@ -1,0 +1,43 @@
+{
+  "change_seq": "5",
+  "language": "swift",
+  "language_version": "swift.v1",
+  "before": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "method",
+          "scope": [],
+          "name": "move",
+          "guards": []
+        },
+        "display_name": "move(from:)",
+        "signature": "func move(from p: Point)",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 40
+        }
+      }
+    ]
+  },
+  "after": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "method",
+          "scope": [],
+          "name": "move",
+          "guards": []
+        },
+        "display_name": "move(at:)",
+        "signature": "func move(at p: Point)",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 40
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,1 @@
+{"change_seq":"5","changes":[],"coverage":{"after":{"reason":"after-parse-error","state":"incomplete"},"before":{"state":"complete"}},"fallback_reason":"after-parse-error","language":"typescript","language_version":"typescript.v1","projection_version":"interface.v1","status":"incomplete"}

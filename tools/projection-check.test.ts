@@ -11,6 +11,7 @@ import {
   runAcceptance,
   runModule,
   runFold,
+  runInterface,
   main,
   EXIT,
   ArgError,
@@ -464,5 +465,95 @@ describe('fold subcommand', () => {
     const code = await main({ argv: ['fold', '--fixture', 'empty'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     assert.equal(code, EXIT.PASS);
     assert.deepEqual(out, [EMPTY_OK]);
+  });
+});
+
+describe('interface subcommand', () => {
+  const tmpDirs: string[] = [];
+  after(async () => {
+    for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true });
+  });
+  async function tmpFile(content: string | Uint8Array): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'iface-cli-'));
+    tmpDirs.push(dir);
+    const path = join(dir, 'input.json');
+    await writeFile(path, content);
+    return path;
+  }
+
+  async function iface(argv: string[], stdin = ''): Promise<{ code: number; out: string[]; err: string[] }> {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runInterface({
+      argv,
+      stdout: (l) => out.push(l),
+      stderr: (l) => err.push(l),
+      cwd: process.cwd(),
+      readStdin: async () => new TextEncoder().encode(stdin),
+    });
+    return { code, out, err };
+  }
+
+  const minimal = JSON.stringify({
+    change_seq: '5',
+    language: 'typescript',
+    language_version: 'typescript.v1',
+    before: { status: 'complete', declarations: [] },
+    after: { status: 'complete', declarations: [] },
+  });
+
+  it('prints a canonical envelope for a fixture and exits 0', async () => {
+    const { code, out } = await iface(['--fixture', 'unchanged']);
+    assert.equal(code, EXIT.PASS);
+    assert.equal(JSON.parse(out[0]!).status, 'ready');
+  });
+
+  it('exits 0 for a fixture that matches its expected.json under --check', async () => {
+    assert.equal((await iface(['--fixture', 'row-ordering', '--check'])).code, EXIT.PASS);
+  });
+
+  it('is byte-deterministic across runs', async () => {
+    const a = await iface(['--fixture', 'signature-changed']);
+    const b = await iface(['--fixture', 'signature-changed']);
+    assert.deepEqual(a.out, b.out);
+  });
+
+  it('builds an envelope from a file path and from stdin', async () => {
+    const path = await tmpFile(minimal);
+    assert.equal((await iface(['--input', path])).code, EXIT.PASS);
+    assert.equal((await iface(['--input', '-'], minimal)).code, EXIT.PASS);
+  });
+
+  const usage: Array<[string, string[]]> = [
+    ['no selector', []],
+    ['both selectors', ['--fixture', 'unchanged', '--input', '-']],
+    ['a repeated selector', ['--fixture', 'unchanged', '--fixture', 'rename']],
+    ['a selector without a value', ['--fixture']],
+    ['an unknown flag', ['--fixture', 'unchanged', '--pretty']],
+    ['a missing fixture', ['--fixture', 'no-such-case']],
+    ['a fixture name that escapes the corpus', ['--fixture', '../v1']],
+    ['a missing input file', ['--input', '/nonexistent/slipstream-iface-input.json']],
+    ['--check without a fixture', ['--input', '-', '--check']],
+  ];
+  for (const [name, argv] of usage) {
+    it(`exits 2 with nothing on stdout for ${name}`, async () => {
+      const { code, out, err } = await iface(argv);
+      assert.equal(code, EXIT.USAGE);
+      assert.deepEqual(out, []);
+      assert.ok(err.length > 0);
+    });
+  }
+
+  it('exits 2 on malformed JSON with nothing on stdout', async () => {
+    const { code, out } = await iface(['--input', '-'], '{not json');
+    assert.equal(code, EXIT.USAGE);
+    assert.deepEqual(out, []);
+  });
+
+  it('is reachable through main', async () => {
+    const out: string[] = [];
+    const code = await main({ argv: ['interface', '--fixture', 'unchanged'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
+    assert.equal(code, EXIT.PASS);
+    assert.equal(JSON.parse(out[0]!).status, 'ready');
   });
 });

@@ -1,0 +1,47 @@
+{
+  "change_seq": "5",
+  "language": "typescript",
+  "language_version": "typescript.v1",
+  "before": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "trace",
+          "guards": [
+            "DEBUG"
+          ]
+        },
+        "display_name": "trace",
+        "signature": "func trace()",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 40
+        }
+      }
+    ]
+  },
+  "after": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "trace",
+          "guards": [
+            "!(DEBUG)"
+          ]
+        },
+        "display_name": "trace",
+        "signature": "func trace()",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 42
+        }
+      }
+    ]
+  }
+}

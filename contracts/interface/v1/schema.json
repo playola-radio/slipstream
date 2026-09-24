@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/projections/interface.v1.json",
+  "title": "interface.v1",
+  "$comment": "Reader-derived projection over two file versions reporting added/removed/signatureChanged named declarations. No log event, seq or policy_seq is appended. Spans cover whole-declaration raw UTF-8 byte ranges. Correspondence is exact identity + exact signature (D3), never similarity scoring or rename detection; identity is a matching key, not proof of rename continuity. Not served until the schema-serving PR adds interface.v1 to the allowlist.",
+  "type": "object",
+  "required": [
+    "change_seq",
+    "projection_version",
+    "language",
+    "language_version",
+    "status",
+    "coverage",
+    "changes"
+  ],
+  "properties": {
+    "change_seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "$comment": "The `seq` of the file.changed event this projection is derived from. Stamped on the response; never part of the cache key."
+    },
+    "projection_version": {
+      "const": "interface.v1"
+    },
+    "language": {
+      "type": ["string", "null"],
+      "$comment": "Plain string, never an enum — the language set grows PR by PR. null exactly when there is no language module (status unsupported)."
+    },
+    "language_version": {
+      "type": ["string", "null"],
+      "$comment": "Names the pinned extractor version. null exactly when there is no language module (status unsupported)."
+    },
+    "status": {
+      "enum": [
+        "ready",
+        "incomplete",
+        "unavailable",
+        "unsupported",
+        "skipped"
+      ],
+      "$comment": "ready: both sides complete/absent and comparison succeeded. incomplete: a side failed to extract, or a duplicate/ambiguous correspondence made the comparison untrustworthy. unavailable: a content blob was missing. unsupported: no language module. skipped: admission rejected, timed out, or was cancelled."
+    },
+    "fallback_reason": {
+      "type": "string",
+      "$comment": "Required on every non-ready status, omitted on ready: before-parse-error, after-parse-error, duplicate-declaration, ambiguous-correspondence, before-blob-missing, after-blob-missing, unsupported-language, overloaded, timeout, cancelled."
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["before", "after"],
+      "properties": {
+        "before": { "$ref": "#/$defs/coverageSide" },
+        "after": { "$ref": "#/$defs/coverageSide" }
+      }
+    },
+    "changes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/change" },
+      "$comment": "Always empty unless status is ready (DA-3: a partial view emits no rows). Rows are sorted removed, then signatureChanged, then added; within a kind by the D8 ordering tuple."
+    }
+  },
+  "if": {
+    "properties": { "status": { "const": "ready" } }
+  },
+  "then": {},
+  "else": {
+    "required": ["fallback_reason"]
+  },
+  "$defs": {
+    "coverageSide": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": [
+            "complete",
+            "absent",
+            "incomplete",
+            "unavailable",
+            "unsupported",
+            "notEvaluated"
+          ],
+          "$comment": "Each side reports its own actual extraction state even when its reason lost status precedence. complete: fully extracted (may hold zero declarations). absent: the file did not exist in this version. notEvaluated: extraction was never reached (skip/cancel)."
+        },
+        "reason": {
+          "type": "string",
+          "$comment": "Present for incomplete/unavailable states (e.g. before-parse-error, before-blob-missing)."
+        }
+      }
+    },
+    "change": {
+      "type": "object",
+      "required": ["kind", "identity", "before", "after"],
+      "properties": {
+        "kind": {
+          "enum": ["added", "removed", "signatureChanged"]
+        },
+        "identity": { "$ref": "#/$defs/identity" },
+        "before": {
+          "$ref": "#/$defs/declaration",
+          "$comment": "null for added. Present for removed and signatureChanged."
+        },
+        "after": {
+          "$ref": "#/$defs/declaration",
+          "$comment": "null for removed. Present for added and signatureChanged."
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "required": ["kind", "scope", "name", "guards"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "$comment": "The declaration kind, e.g. function, method, constructor. A plain string, never an enum."
+        },
+        "scope": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/scopeSegment" },
+          "$comment": "Enclosing scopes, outermost first; empty at top level."
+        },
+        "name": {
+          "type": "string",
+          "$comment": "The base declared name. Overload-distinguishing detail (e.g. Swift argument labels) lives in the signature, not here."
+        },
+        "guards": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "Syntactic #if guard nesting, outer to inner; empty when unguarded. Part of identity: a guard change is remove+add, not signatureChanged."
+        }
+      }
+    },
+    "scopeSegment": {
+      "type": "object",
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "declaration": {
+      "type": ["object", "null"],
+      "$comment": "A declaration record, or null for the absent side of an added/removed row.",
+      "required": ["kind", "display_name", "signature", "span"],
+      "properties": {
+        "kind": { "type": "string" },
+        "display_name": {
+          "type": "string",
+          "$comment": "The qualified, human-facing name."
+        },
+        "signature": {
+          "type": "string",
+          "$comment": "Opaque normalized signature compared only by exact equality."
+        },
+        "span": { "$ref": "#/$defs/span" }
+      }
+    },
+    "span": {
+      "type": "object",
+      "required": ["byte_start", "byte_end"],
+      "properties": {
+        "byte_start": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based inclusive start byte offset of the whole declaration."
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "$comment": "Zero-based exclusive end byte offset; the span is [byte_start, byte_end) over raw UTF-8 bytes."
+        }
+      }
+    }
+  }
+}
