@@ -14,6 +14,7 @@ import { createClipProjectionService } from './clip-projection-service.ts';
 import { languageForPath } from './clip-language.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
+import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
 export interface ReaderServerOptions {
@@ -31,6 +32,9 @@ export interface ReaderServer {
 }
 
 const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
+// The display-rules version every successful /events reply is interpreted under
+// (DA-2). Sourced from the single contract constant, never a second literal.
+const FOLD_CONTRACT_HEADER = 'slipstream-fold-contract';
 
 const SSE_HEARTBEAT_MS = 15000;
 const DRAIN_DEADLINE_MS = 10000;
@@ -340,6 +344,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
           'cache-control': 'no-store',
           'content-type': 'application/x-ndjson; charset=utf-8',
           [DURABLE_SEQ_HEADER]: H.toString(),
+          [FOLD_CONTRACT_HEADER]: DISPLAY_FOLD_CONTRACT,
         });
         for (let seq = effectiveAfter; seq < H;) {
           if (ac.signal.aborted) return;
@@ -393,7 +398,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       else res.destroy();
       return;
     }
-    res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/event-stream; charset=utf-8' });
+    res.writeHead(200, {
+      'cache-control': 'no-store',
+      'content-type': 'text/event-stream; charset=utf-8',
+      [FOLD_CONTRACT_HEADER]: DISPLAY_FOLD_CONTRACT,
+    });
     res.flushHeaders();
 
     // Serialize every write (events and heartbeats) through the bounded path so
