@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Four subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Five subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
