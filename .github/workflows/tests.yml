@@ -46,6 +46,14 @@ jobs:
       - name: Run tool tests
         run: npm run test:tools
 
-      - name: Check display-fold release immutability
+      - name: Check display-fold release immutability (pull request)
         if: github.event_name == 'pull_request'
         run: npm run check:fold-release -- --base ${{ github.event.pull_request.base.sha }}
+
+      - name: Check display-fold release immutability (push)
+        if: github.event_name == 'push'
+        # `before` is the pre-push tip of this branch — the right baseline for what
+        # THIS push changed. It's all-zeros for a brand-new branch/force-created ref,
+        # which the checker already fails closed on (unresolved base = non-zero exit),
+        # so this never silently skips the gate.
+        run: npm run check:fold-release -- --base ${{ github.event.before }}
