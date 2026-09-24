@@ -306,6 +306,44 @@ ref that does not resolve.
 See `DISPLAY-FOLD.md` for the header rules, the manifest shape, and how to release
 `display-fold.v2`.
 
+### Admission checker (`admission`) and the `T5b.1` check
+
+`node tools/projection-check.ts admission` exercises the shared projection
+admission budget (`src/projection-admission.ts`) with synthetic jobs — no clip or
+interface code — against the REAL budget module, then checks its invariants (peak
+running work never exceeds `C`, peak waiting work never exceeds `Q`). Exit codes:
+
+- `0`: the invariants held.
+- `1`: an invariant was violated (the JSON still prints, with `violations`).
+- `2`: bad arguments or an unreadable/invalid trace. Nothing goes to stdout.
+
+```
+node tools/projection-check.ts admission --saturate                       # burst two workloads over the bound
+node tools/projection-check.ts admission --saturate --clip 6 --synthetic 6 --job-ms 200
+node tools/projection-check.ts admission --check-trace over-c.json         # validate a supplied trace
+```
+
+`--saturate` prints one JSON line: `submitted`, `admitted`, `overloaded`, `ok`,
+`timeouts`, `errors`, `activeMax`, `queueMax`, the `config` in effect (`C/Q/W/D`),
+and `invariantsHeld`. The provisional shared config (`C=2 Q=8 W=8 D=100`, not yet
+approved — see `ADMISSION.md`) with the default load overloads a couple of requests
+and times the rest out, so a green run shows the bound actually engaged.
+
+`--check-trace <path>` reuses the same pure invariant check on a trace supplied as
+JSON. A fabricated trace whose `activeMax` exceeds `config.C` is the negative
+control: the checker must exit 1 on it, which is what makes a passing `--saturate`
+run meaningful.
+
+`npm run qa:check -- --pr T5b.1` runs both angles:
+
+- LIVE (public reader): a real `.ts` change still yields a computed clip projection;
+  a repeated read is byte-identical (cache/coalescing preserved); a burst of 24
+  concurrent clip reads does not starve capture of a file written during the burst.
+- FIXTURE (checker child process): the `--saturate` invariants hold while overload
+  and timeouts occur, and the negative-control trace is rejected with exit 1.
+
+The report labels each claim LIVE or FIXTURE.
+
 ### Cleanup
 
 `qa:daemon` removes its owned root on a clean default shutdown (retained under

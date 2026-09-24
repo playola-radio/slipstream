@@ -88,12 +88,15 @@ workload maps to its own disposition.
    full), so a queued clip stuck behind a busy clip worker does not block an interface
    job while global capacity is free.
 
-5. **Shutdown ordering.** The **reader** owns the shared budget and injects it into each
-   service; services own their pools. (For T5b.1 the interface service does not exist yet,
-   so the clip service constructs a **private** budget by default and accepts an injected
-   one — this preserves the existing clip constructor/test API and lets T5b.2 pass a
-   shared instance.) Closing a service that was given an injected budget must cancel only
-   **that** service's work, never shut down other workloads.
+5. **Shutdown ordering.** The end state: the **reader** owns one shared budget and hands
+   it to each service; services own their pools. (For T5b.1 the interface service does not
+   exist yet, so the clip service constructs and owns a **private** budget instance with no
+   injection seam — the module is already workload-agnostic and is proven multi-workload by
+   its synthetic tests, so adding an unused injection parameter now would be speculative
+   generality. Wiring the reader-owned shared instance into both services is T5b.2's job.)
+   Closing a service must cancel only **that** service's work, never shut down other
+   workloads — which is why the clip service closes its own budget today, and why a future
+   shared, reader-owned budget must not be closed by any single service.
 
    Order on shutdown: synchronously mark the budget closed and disable dispatch, settle
    queued/waiting units (`closed`), then let the workload's own pool `close()` perform the
