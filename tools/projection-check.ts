@@ -198,7 +198,15 @@ export async function runAcceptance(io: RunIO): Promise<number> {
   // being refused for the real reason — and the sandbox safety check would never run.
   let env: QaEnv | null = null;
   if (args.env !== null) {
-    env = await readQaEnv(args.env);
+    try {
+      env = await readQaEnv(args.env);
+    } catch (err) {
+      // A missing or malformed --env is an operator-input error, like a bad flag:
+      // report it as USAGE with a clear message rather than letting it reach the
+      // fatal handler as an uncaught stack trace with no diagnosable output.
+      io.stderr(`qa-check: --env ${args.env} could not be read: ${(err as Error).message}`);
+      return EXIT.USAGE;
+    }
     if (env.daemon_commit !== head) {
       io.stderr(`qa-check: --env daemon_commit ${env.daemon_commit} does not match HEAD ${head}; refusing to run against a stale daemon`);
       return EXIT.USAGE;

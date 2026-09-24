@@ -222,6 +222,37 @@ describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
     assert.ok(sink.err.some((l) => /ownership marker/.test(l)));
   });
 
+  it('refuses a missing or malformed --env file with USAGE and a message, not a stack trace or lost report', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    // Missing file.
+    const missing = { out: [] as string[], err: [] as string[] };
+    const missingCode = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', join(dir, 'does-not-exist.json')],
+      stdout: (l) => missing.out.push(l),
+      stderr: (l) => missing.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(missingCode, EXIT.USAGE);
+    assert.equal(missing.out.length, 0, 'a bad --env must never print a report');
+    assert.ok(missing.err.some((l) => /--env .* could not be read/.test(l)));
+    // Malformed JSON.
+    const badPath = join(dir, 'malformed.json');
+    await writeFile(badPath, '{ not json');
+    const bad = { out: [] as string[], err: [] as string[] };
+    const badCode = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', badPath],
+      stdout: (l) => bad.out.push(l),
+      stderr: (l) => bad.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(badCode, EXIT.USAGE);
+    assert.equal(bad.out.length, 0);
+    assert.ok(bad.err.some((l) => /--env .* could not be read/.test(l)));
+  });
+
   it('refuses an --env worktree that is a symlink, even under an owned root (writes must not escape)', async () => {
     const head = await gitHead(process.cwd());
     const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
