@@ -100,17 +100,19 @@ export async function runSaturation(opts: SaturateOptions): Promise<AdmissionTra
   };
 
   const admits: Promise<AdmitOutcome<string>>[] = [];
-  const submit = (workload: string, localConcurrency: number, count: number): void => {
-    for (let i = 0; i < count; i++) {
-      admits.push(budget.admit<string>({ workload, localConcurrency, key: `${workload}:${i}`, run: makeRun() }));
-      sampleQueue();
-    }
+  let seq = 0;
+  // Distinct keys per job so each is its own leader: the burst fills running slots
+  // and then the queue, exercising queue admission and queued expiry. (A shared key
+  // would collapse everything into one compute plus coalesced waiters instead.)
+  const submit = (workload: string, localConcurrency: number): void => {
+    admits.push(budget.admit<string>({ workload, localConcurrency, key: `${workload}:${seq++}`, run: makeRun() }));
+    sampleQueue();
   };
   // Interleave the two workloads so both compete for the shared budget.
   const rounds = Math.max(opts.clip, opts.synthetic);
   for (let i = 0; i < rounds; i++) {
-    if (i < opts.clip) submit('clip', 1, 1);
-    if (i < opts.synthetic) submit('synthetic', config.C, 1);
+    if (i < opts.clip) submit('clip', 1);
+    if (i < opts.synthetic) submit('synthetic', config.C);
   }
   sampleQueue();
 
@@ -130,6 +132,22 @@ export async function runSaturation(opts: SaturateOptions): Promise<AdmissionTra
     config, submitted, admitted: submitted - overloaded,
     overloaded, ok, timeouts, errors, activeMax, queueMax,
   };
+}
+
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** A supplied trace must carry the full config (C/Q/W/D) and every count field as
+ * finite numbers; otherwise the invariant check would silently skip a bound (e.g.
+ * a trace missing config.Q could smuggle an unbounded queueMax past the gate). */
+function isValidTrace(t: unknown): t is AdmissionTrace {
+  if (typeof t !== 'object' || t === null) return false;
+  const trace = t as Record<string, unknown>;
+  const cfg = trace.config;
+  if (typeof cfg !== 'object' || cfg === null) return false;
+  const c = cfg as Record<string, unknown>;
+  if (!(['C', 'Q', 'W', 'D'] as const).every((k) => isFiniteNumber(c[k]))) return false;
+  const fields = ['submitted', 'admitted', 'overloaded', 'ok', 'timeouts', 'errors', 'activeMax', 'queueMax'] as const;
+  return fields.every((f) => isFiniteNumber(trace[f]));
 }
 
 export class AdmissionArgError extends Error {}
@@ -204,16 +222,18 @@ export async function runAdmission(io: AdmissionIO): Promise<number> {
       io.stderr(`admission: cannot read trace: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
       return EXIT.USAGE;
     }
+    let parsedTrace: unknown;
     try {
-      trace = JSON.parse(raw) as AdmissionTrace;
+      parsedTrace = JSON.parse(raw);
     } catch {
       io.stderr('admission: trace is not valid JSON');
       return EXIT.USAGE;
     }
-    if (typeof trace?.config?.C !== 'number' || typeof trace.activeMax !== 'number') {
-      io.stderr('admission: trace is missing required fields (config.C, activeMax)');
+    if (!isValidTrace(parsedTrace)) {
+      io.stderr('admission: trace is malformed (config C/Q/W/D and all count fields must be finite numbers)');
       return EXIT.USAGE;
     }
+    trace = parsedTrace;
   }
 
   const verdict = checkAdmissionInvariants(trace);

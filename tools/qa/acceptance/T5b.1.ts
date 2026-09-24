@@ -105,23 +105,51 @@ async function cacheClaim(ctx: AcceptanceContext, seq: string): Promise<Assertio
   };
 }
 
-/** LIVE: a burst of clip reads must not starve capture. Fire many concurrent
- * reads while writing a NEW file, and require that new change to still be observed
- * on the public events feed within the deadline. */
-async function captureNotStarvedClaim(ctx: AcceptanceContext, seqs: string[], cursor: bigint): Promise<Assertion> {
-  const burst: Promise<unknown>[] = [];
-  for (let i = 0; i < 24; i++) {
-    const seq = seqs[i % seqs.length]!;
-    burst.push(ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/changes/${seq}/clips`, { signal: ctx.signal })
-      .then((r) => { if (r.status !== 200) fail(`a clip read during the burst returned HTTP ${r.status}`); }));
+/** GET a change's clips during the burst; require HTTP 200 and return its status.
+ * The clip service maps a shed request (overloaded/timeout/worker-error) to a
+ * transient envelope with HTTP 200, so status — not the HTTP code — tells shed
+ * apart from computed. */
+async function readClipStatus(ctx: AcceptanceContext, seq: string): Promise<string> {
+  const r = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/changes/${seq}/clips`, { signal: ctx.signal });
+  if (r.status !== 200) fail(`a clip read during the burst returned HTTP ${r.status}`);
+  return (JSON.parse(r.body.toString('utf8')) as ClipProjection).status;
+}
+
+/** LIVE: real projection load must not starve capture. Contend for clip's single
+ * budget slot with concurrent reads over several DISTINCT COLD changes (each a real
+ * uncomputed projection, not a cache hit), and require that a file written during
+ * the load is still observed on the public events feed within the deadline. Some
+ * reads may be shed by the bound — that is the bound working, not starvation. */
+async function captureNotStarvedClaim(ctx: AcceptanceContext, startCursor: bigint): Promise<Assertion> {
+  const coldSeqs: string[] = [];
+  let cursor = startCursor;
+  for (let i = 0; i < 6; i++) {
+    const rel = `t5b1-cold-${i}-${randomUUID()}.ts`;
+    const observed = await writeAndObserve(ctx, rel, `export const cold${i} = () => ${i};\n`, cursor);
+    coldSeqs.push(observed.seq);
+    cursor = observed.cursor;
   }
+
+  // Concurrent reads over distinct cold seqs: duplicate reads of one seq coalesce,
+  // distinct seqs each need their own compute, so the single-slot budget genuinely
+  // queues and sheds while the load is in flight.
+  const statuses: Promise<string>[] = [];
+  for (let round = 0; round < 3; round++) {
+    for (const seq of coldSeqs) statuses.push(readClipStatus(ctx, seq));
+  }
+
   const rel = `t5b1-under-load-${randomUUID()}.ts`;
+  const t0 = Date.now();
   const observed = writeAndObserve(ctx, rel, 'export const underLoad = () => 1;\n', cursor);
-  const [, { seq: newSeq }] = await Promise.all([Promise.all(burst), observed]);
+  const [resolved, { seq: newSeq }] = await Promise.all([Promise.all(statuses), observed]);
+  const captureMs = Date.now() - t0;
+
+  const computed = resolved.filter((s) => s === 'ready' || s === 'fallback').length;
+  const shed = resolved.filter((s) => s !== 'ready' && s !== 'fallback').length;
   return {
     id: 'capture-not-starved-by-clip-load',
-    claim: 'LIVE: while 24 concurrent clip reads are in flight, a newly written source file is still captured and served on the public events feed, so the shared admission bound keeps clip CPU off the capture path',
-    evidence: { concurrent_reads: 24, new_change_seq: newSeq },
+    claim: 'LIVE: while concurrent clip reads over 6 distinct cold changes contend for the single-slot clip budget, a newly written source file is still observed on the public events feed within the deadline; some reads may return the transient shed envelope, which is the shared bound working rather than capture starvation',
+    evidence: { distinct_cold_changes: coldSeqs.length, concurrent_reads: resolved.length, computed, shed, new_change_seq: newSeq, capture_ms: captureMs },
   };
 }
 
@@ -204,7 +232,7 @@ export const t5b1: AcceptanceModule = {
       assertions: [
         await computesClaim(ctx, seqs[0]!),
         await cacheClaim(ctx, seqs[0]!),
-        await captureNotStarvedClaim(ctx, seqs, cursor),
+        await captureNotStarvedClaim(ctx, cursor),
         saturationClaim(),
         await negativeControlClaim(),
       ],

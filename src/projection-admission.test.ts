@@ -246,6 +246,81 @@ test('a queued burst is promoted first-in-first-out', async () => {
   await budget.close();
 });
 
+test('a throwing cancel does not strand the leader or its waiters on close', async () => {
+  // Regression: settle cancels before releasing the flight and resolving. A cancel
+  // that throws must not skip that cleanup, or the leader hangs forever.
+  const budget = createProjectionAdmission({ C: 1, Q: 8, W: 8, D: 60_000 });
+  const leader = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1, key: 'K',
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => { throw new Error('cancel blew up'); } }),
+  });
+  const waiter = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1, key: 'K',
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => {} }),
+  });
+  await budget.close();
+  assert.deepEqual(await leader, { kind: 'closed' });
+  assert.deepEqual(await waiter, { kind: 'closed' });
+  assert.deepEqual(budget.snapshot(), { running: 0, queued: 0, waiters: 0 });
+});
+
+test('identical keys across different workloads never coalesce', async () => {
+  // Regression: a key-only flight map would hand the interface waiter the clip
+  // leader's result, despite their different declared result types.
+  const budget = createProjectionAdmission({ C: 2, Q: 8, W: 8, D: 60_000 });
+  let ifaceRan = false;
+  const clip = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1, key: 'K',
+    run: () => ({ promise: Promise.resolve('clip-value'), cancel: () => {} }),
+  });
+  const iface = budget.admit<string>({
+    workload: 'iface', localConcurrency: 1, key: 'K',
+    run: () => { ifaceRan = true; return { promise: Promise.resolve('iface-value'), cancel: () => {} }; },
+  });
+  assert.deepEqual(await clip, { kind: 'ok', value: 'clip-value' });
+  assert.deepEqual(await iface, { kind: 'ok', value: 'iface-value' });
+  assert.equal(ifaceRan, true);
+  await budget.close();
+});
+
+test('close does not dispatch a queued compute', async () => {
+  // Regression: pump() must refuse to run while closed, or shutdown starts (and
+  // then immediately cancels) queued work.
+  const budget = createProjectionAdmission({ C: 1, Q: 4, W: 4, D: 60_000 });
+  const g = gate();
+  let queuedRan = false;
+  const active = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1, key: 'a',
+    run: () => ({ promise: g.promise, cancel: () => {} }),
+  });
+  const queued = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1, key: 'b',
+    run: () => { queuedRan = true; return { promise: Promise.resolve('v'), cancel: () => {} }; },
+  });
+  await budget.close();
+  assert.deepEqual(await active, { kind: 'closed' });
+  assert.deepEqual(await queued, { kind: 'closed' });
+  assert.equal(queuedRan, false);
+});
+
+test('a compute that rejects after its deadline settles timeout, not error', async () => {
+  // Regression: only the success path checked the absolute deadline. A rejection
+  // whose microtask beats the overdue timer must still settle timeout.
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 1, D: 20 });
+  const g = gate();
+  const p = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1,
+    run: () => ({ promise: g.promise, cancel: () => {} }),
+  });
+  // Spin past the deadline WITHOUT yielding, so the deadline timer (a macrotask)
+  // has not fired; then reject synchronously so its microtask runs first.
+  const until = Date.now() + 40;
+  while (Date.now() < until) { /* busy-wait */ }
+  g.reject(new Error('worker died'));
+  assert.deepEqual(await p, { kind: 'timeout' });
+  await budget.close();
+});
+
 test('a rejected compute promise settles error, releasing the slot', async () => {
   const budget = createProjectionAdmission({ C: 1, Q: 1, W: 1, D: 1000 });
   const first = await budget.admit<string>({

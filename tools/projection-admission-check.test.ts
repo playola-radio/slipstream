@@ -150,6 +150,18 @@ describe('runAdmission CLI', () => {
     assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
   });
 
+  it('rejects a partial trace instead of skipping an unchecked bound', async () => {
+    // config.Q is absent, so the queue bound could not be enforced; a permissive
+    // validator would let queueMax=999 pass. It must be USAGE, never PASS.
+    const path = await tmpTrace(JSON.stringify({
+      config: { C: 2, W: 8, D: 100 },
+      submitted: 1, admitted: 1, overloaded: 0, ok: 1, timeouts: 0, errors: 0, activeMax: 1, queueMax: 999,
+    }));
+    const s = sink();
+    assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
+    assert.equal(s.out.length, 0);
+  });
+
   it('is reachable through main', async () => {
     const out: string[] = [];
     const code = await main({ argv: ['admission', '--saturate', '--clip', '2', '--synthetic', '2', '--job-ms', '60'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });

@@ -44,7 +44,7 @@ export type AdmitOutcome<T> =
   | { kind: 'timeout' }
   | { kind: 'overloaded' }
   | { kind: 'closed' }
-  | { kind: 'error'; error: unknown };
+  | { kind: 'error' };
 
 export interface AdmissionConfig {
   /** Max computes executing at once, across all workloads. */
@@ -67,7 +67,6 @@ export interface ProjectionAdmission {
   admit<T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>>;
   close(): Promise<void>;
   snapshot(): AdmissionSnapshot;
-  readonly config: Readonly<AdmissionConfig>;
 }
 
 // PROVISIONAL — not approved, not measured. A starting point for the combined-load
@@ -102,7 +101,11 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   const runningByWorkload = new Map<string, number>();
   const queue: Unit[] = []; // queued leaders, FIFO
   let waiters = 0;
-  const inFlight = new Map<string, Flight>(); // leader (running or queued) per key
+  // Flights are keyed by (workload, key), never key alone: two workloads may reuse
+  // the same coalescing key for unrelated computes, and a waiter must never receive
+  // another workload's result (its declared result type differs).
+  const inFlight = new Map<string, Flight>();
+  const flightKey = (workload: string, key: string): string => `${workload}\u0000${key}`;
   const live = new Set<Unit>();
   let closed = false;
   let pumping = false;
@@ -123,9 +126,10 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
 
   const releaseFlight = (leader: Unit, outcome: AdmitOutcome<unknown>): void => {
     if (leader.key === undefined) return;
-    const flight = inFlight.get(leader.key);
+    const fk = flightKey(leader.workload, leader.key);
+    const flight = inFlight.get(fk);
     if (!flight || flight.leader !== leader) return;
-    inFlight.delete(leader.key);
+    inFlight.delete(fk);
     for (const waiter of [...flight.waiters]) settle(waiter, outcome);
   };
 
@@ -139,7 +143,10 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     if (prev === 'running') {
       decRunning(unit.workload);
       // Cancel only when forcibly ending unfinished work; ok/error already settled.
-      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed')) unit.handle.cancel();
+      // Fire-and-forget: a throwing cancel must not skip flight release or resolution.
+      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed')) {
+        try { unit.handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
+      }
       releaseFlight(unit, outcome);
     } else if (prev === 'queued') {
       const i = queue.indexOf(unit);
@@ -147,7 +154,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       releaseFlight(unit, outcome);
     } else if (prev === 'waiting') {
       waiters--;
-      if (unit.key !== undefined) inFlight.get(unit.key)?.waiters.delete(unit);
+      if (unit.key !== undefined) inFlight.get(flightKey(unit.workload, unit.key))?.waiters.delete(unit);
     }
 
     unit.resolve(outcome);
@@ -158,8 +165,14 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     let handle: ComputeHandle<unknown>;
     try {
       handle = unit.run();
-    } catch (error) {
-      settle(unit, { kind: 'error', error });
+    } catch {
+      settle(unit, { kind: 'error' });
+      return;
+    }
+    // run() may have settled this unit reentrantly (e.g. it closed the budget). The
+    // handle it returned is then untracked, so cancel it and stop — never install it.
+    if (unit.state === 'settled') {
+      try { handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
       return;
     }
     unit.handle = handle;
@@ -169,18 +182,20 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
         settle(unit, { kind: 'ok', value });
       },
-      (error) => {
+      () => {
         if (unit.state === 'settled') return;
-        settle(unit, { kind: 'error', error });
+        // A rejection after the deadline is a timeout, not a worker error.
+        if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
+        settle(unit, { kind: 'error' });
       },
     );
   };
 
   const pump = (): void => {
-    if (pumping) return;
+    if (pumping || closed) return; // shutdown never dispatches queued computes
     pumping = true;
     try {
-      while (running < C) {
+      while (running < C && !closed) {
         // Oldest runnable queued leader: FIFO, but skip one whose workload cap is full
         // so a queued clip behind a busy clip worker cannot block another workload.
         let idx = -1;
@@ -215,10 +230,12 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         handle: undefined,
       };
 
+      const fk = req.key !== undefined ? flightKey(req.workload, req.key) : undefined;
+
       // Coalesce onto an existing flight (a running or queued leader for this key).
       // Lookup, reservation, and attachment are synchronous — no intervening await.
-      if (req.key !== undefined) {
-        const flight = inFlight.get(req.key);
+      if (fk !== undefined) {
+        const flight = inFlight.get(fk);
         if (flight) {
           if (pending() >= Q || waiters >= W) { resolve({ kind: 'overloaded' }); return; }
           waiters++;
@@ -234,7 +251,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       if (running < C && runningOf(req.workload) < req.localConcurrency) {
         unit.state = 'running';
         incRunning(req.workload);
-        if (req.key !== undefined) inFlight.set(req.key, { leader: unit, waiters: new Set() });
+        if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
         arm(unit);
         live.add(unit);
         startCompute(unit);
@@ -243,7 +260,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       if (pending() < Q) {
         unit.state = 'queued';
         queue.push(unit);
-        if (req.key !== undefined) inFlight.set(req.key, { leader: unit, waiters: new Set() });
+        if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
         arm(unit);
         live.add(unit);
         return;
@@ -261,5 +278,5 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
 
   const snapshot = (): AdmissionSnapshot => ({ running, queued: queue.length, waiters });
 
-  return { admit, close, snapshot, config };
+  return { admit, close, snapshot };
 }
