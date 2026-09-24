@@ -78,7 +78,16 @@ to a dedicated `node --liftoff-only` child process
 (`tools/swift-parse-host.ts`). The checker, the test runner, the acceptance
 runner, and the daemon spawn that child and never load the grammar themselves, so
 a stray parse can never take them down. Merely *importing* `src/swift-grammar.ts`
-is safe — nothing initializes eagerly.
+is safe — nothing initializes eagerly, not even resolving the artifact path (a
+missing install surfaces as the host's exit-2 artifact failure, never an uncaught
+throw during import).
+
+The boundary is **enforced, not merely conventional**: `loadSwiftLanguage`
+refuses to run unless the process was launched with `--liftoff-only`
+(inherited by worker threads), throwing `SwiftArtifactError` instead of aborting
+the host a second later. The only escape is the `SLIPSTREAM_SWIFT_ALLOW_UNISOLATED`
+env var, which *only* the OOM negative control sets so it can reach the load and
+prove the default launch really does abort.
 
 This is proven, not asserted: the `survive` operation parses and then stays alive
 past the observed crash window under `--liftoff-only` (passes), and the same
@@ -94,25 +103,50 @@ check.
 
 A parse runs inside a terminable `worker_thread`. A synchronous parse cannot be
 interrupted from inside, so cancellation is `worker.terminate()` (a hard kill).
-The `cancel-demo` operation starts a pathological parse, proves it is under way,
-terminates it mid-flight, then parses clean input to completion in a fresh
-worker — demonstrating the runtime recovers. Proven in `tools/swift-parse.test.ts`
-and the acceptance check.
+
+Because the parse is synchronous, the worker can only post `started` *just
+before* it blocks — that alone does not prove an in-flight interruption (the
+parse could have finished before the terminate landed). So the `cancel-demo`
+operation additionally **confirms the parse is still unfinished** at termination:
+it watches the worker's `done` message and asserts it is still pending after a
+beat (`inProgressAtCancel`). If a pathological input finished too fast to
+interrupt, that flag is false and the acceptance check **fails honestly** rather
+than claiming a cancellation that did not happen. It then measures the
+termination time and parses clean input to completion in a fresh worker,
+demonstrating the runtime recovers.
+
+Observed: a 200k-block pathological parse is still running when terminated;
+`worker.terminate()` returns in ~2 ms; the replacement parse is clean. Proven in
+`tools/swift-parse.test.ts` and the acceptance check.
 
 ## Measurements (darwin arm64, Node 24.11.0, `--liftoff-only`)
 
 Baseline-only WASM (`--liftoff-only`), so these are the **floor** for parse
-throughput, not what an optimizing tier would reach. Representative, stable
-across runs:
+throughput, not what an optimizing tier would reach. Reproduce with:
 
-| Phase | Time |
-|---|---|
-| Full child cold start (spawn → runtime init + grammar load → one parse → exit) | ~90 ms wall clock |
-| Runtime init + `Language.load` (in-process, warm interpreter) | ~10 ms |
-| First `parseSwiftSource` call (includes first-call warmup) | ~12 ms |
-| Warm parse (same source, subsequent calls) | ~0.1–0.2 ms |
+```
+node tools/projection-check.ts swift-measure
+```
 
-Again: **measurements, not budgets.**
+which loads the grammar once and parses three representative sources of
+increasing size, reporting cold (first) and warm (repeat) parse time for each.
+Runtime init + `Language.load` is ~10 ms. Representative single-run numbers:
+
+| Source | Bytes | Cold (first parse) | Warm (repeat) |
+|---|---|---|---|
+| small (a one-line function) | 51 | ~13 ms* | ~0.2 ms |
+| medium (a struct, 40 methods) | ~2.0 KB | ~4 ms | ~1.6 ms |
+| large (4,000 functions) | ~283 KB | ~214 ms | ~205 ms |
+
+\* The *small* cold number is inflated by the process-wide first-parse JIT
+warmup (it is the first `parseSwiftSource` call in the process); *medium* and
+*large* cold numbers are lower per byte because that one-time warmup is already
+paid. End-to-end, a full checker invocation
+(`node tools/projection-check.ts swift-parse …` — parent process + spawn the
+isolated child + init + load + one parse + exit) is ~210 ms of wall clock.
+
+Again: **measurements, not budgets** (D7). They vary run to run; the sizes are
+fixed by construction so the sweep is reproducible.
 
 ## Corpus and known grammar gaps
 
@@ -140,16 +174,24 @@ are reported honestly rather than collapsed.
 ```
 node tools/projection-check.ts swift-parse --fixture <name>
 node tools/projection-check.ts swift-parse --file <path|->
+node tools/projection-check.ts swift-measure
 ```
 
-Prints one JSON report: artifact provenance, root type, `clean`, ERROR/MISSING
-diagnostics with UTF-8 byte spans, and timings. Exit codes: **0** clean, **1**
-the parse has ERROR/MISSING nodes (report still printed), **2** bad input or an
-artifact/host failure (diagnostic on stderr, no report).
+`swift-parse` prints one JSON report: artifact provenance, root type, `clean`,
+ERROR/MISSING diagnostics with UTF-8 byte spans, and timings. Exit codes: **0**
+clean, **1** the parse has ERROR/MISSING nodes (report still printed), **2** bad
+input or an artifact/host failure (diagnostic on stderr, no report).
+
+`swift-measure` prints the cold/warm size sweep above (small/medium/large). Exit
+**0** when all parse clean, **2** on an artifact/host failure.
 
 ## Acceptance
 
 `node tools/projection-check.ts acceptance --pr T5a.3` (darwin only) proves all of
-the above live against the pinned artifact: load + sha + ABI + licenses, UTF-8
-byte spans, the full corpus cross-check with the known-gap manifest, cancellation,
-and OOM survival with its negative control.
+the above live against the pinned artifact in five assertions: load + sha + ABI +
+licenses, UTF-8 byte spans, the full corpus cross-check with the known-gap
+manifest, mid-flight cancellation (with the completion-race confirmation above),
+and OOM survival whose negative control must abort with a V8 fatal signal — a
+deadline kill or a clean exit-2 is rejected as not-proof. The corpus oracle
+slices every diagnostic span with a **fatal** UTF-8 decode, so a span that splits
+a codepoint fails loudly instead of laundering into a U+FFFD match.
