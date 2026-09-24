@@ -369,6 +369,14 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     await new Promise<void>((resolvePromise) => { readyResolve = resolvePromise; });
     return exitCode;
   } catch (err) {
+    // If a shutdown is already in flight, this throw is a byproduct of the
+    // concurrent teardown — the control socket closed underneath an in-flight
+    // attach/baseline/seed step (e.g. write EPIPE). The signal handler's
+    // performCleanup owns teardown and the exit code, so defer to it rather than
+    // running a second cleanup and surfacing a teardown-induced error as a startup
+    // failure. Only a throw with no shutdown in progress is a genuine startup
+    // failure that must clean up and propagate.
+    if (stopping) return await shutdownComplete!;
     await performCleanup().catch(() => {});
     throw err;
   }
