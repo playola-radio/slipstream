@@ -214,10 +214,15 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     if (daemon === null && starting !== null) {
       try {
         daemon = await starting;
-      } catch {
-        // startDaemon itself failed; its own catch block will run performCleanup
-        // again once the rejection propagates, so there is nothing to stop here.
+      } catch (err) {
+        // startDaemon itself failed. This is a FAILED startup, not a clean one:
+        // report it as a teardown failure so the exit code is non-zero and the
+        // root is retained for diagnosis, rather than deleting the sandbox and
+        // exiting 0. A signal path reaching here could otherwise `process.exit(0)`
+        // and mask the failure before the main flow's own rejection propagates.
         daemon = null;
+        teardownFailed = true;
+        io.stderr(`qa-daemon: startup failed: ${(err as Error).message}; retaining ${args.root}`);
       }
     }
     if (daemon !== null) {

@@ -33,7 +33,7 @@ import {
   type QaEnv,
 } from './qa-support.ts';
 import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
-import { checkRootAgainstRealStore, readOwnerMarker } from './qa/safety.ts';
+import { checkExistingRealDir, checkRootAgainstRealStore, readOwnerMarker } from './qa/safety.ts';
 import { MODULES } from './qa/acceptance/registry.ts';
 import { corpusCasePath, FoldInputError, foldToLine, parseFoldInput } from './display-fold-oracle.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
@@ -54,6 +54,11 @@ async function validateEnvSandbox(env: { worktree: string; run_id: string }): Pr
   if (marker === null || marker.run_id !== env.run_id) {
     return `${root} has no ownership marker matching run_id ${env.run_id}; refusing to run against an unowned worktree`;
   }
+  // An owned parent root does not vouch for the worktree ENTRY: if it is (or has
+  // become) a symlink, the acceptance modules' writes and deletes follow it out of
+  // the sandbox. Require the worktree itself to be a real, existing directory.
+  const worktreeReason = await checkExistingRealDir(env.worktree);
+  if (worktreeReason) return worktreeReason;
   return null;
 }
 
@@ -286,7 +291,15 @@ export async function runAcceptance(io: RunIO): Promise<number> {
 
   if (io.signal.aborted) return EXIT.INTERRUPTED;
 
-  const report = buildReport(head, dirty, checks);
+  // Re-sample dirtiness now: a checkout clean at the start can be edited mid-run
+  // (e.g. before a later module spawns its daemon), and reporting the initial
+  // `dirty: false` would falsely claim the commit describes all the tested code.
+  // Report dirty if it was dirty at EITHER sample; a clean→dirty flip is disclosed.
+  const dirtyNow = await gitIsDirty(io.cwd).catch(() => true);
+  if (dirtyNow && !dirty) {
+    io.stderr(`qa-check: the checkout became dirty during the run; the report's commit ${head} does not fully describe the code under test`);
+  }
+  const report = buildReport(head, dirty || dirtyNow, checks);
   io.stdout(JSON.stringify(report));
   return sawFailure || report.result === 'failed' ? EXIT.FAIL : EXIT.PASS;
 }

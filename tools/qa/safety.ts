@@ -221,6 +221,29 @@ async function assertRealDir(path: string): Promise<void> {
   }
 }
 
+/** Validate an ALREADY-created sandbox worktree (the `--env` case, where the
+ * daemon made the layout and qa-check only connects to it). Unlike `assertRealDir`,
+ * which tolerates an absent path because `mkdir` will create it, here the worktree
+ * must already EXIST and be a real directory: acceptance checks write and delete
+ * inside it, so a symlink would let those escape the sandbox, and an ownership
+ * marker on the parent root does not vouch for the worktree entry itself. Returns a
+ * reason string when refused, or null when the worktree is a safe real directory. */
+export async function checkExistingRealDir(path: string): Promise<string | null> {
+  let st;
+  try {
+    st = await lstat(path);
+  } catch {
+    return `${path} does not exist; refusing to run against a missing worktree`;
+  }
+  if (st.isSymbolicLink()) {
+    return `${path} is a symlink; refusing to run — writes must not escape the sandbox`;
+  }
+  if (!st.isDirectory()) {
+    return `${path} exists and is not a directory`;
+  }
+  return null;
+}
+
 /** Create the sandbox layout under an approved root: the marker, the store dir,
  * and the worktree dir. Idempotent for `--reuse` (dirs may already exist). The
  * store and worktree must be real directories — a symlinked one is refused so

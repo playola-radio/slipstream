@@ -1,7 +1,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -220,6 +220,40 @@ describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
     assert.equal(code, EXIT.USAGE);
     assert.equal(sink.out.length, 0);
     assert.ok(sink.err.some((l) => /ownership marker/.test(l)));
+  });
+
+  it('refuses an --env worktree that is a symlink, even under an owned root (writes must not escape)', async () => {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const root = join(dir, 'root');
+    const { store, worktree } = await prepareRoot(root, 'run-symlink');
+    // Swap the real worktree the daemon created for a symlink pointing OUTSIDE the
+    // sandbox — the ownership marker on `root` still validates, but following the
+    // link would let acceptance writes/deletes escape.
+    const escapeTarget = join(dir, 'escape');
+    await mkdir(escapeTarget, { recursive: true });
+    await rm(worktree, { recursive: true, force: true });
+    await symlink(escapeTarget, worktree);
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT, state: 'ready', run_id: 'run-symlink', daemon_commit: head, daemon_dirty: false,
+      store, worktree, descriptor_path: join(store, 'runtime', 'x.json'),
+      url: 'http://127.0.0.1:1', token: 'fake-token', session_id: 'qa:run-symlink',
+      ready_through_seq: '0', scenario: null,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.equal(sink.out.length, 0);
+    assert.ok(sink.err.some((l) => /symlink/.test(l)));
   });
 
   it('refuses an --env worktree that overlaps the real default store', async () => {
