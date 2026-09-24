@@ -237,6 +237,46 @@ corpus test discovers every case directory and additionally validates each
 The `interface.v1` schema is **stored but not served** — it becomes reachable
 only when a later PR adds it to the schema allowlist in `src/store-reader.ts`.
 
+### Swift grammar feasibility (`swift-parse` and the `T5a.3` check)
+
+`node tools/projection-check.ts swift-parse` is the Swift-grammar feasibility
+checker (`SWIFT-GRAMMAR.md`). It prints one JSON report — artifact provenance,
+root type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte spans, and timings.
+Exit codes: `0` clean, `1` the parse has ERROR/MISSING nodes (report still
+printed), `2` bad input or an artifact/host failure (nothing on stdout).
+
+```
+node tools/projection-check.ts swift-parse --fixture preview-macro   # a corpus case
+node tools/projection-check.ts swift-parse --file Foo.swift           # any file
+cat Foo.swift | node tools/projection-check.ts swift-parse --file -   # stdin
+node tools/projection-check.ts swift-measure                          # cold/warm size sweep
+```
+
+`swift-measure` reports cold (first) and warm (repeat) parse time for small,
+medium, and large representative sources — measurements, not budgets (D7).
+
+The corpus is `contracts/swift-syntax/v1/<case>/{input.swift,expected.json}` — the
+D2 declaration constructs, malformed inputs, and Unicode edge cases. A known
+grammar gap (valid Swift that parses with ERROR nodes, e.g. `#Preview`) is kept in
+the corpus and disclosed, never hidden by dropping the fixture.
+
+**Every Swift parse runs in an isolated `node --liftoff-only` child** because
+loading the grammar trips a V8 out-of-memory that aborts a default Node process
+(see `SWIFT-GRAMMAR.md`). The boundary is enforced: `loadSwiftLanguage` throws
+unless the process was launched with `--liftoff-only`, so `src/swift-grammar.ts`
+and `src/swift-spans.ts` carry pure, in-process unit tests (`npm test`) — one of
+which asserts the guard rejects an ordinary-process load — while anything that
+actually loads the grammar (`tools/swift-parse.test.ts` and the `T5a.3`
+acceptance module) spawns the `--liftoff-only` child and lives under `npm run
+test:tools`. Importing the loader never initializes it (not even resolving the
+artifact path), so the test runner itself is never at risk.
+
+`npm run qa:check -- --pr T5a.3` (darwin only) proves live against the pinned
+artifact: sha/ABI/licenses, UTF-8 byte spans, the full corpus cross-check with the
+known-gap manifest, mid-flight cancellation (confirmed unfinished at
+termination), and OOM survival whose default-launch negative control must abort
+with a V8 fatal signal.
+
 ### Cleanup
 
 `qa:daemon` removes its owned root on a clean default shutdown (retained under

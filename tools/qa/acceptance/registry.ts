@@ -3,5 +3,6 @@ import type { AcceptanceModule } from './types.ts';
 import { tqa } from './T-QA.ts';
 import { t01 } from './T0.1.ts';
 import { t5a1 } from './T5a.1.ts';
+import { t5a3 } from './T5a.3.ts';
 
-export const MODULES: readonly AcceptanceModule[] = [tqa, t01, t5a1];
+export const MODULES: readonly AcceptanceModule[] = [tqa, t01, t5a1, t5a3];

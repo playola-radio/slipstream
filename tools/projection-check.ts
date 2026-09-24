@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Two subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Five subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
@@ -13,6 +13,17 @@
  *    exactly one canonical envelope. Exit 0 = envelope produced (with --check it
  *    matched the fixture's expected.json); 1 = --check mismatch (envelope still
  *    printed); 2 = bad args, missing fixture, unreadable/malformed input.
+ *  - `swift-parse`: the Swift-grammar feasibility checker (SWIFT-GRAMMAR.md).
+ *    `swift-parse --fixture <name>` or `swift-parse --file <path|->` loads the
+ *    pinned grammar in the isolated host and prints one JSON report (artifact
+ *    provenance, root type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte
+ *    spans, timings). Exit 0 = clean; 1 = parse errors (report still printed);
+ *    2 = bad input or an artifact/host failure (diagnostic on stderr, no report).
+ *  - `swift-measure`: cold start (init + language load) and first/warm parse time
+ *    for small/medium/large representative sources, as one JSON report. Numbers
+ *    are measurements, not budgets (D7). Exit 0 = all clean; 1 = a source parsed
+ *    with ERROR/MISSING nodes (report still printed); 2 = artifact/host failure.
+ *    Takes no arguments.
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -22,8 +33,9 @@
  *    runtime / wrong daemon revision (a skipped check never counts as passing);
  *    130 = interrupted.
  */
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { Readable } from 'node:stream';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
   createReaderClient,
@@ -48,6 +60,8 @@ import {
   interfaceToLine,
   parseInterfaceInput,
 } from './interface-projection-oracle.ts';
+import { runSwiftParseChild, runSwiftParseFile, runSwiftParseStdin, swiftFixturePath, SwiftFixtureError } from './swift-parse.ts';
+import type { HostResult } from './swift-parse-host.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -249,6 +263,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
   for (const mod of mods) {
     if (io.signal.aborted) return EXIT.INTERRUPTED;
 
+    const needsDaemon = mod.needsDaemon !== false;
     let handle: QaDaemonHandle | null = null;
     let ephemeralRoot: string | null = null;
     let reader: ReaderClient;
@@ -256,7 +271,13 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     let sessionId: string;
 
     try {
-      if (env !== null) {
+      if (!needsDaemon) {
+        // A self-contained module may only use ctx.signal. Keep the existing
+        // context shape so daemon-backed modules retain their strict contract.
+        reader = {} as ReaderClient;
+        worktree = '';
+        sessionId = '';
+      } else if (env !== null) {
         // Operator-supplied daemon, already validated above (fresh commit + sandbox).
         reader = createReaderClient(env.url, env.token);
         worktree = env.worktree;
@@ -329,7 +350,8 @@ export interface FoldIO {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   cwd: string;
-  readStdin: () => Promise<Uint8Array>;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
+  signal?: AbortSignal;
 }
 
 type FoldInput = { fixture: string } | { events: string };
@@ -359,7 +381,7 @@ export async function runFold(io: FoldIO): Promise<number> {
       const path = corpusCasePath(input.fixture, 'input.ndjson');
       bytes = await readFile(path).catch(() => { throw new FoldInputError(`no fixture named '${input.fixture}'`); });
     } else if (input.events === '-') {
-      bytes = await io.readStdin();
+      bytes = await io.readStdin(io.signal);
     } else {
       bytes = await readFile(resolve(io.cwd, input.events)).catch((err: NodeJS.ErrnoException) => {
         throw new FoldInputError(`cannot read events file: ${err.code ?? err.message}`);
@@ -367,7 +389,7 @@ export async function runFold(io: FoldIO): Promise<number> {
     }
     records = parseFoldInput(bytes);
   } catch (err) {
-    if (!(err instanceof ArgError) && !(err instanceof FoldInputError)) throw err;
+    if (!(err instanceof ArgError) && !(err instanceof FoldInputError) && !(err instanceof StdinReadAbortError)) throw err;
     io.stderr(`qa-check fold: ${err.message}`);
     return EXIT.USAGE;
   }
@@ -381,7 +403,17 @@ export interface InterfaceIO {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   cwd: string;
-  readStdin: () => Promise<Uint8Array>;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
+  signal?: AbortSignal;
+}
+
+export interface SwiftParseIO {
+  argv: readonly string[];
+  stdout: (line: string) => void;
+  stderr: (line: string) => void;
+  cwd: string;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
+  signal?: AbortSignal;
 }
 
 type InterfaceArgs = { fixture: string; check: boolean } | { input: string };
@@ -434,7 +466,7 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
       });
       if (args.check) expectedPath = interfaceCasePath(args.fixture, 'expected.json');
     } else if (args.input === '-') {
-      bytes = await io.readStdin();
+      bytes = await io.readStdin(io.signal);
     } else {
       bytes = await readFile(resolve(io.cwd, args.input)).catch((err: NodeJS.ErrnoException) => {
         throw new InterfaceInputError(`cannot read input file: ${err.code ?? err.message}`);
@@ -442,7 +474,7 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
     }
     line = interfaceToLine(parseInterfaceInput(bytes));
   } catch (err) {
-    if (!(err instanceof ArgError) && !(err instanceof InterfaceInputError)) throw err;
+    if (!(err instanceof ArgError) && !(err instanceof InterfaceInputError) && !(err instanceof StdinReadAbortError)) throw err;
     io.stderr(`qa-check interface: ${err.message}`);
     return EXIT.USAGE;
   }
@@ -464,25 +496,164 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
   return EXIT.PASS;
 }
 
-async function readAllStdin(): Promise<Uint8Array> {
+/** Bad input for `swift-parse` (missing/unreadable source, invalid UTF-8) —
+ * distinct from ArgError so both map to exit 2 but read clearly. */
+class SwiftParseInputError extends Error {}
+
+type SwiftParseSelector = { fixture: string } | { file: string };
+
+function parseSwiftParseArgs(argv: readonly string[]): SwiftParseSelector {
+  let input: SwiftParseSelector | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (flag !== '--fixture' && flag !== '--file') throw new ArgError(`unknown swift-parse argument '${flag}'`);
+    const value = argv[++i];
+    if (value === undefined) throw new ArgError(`${flag} requires a value`);
+    if (input) throw new ArgError('swift-parse takes exactly one of --fixture <name> / --file <path|->');
+    input = flag === '--fixture' ? { fixture: value } : { file: value };
+  }
+  if (!input) throw new ArgError('swift-parse requires --fixture <name> or --file <path|->');
+  return input;
+}
+
+/** `projection-check swift-parse`: load the pinned Swift grammar in the isolated
+ * host, parse one source, and print a JSON report (artifact provenance, root
+ * type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte spans, timings).
+ * Named files are read and decoded only by the isolated host; stdin bytes are
+ * forwarded directly to it. Exit 0 = clean parse; 1 = parse produced ERROR/MISSING nodes;
+ * 2 = bad input or an artifact/host failure. */
+export async function runSwiftParseCheck(io: SwiftParseIO): Promise<number> {
+  let run: () => Promise<Extract<HostResult, { op: 'parse' }>>;
+  try {
+    const input = parseSwiftParseArgs(io.argv);
+    if ('fixture' in input) {
+      let path: string;
+      try {
+        path = swiftFixturePath(input.fixture);
+      } catch (err) {
+        if (err instanceof SwiftFixtureError) throw new SwiftParseInputError(err.message);
+        throw err;
+      }
+      run = () => runSwiftParseFile<Extract<HostResult, { op: 'parse' }>>(path, { signal: io.signal });
+    } else if (input.file === '-') {
+      const bytes = await io.readStdin(io.signal);
+      run = () => runSwiftParseStdin<Extract<HostResult, { op: 'parse' }>>(bytes, { signal: io.signal });
+    } else {
+      const path = resolve(io.cwd, input.file);
+      await access(path).catch((err: NodeJS.ErrnoException) => {
+        throw new SwiftParseInputError(`cannot read Swift file: ${err.code ?? err.message}`);
+      });
+      run = () => runSwiftParseFile<Extract<HostResult, { op: 'parse' }>>(path, { signal: io.signal });
+    }
+  } catch (err) {
+    if (!(err instanceof ArgError) && !(err instanceof SwiftParseInputError) && !(err instanceof StdinReadAbortError)) throw err;
+    io.stderr(`swift-parse: ${err.message}`);
+    return EXIT.USAGE;
+  }
+
+  let res: Extract<HostResult, { op: 'parse' }>;
+  try {
+    res = await run();
+  } catch (err) {
+    // A host/artifact failure (sha mismatch, ABI reject, crash) is not a clean
+    // parse-error result — surface it as exit 2, never as a passing report.
+    io.stderr(`swift-parse: artifact/host failed: ${(err as Error).message}`);
+    return EXIT.USAGE;
+  }
+
+  io.stdout(JSON.stringify({
+    artifact: res.provenance,
+    rootType: res.result.rootType,
+    clean: res.result.clean,
+    byteLength: res.result.byteLength,
+    diagnostics: res.result.diagnostics,
+    timings: res.timings,
+  }));
+  return res.result.clean ? EXIT.PASS : EXIT.FAIL;
+}
+
+/** Three representative Swift sources of increasing size, for the cold/warm
+ * measurement the brief requires (small / medium / large). Synthetic and
+ * deterministic so the byte sizes are stable across machines; the timings are
+ * not (they are the point). */
+function representativeSwiftSources(): { label: string; source: string }[] {
+  const small = 'func greet(name: String) -> String { return name }\n';
+  const medium =
+    'import Foundation\n\nstruct Widget {\n' +
+    Array.from({ length: 40 }, (_, i) => `  func step${i}(_ x: Int) -> Int { return x + ${i} }`).join('\n') +
+    '\n}\n';
+  const large =
+    'import Foundation\n\n' +
+    Array.from({ length: 4000 }, (_, i) => `func f${i}(_ a: Int, _ b: Int) -> Int { let c = a + b; return c * ${i} }`).join('\n') +
+    '\n';
+  return [{ label: 'small', source: small }, { label: 'medium', source: medium }, { label: 'large', source: large }];
+}
+
+/** `projection-check swift-measure`: load the pinned grammar once in the isolated
+ * host and report cold start (init + language load) plus first/warm parse time
+ * for small/medium/large representative sources. Prints one JSON report; the
+ * numbers are measurements, not budgets (D7). Exit 0 = all parsed clean; 1 = a
+ * source parsed with ERROR/MISSING nodes; 2 = an artifact/host failure. Takes no
+ * arguments. */
+export async function runSwiftMeasure(io: { argv: readonly string[]; stdout: (l: string) => void; stderr: (l: string) => void; signal?: AbortSignal }): Promise<number> {
+  if (io.argv.length > 0) {
+    io.stderr(`swift-measure: unexpected argument '${io.argv[0]}' (takes none)`);
+    return EXIT.USAGE;
+  }
+  let res: Extract<HostResult, { op: 'measure' }>;
+  try {
+    res = await runSwiftParseChild<Extract<HostResult, { op: 'measure' }>>({ op: 'measure', sources: representativeSwiftSources() }, { signal: io.signal });
+  } catch (err) {
+    io.stderr(`swift-measure: artifact/host failed: ${(err as Error).message}`);
+    return EXIT.USAGE;
+  }
+  io.stdout(JSON.stringify({ artifact: res.provenance, initAndLoadMs: res.initAndLoadMs, parses: res.parses }));
+  return res.parses.every((p) => p.clean) ? EXIT.PASS : EXIT.FAIL;
+}
+
+export class StdinReadAbortError extends Error {
+  constructor() {
+    super('stdin read aborted by signal');
+  }
+}
+
+/** Read stdin until EOF, or stop the underlying stream as soon as the caller aborts. */
+export async function readAllStdin(signal?: AbortSignal, stdin: Readable = process.stdin): Promise<Uint8Array> {
+  let aborted = signal?.aborted ?? false;
+  const onAbort = (): void => {
+    aborted = true;
+    stdin.destroy();
+  };
+  if (aborted) stdin.destroy();
+  else signal?.addEventListener('abort', onAbort, { once: true });
   const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  try {
+    for await (const chunk of stdin) chunks.push(chunk as Buffer);
+  } catch (err) {
+    if (aborted) throw new StdinReadAbortError();
+    throw err;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
+  if (aborted) throw new StdinReadAbortError();
   return Buffer.concat(chunks);
 }
 
 export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly string[] }): Promise<number> {
   const [sub, ...rest] = io.argv;
-  if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
-  if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
-  if (sub !== 'acceptance') {
-    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', or 'interface'`);
-    return EXIT.USAGE;
-  }
   const controller = new AbortController();
   const onSignal = (): void => controller.abort();
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
   try {
+    if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
+    if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
+    if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
+    if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr, signal: controller.signal });
+    if (sub !== 'acceptance') {
+      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'swift-parse', or 'swift-measure'`);
+      return EXIT.USAGE;
+    }
     return await runAcceptance({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd, signal: controller.signal });
   } finally {
     process.off('SIGINT', onSignal);

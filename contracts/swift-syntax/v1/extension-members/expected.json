@@ -1,0 +1,8 @@
+{
+  "description": "members declared in an extension",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

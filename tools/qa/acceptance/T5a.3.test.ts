@@ -1,0 +1,164 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { checkFixtureAgainstExpected, assertRequiredCorpusCases, hasV8OomSignature, t5a3, type ExpectedCase } from './T5a.3.ts';
+import type { AcceptanceContext } from './types.ts';
+import type { SwiftParseResult } from '../../../src/swift-grammar.ts';
+
+// The corpus cross-check's honesty rules are pure, so they are proven here with
+// synthetic parse results — no grammar load. The live parse is exercised by the
+// module itself under qa:check on darwin.
+
+const cleanExpected: ExpectedCase = {
+  description: 'clean case', category: 'd2-construct', rootType: 'source_file',
+  clean: true, knownGap: false, diagnostics: [],
+};
+const cleanBytes = Buffer.from('func f(){}', 'utf8');
+const cleanResult: SwiftParseResult = { rootType: 'source_file', clean: true, diagnostics: [], byteLength: cleanBytes.length };
+
+// '#Preview' — 8 bytes, one recorded ERROR diagnostic that slices "#Preview".
+const gapBytes = Buffer.from('#Preview {\n}\n', 'utf8');
+const gapExpected: ExpectedCase = {
+  description: 'preview macro', category: 'd2-construct', rootType: 'source_file',
+  clean: false, knownGap: true,
+  diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 8, startRow: 0, startColumn: 0, endRow: 0, endColumn: 8, byteSlice: '#Preview' }],
+};
+const gapResult: SwiftParseResult = {
+  rootType: 'source_file', clean: false, byteLength: gapBytes.length,
+  diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 8, startRow: 0, startColumn: 0, endRow: 0, endColumn: 8 }],
+};
+
+describe('checkFixtureAgainstExpected', () => {
+  it('accepts a clean fixture that matches its envelope', () => {
+    assert.doesNotThrow(() => checkFixtureAgainstExpected('ok', cleanBytes, cleanExpected, cleanResult));
+  });
+
+  it('accepts a known-gap fixture whose byte span slices the recorded text', () => {
+    assert.doesNotThrow(() => checkFixtureAgainstExpected('preview-macro', gapBytes, gapExpected, gapResult));
+  });
+
+  it('rejects an UNDOCUMENTED gap: a live parse that errors where the envelope is clean', () => {
+    assert.throws(() => checkFixtureAgainstExpected('drift', gapBytes, cleanExpected, gapResult), /clean=false, expected true/);
+  });
+
+  it('rejects a STALE gap: a knownGap flag that no longer matches the parse', () => {
+    const stale: ExpectedCase = { ...cleanExpected, knownGap: true };
+    assert.throws(() => checkFixtureAgainstExpected('stale', cleanBytes, stale, cleanResult), /stale or dishonest gap flag/);
+  });
+
+  it('rejects a byte span whose bytes do not slice the recorded byteSlice text', () => {
+    // Diagnostic fields match the envelope, but the recorded byteSlice claims
+    // different text than [byteStart,byteEnd) slices out of the real bytes.
+    const lyingSlice: ExpectedCase = {
+      ...gapExpected,
+      diagnostics: [{ ...gapExpected.diagnostics[0]!, byteSlice: 'Preview!' }],
+    };
+    assert.throws(() => checkFixtureAgainstExpected('bad-span', gapBytes, lyingSlice, gapResult), /byte span .* slices/);
+  });
+
+  it('rejects a diagnostic-count mismatch', () => {
+    const extra: SwiftParseResult = { ...gapResult, diagnostics: [...gapResult.diagnostics, ...gapResult.diagnostics] };
+    assert.throws(() => checkFixtureAgainstExpected('count', gapBytes, gapExpected, extra), /2 diagnostics, expected 1/);
+  });
+
+  it('rejects a root-type mismatch', () => {
+    const wrongRoot: SwiftParseResult = { ...cleanResult, rootType: 'ERROR' };
+    assert.throws(() => checkFixtureAgainstExpected('root', Buffer.from('x'), cleanExpected, wrongRoot), /root ERROR/);
+  });
+
+  it('rejects a byteLength that does not match the real source length', () => {
+    const lying: SwiftParseResult = { ...cleanResult, byteLength: 999 };
+    assert.throws(() => checkFixtureAgainstExpected('bytelen', cleanBytes, cleanExpected, lying), /byteLength=999/);
+  });
+
+  it('rejects a byte span that splits a UTF-8 codepoint (no U+FFFD laundering)', () => {
+    // '😀' is 4 bytes; a [1,2) span lands inside the codepoint. Buffer.toString
+    // would have substituted U+FFFD and matched a recorded '�'; a fatal
+    // decode must reject it instead.
+    const emoji = Buffer.from('😀', 'utf8');
+    const midCodepoint: SwiftParseResult = {
+      rootType: 'source_file', clean: false, byteLength: emoji.length,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 1, byteEnd: 2, startRow: 0, startColumn: 0, endRow: 0, endColumn: 1 }],
+    };
+    const expected: ExpectedCase = {
+      description: 'mid-codepoint', category: 'd2-construct', rootType: 'source_file',
+      clean: false, knownGap: true,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 1, byteEnd: 2, startRow: 0, startColumn: 0, endRow: 0, endColumn: 1, byteSlice: '�' }],
+    };
+    assert.throws(() => checkFixtureAgainstExpected('mid-codepoint', emoji, expected, midCodepoint), /splits a UTF-8 codepoint/);
+  });
+
+  it('rejects a ZERO-WIDTH span that lands inside a codepoint (MISSING node)', () => {
+    // A MISSING node has byteStart===byteEnd; an empty slice always decodes
+    // cleanly, so the fatal decode alone cannot catch [1,1) inside '😀'. The
+    // per-endpoint boundary check must reject it.
+    const emoji = Buffer.from('😀', 'utf8');
+    const midMissing: SwiftParseResult = {
+      rootType: 'source_file', clean: false, byteLength: emoji.length,
+      diagnostics: [{ kind: 'missing', nodeType: 'ERROR', byteStart: 1, byteEnd: 1, startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    };
+    const expected: ExpectedCase = {
+      description: 'zero-width interior', category: 'd2-construct', rootType: 'source_file',
+      clean: false, knownGap: true,
+      diagnostics: [{ kind: 'missing', nodeType: 'ERROR', byteStart: 1, byteEnd: 1, startRow: 0, startColumn: 0, endRow: 0, endColumn: 0, byteSlice: '' }],
+    };
+    assert.throws(() => checkFixtureAgainstExpected('zero-width', emoji, expected, midMissing), /splits a UTF-8 codepoint/);
+  });
+
+  it('preserves a leading BOM in a diagnostic slice (does not silently trim it)', () => {
+    // '﻿x' is EF BB BF 78; a [0,4) span must slice back to the BOM + 'x',
+    // not the trimmed 'x' a default (ignoreBOM:false) decoder would return.
+    const bom = Buffer.from('﻿x', 'utf8');
+    const result: SwiftParseResult = {
+      rootType: 'source_file', clean: false, byteLength: bom.length,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 4, startRow: 0, startColumn: 0, endRow: 0, endColumn: 2 }],
+    };
+    const base: ExpectedCase = {
+      description: 'bom slice', category: 'd2-construct', rootType: 'source_file',
+      clean: false, knownGap: true,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 4, startRow: 0, startColumn: 0, endRow: 0, endColumn: 2, byteSlice: '﻿x' }],
+    };
+    assert.doesNotThrow(() => checkFixtureAgainstExpected('bom-kept', bom, base, result));
+    const trimmed: ExpectedCase = { ...base, diagnostics: [{ ...base.diagnostics[0]!, byteSlice: 'x' }] };
+    assert.throws(() => checkFixtureAgainstExpected('bom-trimmed', bom, trimmed, result), /slices/);
+  });
+});
+
+describe('assertRequiredCorpusCases', () => {
+  it('accepts the complete pinned corpus-case set', () => {
+    assert.doesNotThrow(() => assertRequiredCorpusCases([
+      'argument-labels', 'async-throws', 'attributes-mainactor', 'bom',
+      'conditional-compilation', 'crlf', 'default-args', 'extension-members',
+      'generics-where', 'init', 'malformed-stray-token', 'malformed-truncated',
+      'malformed-unclosed-brace', 'methods', 'preview-macro',
+      'protocol-requirements', 'swiftui-view', 'top-level-func',
+      'unicode-astral', 'unicode-cjk', 'unicode-combining',
+    ]));
+  });
+
+  it('rejects a missing required corpus case', () => {
+    assert.throws(
+      () => assertRequiredCorpusCases(['top-level-func']),
+      /missing required corpus cases: .*preview-macro/,
+    );
+  });
+});
+
+describe('T5a.3 self-contained lifecycle', () => {
+  it('declares that it does not need a QA daemon', () => {
+    assert.equal(t5a3.needsDaemon, false);
+  });
+
+  it('does not launch a Swift child after its context has been aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const ctx = { worktree: '', sessionId: '', reader: {} as AcceptanceContext['reader'], signal: controller.signal };
+    await assert.rejects(t5a3.run(ctx), /aborted before start/);
+  });
+});
+
+describe('hasV8OomSignature', () => {
+  it('requires the observed V8 OOM evidence, not merely a fatal signal', () => {
+    assert.equal(hasV8OomSignature('Fatal process out of memory: Zone'), true);
+    assert.equal(hasV8OomSignature('fatal signal SIGTRAP from another crash'), false);
+  });
+});

@@ -1,0 +1,31 @@
+{
+  "description": "#Preview macro",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": false,
+  "knownGap": true,
+  "diagnostics": [
+    {
+      "kind": "error",
+      "nodeType": "ERROR",
+      "byteStart": 0,
+      "byteEnd": 8,
+      "startRow": 0,
+      "startColumn": 0,
+      "endRow": 0,
+      "endColumn": 8,
+      "byteSlice": "#Preview"
+    },
+    {
+      "kind": "error",
+      "nodeType": "ERROR",
+      "byteStart": 0,
+      "byteEnd": 8,
+      "startRow": 0,
+      "startColumn": 0,
+      "endRow": 0,
+      "endColumn": 8,
+      "byteSlice": "#Preview"
+    }
+  ]
+}

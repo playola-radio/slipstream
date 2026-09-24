@@ -1,0 +1,20 @@
+{
+  "description": "a stray closing brace at top level",
+  "category": "malformed",
+  "rootType": "source_file",
+  "clean": false,
+  "knownGap": false,
+  "diagnostics": [
+    {
+      "kind": "error",
+      "nodeType": "ERROR",
+      "byteStart": 12,
+      "byteEnd": 13,
+      "startRow": 1,
+      "startColumn": 0,
+      "endRow": 1,
+      "endColumn": 1,
+      "byteSlice": "}"
+    }
+  ]
+}

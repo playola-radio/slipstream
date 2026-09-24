@@ -1,0 +1,20 @@
+{
+  "description": "function body brace never closed",
+  "category": "malformed",
+  "rootType": "source_file",
+  "clean": false,
+  "knownGap": false,
+  "diagnostics": [
+    {
+      "kind": "error",
+      "nodeType": "ERROR",
+      "byteStart": 0,
+      "byteEnd": 25,
+      "startRow": 0,
+      "startColumn": 0,
+      "endRow": 2,
+      "endColumn": 0,
+      "byteSlice": "func f() {\n    let x = 1\n"
+    }
+  ]
+}
