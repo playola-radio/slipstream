@@ -403,7 +403,8 @@ export interface InterfaceIO {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   cwd: string;
-  readStdin: () => Promise<Uint8Array>;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
+  signal?: AbortSignal;
 }
 
 export interface SwiftParseIO {
@@ -465,7 +466,7 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
       });
       if (args.check) expectedPath = interfaceCasePath(args.fixture, 'expected.json');
     } else if (args.input === '-') {
-      bytes = await io.readStdin();
+      bytes = await io.readStdin(io.signal);
     } else {
       bytes = await readFile(resolve(io.cwd, args.input)).catch((err: NodeJS.ErrnoException) => {
         throw new InterfaceInputError(`cannot read input file: ${err.code ?? err.message}`);
@@ -473,7 +474,7 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
     }
     line = interfaceToLine(parseInterfaceInput(bytes));
   } catch (err) {
-    if (!(err instanceof ArgError) && !(err instanceof InterfaceInputError)) throw err;
+    if (!(err instanceof ArgError) && !(err instanceof InterfaceInputError) && !(err instanceof StdinReadAbortError)) throw err;
     io.stderr(`qa-check interface: ${err.message}`);
     return EXIT.USAGE;
   }
@@ -646,7 +647,7 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
   process.on('SIGTERM', onSignal);
   try {
     if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
-    if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
+    if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr, signal: controller.signal });
     if (sub !== 'acceptance') {

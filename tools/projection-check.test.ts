@@ -556,6 +556,23 @@ describe('interface subcommand', () => {
     assert.deepEqual(out, []);
   });
 
+  it('reports an interrupted stdin read as usage failure', async () => {
+    const controller = new AbortController();
+    const stdin = new Readable({ read() {} });
+    const err: string[] = [];
+    controller.abort();
+    const code = await runInterface({
+      argv: ['--input', '-'],
+      stdout: () => assert.fail('an interrupted stdin read must not print an envelope'),
+      stderr: (line) => err.push(line),
+      cwd: process.cwd(),
+      signal: controller.signal,
+      readStdin: (signal) => readAllStdin(signal, stdin),
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.match(err.join('\n'), /stdin read aborted by signal/);
+  });
+
   it('is reachable through main', async () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface', '--fixture', 'unchanged'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
