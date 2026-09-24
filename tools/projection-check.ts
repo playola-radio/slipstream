@@ -35,6 +35,7 @@
  */
 import { access, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { Readable } from 'node:stream';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
   createReaderClient,
@@ -349,7 +350,8 @@ export interface FoldIO {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   cwd: string;
-  readStdin: () => Promise<Uint8Array>;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
+  signal?: AbortSignal;
 }
 
 type FoldInput = { fixture: string } | { events: string };
@@ -379,7 +381,7 @@ export async function runFold(io: FoldIO): Promise<number> {
       const path = corpusCasePath(input.fixture, 'input.ndjson');
       bytes = await readFile(path).catch(() => { throw new FoldInputError(`no fixture named '${input.fixture}'`); });
     } else if (input.events === '-') {
-      bytes = await io.readStdin();
+      bytes = await io.readStdin(io.signal);
     } else {
       bytes = await readFile(resolve(io.cwd, input.events)).catch((err: NodeJS.ErrnoException) => {
         throw new FoldInputError(`cannot read events file: ${err.code ?? err.message}`);
@@ -387,7 +389,7 @@ export async function runFold(io: FoldIO): Promise<number> {
     }
     records = parseFoldInput(bytes);
   } catch (err) {
-    if (!(err instanceof ArgError) && !(err instanceof FoldInputError)) throw err;
+    if (!(err instanceof ArgError) && !(err instanceof FoldInputError) && !(err instanceof StdinReadAbortError)) throw err;
     io.stderr(`qa-check fold: ${err.message}`);
     return EXIT.USAGE;
   }
@@ -409,7 +411,7 @@ export interface SwiftParseIO {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   cwd: string;
-  readStdin: () => Promise<Uint8Array>;
+  readStdin: (signal?: AbortSignal) => Promise<Uint8Array>;
   signal?: AbortSignal;
 }
 
@@ -533,7 +535,7 @@ export async function runSwiftParseCheck(io: SwiftParseIO): Promise<number> {
       }
       run = () => runSwiftParseFile<Extract<HostResult, { op: 'parse' }>>(path, { signal: io.signal });
     } else if (input.file === '-') {
-      const bytes = await io.readStdin();
+      const bytes = await io.readStdin(io.signal);
       run = () => runSwiftParseStdin<Extract<HostResult, { op: 'parse' }>>(bytes, { signal: io.signal });
     } else {
       const path = resolve(io.cwd, input.file);
@@ -543,7 +545,7 @@ export async function runSwiftParseCheck(io: SwiftParseIO): Promise<number> {
       run = () => runSwiftParseFile<Extract<HostResult, { op: 'parse' }>>(path, { signal: io.signal });
     }
   } catch (err) {
-    if (!(err instanceof ArgError) && !(err instanceof SwiftParseInputError)) throw err;
+    if (!(err instanceof ArgError) && !(err instanceof SwiftParseInputError) && !(err instanceof StdinReadAbortError)) throw err;
     io.stderr(`swift-parse: ${err.message}`);
     return EXIT.USAGE;
   }
@@ -608,9 +610,31 @@ export async function runSwiftMeasure(io: { argv: readonly string[]; stdout: (l:
   return res.parses.every((p) => p.clean) ? EXIT.PASS : EXIT.FAIL;
 }
 
-async function readAllStdin(): Promise<Uint8Array> {
+export class StdinReadAbortError extends Error {
+  constructor() {
+    super('stdin read aborted by signal');
+  }
+}
+
+/** Read stdin until EOF, or stop the underlying stream as soon as the caller aborts. */
+export async function readAllStdin(signal?: AbortSignal, stdin: Readable = process.stdin): Promise<Uint8Array> {
+  let aborted = signal?.aborted ?? false;
+  const onAbort = (): void => {
+    aborted = true;
+    stdin.destroy();
+  };
+  if (aborted) stdin.destroy();
+  else signal?.addEventListener('abort', onAbort, { once: true });
   const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  try {
+    for await (const chunk of stdin) chunks.push(chunk as Buffer);
+  } catch (err) {
+    if (aborted) throw new StdinReadAbortError();
+    throw err;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
+  if (aborted) throw new StdinReadAbortError();
   return Buffer.concat(chunks);
 }
 
@@ -621,7 +645,7 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
   try {
-    if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
+    if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
     if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr, signal: controller.signal });

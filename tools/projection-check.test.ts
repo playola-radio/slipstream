@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
 import {
   parseAcceptanceArgs,
   runAcceptance,
@@ -15,6 +16,8 @@ import {
   runSwiftParseCheck,
   runSwiftMeasure,
   main,
+  readAllStdin,
+  StdinReadAbortError,
   EXIT,
   ArgError,
 } from './projection-check.ts';
@@ -561,6 +564,17 @@ describe('interface subcommand', () => {
   });
 });
 
+describe('stdin reads', () => {
+  it('rejects promptly when an open stream is aborted', async () => {
+    const controller = new AbortController();
+    const stdin = new Readable({ read() {} });
+    const pending = readAllStdin(controller.signal, stdin);
+    controller.abort();
+    await assert.rejects(pending, StdinReadAbortError);
+    assert.equal(stdin.destroyed, true);
+  });
+});
+
 describe('swift-parse subcommand', () => {
   // Each case spawns the isolated --liftoff-only host that actually loads the
   // Swift grammar, so these are slower than the pure fold cases.
@@ -635,6 +649,23 @@ describe('swift-parse subcommand', () => {
     const { code, out } = await swift(['--file', '-'], 'let x = 1\n');
     assert.equal(code, EXIT.PASS);
     assert.equal(JSON.parse(out[0]!).clean, true);
+  });
+
+  it('reports an interrupted stdin read as usage failure without starting the host', async () => {
+    const controller = new AbortController();
+    const stdin = new Readable({ read() {} });
+    const err: string[] = [];
+    controller.abort();
+    const code = await runSwiftParseCheck({
+      argv: ['--file', '-'],
+      stdout: () => assert.fail('an interrupted stdin read must not print a report'),
+      stderr: (line) => err.push(line),
+      cwd: process.cwd(),
+      signal: controller.signal,
+      readStdin: (signal) => readAllStdin(signal, stdin),
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.match(err.join('\n'), /stdin read aborted by signal/);
   });
 
   const usage: Array<[string, string[]]> = [
