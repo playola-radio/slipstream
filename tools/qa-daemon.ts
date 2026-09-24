@@ -173,9 +173,12 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   }
 
   // The launch nonce (if a parent supplied one) IS the run_id, so the env this
-  // child publishes can be told apart from any stale predecessor's env.
+  // child publishes can be told apart from any stale predecessor's env. Under
+  // `--reuse` this nonce is fresh per spawn and so differs from the id the keep
+  // run stamped into the owner marker; `prepareRoot({ reuse })` adopts the kept
+  // root rather than mistaking the fresh nonce for a concurrent claimant.
   const runId = args.runId ?? randomUUID();
-  const { store, worktree } = await prepareRoot(args.root, runId);
+  const { store, worktree } = await prepareRoot(args.root, runId, { reuse: args.reuse });
   const daemonCommit = await gitHead(io.cwd).catch(() => 'unknown');
   const daemonDirty = await gitIsDirty(io.cwd).catch(() => true); // unknown reads as dirty, never a false-clean claim
   const envPath = join(args.root, QA_ENV_NAME);

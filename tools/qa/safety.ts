@@ -252,16 +252,27 @@ export async function checkExistingRealDir(path: string): Promise<string | null>
  * Claiming the marker is unconditional and atomic (`writeOwnerMarker`'s
  * first-writer-wins `link`), never a check-then-act: two concurrent callers
  * racing on the same fresh root must not both believe they own it. A losing
- * claim is only tolerated when the marker that won is already ours (a retry
- * of a prior successful claim under the same `runId`, e.g. `--reuse`) — any
- * other winner means a second run genuinely raced us, and we refuse rather
- * than proceed to write into or later delete a root we do not own. */
-export async function prepareRoot(root: string, runId: string): Promise<{ store: string; worktree: string }> {
+ * claim is tolerated in exactly two cases:
+ *  - the winning marker is already ours (a retry under the same `runId`); or
+ *  - `opts.reuse` is set and a valid marker exists — an explicit `--reuse` of a
+ *    root a prior run kept. The `runId` here is only a per-spawn launch nonce, so
+ *    it legitimately differs from the id the keep run stamped; we adopt the kept
+ *    root and leave its marker untouched (`evaluateRoot` already refused a live or
+ *    ambiguous daemon before we got here, so the keep run is provably gone).
+ * Any other lost claim — a foreign marker on a FRESH run — means a second run
+ * genuinely raced us, and we refuse rather than write into or later delete a root
+ * we do not own. */
+export async function prepareRoot(
+  root: string,
+  runId: string,
+  opts: { reuse?: boolean } = {},
+): Promise<{ store: string; worktree: string }> {
   await mkdir(root, { recursive: true, mode: 0o700 });
   const claimed = await writeOwnerMarker(root, runId);
   if (!claimed) {
     const marker = await readOwnerMarker(root);
-    if (marker === null || marker.run_id !== runId) {
+    const tolerated = marker !== null && (opts.reuse === true || marker.run_id === runId);
+    if (!tolerated) {
       throw new Error(`refusing QA root ${root}: a concurrent run claimed ownership first`);
     }
   }

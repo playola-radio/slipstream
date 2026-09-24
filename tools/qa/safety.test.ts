@@ -218,6 +218,34 @@ describe('safety', () => {
       const marker = await readOwnerMarker(root);
       assert.equal(marker?.run_id, 'run-winner');
     });
+
+    it('adopts a kept root under --reuse even when the launch nonce differs (keep→reuse)', async () => {
+      const root = join(base, 'prep-reuse-adopt');
+      // A --keep run mints its ownership id and leaves the marker behind.
+      await prepareRoot(root, 'run-keep');
+      const before = await readOwnerMarker(root);
+      // A later --reuse spawn arrives with a DIFFERENT launch nonce (harness-proc
+      // mints a fresh nonce per process for its readiness handshake). It must adopt
+      // the kept root rather than refuse it as a concurrent claimant.
+      const { store, worktree } = await prepareRoot(root, 'run-reuse-nonce', { reuse: true });
+      assert.equal(store, join(root, 'store'));
+      assert.equal(worktree, join(root, 'worktree'));
+      // Ownership is left exactly as the keep run wrote it — no silent takeover.
+      const after = await readOwnerMarker(root);
+      assert.equal(after?.run_id, 'run-keep');
+      assert.equal(after?.created_at_ms, before?.created_at_ms);
+    });
+
+    it('does not let --reuse relax the concurrent-fresh-claim guard for a genuinely unowned root', async () => {
+      // --reuse tolerating a foreign marker must not become "tolerate anything":
+      // a fresh (reuse:false) run losing the claim is still a refusal, so two
+      // concurrent FRESH runs can never both believe they own one new root.
+      const root = join(base, 'prep-reuse-guard');
+      await prepareRoot(root, 'run-winner');
+      await assert.rejects(prepareRoot(root, 'run-loser', { reuse: false }), /concurrent run claimed ownership/);
+      const marker = await readOwnerMarker(root);
+      assert.equal(marker?.run_id, 'run-winner');
+    });
   });
 
   describe('mayDeleteRoot', () => {
