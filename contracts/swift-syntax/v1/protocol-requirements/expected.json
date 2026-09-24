@@ -1,0 +1,8 @@
+{
+  "description": "protocol method requirement",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

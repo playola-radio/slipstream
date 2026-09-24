@@ -1,0 +1,8 @@
+{
+  "description": "leading UTF-8 BOM",
+  "category": "unicode",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

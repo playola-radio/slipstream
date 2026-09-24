@@ -1,0 +1,8 @@
+{
+  "description": "astral emoji in a string literal",
+  "category": "unicode",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

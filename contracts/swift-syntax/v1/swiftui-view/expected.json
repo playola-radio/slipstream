@@ -1,0 +1,8 @@
+{
+  "description": "SwiftUI View with a result-builder body",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

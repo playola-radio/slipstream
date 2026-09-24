@@ -1,0 +1,20 @@
+{
+  "description": "file truncated mid-signature",
+  "category": "malformed",
+  "rootType": "source_file",
+  "clean": false,
+  "knownGap": false,
+  "diagnostics": [
+    {
+      "kind": "error",
+      "nodeType": "ERROR",
+      "byteStart": 0,
+      "byteEnd": 23,
+      "startRow": 0,
+      "startColumn": 0,
+      "endRow": 0,
+      "endColumn": 23,
+      "byteSlice": "func compute(a: Int, b:"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "description": "methods inside a struct",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}

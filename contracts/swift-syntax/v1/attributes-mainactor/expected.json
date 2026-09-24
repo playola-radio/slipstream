@@ -1,0 +1,8 @@
+{
+  "description": "@MainActor attribute on a function",
+  "category": "d2-construct",
+  "rootType": "source_file",
+  "clean": true,
+  "knownGap": false,
+  "diagnostics": []
+}
