@@ -47,6 +47,22 @@ const DIAG_KEYS: (keyof SwiftDiagnostic)[] = [
   'kind', 'nodeType', 'byteStart', 'byteEnd', 'startRow', 'startColumn', 'endRow', 'endColumn',
 ];
 
+/** Slice [start,end) out of the source bytes as UTF-8, FATAL on a partial
+ * codepoint. `Buffer.toString('utf8')` would silently substitute U+FFFD, so a
+ * span that splits a multi-byte character (e.g. inside an emoji) could match a
+ * recorded replacement character and certify a byte-span contract violation.
+ * A fatal decode turns that into a loud failure instead. */
+function fatalUtf8Slice(name: string, i: number, bytes: Buffer, start: number, end: number): string {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > bytes.length) {
+    fail(`${name}: diagnostic ${i} byte span [${start},${end}) is out of range for ${bytes.length} source bytes`);
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(start, end));
+  } catch {
+    fail(`${name}: diagnostic ${i} byte span [${start},${end}) splits a UTF-8 codepoint — spans must fall on codepoint boundaries`);
+  }
+}
+
 /**
  * Cross-check one fixture's live parse against its recorded envelope. Pure so the
  * honesty rules are unit-testable without spawning the grammar. Throws on any
@@ -63,6 +79,11 @@ export function checkFixtureAgainstExpected(
 ): void {
   if (result.rootType !== expected.rootType) fail(`${name}: root ${result.rootType}, expected ${expected.rootType}`);
   if (result.clean !== expected.clean) fail(`${name}: clean=${result.clean}, expected ${expected.clean} (an undocumented grammar drift)`);
+  // The reported byte length must equal the real source length, or every span
+  // below is measured against a fiction.
+  if (result.byteLength !== bytes.length) {
+    fail(`${name}: byteLength=${result.byteLength}, but the source is ${bytes.length} bytes`);
+  }
   if (result.diagnostics.length !== expected.diagnostics.length) {
     fail(`${name}: ${result.diagnostics.length} diagnostics, expected ${expected.diagnostics.length}`);
   }
@@ -71,7 +92,7 @@ export function checkFixtureAgainstExpected(
     for (const key of DIAG_KEYS) {
       if (actual[key] !== want[key]) fail(`${name}: diagnostic ${i} ${key}=${String(actual[key])}, expected ${String(want[key])}`);
     }
-    const slice = bytes.subarray(actual.byteStart, actual.byteEnd).toString('utf8');
+    const slice = fatalUtf8Slice(name, i, bytes, actual.byteStart, actual.byteEnd);
     if (slice !== want.byteSlice) fail(`${name}: diagnostic ${i} byte span [${actual.byteStart},${actual.byteEnd}) slices ${JSON.stringify(slice)}, expected ${JSON.stringify(want.byteSlice)}`);
   });
   // Honest known-gap manifest: a non-malformed fixture that does not parse clean
@@ -82,7 +103,7 @@ export function checkFixtureAgainstExpected(
   }
 }
 
-async function artifactClaim(): Promise<{ assertion: Assertion; result: ParseResult }> {
+async function artifactClaim(): Promise<Assertion> {
   const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source: 'func greet(name: String) -> String { return name }\n' });
   const p = r.provenance;
   if (p.sha256 !== EXPECTED_SHA256) fail(`artifact sha256 ${p.sha256} != pinned ${EXPECTED_SHA256}`);
@@ -91,15 +112,12 @@ async function artifactClaim(): Promise<{ assertion: Assertion; result: ParseRes
   if (p.wrapper.license !== WRAPPER.license) fail(`wrapper license ${p.wrapper.license} != ${WRAPPER.license}`);
   if (!r.result.clean || r.result.rootType !== 'source_file') fail(`a plain function did not parse clean: ${JSON.stringify(r.result)}`);
   return {
-    result: r,
-    assertion: {
-      id: 'swift-artifact-load',
-      claim: 'LIVE: the pinned tree-sitter-swift.wasm loads under web-tree-sitter with the exact sha256 and ABI, its grammar (MIT) and wrapper (Unlicense) licenses distinct, and parses a plain function clean',
-      evidence: {
-        sha256: p.sha256, abiVersion: p.abiVersion, supportedAbi: p.supportedAbi,
-        grammar: p.grammar, wrapper: p.wrapper, webTreeSitter: p.webTreeSitter,
-        initAndLoadMs: r.timings.initAndLoadMs, firstParseMs: r.timings.firstParseMs,
-      },
+    id: 'swift-artifact-load',
+    claim: 'the pinned tree-sitter-swift.wasm loads under web-tree-sitter with the exact sha256 and ABI, its grammar (MIT) and wrapper (Unlicense) licenses distinct, and parses a plain function clean',
+    evidence: {
+      sha256: p.sha256, abiVersion: p.abiVersion, supportedAbi: p.supportedAbi,
+      grammar: p.grammar, wrapper: p.wrapper, webTreeSitter: p.webTreeSitter,
+      initAndLoadMs: r.timings.initAndLoadMs, firstParseMs: r.timings.firstParseMs,
     },
   };
 }
@@ -116,7 +134,7 @@ async function byteSpanClaim(): Promise<Assertion> {
   if (slice !== 'func f( {') fail(`ERROR byte span slices ${JSON.stringify(slice)}, expected "func f( {"`);
   return {
     id: 'swift-byte-spans',
-    claim: 'LIVE: after an astral emoji (2 UTF-16 units / 4 UTF-8 bytes), a diagnostic\'s byte span starts at byte 15 and slices the exact malformed text — spans are UTF-8 bytes, not UTF-16 indices',
+    claim: 'after an astral emoji (2 UTF-16 units / 4 UTF-8 bytes), a diagnostic\'s byte span starts at byte 15 and slices the exact malformed text — spans are UTF-8 bytes, not UTF-16 indices',
     evidence: { byteStart: err.byteStart, byteEnd: err.byteEnd, slice },
   };
 }
@@ -134,7 +152,7 @@ async function corpusClaim(): Promise<Assertion> {
   }
   return {
     id: 'swift-corpus',
-    claim: 'LIVE: every corpus fixture parses to its recorded envelope with byte spans that slice the exact source text, and each declaration/Unicode fixture that does not parse clean is disclosed as a known grammar gap (never hidden by dropping the fixture)',
+    claim: 'every recorded corpus fixture, re-parsed through the live grammar, matches its envelope with byte spans that slice the exact source text, and each declaration/Unicode fixture that does not parse clean is disclosed as a known grammar gap (never hidden by dropping the fixture)',
     evidence: { fixtures: names.length, knownGaps: gaps },
   };
 }
@@ -146,12 +164,15 @@ async function cancellationClaim(): Promise<Assertion> {
     { deadlineMs: 60_000 },
   );
   if (!r.startedBeforeCancel) fail('the pathological parse never started, so cancellation proves nothing');
-  if (!r.cancelled) fail('the in-progress parse was not cancelled');
+  // The host confirmed the parse was still running when it terminated — not that
+  // it had already completed. Without this the cancellation demo proves nothing.
+  if (!r.inProgressAtCancel) fail('the pathological parse had already finished before termination — cancellation was not demonstrated mid-flight');
+  if (!(r.terminateMs >= 0)) fail(`missing termination timing: ${JSON.stringify(r)}`);
   if (!r.replacement.clean || r.replacement.rootType !== 'source_file') fail(`the replacement parse did not recover: ${JSON.stringify(r.replacement)}`);
   return {
     id: 'swift-cancellation',
-    claim: 'LIVE: an in-progress parse in a terminable worker is cancelled mid-flight, and a fresh worker parses clean input to completion afterward',
-    evidence: { startedBeforeCancel: r.startedBeforeCancel, cancelled: r.cancelled, replacement: r.replacement },
+    claim: 'a parse still in flight (confirmed unfinished at termination) is cancelled by hard-terminating its worker, and a fresh worker parses clean input to completion afterward',
+    evidence: { startedBeforeCancel: r.startedBeforeCancel, inProgressAtCancel: r.inProgressAtCancel, terminateMs: r.terminateMs, replacement: r.replacement },
   };
 }
 
@@ -162,21 +183,26 @@ async function oomSurvivalClaim(): Promise<Assertion> {
     { deadlineMs: 15_000 },
   );
   if (survived.heldMs !== holdMs || !survived.result.clean) fail(`--liftoff-only host did not survive the OOM window: ${JSON.stringify(survived)}`);
-  // Negative control: the same parse on a default launch aborts the process.
-  let controlAborted = false;
+  // Negative control: the same parse on a default launch aborts the process. It
+  // must abort via a V8 fatal-error SIGNAL — NOT our own deadline SIGKILL, NOT a
+  // clean exit-2 load failure (signal null). Accepting either of those would let
+  // an unrelated failure masquerade as the OOM and pass this gate.
+  const V8_FATAL_SIGNALS = new Set<NodeJS.Signals>(['SIGTRAP', 'SIGABRT', 'SIGILL', 'SIGSEGV', 'SIGBUS']);
   let controlDetail: SwiftChildError['detail'] | null = null;
   try {
     await runSwiftParseChild<SurviveResult>({ op: 'survive', source: 'func f() {}\n', holdMs }, { deadlineMs: 15_000, liftoffOnly: false });
   } catch (err) {
     if (!(err instanceof SwiftChildError)) throw err;
-    controlAborted = err.detail.signal !== null || (err.detail.code ?? 0) !== 0;
     controlDetail = err.detail;
   }
-  if (!controlAborted) fail('the default-launch negative control did NOT abort — the --liftoff-only survival is not load-bearing');
+  if (!controlDetail) fail('the default-launch negative control did NOT abort — the --liftoff-only survival is not load-bearing');
+  if (controlDetail.signal === null || !V8_FATAL_SIGNALS.has(controlDetail.signal)) {
+    fail(`the negative control did not abort with a V8 fatal signal (got code=${controlDetail.code}, signal=${controlDetail.signal}); a deadline SIGKILL or clean exit-2 is not proof of the OOM`);
+  }
   return {
     id: 'swift-oom-survival',
-    claim: 'LIVE: under --liftoff-only the host parses and stays alive past the observed V8 out-of-memory window, while the same parse on a default Node launch aborts the process (the negative control)',
-    evidence: { heldMs: survived.heldMs, control: { code: controlDetail?.code ?? null, signal: controlDetail?.signal ?? null } },
+    claim: 'under --liftoff-only the host parses and stays alive past the observed V8 out-of-memory window, while the same parse on a default Node launch aborts the process with a V8 fatal signal (the negative control)',
+    evidence: { heldMs: survived.heldMs, control: { code: controlDetail.code, signal: controlDetail.signal } },
   };
 }
 
@@ -184,10 +210,9 @@ export const t5a3: AcceptanceModule = {
   id: 'T5a.3',
   requiresPlatform: 'darwin',
   async run() {
-    const { assertion: artifact } = await artifactClaim();
     return {
       assertions: [
-        artifact,
+        await artifactClaim(),
         await byteSpanClaim(),
         await corpusClaim(),
         await cancellationClaim(),
