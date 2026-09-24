@@ -5,8 +5,9 @@ import { createHash } from 'node:crypto';
 import {
   verifyArtifactHash,
   checkAbi,
+  loadSwiftLanguage,
   SwiftArtifactError,
-  SWIFT_WASM_PATH,
+  swiftWasmPath,
   EXPECTED_SHA256,
   EXPECTED_ABI,
 } from './swift-grammar.ts';
@@ -14,6 +15,18 @@ import {
 // These exercise the loader's guards WITHOUT loading the grammar, so they run in
 // an ordinary Node process (loading Swift needs --liftoff-only; see
 // tools/swift-parse.test.ts for the end-to-end load/parse coverage).
+
+const SWIFT_WASM_PATH = swiftWasmPath();
+
+test('loadSwiftLanguage refuses to run outside a --liftoff-only process', async () => {
+  // This test process is a plain Node launch, so the isolation guard must throw
+  // BEFORE any grammar bytes are read — otherwise the OOM could abort the run.
+  await assert.rejects(loadSwiftLanguage(), (err: unknown) => {
+    assert.ok(err instanceof SwiftArtifactError);
+    assert.match(err.message, /--liftoff-only/);
+    return true;
+  });
+});
 
 test('verifyArtifactHash accepts the matching hash', () => {
   verifyArtifactHash(EXPECTED_SHA256, EXPECTED_SHA256, SWIFT_WASM_PATH);

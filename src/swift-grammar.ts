@@ -11,7 +11,10 @@
  * found is launching the host process with `node --liftoff-only` (single-tier
  * baseline WASM); workers inherit it. So `loadSwiftLanguage`/`parseSwiftSource`
  * must only ever execute inside such a process (see tools/swift-parse-host.ts).
- * Merely importing this module is safe — nothing here initializes eagerly.
+ * Merely importing this module is safe — nothing here initializes eagerly, not
+ * even resolving the artifact path — and `loadSwiftLanguage` refuses to run
+ * outside a `--liftoff-only` process so an accidental in-process load fails loud
+ * instead of aborting the host a second later.
  */
 import { createRequire } from 'node:module';
 import { readFileSync, existsSync } from 'node:fs';
@@ -22,8 +25,14 @@ import { buildUtf16ToByteTable, utf16RangeToByteRange } from './swift-spans.ts';
 
 const require = createRequire(import.meta.url);
 
-/** The bundled artifact, resolved from the pinned `tree-sitter-wasms` package. */
-export const SWIFT_WASM_PATH = require.resolve('tree-sitter-wasms/out/tree-sitter-swift.wasm');
+/** Package specifier for the bundled artifact, resolved lazily (see
+ * `swiftWasmPath`) so importing this module never touches the filesystem. */
+const SWIFT_WASM_SPECIFIER = 'tree-sitter-wasms/out/tree-sitter-swift.wasm';
+
+/** Env escape that lets a NON-`--liftoff-only` process load the grammar anyway.
+ * Set by ONLY the OOM negative control (tools/swift-parse.ts), which must reach
+ * the load to prove the default launch aborts. Nothing else should set it. */
+export const SWIFT_UNISOLATED_ENV = 'SLIPSTREAM_SWIFT_ALLOW_UNISOLATED';
 
 /** sha256 of the pinned WASM — the artifact's exact identity. The npm range the
  * wrapper declares (`^0.4.0`) is not an exact grammar revision, so this hash,
@@ -59,6 +68,36 @@ export class SwiftArtifactError extends Error {
     this.name = 'SwiftArtifactError';
     this.detail = detail;
   }
+}
+
+/** Resolve the bundled WASM path lazily, wrapping a resolution failure as a
+ * `SwiftArtifactError` (never a raw `MODULE_NOT_FOUND`). Memoized. Called only
+ * from `loadSwiftLanguage`, so a missing install surfaces as the host's exit-2
+ * artifact failure rather than an uncaught throw during module import. */
+let wasmPathCache: string | undefined;
+export function swiftWasmPath(): string {
+  if (wasmPathCache) return wasmPathCache;
+  try {
+    wasmPathCache = require.resolve(SWIFT_WASM_SPECIFIER);
+  } catch (error) {
+    throw new SwiftArtifactError('pinned Swift WASM not found', {
+      specifier: SWIFT_WASM_SPECIFIER,
+    }, { cause: error });
+  }
+  return wasmPathCache;
+}
+
+/** Refuse to load the grammar outside a `--liftoff-only` process. Loading here
+ * would abort the process a second later inside V8's WASM tier-up (see the file
+ * header); failing fast keeps the boundary real instead of by convention. The
+ * `--liftoff-only` flag is inherited by worker threads (verified). */
+function assertIsolatedProcess(): void {
+  if (process.execArgv.includes('--liftoff-only')) return;
+  if (process.env[SWIFT_UNISOLATED_ENV] === '1') return;
+  throw new SwiftArtifactError('refusing to load the Swift grammar outside a --liftoff-only process', {
+    execArgv: process.execArgv,
+    hint: 'load via runSwiftParseChild (tools/swift-parse.ts), which spawns the isolated host',
+  });
 }
 
 /** Fail loudly if the bytes on disk are not the pinned artifact. Pure so the
@@ -160,9 +199,11 @@ function ensureInit(): Promise<void> {
  * that are actually loaded (rather than hashing a path and re-reading it) closes
  * the verification gap Codex flagged. */
 export async function loadSwiftLanguage(): Promise<LoadedSwift> {
-  const bytes = readFileSync(SWIFT_WASM_PATH);
+  assertIsolatedProcess();
+  const path = swiftWasmPath();
+  const bytes = readFileSync(path);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  verifyArtifactHash(sha256, EXPECTED_SHA256, SWIFT_WASM_PATH);
+  verifyArtifactHash(sha256, EXPECTED_SHA256, path);
 
   await ensureInit();
   const supported = { min: MIN_COMPATIBLE_VERSION, max: LANGUAGE_VERSION };
@@ -172,7 +213,7 @@ export async function loadSwiftLanguage(): Promise<LoadedSwift> {
     language = await Language.load(bytes);
   } catch (error) {
     throw new SwiftArtifactError('Language.load failed for the Swift WASM', {
-      path: SWIFT_WASM_PATH,
+      path,
       sha256,
       supportedAbi: supported,
     }, { cause: error });
@@ -187,7 +228,7 @@ export async function loadSwiftLanguage(): Promise<LoadedSwift> {
   } catch (error) {
     probe.delete();
     throw new SwiftArtifactError('Parser.setLanguage rejected the Swift grammar ABI', {
-      path: SWIFT_WASM_PATH,
+      path,
       sha256,
       abiVersion,
       supportedAbi: supported,
@@ -195,12 +236,12 @@ export async function loadSwiftLanguage(): Promise<LoadedSwift> {
   }
   probe.delete();
 
-  checkAbi(abiVersion, EXPECTED_ABI, supported, { path: SWIFT_WASM_PATH, sha256 });
+  checkAbi(abiVersion, EXPECTED_ABI, supported, { path, sha256 });
 
   return {
     language,
     provenance: {
-      path: SWIFT_WASM_PATH,
+      path,
       sha256,
       abiVersion,
       supportedAbi: supported,
@@ -231,7 +272,7 @@ export interface SwiftParseResult {
   byteLength: number;
 }
 
-export class SwiftTraversalError extends Error {}
+class SwiftTraversalError extends Error {}
 
 /** Cap on nodes visited during diagnostic traversal. A pathological tree that
  * blows the cap throws (never returns a truncated `clean:true`); wall-clock
@@ -242,16 +283,13 @@ const MAX_NODES = 500_000;
 /** Parse Swift source and collect its ERROR/MISSING diagnostics with byte spans.
  * Visits EVERY node (including anonymous missing tokens), so no nested defect is
  * hidden. `clean` is true only when the whole tree is free of ERROR/MISSING. */
-export function parseSwiftSource(language: Language, source: string, opts?: { deadlineMs?: number }): SwiftParseResult {
+export function parseSwiftSource(language: Language, source: string): SwiftParseResult {
   const parser = new Parser();
   let tree = null as ReturnType<Parser['parse']>;
   try {
     parser.setLanguage(language);
-    const parseOpts = opts?.deadlineMs !== undefined
-      ? { progressCallback: (() => { const end = performance.now() + opts.deadlineMs!; return () => performance.now() > end; })() }
-      : undefined;
-    tree = parser.parse(source, null, parseOpts);
-    if (!tree) throw new SwiftTraversalError('parse timed out before completion');
+    tree = parser.parse(source);
+    if (!tree) throw new SwiftTraversalError('parser returned no tree');
 
     const table = buildUtf16ToByteTable(source);
     const diagnostics: SwiftDiagnostic[] = [];
