@@ -14,7 +14,8 @@
  * Merely importing this module is safe — nothing here initializes eagerly.
  */
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Parser, Language, LANGUAGE_VERSION, MIN_COMPATIBLE_VERSION, type Node } from 'web-tree-sitter';
 import { buildUtf16ToByteTable, utf16RangeToByteRange } from './swift-spans.ts';
@@ -98,12 +99,33 @@ export function checkAbi(
 }
 
 function installedVersion(pkg: string): string {
+  // Some packages (web-tree-sitter) block `./package.json` in their exports map,
+  // so resolve the package entry and walk up to the nearest package.json instead.
   try {
-    const json = JSON.parse(readFileSync(require.resolve(`${pkg}/package.json`), 'utf8')) as { version?: string };
-    return json.version ?? 'unknown';
+    return readVersionAt(require.resolve(`${pkg}/package.json`));
   } catch {
+    try {
+      let dir = dirname(require.resolve(pkg));
+      for (;;) {
+        const candidate = join(dir, 'package.json');
+        if (existsSync(candidate)) {
+          const v = readVersionAt(candidate);
+          if (v !== 'unknown') return v;
+        }
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    } catch {
+      // fall through to 'unknown'
+    }
     return 'unknown';
   }
+}
+
+function readVersionAt(pkgJsonPath: string): string {
+  const json = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as { version?: string };
+  return json.version ?? 'unknown';
 }
 
 /** Everything the checker prints about the artifact and runtime it loaded. */
