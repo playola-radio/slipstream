@@ -39,17 +39,21 @@ async function readStdin(): Promise<string> {
 /** Run one Swift parse in a fresh terminable worker, resolving when the parse
  * finishes (`done`) — or rejecting if the worker errors. Returns a `cancel`
  * that hard-terminates the worker (a synchronous parse cannot be stopped from
- * inside), plus a `started` promise that resolves when the worker is about to
- * block in the parse. Because the parse is synchronous, `started` can only fire
- * immediately before it — the caller proves mid-flight cancellation by checking
- * `done` is still pending, not by trusting `started` alone. */
+ * inside), a `started` promise that resolves when the worker is about to block
+ * in the parse, and `finished()`, which reads a shared flag the worker sets the
+ * instant the parse returns. Because the parse is synchronous, `started` can
+ * only fire immediately before it; the caller proves mid-flight cancellation by
+ * reading `finished()` (shared memory, immune to this process's event-loop
+ * scheduling), not by trusting `started` alone or by racing a `done` message. */
 function runInWorker(source: string): {
   done: Promise<SwiftParseResult>;
   started: Promise<void>;
+  finished: () => boolean;
   cancel: () => Promise<number>;
   worker: Worker;
 } {
   const worker = new Worker(WORKER_URL);
+  const progress = new Int32Array(new SharedArrayBuffer(4));
   let onStarted!: () => void;
   const started = new Promise<void>((res) => { onStarted = res; });
   const done = new Promise<SwiftParseResult>((resolve, reject) => {
@@ -60,8 +64,14 @@ function runInWorker(source: string): {
     });
     worker.on('error', reject);
   });
-  worker.postMessage({ source });
-  return { done, started, cancel: () => worker.terminate(), worker };
+  worker.postMessage({ source, progress });
+  return {
+    done,
+    started,
+    finished: () => Atomics.load(progress, 0) === 1,
+    cancel: () => worker.terminate(),
+    worker,
+  };
 }
 
 async function main(): Promise<number> {
@@ -70,16 +80,17 @@ async function main(): Promise<number> {
   if (request.op === 'cancel-demo') {
     const first = runInWorker(request.pathologicalSource);
     await first.started;
-    // Completion-race guard: a synchronous parse can only be terminated from
-    // outside, so `started` is posted just before the parse blocks the worker.
-    // Terminating unconditionally would prove nothing if the parse had already
-    // finished — so watch `first.done` and confirm it is STILL pending after a
-    // beat. `inProgressAtCancel:false` means the pathological input was too small
-    // to interrupt; the acceptance check treats that as a failure, never a pass.
-    let doneSettled = false;
-    first.done.then(() => { doneSettled = true; }, () => { doneSettled = true; });
+    // Completion guard: a synchronous parse can only be terminated from outside,
+    // so `started` is posted just before the parse blocks the worker. Terminating
+    // unconditionally would prove nothing if the parse had already finished — so
+    // after a beat, read the worker's shared progress flag, which it sets the
+    // instant the parse returns. Reading shared memory (not racing a `done`
+    // message) means a stalled parent event loop can never mistake a finished
+    // parse for a running one. `inProgressAtCancel:false` means the pathological
+    // input was too small to interrupt; the acceptance check treats that as a
+    // failure, never a pass.
     await new Promise((res) => setTimeout(res, 150));
-    const inProgressAtCancel = !doneSettled;
+    const inProgressAtCancel = !first.finished();
     const t = performance.now();
     await first.cancel();
     const terminateMs = performance.now() - t;

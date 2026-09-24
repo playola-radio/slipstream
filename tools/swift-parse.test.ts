@@ -58,6 +58,20 @@ test('cancels an in-progress parse and recovers in a replacement worker', async 
   assert.equal(r.replacement.rootType, 'source_file');
 });
 
+test('cancel-demo reports inProgressAtCancel:false when the parse finished first', async () => {
+  // A trivially fast "pathological" source completes long before the 150ms beat.
+  // The worker sets its shared progress flag the instant the parse returns, so
+  // the host reads finished()===true regardless of its own event-loop timing and
+  // must honestly report inProgressAtCancel:false rather than a false positive.
+  const r = only('cancel-demo', await runSwiftParseChild(
+    { op: 'cancel-demo', pathologicalSource: 'func f() {}\n', cleanSource: 'struct S {}\n' },
+    { deadlineMs: 60_000 },
+  ));
+  assert.equal(r.startedBeforeCancel, true);
+  assert.equal(r.inProgressAtCancel, false, 'a parse that finished before the beat must not be claimed as in-progress');
+  assert.equal(r.replacement.clean, true);
+});
+
 test('an already-aborted signal never launches work', async () => {
   const controller = new AbortController();
   controller.abort();
