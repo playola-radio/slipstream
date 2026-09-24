@@ -36,7 +36,11 @@ async function finiteHeaderClaim(ctx: AcceptanceContext): Promise<Assertion> {
   };
 }
 
-/** empty replay (after=H) → 200 stamped, zero records. */
+/** replay from the current high-water (after=H) → 200, stamped, and — since the
+ * session may keep advancing between requests when acceptance runs against an
+ * existing operator-supplied daemon — every record it does carry (if any) is
+ * strictly newer than H rather than a stale replay of what after=H already
+ * covers. */
 async function emptyReplayClaim(ctx: AcceptanceContext): Promise<Assertion> {
   const first = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`, { signal: ctx.signal });
   const H = first.headers.get('slipstream-durable-seq');
@@ -44,11 +48,13 @@ async function emptyReplayClaim(ctx: AcceptanceContext): Promise<Assertion> {
   const res = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=${H}`, { signal: ctx.signal });
   if (res.status !== 200) fail(`empty replay returned ${res.status}`);
   if (res.headers.get(FOLD_HEADER) !== DISPLAY_FOLD_CONTRACT) fail(`empty replay missing ${FOLD_HEADER}`);
-  if (res.body.length !== 0) fail(`empty replay body was ${res.body.length} bytes, expected 0`);
+  const records = parseNdjson(res.body.toString('utf8'));
+  const stale = records.filter((r) => BigInt(r.seq as string) <= BigInt(H));
+  if (stale.length) fail(`replay after=${H} carried ${stale.length} record(s) at or before H, expected only records newer than H`);
   return {
     id: 'empty-replay-header',
-    claim: `LIVE: a caught-up (empty) finite replay is still 200 with ${FOLD_HEADER} and a zero-record body`,
-    evidence: { durable_seq: H, body_bytes: res.body.length },
+    claim: `LIVE: a finite replay from the current high-water is still 200 with ${FOLD_HEADER}, carrying no record at or before that high-water`,
+    evidence: { durable_seq: H, body_bytes: res.body.length, records: records.length },
   };
 }
 
@@ -93,20 +99,23 @@ async function noHeaderOnErrorsClaim(ctx: AcceptanceContext): Promise<Assertion>
   };
 }
 
-/** The header is additive: the finite body is the unchanged event NDJSON and
+/** The header is additive: the finite body is unchanged event NDJSON (a prefix
+ * of any later replay, since the session may keep advancing between requests
+ * when acceptance runs against an existing operator-supplied daemon — history
+ * is append-only, so `a`'s bytes must recur verbatim at the front of `b`) and
  * folds under exactly the advertised contract (as in T0.1). */
 async function bodyUnchangedClaim(ctx: AcceptanceContext): Promise<Assertion> {
   const a = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`, { signal: ctx.signal });
   const b = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`, { signal: ctx.signal });
-  if (!a.body.equals(b.body)) fail('two identical finite replays returned different bodies');
+  if (!b.body.subarray(0, a.body.length).equals(a.body)) fail("a later finite replay did not reproduce the earlier one's bytes as a prefix");
   const events = parseNdjson(a.body.toString('utf8'));
   const folded = JSON.parse(canonicalJson(foldDisplay(events))) as { contract: string; result: string };
   if (folded.contract !== DISPLAY_FOLD_CONTRACT) fail(`served body folds under '${folded.contract}', not the advertised '${DISPLAY_FOLD_CONTRACT}'`);
   if (folded.result !== 'ok') fail(`served body folds to result '${folded.result}', not 'ok' — the header would advertise a contract the body cannot satisfy`);
   return {
     id: 'body-unchanged',
-    claim: `LIVE: stamping ${FOLD_HEADER} left the body byte-stable, and it folds cleanly (result 'ok') under the advertised contract`,
-    evidence: { body_bytes: a.body.length, records: events.length, folds_under: folded.contract, result: folded.result },
+    claim: `LIVE: stamping ${FOLD_HEADER} left prior history byte-stable across replays, and it folds cleanly (result 'ok') under the advertised contract`,
+    evidence: { body_bytes: a.body.length, later_body_bytes: b.body.length, records: events.length, folds_under: folded.contract, result: folded.result },
   };
 }
 
