@@ -1,0 +1,265 @@
+/**
+ * A small bounded admission budget shared across projection workloads.
+ *
+ * Clip projection and the upcoming interface projection each turn a change's
+ * before/after blobs into a derived view on demand, in terminable workers. Two
+ * independently-bounded pools can still JOINTLY starve capture, so both draw
+ * from one budget: at most `C` computes execute at once (across all workloads),
+ * at most `Q` admitted requests wait without running (queued leaders plus
+ * coalesced waiters), at most `W` of those waiters may be coalesced, and every
+ * admitted request has a deadline `D` measured FROM ADMISSION — queue wait
+ * included (STAGE-T-PREREQS.md decision D7; rationale in ADMISSION.md).
+ *
+ * It is deliberately NOT a general job framework: no priorities, persistence,
+ * retries, or plugins. Each workload keeps its own compute protocol, worker
+ * pool, cache, and response envelope. The budget never constructs a projection
+ * envelope; it returns a neutral outcome the workload maps to its own view.
+ *
+ * Every terminal transition runs through one idempotent `settle` that clears the
+ * unit's timer, releases its reserved slots exactly once, cancels still-running
+ * work, and ignores any late completion. A settled (timed-out) request is not
+ * proof its worker stopped consuming CPU — real teardown is the workload pool's
+ * responsibility; the budget bounds admitted running work as a proxy.
+ */
+
+export interface ComputeHandle<T> {
+  promise: Promise<T>;
+  /** Stop the running compute. Fire-and-forget; the budget never awaits it. */
+  cancel: () => void;
+}
+
+export interface AdmitRequest<T> {
+  /** Workload identity — groups per-workload concurrency and does not coalesce. */
+  workload: string;
+  /** Max computes this workload may run at once (clip: 1 single worker). */
+  localConcurrency: number;
+  /** Coalescing key; identical concurrent keys share one compute. Undefined never coalesces. */
+  key?: string;
+  /** Starts the compute; called once, when a running slot is granted. */
+  run: () => ComputeHandle<T>;
+}
+
+export type AdmitOutcome<T> =
+  | { kind: 'ok'; value: T }
+  | { kind: 'timeout' }
+  | { kind: 'overloaded' }
+  | { kind: 'closed' }
+  | { kind: 'error'; error: unknown };
+
+export interface AdmissionConfig {
+  /** Max computes executing at once, across all workloads. */
+  C: number;
+  /** Max admitted-but-not-running units: queued leaders plus coalesced waiters. */
+  Q: number;
+  /** Sub-cap on coalesced waiters within Q (W <= Q). */
+  W: number;
+  /** Per-request deadline in ms, measured from admission (queue wait included). */
+  D: number;
+}
+
+export interface AdmissionSnapshot {
+  running: number;
+  queued: number;
+  waiters: number;
+}
+
+export interface ProjectionAdmission {
+  admit<T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>>;
+  close(): Promise<void>;
+  snapshot(): AdmissionSnapshot;
+  readonly config: Readonly<AdmissionConfig>;
+}
+
+// PROVISIONAL — not approved, not measured. A starting point for the combined-load
+// measurements that decide the real numbers, per D7, after the TypeScript (T5a.2)
+// and Swift (T5a.4) modules exist. See ADMISSION.md. Nothing may claim these are
+// approved. C=2 lets one clip and one interface compute run at once.
+export const PROVISIONAL_SHARED_ADMISSION: AdmissionConfig = { C: 2, Q: 8, W: 8, D: 100 };
+
+type UnitState = 'running' | 'queued' | 'waiting' | 'settled';
+
+interface Unit {
+  workload: string;
+  localConcurrency: number;
+  key?: string;
+  run: () => ComputeHandle<unknown>;
+  resolve: (outcome: AdmitOutcome<unknown>) => void;
+  state: UnitState;
+  deadlineAt: number;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  handle: ComputeHandle<unknown> | undefined;
+}
+
+interface Flight {
+  leader: Unit;
+  waiters: Set<Unit>;
+}
+
+export function createProjectionAdmission(config: AdmissionConfig): ProjectionAdmission {
+  const { C, Q, W, D } = config;
+
+  let running = 0;
+  const runningByWorkload = new Map<string, number>();
+  const queue: Unit[] = []; // queued leaders, FIFO
+  let waiters = 0;
+  const inFlight = new Map<string, Flight>(); // leader (running or queued) per key
+  const live = new Set<Unit>();
+  let closed = false;
+  let pumping = false;
+
+  const runningOf = (w: string): number => runningByWorkload.get(w) ?? 0;
+  const incRunning = (w: string): void => { running++; runningByWorkload.set(w, runningOf(w) + 1); };
+  const decRunning = (w: string): void => {
+    running--;
+    const n = runningOf(w) - 1;
+    if (n <= 0) runningByWorkload.delete(w); else runningByWorkload.set(w, n);
+  };
+  const pending = (): number => queue.length + waiters;
+
+  const arm = (unit: Unit): void => {
+    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }), D);
+    unit.timer.unref(); // a pending deadline must never hold the process open
+  };
+
+  const releaseFlight = (leader: Unit, outcome: AdmitOutcome<unknown>): void => {
+    if (leader.key === undefined) return;
+    const flight = inFlight.get(leader.key);
+    if (!flight || flight.leader !== leader) return;
+    inFlight.delete(leader.key);
+    for (const waiter of [...flight.waiters]) settle(waiter, outcome);
+  };
+
+  const settle = (unit: Unit, outcome: AdmitOutcome<unknown>): void => {
+    if (unit.state === 'settled') return;
+    const prev = unit.state;
+    unit.state = 'settled';
+    if (unit.timer !== undefined) clearTimeout(unit.timer);
+    live.delete(unit);
+
+    if (prev === 'running') {
+      decRunning(unit.workload);
+      // Cancel only when forcibly ending unfinished work; ok/error already settled.
+      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed')) unit.handle.cancel();
+      releaseFlight(unit, outcome);
+    } else if (prev === 'queued') {
+      const i = queue.indexOf(unit);
+      if (i >= 0) queue.splice(i, 1);
+      releaseFlight(unit, outcome);
+    } else if (prev === 'waiting') {
+      waiters--;
+      if (unit.key !== undefined) inFlight.get(unit.key)?.waiters.delete(unit);
+    }
+
+    unit.resolve(outcome);
+    pump();
+  };
+
+  const startCompute = (unit: Unit): void => {
+    let handle: ComputeHandle<unknown>;
+    try {
+      handle = unit.run();
+    } catch (error) {
+      settle(unit, { kind: 'error', error });
+      return;
+    }
+    unit.handle = handle;
+    handle.promise.then(
+      (value) => {
+        if (unit.state === 'settled') return; // late completion ignored
+        if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
+        settle(unit, { kind: 'ok', value });
+      },
+      (error) => {
+        if (unit.state === 'settled') return;
+        settle(unit, { kind: 'error', error });
+      },
+    );
+  };
+
+  const pump = (): void => {
+    if (pumping) return;
+    pumping = true;
+    try {
+      while (running < C) {
+        // Oldest runnable queued leader: FIFO, but skip one whose workload cap is full
+        // so a queued clip behind a busy clip worker cannot block another workload.
+        let idx = -1;
+        for (let i = 0; i < queue.length; i++) {
+          if (runningOf(queue[i]!.workload) < queue[i]!.localConcurrency) { idx = i; break; }
+        }
+        if (idx < 0) break;
+        const unit = queue[idx]!;
+        if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); continue; }
+        queue.splice(idx, 1);
+        unit.state = 'running';
+        incRunning(unit.workload);
+        startCompute(unit);
+      }
+    } finally {
+      pumping = false;
+    }
+  };
+
+  const admit = <T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
+    if (closed) return Promise.resolve({ kind: 'closed' });
+    return new Promise<AdmitOutcome<T>>((resolve) => {
+      const unit: Unit = {
+        workload: req.workload,
+        localConcurrency: req.localConcurrency,
+        key: req.key,
+        run: req.run as () => ComputeHandle<unknown>,
+        resolve: resolve as (outcome: AdmitOutcome<unknown>) => void,
+        state: 'queued',
+        deadlineAt: Date.now() + D,
+        timer: undefined,
+        handle: undefined,
+      };
+
+      // Coalesce onto an existing flight (a running or queued leader for this key).
+      // Lookup, reservation, and attachment are synchronous — no intervening await.
+      if (req.key !== undefined) {
+        const flight = inFlight.get(req.key);
+        if (flight) {
+          if (pending() >= Q || waiters >= W) { resolve({ kind: 'overloaded' }); return; }
+          waiters++;
+          unit.state = 'waiting';
+          flight.waiters.add(unit);
+          arm(unit);
+          live.add(unit);
+          return;
+        }
+      }
+
+      // New leader: run now if there is capacity, else queue, else reject.
+      if (running < C && runningOf(req.workload) < req.localConcurrency) {
+        unit.state = 'running';
+        incRunning(req.workload);
+        if (req.key !== undefined) inFlight.set(req.key, { leader: unit, waiters: new Set() });
+        arm(unit);
+        live.add(unit);
+        startCompute(unit);
+        return;
+      }
+      if (pending() < Q) {
+        unit.state = 'queued';
+        queue.push(unit);
+        if (req.key !== undefined) inFlight.set(req.key, { leader: unit, waiters: new Set() });
+        arm(unit);
+        live.add(unit);
+        return;
+      }
+      resolve({ kind: 'overloaded' });
+    });
+  };
+
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    // Settle every live unit exactly once; each settle clears its timer and slot.
+    for (const unit of [...live]) settle(unit, { kind: 'closed' });
+  };
+
+  const snapshot = (): AdmissionSnapshot => ({ running, queued: queue.length, waiters });
+
+  return { admit, close, snapshot, config };
+}
