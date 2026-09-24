@@ -81,19 +81,25 @@ async function main(): Promise<number> {
     const first = runInWorker(request.pathologicalSource);
     await first.started;
     // Completion guard: a synchronous parse can only be terminated from outside,
-    // so `started` is posted just before the parse blocks the worker. Terminating
-    // unconditionally would prove nothing if the parse had already finished — so
-    // after a beat, read the worker's shared progress flag, which it sets the
-    // instant the parse returns. Reading shared memory (not racing a `done`
-    // message) means a stalled parent event loop can never mistake a finished
-    // parse for a running one. `inProgressAtCancel:false` means the pathological
-    // input was too small to interrupt; the acceptance check treats that as a
-    // failure, never a pass.
+    // so `started` is posted just before the parse blocks the worker. Give it a
+    // beat to get into the parse, then hard-terminate and read the worker's
+    // shared progress flag AFTER teardown completes. The worker stores the flag
+    // the instant the parse returns, before any teardown, so once the thread has
+    // exited: flag set => the parse finished before it was killed; flag unset =>
+    // it was still parsing when terminated. Sampling at the teardown boundary
+    // (not before terminate) closes the check-to-terminate window — a parse that
+    // completes while the host is descheduled is observed as finished, never
+    // mis-reported as interrupted. `inProgressAtCancel:false` means the
+    // pathological input finished before the kill landed; the acceptance check
+    // treats that as a failure, never a pass. (One irreducible sub-instruction
+    // window remains: a parse that returns but is killed before its very next
+    // store executes — documented in SWIFT-GRAMMAR.md, inherent to a
+    // non-interruptible synchronous parse.)
     await new Promise((res) => setTimeout(res, 150));
-    const inProgressAtCancel = !first.finished();
     const t = performance.now();
     await first.cancel();
     const terminateMs = performance.now() - t;
+    const inProgressAtCancel = !first.finished();
     // The runtime recovers: a replacement worker parses clean input to completion.
     const second = runInWorker(request.cleanSource);
     const result = await second.done;

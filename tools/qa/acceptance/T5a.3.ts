@@ -180,14 +180,15 @@ async function cancellationClaim(): Promise<Assertion> {
     { deadlineMs: 60_000 },
   );
   if (!r.startedBeforeCancel) fail('the pathological parse never started, so cancellation proves nothing');
-  // The host confirmed the parse was still running when it terminated — not that
-  // it had already completed. Without this the cancellation demo proves nothing.
+  // Read after teardown: the worker's completion flag was still unset once the
+  // worker had exited, so the parse had not finished when it was terminated —
+  // not merely that the host hadn't yet heard about a completion.
   if (!r.inProgressAtCancel) fail('the pathological parse had already finished before termination — cancellation was not demonstrated mid-flight');
   if (!(r.terminateMs >= 0)) fail(`missing termination timing: ${JSON.stringify(r)}`);
   if (!r.replacement.clean || r.replacement.rootType !== 'source_file') fail(`the replacement parse did not recover: ${JSON.stringify(r.replacement)}`);
   return {
     id: 'swift-cancellation',
-    claim: 'a parse still in flight (confirmed unfinished at termination) is cancelled by hard-terminating its worker, and a fresh worker parses clean input to completion afterward',
+    claim: "a parse still running when its worker was terminated (its completion flag, set only after the parse returns, was still unset once the worker had been torn down) is cancelled by hard-terminating that worker, and a fresh worker parses clean input to completion afterward",
     evidence: { startedBeforeCancel: r.startedBeforeCancel, inProgressAtCancel: r.inProgressAtCancel, terminateMs: r.terminateMs, replacement: r.replacement },
   };
 }

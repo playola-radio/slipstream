@@ -107,16 +107,30 @@ interrupted from inside, so cancellation is `worker.terminate()` (a hard kill).
 Because the parse is synchronous, the worker can only post `started` *just
 before* it blocks — that alone does not prove an in-flight interruption (the
 parse could have finished before the terminate landed). So the `cancel-demo`
-operation additionally **confirms the parse is still unfinished** at termination
-via a **shared-memory flag**: the worker stores `1` into a `SharedArrayBuffer`
-the instant the parse returns, before posting `done`, and the host reads that
-flag after a beat (`inProgressAtCancel = !finished`). Reading shared memory
-rather than racing the `done` message means a stalled host event loop can never
-mistake a finished parse for a running one. If a pathological input finished too
-fast to interrupt, the flag is set and `inProgressAtCancel` is false, so the
-acceptance check **fails honestly** rather than claiming a cancellation that did
-not happen. It then measures the termination time and parses clean input to
-completion in a fresh worker, demonstrating the runtime recovers.
+operation additionally **confirms the parse was still unfinished when the worker
+was terminated** via a **shared-memory flag**: the worker stores `1` into a
+`SharedArrayBuffer` the instant the parse returns, before posting `done` and
+before any teardown. The host gives the parse a beat, hard-terminates the worker,
+and reads the flag **after `terminate()` has resolved** (i.e. after the thread
+has exited): `inProgressAtCancel = !finished`. Sampling at the teardown boundary,
+rather than before the terminate, is what makes this honest — a parse that
+completes while the host is descheduled has already stored its flag by the time
+the thread exits, so it is observed as finished, never mis-reported as
+interrupted. If a pathological input finished too fast to interrupt, the flag is
+set and `inProgressAtCancel` is false, so the acceptance check **fails honestly**
+rather than claiming a cancellation that did not happen. It then measures the
+termination time and parses clean input to completion in a fresh worker,
+demonstrating the runtime recovers.
+
+**One irreducible window remains, and we do not claim otherwise.** A parse that
+*returns* but is killed in the few instructions before its very next statement
+(the flag store) executes would read as `inProgressAtCancel:true`. This window is
+inherent to a non-interruptible synchronous parse — no sampling scheme can make
+completion, flag publication, and termination a single indivisible step — and is
+sub-instruction against a multi-second pathological parse. The claim is therefore
+scoped precisely to what the flag proves: *the completion flag was still unset
+once the worker had been torn down*, not a guarantee about the exact instant the
+kill landed.
 
 Observed: a 200k-block pathological parse is still running when terminated;
 `worker.terminate()` returns in ~2 ms; the replacement parse is clean. Proven in
