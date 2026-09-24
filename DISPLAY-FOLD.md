@@ -239,7 +239,7 @@ promises. A version is released by a **manifest** at
 - the **display dependency list** — the exact static import closure of
   `src/display-fold.ts`;
 - an **implementation fingerprint** (`sha256:…`) over the raw bytes of that closure
-  (a hash-of-hashes; algorithm id `slipstream.fold-release.v1`);
+  (a hash-of-hashes: each dep's SHA-256 with its path, hashed together);
 - the **corpus**: every case name with the SHA-256 of its `input.ndjson` and
   `expected.json`.
 
@@ -342,7 +342,6 @@ Architected with Codex (consult mode) before implementing the header and gates:
    (lowercase hex), joined as `"<hex>  <relpath>\n"` in code-unit path order, then
    hashed. Corpus hashes cover the **exact discovered file set** (both files per
    case; a stray or missing file fails), not just the manifest's listed entries.
-   The algorithm id is recorded in the manifest.
 3. **Import closure.** Use the TypeScript parser API (`ts.createSourceFile` + AST),
    never a regex — it sees `import type`, re-exports, side-effect imports, and
    `import('…')` type nodes. Fail closed on dynamic `import()`, `require`,
@@ -350,10 +349,11 @@ Architected with Codex (consult mode) before implementing the header and gates:
    non-relative or non-`.ts` specifier.
 4. **Immutability base.** Do not bake a stale default that silently passes when it
    goes missing. Resolve the base to a commit (`rev-parse --verify`); a missing base
-   in a git tree exits `2`. Compare with a two-dot `git diff <base>` against the
-   working tree (so uncommitted edits are caught), rejecting Modified/Deleted/
-   Type-changed released files and allowing Additions — this naturally permits this
-   PR to add v1's first manifest while the already-committed v1 corpus stays frozen.
+   in a git tree exits `2`. Compare the base against **both `HEAD` and the working
+   tree** (`git diff <base> HEAD` ∪ `git diff <base>`), so neither a committed change
+   that is locally reverted nor an uncommitted edit escapes — rejecting Modified/
+   Deleted/Type-changed released files and allowing Additions. This naturally permits
+   this PR to add v1's first manifest while the already-committed v1 corpus stays frozen.
    CI passes the PR base SHA explicitly with full history; a non-git tree (a
    throwaway test copy) reports immutability as not-applicable and is driven by the
    fingerprint gate alone.

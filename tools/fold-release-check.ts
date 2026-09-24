@@ -6,9 +6,9 @@
  *    fingerprint, and corpus hashes and compare them to the released manifest.
  *    Runs on any `--root`; needs no git.
  *  - Gate 4 (immutability): no file that already exists under `contracts/` in the
- *    base tree may be modified, deleted, or type-changed in the working tree.
- *    Additions (a new manifest, a whole new version directory) are allowed. Needs
- *    git; compares the base commit against the working tree.
+ *    base tree may be modified, deleted, or type-changed — in HEAD or in the
+ *    working tree. Additions (a new manifest, a whole new version directory) are
+ *    allowed. Needs git; compares the base commit against both HEAD and the tree.
  *
  * Prints exactly one JSON result to stdout. Exit 0 = both gates pass; 1 = a gate
  * failed; 2 = bad args, or the base ref could not be resolved in a git work tree
@@ -24,8 +24,17 @@ export const FOLD_RELEASE_EXIT = { PASS: 0, FAIL: 1, USAGE: 2 } as const;
 export const DEFAULT_BASE = 'origin/briankeane/vienna';
 const PROTECTED_PREFIX = 'contracts/display-fold/';
 
-export interface FoldReleaseArgs { root: string; base: string }
+interface FoldReleaseArgs { root: string; base: string }
 export class FoldReleaseArgError extends Error {}
+
+/** Consume the value token after `flag`, refusing a missing value or one that is
+ * itself an option (`--root --base` is malformed usage, not root='--base'). */
+function takeValue(argv: readonly string[], i: number, flag: string): string {
+  const v = argv[i];
+  if (v === undefined) throw new FoldReleaseArgError(`${flag} requires a value`);
+  if (v.startsWith('--')) throw new FoldReleaseArgError(`${flag} requires a value, got option ${v}`);
+  return v;
+}
 
 export function parseFoldReleaseArgs(argv: readonly string[], cwd: string): FoldReleaseArgs {
   let root = cwd;
@@ -33,13 +42,9 @@ export function parseFoldReleaseArgs(argv: readonly string[], cwd: string): Fold
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--root') {
-      const v = argv[++i];
-      if (v === undefined) throw new FoldReleaseArgError('--root requires a directory');
-      root = resolve(cwd, v);
+      root = resolve(cwd, takeValue(argv, ++i, '--root'));
     } else if (arg === '--base') {
-      const v = argv[++i];
-      if (v === undefined) throw new FoldReleaseArgError('--base requires a ref');
-      base = v;
+      base = takeValue(argv, ++i, '--base');
     } else {
       throw new FoldReleaseArgError(`unknown argument: ${arg}`);
     }
@@ -73,23 +78,34 @@ function resolveBase(root: string, base: string): string | null {
 }
 
 /**
- * Compare the base commit against the working tree under `contracts/`. Any
- * base-existing file that is Modified / Deleted / Type-changed (a symlink swap)
- * / Copied is a violation; Additions are allowed.
+ * Compare the base commit against both `HEAD` (what this branch would merge) and
+ * the working tree, under `contracts/`. Any base-existing file that is Modified /
+ * Deleted / Type-changed in either is a violation; Additions are allowed. Checking
+ * both closes two holes: a committed change locally reverted in the working tree
+ * (caught by base..HEAD) and an uncommitted edit (caught by base..worktree).
  */
 export function checkImmutability(root: string, base: string): Immutability {
   if (!inGitWorkTree(root)) return { checked: false, reason: 'root is not inside a git work tree' };
   const baseSha = resolveBase(root, base);
   if (baseSha === null) return { checked: true, base, violations: [`__unresolved__:${base}`] };
 
+  const violations = new Map<string, string>();
+  for (const [path, msg] of collectDiff(root, [baseSha, 'HEAD'])) violations.set(path, msg);
+  for (const [path, msg] of collectDiff(root, [baseSha])) if (!violations.has(path)) violations.set(path, msg);
+  return { checked: true, base: baseSha, violations: [...violations.values()] };
+}
+
+/** Parse `git diff --raw` (base against `refs`, or the working tree when `refs`
+ * holds only the base) into [path, violation-message] pairs; Additions omitted. */
+function collectDiff(root: string, refs: string[]): [string, string][] {
   const raw = execFileSync(
     'git',
-    ['-C', root, 'diff', '--no-renames', '-z', '--raw', baseSha, '--', PROTECTED_PREFIX],
+    ['-C', root, 'diff', '--no-renames', '-z', '--raw', ...refs, '--', PROTECTED_PREFIX],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
   );
-  const violations: string[] = [];
-  // -z --raw records: ":<m1> <m2> <sha1> <sha2> <status>\0<path>\0" (rename/copy add
-  // a second path field; --no-renames keeps every record single-path here).
+  const out: [string, string][] = [];
+  // -z --raw records: ":<m1> <m2> <sha1> <sha2> <status>\0<path>\0". --no-renames
+  // keeps every record single-path (no rename/copy statuses).
   const parts = raw.split('\0');
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const meta = parts[i];
@@ -97,13 +113,12 @@ export function checkImmutability(root: string, base: string): Immutability {
     const status = meta.slice(meta.lastIndexOf(' ') + 1);
     const path = parts[i + 1]!;
     if (status.startsWith('A')) continue; // additions are allowed
-    if (status.startsWith('M')) violations.push(`${path}: modified since release`);
-    else if (status.startsWith('D')) violations.push(`${path}: deleted since release`);
-    else if (status.startsWith('T')) violations.push(`${path}: type changed since release`);
-    else if (status.startsWith('C')) violations.push(`${path}: copied over since release`);
-    else violations.push(`${path}: changed since release (${status})`);
+    if (status.startsWith('M')) out.push([path, `${path}: modified since release`]);
+    else if (status.startsWith('D')) out.push([path, `${path}: deleted since release`]);
+    else if (status.startsWith('T')) out.push([path, `${path}: type changed since release`]);
+    else out.push([path, `${path}: changed since release (${status})`]);
   }
-  return { checked: true, base: baseSha, violations };
+  return out;
 }
 
 export interface RunFoldReleaseIO {

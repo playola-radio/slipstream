@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, cp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, cp, writeFile, readFile, rm, symlink, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -55,6 +55,33 @@ describe('fold-release closure discovery', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('rejects a require(...) call the fingerprint could not account for', async () => {
+    const root = await stageTree();
+    try {
+      const p = join(root, FOLD_ENTRY);
+      const src = await readFile(p, 'utf8');
+      await writeFile(p, `const late = () => require('./snapshot.ts');\nvoid late;\n${src}`);
+      assert.throws(() => discoverImportClosure(root), FoldReleaseError);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a closure file that is a symlink', async () => {
+    const root = await stageTree();
+    try {
+      const p = join(root, 'src/snapshot.ts');
+      const bytes = await readFile(p);
+      const outside = join(root, 'outside-snapshot.ts');
+      await writeFile(outside, bytes);
+      await unlink(p);
+      await symlink(outside, p);
+      assert.throws(() => discoverImportClosure(root), FoldReleaseError);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('fold-release fingerprint gate', () => {
@@ -71,7 +98,6 @@ describe('fold-release fingerprint gate', () => {
   it('fails on a changed byte in a listed dependency', async () => {
     const root = await stageTree();
     try {
-      await cp(join(REPO_ROOT, 'contracts/display-fold/v1/manifest.json'), join(root, 'contracts/display-fold/v1/manifest.json'));
       const p = join(root, 'src/snapshot.ts');
       await writeFile(p, `${await readFile(p, 'utf8')}\n// drift\n`);
       const failures = checkFingerprintGate(root);
@@ -84,7 +110,6 @@ describe('fold-release fingerprint gate', () => {
   it('fails when the closure gains an import the manifest does not list', async () => {
     const root = await stageTree();
     try {
-      await cp(join(REPO_ROOT, 'contracts/display-fold/v1/manifest.json'), join(root, 'contracts/display-fold/v1/manifest.json'));
       await writeFile(join(root, 'src/extra.ts'), 'export const extra = 1;\n');
       const p = join(root, FOLD_ENTRY);
       await writeFile(p, `import { extra } from './extra.ts';\nvoid extra;\n${await readFile(p, 'utf8')}`);
@@ -98,11 +123,22 @@ describe('fold-release fingerprint gate', () => {
   it('fails and names the case when a corpus expected.json changes', async () => {
     const root = await stageTree();
     try {
-      await cp(join(REPO_ROOT, 'contracts/display-fold/v1/manifest.json'), join(root, 'contracts/display-fold/v1/manifest.json'));
       const p = join(root, 'contracts/display-fold/v1/empty/expected.json');
       await writeFile(p, `${await readFile(p, 'utf8')} `);
       const failures = checkFingerprintGate(root);
       assert.ok(failures.some((f) => /'empty'/.test(f) && /expected\.json changed/.test(f)), failures.join('\n'));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a gate failure (never throws) on a malformed manifest corpus entry', async () => {
+    const root = await stageTree();
+    try {
+      const p = join(root, 'contracts/display-fold/v1/manifest.json');
+      await writeFile(p, JSON.stringify({ contract: 'display-fold.v1', display_dependencies: ['src/display-fold.ts'], corpus: [null] }));
+      const failures = checkFingerprintGate(root);
+      assert.ok(failures.some((f) => /corpus entry/.test(f)), failures.join('\n'));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

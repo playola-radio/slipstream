@@ -1,6 +1,5 @@
 {
   "contract": "display-fold.v1",
-  "algorithm": "slipstream.fold-release.v1",
   "canonical_output": "NDJSON: one canonical-JSON object per fold result; object keys sorted, arrays ordered, seqs as decimal strings, strings compared by UTF-16 code unit",
   "supported_event_versions": [
     "slipstream.file.changed.v1",

@@ -19,15 +19,11 @@
  * This module is test/tooling-only (it pulls in `typescript`, a devDependency);
  * the daemon never imports it.
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, lstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, resolve } from 'node:path';
 import ts from 'typescript';
-
-/** The fingerprint/corpus-hash scheme this module implements, recorded in the
- * manifest so a future scheme change is itself visible as a manifest change. */
-export const RELEASE_ALGORITHM = 'slipstream.fold-release.v1';
 
 /** The single fold entry point whose import closure defines the display deps. */
 export const FOLD_ENTRY = 'src/display-fold.ts';
@@ -44,14 +40,13 @@ const CONTRACT_DIR = 'contracts/display-fold/v1';
 const CASE_NAME = /^[a-z0-9][a-z0-9-]*$/;
 const CORPUS_FILES = ['input.ndjson', 'expected.json'] as const;
 
-export interface CorpusEntry {
+interface CorpusEntry {
   case: string;
   input_sha256: string;
   expected_sha256: string;
 }
-export interface FoldManifest {
+interface FoldManifest {
   contract: string;
-  algorithm: string;
   canonical_output: string;
   supported_event_versions: string[];
   display_dependencies: string[];
@@ -72,20 +67,30 @@ function repoRel(root: string, abs: string): string {
 function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
+function isSymlink(abs: string): boolean {
+  try {
+    return lstatSync(abs).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The static import closure of `entry`, as sorted repo-relative POSIX `.ts`
  * paths (including the entry itself). Fails closed on anything the fingerprint
  * cannot cover.
  */
-export function discoverImportClosure(root: string, entry = FOLD_ENTRY): string[] {
+export function discoverImportClosure(root: string): string[] {
   const found = new Set<string>();
-  const queue: string[] = [entry];
+  const queue: string[] = [FOLD_ENTRY];
   while (queue.length) {
     const rel = queue.shift()!;
     if (found.has(rel)) continue;
     found.add(rel);
     const abs = join(root, rel);
+    // A symlink would let the fingerprint hash bytes from outside the tree the
+    // gate believes it is judging; refuse it rather than follow it.
+    if (isSymlink(abs)) throw new FoldReleaseError(`${rel}: is a symlink; a fold-closure file must be a regular file`);
     let text: string;
     try {
       text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(abs));
@@ -120,6 +125,8 @@ function collectSpecifiers(sf: ts.SourceFile, rel: string): string[] {
       else throw new FoldReleaseError(`${rel}: non-literal import type is not allowed in a fold-closure file`);
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       throw new FoldReleaseError(`${rel}: dynamic import() is not allowed in a fold-closure file`);
+    } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
+      throw new FoldReleaseError(`${rel}: require(...) is not allowed in a fold-closure file`);
     } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
       throw new FoldReleaseError(`${rel}: import-equals-require is not allowed in a fold-closure file`);
     }
@@ -162,7 +169,7 @@ export function computeFingerprint(root: string, deps: readonly string[]): strin
 
 /** Every corpus case discovered on disk, as sorted content-hash entries. Fails
  * closed if a case dir is missing a required file or carries an extra one. */
-export function computeCorpus(root: string): CorpusEntry[] {
+function computeCorpus(root: string): CorpusEntry[] {
   const base = join(root, CONTRACT_DIR);
   let names: string[];
   try {
@@ -210,22 +217,21 @@ export function loadManifest(root: string): FoldManifest {
   if (!m || m.contract !== CONTRACT_ID || !Array.isArray(m.display_dependencies) || !Array.isArray(m.corpus)) {
     throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: not a display-fold.v1 manifest`);
   }
+  if (!m.display_dependencies.every((d) => typeof d === 'string')) {
+    throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: display_dependencies must be a list of strings`);
+  }
+  if (!m.corpus.every(isCorpusEntry)) {
+    throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: every corpus entry needs string case/input_sha256/expected_sha256`);
+  }
   return m;
 }
 
-/** The recomputed release state for the current working tree. */
-export interface RecomputedRelease {
-  display_dependencies: string[];
-  implementation_fingerprint: string;
-  corpus: CorpusEntry[];
-}
-export function recomputeRelease(root: string): RecomputedRelease {
-  const deps = discoverImportClosure(root);
-  return {
-    display_dependencies: deps,
-    implementation_fingerprint: computeFingerprint(root, deps),
-    corpus: computeCorpus(root),
-  };
+function isCorpusEntry(v: unknown): v is CorpusEntry {
+  const e = v as CorpusEntry | null;
+  return (
+    !!e && typeof e === 'object' &&
+    typeof e.case === 'string' && typeof e.input_sha256 === 'string' && typeof e.expected_sha256 === 'string'
+  );
 }
 
 /**
@@ -236,14 +242,11 @@ export function recomputeRelease(root: string): RecomputedRelease {
 export function checkFingerprintGate(root: string): string[] {
   const failures: string[] = [];
   let manifest: FoldManifest;
+  let actual: { display_dependencies: string[]; implementation_fingerprint: string; corpus: CorpusEntry[] };
   try {
     manifest = loadManifest(root);
-  } catch (err) {
-    return [(err as Error).message];
-  }
-  let actual: RecomputedRelease;
-  try {
-    actual = recomputeRelease(root);
+    const deps = discoverImportClosure(root);
+    actual = { display_dependencies: deps, implementation_fingerprint: computeFingerprint(root, deps), corpus: computeCorpus(root) };
   } catch (err) {
     return [(err as Error).message];
   }

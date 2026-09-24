@@ -54,11 +54,13 @@ async function emptyReplayClaim(ctx: AcceptanceContext): Promise<Assertion> {
 
 /** SSE follow → 200 stamped in the response head, before any event byte. */
 async function sseHeaderClaim(ctx: AcceptanceContext): Promise<Assertion> {
+  // AbortSignal.any fires even if ctx.signal already aborted before we get here,
+  // which a late addEventListener('abort', …) would miss; ac ends the stream once
+  // we have the head.
   const ac = new AbortController();
-  const onOuter = (): void => ac.abort();
-  ctx.signal.addEventListener('abort', onOuter, { once: true });
+  const signal = AbortSignal.any([ctx.signal, ac.signal]);
   try {
-    const res = await ctx.reader.open(`/v1/sessions/${ctx.sessionId}/events?follow=true&after=0`, { signal: ac.signal });
+    const res = await ctx.reader.open(`/v1/sessions/${ctx.sessionId}/events?follow=true&after=0`, { signal });
     if (res.status !== 200) fail(`SSE follow returned ${res.status}`);
     const header = res.headers.get(FOLD_HEADER);
     if (header !== DISPLAY_FOLD_CONTRACT) fail(`SSE follow ${FOLD_HEADER}='${header}', expected '${DISPLAY_FOLD_CONTRACT}'`);
@@ -69,7 +71,6 @@ async function sseHeaderClaim(ctx: AcceptanceContext): Promise<Assertion> {
     };
   } finally {
     ac.abort();
-    ctx.signal.removeEventListener('abort', onOuter);
   }
 }
 
@@ -99,13 +100,13 @@ async function bodyUnchangedClaim(ctx: AcceptanceContext): Promise<Assertion> {
   const b = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/events?after=0`, { signal: ctx.signal });
   if (!a.body.equals(b.body)) fail('two identical finite replays returned different bodies');
   const events = parseNdjson(a.body.toString('utf8'));
-  const folded = canonicalJson(foldDisplay(events));
-  const contract = (JSON.parse(folded) as { contract: string }).contract;
-  if (contract !== DISPLAY_FOLD_CONTRACT) fail(`served body folds under '${contract}', not the advertised '${DISPLAY_FOLD_CONTRACT}'`);
+  const folded = JSON.parse(canonicalJson(foldDisplay(events))) as { contract: string; result: string };
+  if (folded.contract !== DISPLAY_FOLD_CONTRACT) fail(`served body folds under '${folded.contract}', not the advertised '${DISPLAY_FOLD_CONTRACT}'`);
+  if (folded.result !== 'ok') fail(`served body folds to result '${folded.result}', not 'ok' — the header would advertise a contract the body cannot satisfy`);
   return {
     id: 'body-unchanged',
-    claim: `LIVE: stamping ${FOLD_HEADER} left the body byte-stable, and it folds under the advertised contract`,
-    evidence: { body_bytes: a.body.length, records: events.length, folds_under: contract },
+    claim: `LIVE: stamping ${FOLD_HEADER} left the body byte-stable, and it folds cleanly (result 'ok') under the advertised contract`,
+    evidence: { body_bytes: a.body.length, records: events.length, folds_under: folded.contract, result: folded.result },
   };
 }
 
