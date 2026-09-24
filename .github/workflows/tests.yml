@@ -46,6 +46,14 @@ jobs:
       - name: Run tool tests
         run: npm run test:tools
 
+      - name: Run QA acceptance checks (macOS only)
+        # qa:check drives REAL daemons; several acceptance modules are darwin-gated
+        # (they need real FSEvents capture) and projection-check REFUSES them with a
+        # non-zero exit on linux rather than counting a skip as a pass — so this gate
+        # runs on macOS only, where every registered module executes for real (~30s).
+        if: runner.os == 'macOS'
+        run: npm run qa:check -- --all
+
       - name: Check display-fold release immutability (pull request)
         if: github.event_name == 'pull_request'
         run: npm run check:fold-release -- --base ${{ github.event.pull_request.base.sha }}
