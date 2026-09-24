@@ -61,7 +61,9 @@
   "if": {
     "properties": { "status": { "const": "ready" } }
   },
-  "then": {},
+  "then": {
+    "not": { "required": ["fallback_reason"] }
+  },
   "else": {
     "required": ["fallback_reason"],
     "properties": {

@@ -41,6 +41,34 @@ describe('parseInterfaceInput', () => {
     assert.equal(input.languageVersion, null);
   });
 
+  it('rejects mismatched language and language_version nullability', () => {
+    for (const [language, language_version] of [['typescript', null], [null, 'typescript.v1']]) {
+      assert.throws(
+        () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language, language_version, before: { status: 'absent' }, after: { status: 'absent' } }))),
+        (err: Error) => err instanceof InterfaceInputError && /language_version/.test(err.message),
+      );
+    }
+  });
+
+  it('rejects a notEvaluated side when a language module exists without an admission skip', () => {
+    assert.throws(
+      () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'typescript', language_version: 'typescript.v1', before: { status: 'notEvaluated' }, after: { status: 'complete', declarations: [] } }))),
+      (err: Error) => err instanceof InterfaceInputError && /notEvaluated side requires no language module or an admission skip/.test(err.message),
+    );
+  });
+
+  it('rejects incomplete and unavailable reasons that do not match their side', () => {
+    for (const [before, allowed] of [
+      [{ status: 'incomplete', reason: 'after-parse-error' }, 'before-parse-error'],
+      [{ status: 'unavailable', reason: 'after-blob-missing' }, 'before-blob-missing'],
+    ] as const) {
+      assert.throws(
+        () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'typescript', language_version: 'typescript.v1', before, after: { status: 'absent' } }))),
+        (err: Error) => err instanceof InterfaceInputError && err.message.includes(allowed),
+      );
+    }
+  });
+
   it('rejects invalid UTF-8', () => {
     assert.throws(() => parseInterfaceInput(new Uint8Array([0x7b, 0xff, 0x7d])), InterfaceInputError);
   });

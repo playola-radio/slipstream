@@ -99,7 +99,7 @@ function parseDeclaration(value: unknown, where: string): Declaration {
   };
 }
 
-function parseSide(value: unknown, where: string): SideExtraction {
+function parseSide(value: unknown, where: string, side: 'before' | 'after'): SideExtraction {
   const o = asObject(value, where);
   const status = asString(o.status, `${where}.status`);
   switch (status) {
@@ -117,12 +117,20 @@ function parseSide(value: unknown, where: string): SideExtraction {
     case 'notEvaluated':
       noExtraKeys(o, ['status'], where);
       return { status: 'notEvaluated' };
-    case 'incomplete':
+    case 'incomplete': {
       noExtraKeys(o, ['status', 'reason'], where);
-      return { status: 'incomplete', reason: asString(o.reason, `${where}.reason`) };
-    case 'unavailable':
+      const reason = asString(o.reason, `${where}.reason`);
+      const allowed = `${side}-parse-error`;
+      if (reason !== allowed) fail(`${where}.reason must be '${allowed}'`);
+      return { status: 'incomplete', reason };
+    }
+    case 'unavailable': {
       noExtraKeys(o, ['status', 'reason'], where);
-      return { status: 'unavailable', reason: asString(o.reason, `${where}.reason`) };
+      const reason = asString(o.reason, `${where}.reason`);
+      const allowed = `${side}-blob-missing`;
+      if (reason !== allowed) fail(`${where}.reason must be '${allowed}'`);
+      return { status: 'unavailable', reason };
+    }
     default:
       return fail(`${where}.status '${status}' is not a valid side status`);
   }
@@ -158,13 +166,19 @@ export function parseInterfaceInput(bytes: Uint8Array): BuildInput {
   const changeSeq = asString(o.change_seq, 'input.change_seq');
   if (!CHANGE_SEQ.test(changeSeq)) fail('input.change_seq must be a positive decimal string');
 
-  const input: BuildInput = {
-    changeSeq,
-    language: parseNullableString(o.language, 'input.language'),
-    languageVersion: parseNullableString(o.language_version, 'input.language_version'),
-    before: parseSide(o.before, 'input.before'),
-    after: parseSide(o.after, 'input.after'),
-  };
+  const language = parseNullableString(o.language, 'input.language');
+  const languageVersion = parseNullableString(o.language_version, 'input.language_version');
+  const before = parseSide(o.before, 'input.before', 'before');
+  const after = parseSide(o.after, 'input.after', 'after');
+
+  if ((language === null) !== (languageVersion === null)) {
+    fail('input.language and input.language_version must both be null or both be set');
+  }
+  if ((before.status === 'notEvaluated' || after.status === 'notEvaluated') && language !== null && admission === undefined) {
+    fail('a notEvaluated side requires no language module or an admission skip');
+  }
+
+  const input: BuildInput = { changeSeq, language, languageVersion, before, after };
   if (admission !== undefined) input.admission = admission;
   return input;
 }

@@ -5,15 +5,15 @@
  * (the schema is not served, no interface route exists) alongside the synthetic
  * corpus that exercises the core.
  *
- * LIVE claims hit the public reader of a real qa-daemon (HTTP only — no capture,
- * so no platform gate). FIXTURE claims drive the checker oracle over the
- * hand-written contracts/interface/v1 corpus.
+ * LIVE claims hit the public reader of a real qa-daemon seeded with observed
+ * changes. FIXTURE claims drive the checker oracle over the hand-written
+ * contracts/interface/v1 corpus.
  */
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../../../src/display-fold.ts';
 import { validate, type JsonSchema } from '../../../src/schema.ts';
-import type { Assertion } from '../../qa-support.ts';
+import { FILE_CHANGED_TYPE, type Assertion } from '../../qa-support.ts';
 import {
   corpusCasePath,
   interfaceToLine,
@@ -37,13 +37,17 @@ async function notServedClaim(ctx: AcceptanceContext): Promise<Assertion> {
   const clip = await ctx.reader.raw('/v1/schemas/projections/clip.v3', { signal: ctx.signal });
   if (clip.status !== 200) fail(`control: clip.v3 schema should be served, got ${clip.status}`);
 
-  const route = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/changes/1/interfaces`, { signal: ctx.signal });
+  const { events } = await ctx.reader.finite(ctx.sessionId, 0n, ctx.signal);
+  const change = events.find((event) => event.type === FILE_CHANGED_TYPE);
+  if (change?.seq === undefined) fail('session has no file.changed event to probe for an interfaces route');
+
+  const route = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/changes/${change.seq}/interfaces`, { signal: ctx.signal });
   if (route.status !== 404) fail(`no interface route should exist yet, got ${route.status}`);
 
   return {
     id: 'interface-not-served',
     claim: 'LIVE: interface.v1 has no public surface yet — its schema route is 404 (while clip.v3 serves 200) and the per-change interfaces route is 404',
-    evidence: { interface_schema: iface.status, clip_schema: clip.status, interface_route: route.status },
+    evidence: { interface_schema: iface.status, clip_schema: clip.status, change_seq: change.seq, interface_route: route.status },
   };
 }
 
@@ -72,10 +76,16 @@ async function schemaClaim(): Promise<Assertion> {
     const expected = JSON.parse(await readFile(corpusCasePath(name, 'expected.json'), 'utf8'));
     const errors = validate(schema, expected);
     if (errors.length > 0) fail(`corpus case ${name} does not validate against interface.v1 schema: ${errors.join('; ')}`);
+    if (('fallback_reason' in expected) !== (expected.status !== 'ready')) {
+      fail(`corpus case ${name} must have fallback_reason exactly when status is not ready`);
+    }
+    if (expected.status !== 'ready' && expected.changes.length !== 0) {
+      fail(`corpus case ${name} must have no changes unless status is ready`);
+    }
   }
   return {
     id: 'interface-schema',
-    claim: 'FIXTURE: every corpus expected.json validates against contracts/interface/v1/schema.json',
+    claim: 'FIXTURE: every corpus expected.json validates against contracts/interface/v1/schema.json, with fallback_reason presence and non-ready empty changes checked directly',
     evidence: { cases: names.length },
   };
 }
@@ -100,6 +110,7 @@ async function orderingClaim(): Promise<Assertion> {
 
 export const t5a1: AcceptanceModule = {
   id: 'T5a.1',
+  scenario: 'T-QA',
   async run(ctx) {
     return {
       assertions: [
