@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Five subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Six subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
@@ -24,6 +24,9 @@
  *    are measurements, not budgets (D7). Exit 0 = all clean; 1 = a source parsed
  *    with ERROR/MISSING nodes (report still printed); 2 = artifact/host failure.
  *    Takes no arguments.
+ *  - `fold-release`: the display-fold.v1 release gates (fingerprint + immutability;
+ *    see tools/fold-release-check.ts). Prints one JSON result; exit 0 = pass, 1 =
+ *    a gate failed, 2 = bad args or an unresolvable base ref.
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -62,6 +65,7 @@ import {
 } from './interface-projection-oracle.ts';
 import { runSwiftParseChild, runSwiftParseFile, runSwiftParseStdin, swiftFixturePath, SwiftFixtureError } from './swift-parse.ts';
 import type { HostResult } from './swift-parse-host.ts';
+import { runFoldRelease } from './fold-release-check.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -650,8 +654,9 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
     if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin, signal: controller.signal });
     if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr, signal: controller.signal });
+    if (sub === 'fold-release') return runFoldRelease({ ...io, argv: rest });
     if (sub !== 'acceptance') {
-      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'swift-parse', or 'swift-measure'`);
+      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'swift-parse', 'swift-measure', or 'fold-release'`);
       return EXIT.USAGE;
     }
     return await runAcceptance({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd, signal: controller.signal });
