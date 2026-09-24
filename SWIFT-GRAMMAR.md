@@ -107,13 +107,16 @@ interrupted from inside, so cancellation is `worker.terminate()` (a hard kill).
 Because the parse is synchronous, the worker can only post `started` *just
 before* it blocks — that alone does not prove an in-flight interruption (the
 parse could have finished before the terminate landed). So the `cancel-demo`
-operation additionally **confirms the parse is still unfinished** at termination:
-it watches the worker's `done` message and asserts it is still pending after a
-beat (`inProgressAtCancel`). If a pathological input finished too fast to
-interrupt, that flag is false and the acceptance check **fails honestly** rather
-than claiming a cancellation that did not happen. It then measures the
-termination time and parses clean input to completion in a fresh worker,
-demonstrating the runtime recovers.
+operation additionally **confirms the parse is still unfinished** at termination
+via a **shared-memory flag**: the worker stores `1` into a `SharedArrayBuffer`
+the instant the parse returns, before posting `done`, and the host reads that
+flag after a beat (`inProgressAtCancel = !finished`). Reading shared memory
+rather than racing the `done` message means a stalled host event loop can never
+mistake a finished parse for a running one. If a pathological input finished too
+fast to interrupt, the flag is set and `inProgressAtCancel` is false, so the
+acceptance check **fails honestly** rather than claiming a cancellation that did
+not happen. It then measures the termination time and parses clean input to
+completion in a fresh worker, demonstrating the runtime recovers.
 
 Observed: a 200k-block pathological parse is still running when terminated;
 `worker.terminate()` returns in ~2 ms; the replacement parse is clean. Proven in
@@ -183,7 +186,8 @@ clean, **1** the parse has ERROR/MISSING nodes (report still printed), **2** bad
 input or an artifact/host failure (diagnostic on stderr, no report).
 
 `swift-measure` prints the cold/warm size sweep above (small/medium/large). Exit
-**0** when all parse clean, **2** on an artifact/host failure.
+**0** when all parse clean, **1** if a source parsed with ERROR/MISSING nodes
+(report still printed), **2** on an artifact/host failure.
 
 ## Acceptance
 

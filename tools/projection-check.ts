@@ -21,8 +21,9 @@
  *    2 = bad input or an artifact/host failure (diagnostic on stderr, no report).
  *  - `swift-measure`: cold start (init + language load) and first/warm parse time
  *    for small/medium/large representative sources, as one JSON report. Numbers
- *    are measurements, not budgets (D7). Exit 0 = all clean; 2 = artifact/host
- *    failure. Takes no arguments.
+ *    are measurements, not budgets (D7). Exit 0 = all clean; 1 = a source parsed
+ *    with ERROR/MISSING nodes (report still printed); 2 = artifact/host failure.
+ *    Takes no arguments.
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -583,8 +584,9 @@ function representativeSwiftSources(): { label: string; source: string }[] {
 /** `projection-check swift-measure`: load the pinned grammar once in the isolated
  * host and report cold start (init + language load) plus first/warm parse time
  * for small/medium/large representative sources. Prints one JSON report; the
- * numbers are measurements, not budgets (D7). Exit 0 = all parsed clean; 2 = an
- * artifact/host failure. Takes no arguments. */
+ * numbers are measurements, not budgets (D7). Exit 0 = all parsed clean; 1 = a
+ * source parsed with ERROR/MISSING nodes; 2 = an artifact/host failure. Takes no
+ * arguments. */
 export async function runSwiftMeasure(io: { argv: readonly string[]; stdout: (l: string) => void; stderr: (l: string) => void }): Promise<number> {
   if (io.argv.length > 0) {
     io.stderr(`swift-measure: unexpected argument '${io.argv[0]}' (takes none)`);
