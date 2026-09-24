@@ -34,6 +34,7 @@ import {
   createReaderClient,
   awaitEventType,
   gitHead,
+  gitIsDirty,
   writeQaEnv,
   readQaEnv,
   BASELINE_COMPLETED_TYPE,
@@ -176,6 +177,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   const runId = args.runId ?? randomUUID();
   const { store, worktree } = await prepareRoot(args.root, runId);
   const daemonCommit = await gitHead(io.cwd).catch(() => 'unknown');
+  const daemonDirty = await gitIsDirty(io.cwd).catch(() => true); // unknown reads as dirty, never a false-clean claim
   const envPath = join(args.root, QA_ENV_NAME);
 
   const controller = new AbortController();
@@ -317,6 +319,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       state: 'ready',
       run_id: runId,
       daemon_commit: daemonCommit,
+      daemon_dirty: daemonDirty,
       store,
       worktree,
       descriptor_path: descriptorPath,

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   sha256Hex,
   parseNdjson,
@@ -12,6 +14,7 @@ import {
   buildReport,
   writeQaEnv,
   readQaEnv,
+  gitIsDirty,
   awaitEventType,
   DurabilityTimeoutError,
   QA_ENV_FORMAT,
@@ -108,16 +111,61 @@ describe('qa-support', () => {
     });
   });
 
+  describe('gitIsDirty', () => {
+    const execFileP = promisify(execFile);
+
+    it('is false for a clean checkout and true once a file is modified', async () => {
+      const repo = await mkdtemp(join(tmpdir(), 'slipstream-qa-dirty-'));
+      try {
+        await execFileP('git', ['init', '-q'], { cwd: repo });
+        await execFileP('git', ['config', 'user.email', 'qa@example.com'], { cwd: repo });
+        await execFileP('git', ['config', 'user.name', 'qa'], { cwd: repo });
+        await writeFile(join(repo, 'a.txt'), 'one');
+        await execFileP('git', ['add', 'a.txt'], { cwd: repo });
+        await execFileP('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+        assert.equal(await gitIsDirty(repo), false);
+
+        await writeFile(join(repo, 'a.txt'), 'two');
+        assert.equal(await gitIsDirty(repo), true);
+      } finally {
+        await rm(repo, { recursive: true, force: true });
+      }
+    });
+
+    it('is true for an untracked file even with no tracked changes', async () => {
+      const repo = await mkdtemp(join(tmpdir(), 'slipstream-qa-dirty-untracked-'));
+      try {
+        await execFileP('git', ['init', '-q'], { cwd: repo });
+        await execFileP('git', ['config', 'user.email', 'qa@example.com'], { cwd: repo });
+        await execFileP('git', ['config', 'user.name', 'qa'], { cwd: repo });
+        await writeFile(join(repo, 'committed.txt'), 'x');
+        await execFileP('git', ['add', 'committed.txt'], { cwd: repo });
+        await execFileP('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+        await writeFile(join(repo, 'new.txt'), 'x');
+        assert.equal(await gitIsDirty(repo), true);
+      } finally {
+        await rm(repo, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('buildReport', () => {
     it('is passed only when every check passed', () => {
-      const passed = buildReport('abc', [{ id: 'A', result: 'passed', assertions: [] }]);
+      const passed = buildReport('abc', false, [{ id: 'A', result: 'passed', assertions: [] }]);
       assert.equal(passed.format, QA_REPORT_FORMAT);
       assert.equal(passed.result, 'passed');
-      const mixed = buildReport('abc', [
+      const mixed = buildReport('abc', false, [
         { id: 'A', result: 'passed', assertions: [] },
         { id: 'B', result: 'failed', assertions: [] },
       ]);
       assert.equal(mixed.result, 'failed');
+    });
+
+    it('carries the dirty flag through unchanged', () => {
+      const clean = buildReport('abc', false, []);
+      assert.equal(clean.dirty, false);
+      const dirty = buildReport('abc', true, []);
+      assert.equal(dirty.dirty, true);
     });
   });
 
@@ -132,6 +180,7 @@ describe('qa-support', () => {
         state: 'ready',
         run_id: 'run-1',
         daemon_commit: 'deadbeef',
+        daemon_dirty: false,
         store: '/x/store',
         worktree: '/x/worktree',
         descriptor_path: '/x/store/runtime/abc.json',
@@ -150,7 +199,7 @@ describe('qa-support', () => {
 
     it('rejects a file with the wrong format', async () => {
       const path = join(base, 'bad.json');
-      await writeQaEnv(path, { format: 'nope' as typeof QA_ENV_FORMAT, state: 'ready', run_id: '', daemon_commit: '', store: '', worktree: '', descriptor_path: '', url: '', token: '', session_id: '', ready_through_seq: '0', scenario: null });
+      await writeQaEnv(path, { format: 'nope' as typeof QA_ENV_FORMAT, state: 'ready', run_id: '', daemon_commit: '', daemon_dirty: false, store: '', worktree: '', descriptor_path: '', url: '', token: '', session_id: '', ready_through_seq: '0', scenario: null });
       await assert.rejects(() => readQaEnv(path), /not a slipstream-qa\.v1/);
     });
 
@@ -169,7 +218,7 @@ describe('qa-support', () => {
     it('rejects an env whose token carries a header-injecting newline', async () => {
       const path = join(base, 'evil-token.json');
       const env: QaEnv = {
-        format: QA_ENV_FORMAT, state: 'ready', run_id: 'r', daemon_commit: 'c',
+        format: QA_ENV_FORMAT, state: 'ready', run_id: 'r', daemon_commit: 'c', daemon_dirty: false,
         store: '/x/store', worktree: '/x/worktree', descriptor_path: '/x/store/runtime/a.json',
         url: 'http://127.0.0.1:1', token: 'Bearer sentinel\nX-Secret: leak', session_id: 'qa:r',
         ready_through_seq: '0', scenario: null,

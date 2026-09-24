@@ -18,12 +18,13 @@
  *    130 = interrupted.
  */
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
   createReaderClient,
   readQaEnv,
   gitHead,
+  gitIsDirty,
   buildReport,
   mkdtempRoot,
   rmMkdtempRoot,
@@ -31,9 +32,29 @@ import {
   type ReaderClient,
 } from './qa-support.ts';
 import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
+import { checkRootAgainstRealStore, readOwnerMarker } from './qa/safety.ts';
 import { MODULES } from './qa/acceptance/registry.ts';
 import { corpusCasePath, FoldInputError, foldToLine, parseFoldInput } from './display-fold-oracle.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
+
+/**
+ * Validate an operator-supplied `--env`'s worktree the same way `qa-daemon.ts`
+ * itself validates a root before touching it: not overlapping the real store,
+ * and carrying an ownership marker claimed by the SAME run that wrote this env
+ * file. Without this, a matching `daemon_commit` alone was enough to accept
+ * `env.worktree` — a mistaken or stale env file could point acceptance checks
+ * (which write and delete files) at an unrelated, unowned worktree.
+ */
+async function validateEnvSandbox(env: { worktree: string; run_id: string }): Promise<string | null> {
+  const root = dirname(env.worktree);
+  const overlap = await checkRootAgainstRealStore(root);
+  if (overlap) return overlap.message;
+  const marker = await readOwnerMarker(root);
+  if (marker === null || marker.run_id !== env.run_id) {
+    return `${root} has no ownership marker matching run_id ${env.run_id}; refusing to run against an unowned worktree`;
+  }
+  return null;
+}
 
 export type Selection = { all: true } | { pr: string };
 export interface AcceptanceArgs { selection: Selection; env: string | null }
@@ -158,6 +179,10 @@ export async function runAcceptance(io: RunIO): Promise<number> {
   if (io.signal.aborted) return EXIT.INTERRUPTED;
 
   const head = await gitHead(io.cwd).catch(() => 'unknown');
+  const dirty = await gitIsDirty(io.cwd).catch(() => true); // unknown reads as dirty, never a false-clean claim
+  if (dirty) {
+    io.stderr(`qa-check: this checkout has uncommitted changes; the report's commit ${head} does not fully describe the code under test`);
+  }
 
   // Precondition: platform gate. A module that cannot run here is not skipped-as-pass.
   for (const mod of mods) {
@@ -185,6 +210,16 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         const env = await readQaEnv(args.env);
         if (env.daemon_commit !== head) {
           io.stderr(`qa-check: --env daemon_commit ${env.daemon_commit} does not match HEAD ${head}; refusing to run against a stale daemon`);
+          return EXIT.USAGE;
+        }
+        if (env.daemon_dirty) {
+          io.stderr(`qa-check: --env daemon at ${env.daemon_commit} had uncommitted changes when it started; the commit match does not fully describe the code it runs`);
+        }
+        // Sandbox gate: a matching commit is not proof the worktree is a harness-
+        // owned sandbox. Refuse the same way qa-daemon.ts refuses at startup.
+        const refusal = await validateEnvSandbox(env);
+        if (refusal !== null) {
+          io.stderr(`qa-check: ${refusal}`);
           return EXIT.USAGE;
         }
         reader = createReaderClient(env.url, env.token);
@@ -218,10 +253,12 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     // or the JSON would claim `passed` while the process exits non-zero. Mutating
     // the pushed result (buildReport recomputes the overall verdict) keeps the two
     // honest in lockstep.
+    let stopFailed = false;
     if (handle) {
       try {
         await handle.stop();
       } catch (err) {
+        stopFailed = true;
         const message = `cleanup: ${(err as Error).message}`;
         io.stderr(`qa-check: ${mod.id} cleanup failed: ${(err as Error).message}`);
         result.result = 'failed';
@@ -229,12 +266,16 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         sawFailure = true;
       }
     }
-    if (ephemeralRoot) await rmMkdtempRoot(ephemeralRoot).catch(() => {});
+    // A failed stop means the daemon's own teardown retained its root for
+    // diagnosis (qa-daemon.ts's own failure-retains-root behavior) — deleting the
+    // mkdtemp parent here would discard exactly those artifacts, so skip it.
+    if (ephemeralRoot && !stopFailed) await rmMkdtempRoot(ephemeralRoot).catch(() => {});
+    else if (ephemeralRoot && stopFailed) io.stderr(`qa-check: ${mod.id} retaining ${ephemeralRoot} for inspection after a failed shutdown`);
   }
 
   if (io.signal.aborted) return EXIT.INTERRUPTED;
 
-  const report = buildReport(head, checks);
+  const report = buildReport(head, dirty, checks);
   io.stdout(JSON.stringify(report));
   return sawFailure || report.result === 'failed' ? EXIT.FAIL : EXIT.PASS;
 }

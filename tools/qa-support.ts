@@ -32,6 +32,20 @@ export function gitHead(cwd: string): Promise<string> {
   });
 }
 
+/** Whether `cwd`'s worktree has uncommitted changes (tracked or untracked). A
+ * commit hash alone cannot distinguish "this exact code ran" from "this code
+ * plus uncommitted edits ran" — callers that stamp or check `gitHead` must
+ * disclose this alongside it rather than let a passing report be silently
+ * attributed to a commit that does not contain the code actually tested. */
+export function gitIsDirty(cwd: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['status', '--porcelain'], { cwd }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout.trim().length > 0);
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Descriptor bootstrap
 // ---------------------------------------------------------------------------
@@ -415,6 +429,11 @@ export interface QaEnv {
   state: 'ready' | 'stopped';
   run_id: string;
   daemon_commit: string;
+  /** Whether `daemon_commit`'s checkout had uncommitted changes when this daemon
+   * started. `daemon_commit` alone cannot tell "exactly this commit ran" apart
+   * from "this commit plus local edits ran" — an `--env` consumer must see this
+   * to honestly judge what code the daemon it is attaching to actually runs. */
+  daemon_dirty: boolean;
   store: string;
   worktree: string;
   descriptor_path: string;
@@ -480,13 +499,18 @@ export interface CheckResult { id: string; result: 'passed' | 'failed'; assertio
 export interface QaReport {
   format: typeof QA_REPORT_FORMAT;
   commit: string;
+  /** Whether `commit`'s checkout had uncommitted changes when this report was
+   * built. `commit` alone cannot tell a clean run apart from one with local
+   * edits layered on top — a passing report must not be silently attributed to
+   * a commit that does not contain the code actually tested. */
+  dirty: boolean;
   result: 'passed' | 'failed';
   checks: CheckResult[];
 }
 
-export function buildReport(commit: string, checks: CheckResult[]): QaReport {
+export function buildReport(commit: string, dirty: boolean, checks: CheckResult[]): QaReport {
   const result = checks.every((c) => c.result === 'passed') ? 'passed' : 'failed';
-  return { format: QA_REPORT_FORMAT, commit, result, checks };
+  return { format: QA_REPORT_FORMAT, commit, dirty, result, checks };
 }
 
 export function sleep(ms: number): Promise<void> {

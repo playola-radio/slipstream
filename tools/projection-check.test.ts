@@ -15,6 +15,8 @@ import {
   EXIT,
   ArgError,
 } from './projection-check.ts';
+import { gitHead, writeQaEnv, QA_ENV_FORMAT, type QaEnv } from './qa-support.ts';
+import { prepareRoot } from './qa/safety.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 describe('runModule resource cleanup', () => {
@@ -144,6 +146,137 @@ describe('runAcceptance exit codes (no daemon needed)', () => {
       signal: aborted.signal,
     });
     assert.equal(code, EXIT.INTERRUPTED);
+  });
+});
+
+describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
+  const tmpDirs: string[] = [];
+  after(async () => {
+    for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true });
+  });
+
+  async function fakeEnv(overrides: Partial<QaEnv> = {}): Promise<{ path: string; env: QaEnv }> {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT,
+      state: 'ready',
+      run_id: 'run-fake',
+      daemon_commit: head,
+      daemon_dirty: false,
+      store: join(dir, 'root', 'store'),
+      worktree: join(dir, 'root', 'worktree'),
+      descriptor_path: join(dir, 'root', 'store', 'runtime', 'x.json'),
+      url: 'http://127.0.0.1:1',
+      token: 'fake-token',
+      session_id: 'qa:run-fake',
+      ready_through_seq: '0',
+      scenario: null,
+      ...overrides,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    return { path, env };
+  }
+
+  it('refuses an --env worktree with no ownership marker at all', async () => {
+    const { path } = await fakeEnv();
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.equal(sink.out.length, 0, 'a refused --env must never print a report');
+    assert.ok(sink.err.some((l) => /ownership marker/.test(l)));
+  });
+
+  it('refuses an --env worktree owned by a DIFFERENT run_id than the env claims', async () => {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const root = join(dir, 'root');
+    const { store, worktree } = await prepareRoot(root, 'run-actual-owner');
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT, state: 'ready', run_id: 'run-claimed-by-env', daemon_commit: head, daemon_dirty: false,
+      store, worktree, descriptor_path: join(store, 'runtime', 'x.json'),
+      url: 'http://127.0.0.1:1', token: 'fake-token', session_id: 'qa:run-claimed-by-env',
+      ready_through_seq: '0', scenario: null,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.equal(sink.out.length, 0);
+    assert.ok(sink.err.some((l) => /ownership marker/.test(l)));
+  });
+
+  it('refuses an --env worktree that overlaps the real default store', async () => {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT, state: 'ready', run_id: 'run-fake', daemon_commit: head, daemon_dirty: false,
+      store: join('/nonexistent', '.slipstream', 'store'),
+      worktree: join('/nonexistent', '.slipstream', 'worktree'),
+      descriptor_path: '/nonexistent/.slipstream/store/runtime/x.json',
+      url: 'http://127.0.0.1:1', token: 'fake-token', session_id: 'qa:run-fake',
+      ready_through_seq: '0', scenario: null,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(code, EXIT.USAGE);
+    assert.equal(sink.out.length, 0);
+  });
+
+  it('accepts an --env worktree with a valid, matching ownership marker (passes the sandbox gate, then fails for lack of a live daemon)', async () => {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const root = join(dir, 'root');
+    const { store, worktree } = await prepareRoot(root, 'run-owned');
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT, state: 'ready', run_id: 'run-owned', daemon_commit: head, daemon_dirty: false,
+      store, worktree, descriptor_path: join(store, 'runtime', 'x.json'),
+      url: 'http://127.0.0.1:1', token: 'fake-token', session_id: 'qa:run-owned',
+      ready_through_seq: '0', scenario: null,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    // The sandbox gate passes (no "ownership marker" / overlap refusal), so
+    // it proceeds to actually run the module against the fake unreachable
+    // reader URL — which fails for an unrelated reason (connection refused),
+    // proving this test isn't accidentally hitting the sandbox refusal.
+    assert.ok(!sink.err.some((l) => /ownership marker|overlaps the real daemon store/.test(l)));
+    assert.equal(code, EXIT.FAIL);
+    assert.equal(sink.out.length, 1, 'a run that reached module execution still prints exactly one report');
   });
 });
 
