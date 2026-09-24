@@ -9,7 +9,7 @@
  * See INTERFACE-PROJECTION.md for the full contract.
  */
 
-export const INTERFACE_PROJECTION_VERSION = 'interface.v1';
+const INTERFACE_PROJECTION_VERSION = 'interface.v1';
 
 /** A half-open range of UTF-8 byte offsets `[byteStart, byteEnd)` into a file. */
 export interface ByteSpan {
@@ -327,14 +327,18 @@ function classify(input: BuildInput): { status: ProjectionStatus; reason?: strin
     return { status: 'incomplete', reason: 'duplicate-declaration', changes: [] };
   }
 
+  // Ambiguity outranks unavailable/unsupported/admission, but it can only be
+  // judged when both sides are comparable; compute the correspondence here and
+  // hold its rows for the ready fallback, which is the lowest-precedence outcome.
   const bComparable = before.status === 'complete' || before.status === 'absent';
   const aComparable = after.status === 'complete' || after.status === 'absent';
+  let ready: Change[] | null = null;
   if (bComparable && aComparable) {
     const bd = before.status === 'complete' ? before.declarations : [];
     const ad = after.status === 'complete' ? after.declarations : [];
     const result = compare(bd, ad);
     if (result.ambiguous) return { status: 'incomplete', reason: 'ambiguous-correspondence', changes: [] };
-    return { status: 'ready', changes: result.changes };
+    ready = result.changes;
   }
 
   if (before.status === 'unavailable') return { status: 'unavailable', reason: before.reason, changes: [] };
@@ -342,6 +346,9 @@ function classify(input: BuildInput): { status: ProjectionStatus; reason?: strin
 
   if (input.language === null) return { status: 'unsupported', reason: 'unsupported-language', changes: [] };
   if (input.admission) return { status: 'skipped', reason: input.admission, changes: [] };
+
+  // ready is last: a successful comparison is only reported when nothing else applied.
+  if (ready !== null) return { status: 'ready', changes: ready };
 
   throw new Error('interface projection: incoherent disposition inputs');
 }

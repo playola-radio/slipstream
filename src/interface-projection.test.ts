@@ -318,6 +318,29 @@ test('every non-ready status carries changes: [] and a fallback_reason', () => {
   assert.ok(p.fallback_reason);
 });
 
+test('admission outranks a would-be-ready comparison (ready is last-resort)', () => {
+  // Even if both sides look comparable, a skip disposition must win: a `ready`
+  // status would falsely claim a comparison the admission gate prevented.
+  const p = buildInterfaceProjection({
+    ...ready([], [decl('f', 'f()')]),
+    admission: 'timeout',
+  });
+  assert.equal(p.status, 'skipped');
+  assert.equal(p.fallback_reason, 'timeout');
+  assert.deepEqual(p.changes, []);
+});
+
+test('no module outranks a would-be-ready comparison', () => {
+  const p = buildInterfaceProjection({
+    ...ready([], [decl('f', 'f()')]),
+    language: null,
+    languageVersion: null,
+  });
+  assert.equal(p.status, 'unsupported');
+  assert.equal(p.fallback_reason, 'unsupported-language');
+  assert.deepEqual(p.changes, []);
+});
+
 test('ready omits fallback_reason', () => {
   const p = buildInterfaceProjection(ready([decl('f', 'f()')], [decl('f', 'f()')]));
   assert.equal('fallback_reason' in p, false);

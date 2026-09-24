@@ -63,7 +63,13 @@
   },
   "then": {},
   "else": {
-    "required": ["fallback_reason"]
+    "required": ["fallback_reason"],
+    "properties": {
+      "changes": {
+        "maxItems": 0,
+        "$comment": "DA-3: a non-ready disposition emits zero rows; only a ready comparison may carry changes."
+      }
+    }
   },
   "$defs": {
     "coverageSide": {

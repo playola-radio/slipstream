@@ -69,6 +69,46 @@ describe('parseInterfaceInput', () => {
       InterfaceInputError,
     );
   });
+
+  it('rejects a change_seq that is not a positive decimal string', () => {
+    for (const change_seq of ['0', '-1', '01', '1.5', 'abc', '']) {
+      assert.throws(
+        () => parseInterfaceInput(bytes(JSON.stringify({ change_seq, language: 'ts', language_version: 'ts.v1', before: { status: 'absent' }, after: { status: 'absent' } }))),
+        (err: Error) => err instanceof InterfaceInputError && /change_seq/.test(err.message),
+        `change_seq ${JSON.stringify(change_seq)}`,
+      );
+    }
+  });
+
+  it('rejects a reversed byte span (byte_end < byte_start)', () => {
+    const decl = { identity: { kind: 'function', scope: [], name: 'f', guards: [] }, display_name: 'f', signature: 'f()', span: { byte_start: 2, byte_end: 1 } };
+    assert.throws(
+      () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'ts', language_version: 'ts.v1', before: { status: 'absent' }, after: { status: 'complete', declarations: [decl] } }))),
+      (err: Error) => err instanceof InterfaceInputError && /byte_end/.test(err.message),
+    );
+  });
+
+  it('rejects an unsafe-integer byte offset', () => {
+    const decl = { identity: { kind: 'function', scope: [], name: 'f', guards: [] }, display_name: 'f', signature: 'f()', span: { byte_start: 0, byte_end: 9007199254740992 } };
+    assert.throws(
+      () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'ts', language_version: 'ts.v1', before: { status: 'absent' }, after: { status: 'complete', declarations: [decl] } }))),
+      (err: Error) => err instanceof InterfaceInputError && /safe integer/.test(err.message),
+    );
+  });
+
+  it('rejects an unknown top-level property', () => {
+    assert.throws(
+      () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'ts', language_version: 'ts.v1', before: { status: 'absent' }, after: { status: 'absent' }, unexpected: true }))),
+      (err: Error) => err instanceof InterfaceInputError && /unexpected/.test(err.message),
+    );
+  });
+
+  it('rejects a property that does not apply to the side status', () => {
+    assert.throws(
+      () => parseInterfaceInput(bytes(JSON.stringify({ change_seq: '1', language: 'ts', language_version: 'ts.v1', before: { status: 'absent', declarations: 'bad' }, after: { status: 'absent' } }))),
+      (err: Error) => err instanceof InterfaceInputError && /declarations/.test(err.message),
+    );
+  });
 });
 
 describe('interfaceToLine', () => {
