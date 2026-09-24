@@ -85,4 +85,39 @@ describe('checkFixtureAgainstExpected', () => {
     };
     assert.throws(() => checkFixtureAgainstExpected('mid-codepoint', emoji, expected, midCodepoint), /splits a UTF-8 codepoint/);
   });
+
+  it('rejects a ZERO-WIDTH span that lands inside a codepoint (MISSING node)', () => {
+    // A MISSING node has byteStart===byteEnd; an empty slice always decodes
+    // cleanly, so the fatal decode alone cannot catch [1,1) inside '😀'. The
+    // per-endpoint boundary check must reject it.
+    const emoji = Buffer.from('😀', 'utf8');
+    const midMissing: SwiftParseResult = {
+      rootType: 'source_file', clean: false, byteLength: emoji.length,
+      diagnostics: [{ kind: 'missing', nodeType: 'ERROR', byteStart: 1, byteEnd: 1, startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    };
+    const expected: ExpectedCase = {
+      description: 'zero-width interior', category: 'd2-construct', rootType: 'source_file',
+      clean: false, knownGap: true,
+      diagnostics: [{ kind: 'missing', nodeType: 'ERROR', byteStart: 1, byteEnd: 1, startRow: 0, startColumn: 0, endRow: 0, endColumn: 0, byteSlice: '' }],
+    };
+    assert.throws(() => checkFixtureAgainstExpected('zero-width', emoji, expected, midMissing), /splits a UTF-8 codepoint/);
+  });
+
+  it('preserves a leading BOM in a diagnostic slice (does not silently trim it)', () => {
+    // '﻿x' is EF BB BF 78; a [0,4) span must slice back to the BOM + 'x',
+    // not the trimmed 'x' a default (ignoreBOM:false) decoder would return.
+    const bom = Buffer.from('﻿x', 'utf8');
+    const result: SwiftParseResult = {
+      rootType: 'source_file', clean: false, byteLength: bom.length,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 4, startRow: 0, startColumn: 0, endRow: 0, endColumn: 2 }],
+    };
+    const base: ExpectedCase = {
+      description: 'bom slice', category: 'd2-construct', rootType: 'source_file',
+      clean: false, knownGap: true,
+      diagnostics: [{ kind: 'error', nodeType: 'ERROR', byteStart: 0, byteEnd: 4, startRow: 0, startColumn: 0, endRow: 0, endColumn: 2, byteSlice: '﻿x' }],
+    };
+    assert.doesNotThrow(() => checkFixtureAgainstExpected('bom-kept', bom, base, result));
+    const trimmed: ExpectedCase = { ...base, diagnostics: [{ ...base.diagnostics[0]!, byteSlice: 'x' }] };
+    assert.throws(() => checkFixtureAgainstExpected('bom-trimmed', bom, trimmed, result), /slices/);
+  });
 });

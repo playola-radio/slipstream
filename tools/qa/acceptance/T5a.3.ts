@@ -47,17 +47,33 @@ const DIAG_KEYS: (keyof SwiftDiagnostic)[] = [
   'kind', 'nodeType', 'byteStart', 'byteEnd', 'startRow', 'startColumn', 'endRow', 'endColumn',
 ];
 
-/** Slice [start,end) out of the source bytes as UTF-8, FATAL on a partial
- * codepoint. `Buffer.toString('utf8')` would silently substitute U+FFFD, so a
- * span that splits a multi-byte character (e.g. inside an emoji) could match a
- * recorded replacement character and certify a byte-span contract violation.
- * A fatal decode turns that into a loud failure instead. */
+/** True when byte offset `i` falls on a UTF-8 codepoint boundary: either the end
+ * of the buffer, or a byte that is not a continuation byte (`10xxxxxx`). Checked
+ * per-endpoint so a zero-width span (a MISSING node) whose offset lands inside a
+ * multi-byte character is caught — an empty slice always decodes cleanly, so the
+ * decode below cannot see that on its own. */
+function isCodepointBoundary(bytes: Buffer, i: number): boolean {
+  if (i === bytes.length) return true;
+  return (bytes[i]! & 0xc0) !== 0x80;
+}
+
+/** Slice [start,end) out of the source bytes as UTF-8, FATAL on a span that does
+ * not fall on codepoint boundaries. `Buffer.toString('utf8')` would silently
+ * substitute U+FFFD, so a span that splits a multi-byte character (e.g. inside
+ * an emoji) could match a recorded replacement character and certify a byte-span
+ * contract violation. Both endpoints are boundary-checked (so a zero-width span
+ * inside a codepoint fails too), then the slice is decoded fatally as a backstop.
+ * `ignoreBOM:true` keeps a leading BOM in the output so a byte-exact slice is not
+ * silently trimmed. */
 function fatalUtf8Slice(name: string, i: number, bytes: Buffer, start: number, end: number): string {
   if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > bytes.length) {
     fail(`${name}: diagnostic ${i} byte span [${start},${end}) is out of range for ${bytes.length} source bytes`);
   }
+  if (!isCodepointBoundary(bytes, start) || !isCodepointBoundary(bytes, end)) {
+    fail(`${name}: diagnostic ${i} byte span [${start},${end}) splits a UTF-8 codepoint — spans must fall on codepoint boundaries`);
+  }
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(start, end));
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(start, end));
   } catch {
     fail(`${name}: diagnostic ${i} byte span [${start},${end}) splits a UTF-8 codepoint — spans must fall on codepoint boundaries`);
   }
