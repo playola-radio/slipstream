@@ -105,21 +105,36 @@ async function cacheClaim(ctx: AcceptanceContext, seq: string): Promise<Assertio
   };
 }
 
-/** GET a change's clips during the burst; require HTTP 200 and return its status.
+interface TimedRead { status: string; start: number; end: number }
+
+/** GET a change's clips during the burst, timing the request; require HTTP 200.
  * The clip service maps a shed request (overloaded/timeout/worker-error) to a
  * transient envelope with HTTP 200, so status — not the HTTP code — tells shed
- * apart from computed. */
-async function readClipStatus(ctx: AcceptanceContext, seq: string): Promise<string> {
+ * apart from computed. The [start, end] wall-clock span is the evidence a caller
+ * needs to prove this read's compute overlapped some other window in time. */
+async function readClipStatus(ctx: AcceptanceContext, seq: string): Promise<TimedRead> {
+  const start = Date.now();
   const r = await ctx.reader.raw(`/v1/sessions/${ctx.sessionId}/changes/${seq}/clips`, { signal: ctx.signal });
+  const end = Date.now();
   if (r.status !== 200) fail(`a clip read during the burst returned HTTP ${r.status}`);
-  return (JSON.parse(r.body.toString('utf8')) as ClipProjection).status;
+  const status = (JSON.parse(r.body.toString('utf8')) as ClipProjection).status;
+  return { status, start, end };
+}
+
+/** Two closed wall-clock intervals overlap iff each starts at or before the
+ * other ends. Exported for unit coverage independent of a live daemon. */
+export function intervalsOverlap(a: { start: number; end: number }, b: { start: number; end: number }): boolean {
+  return a.start <= b.end && b.start <= a.end;
 }
 
 /** LIVE: real projection load must not starve capture. Contend for clip's single
  * budget slot with concurrent reads over several DISTINCT COLD changes (each a real
  * uncomputed projection, not a cache hit), and require that a file written during
  * the load is still observed on the public events feed within the deadline. Some
- * reads may be shed by the bound — that is the bound working, not starvation. */
+ * reads may be shed by the bound — that is the bound working, not starvation.
+ * "Not starved" is only a meaningful claim if clip compute was demonstrably
+ * running DURING the capture write, not merely completed somewhere in the same
+ * test — so a computed read's own timed span must overlap the capture span. */
 async function captureNotStarvedClaim(ctx: AcceptanceContext, startCursor: bigint): Promise<Assertion> {
   const coldSeqs: string[] = [];
   let cursor = startCursor;
@@ -133,28 +148,39 @@ async function captureNotStarvedClaim(ctx: AcceptanceContext, startCursor: bigin
   // Concurrent reads over distinct cold seqs: duplicate reads of one seq coalesce,
   // distinct seqs each need their own compute, so the single-slot budget genuinely
   // queues and sheds while the load is in flight.
-  const statuses: Promise<string>[] = [];
+  const reads: Promise<TimedRead>[] = [];
   for (let round = 0; round < 3; round++) {
-    for (const seq of coldSeqs) statuses.push(readClipStatus(ctx, seq));
+    for (const seq of coldSeqs) reads.push(readClipStatus(ctx, seq));
   }
 
   const rel = `t5b1-under-load-${randomUUID()}.ts`;
-  const t0 = Date.now();
+  const captureStart = Date.now();
   const observed = writeAndObserve(ctx, rel, 'export const underLoad = () => 1;\n', cursor);
-  const [resolved, { seq: newSeq }] = await Promise.all([Promise.all(statuses), observed]);
-  const captureMs = Date.now() - t0;
+  const [resolved, { seq: newSeq }] = await Promise.all([Promise.all(reads), observed]);
+  const captureEnd = Date.now();
+  const captureSpan = { start: captureStart, end: captureEnd };
 
-  const computed = resolved.filter((s) => s === 'ready' || s === 'fallback').length;
-  const shed = resolved.filter((s) => s !== 'ready' && s !== 'fallback').length;
+  const computedReads = resolved.filter((r) => r.status === 'ready' || r.status === 'fallback');
+  const shed = resolved.length - computedReads.length;
   // The load only tests starvation if real projection work actually ran alongside
   // capture; if every read were shed, no clip CPU would have contended at all.
-  if (computed < 1) {
+  if (computedReads.length < 1) {
     fail('capture-not-starved exercised no real projection work: every clip read was shed, so clip CPU never contended with capture');
+  }
+  // A computed read finishing well before or after the capture write proves
+  // nothing about contention during capture — require measured temporal overlap.
+  const overlapping = computedReads.filter((r) => intervalsOverlap(r, captureSpan));
+  if (overlapping.length < 1) {
+    fail(`capture-not-starved found ${computedReads.length} computed read(s) but none overlapped the capture write's window [${captureStart}, ${captureEnd}]: read spans were ${JSON.stringify(computedReads.map((r) => [r.start, r.end]))}`);
   }
   return {
     id: 'capture-not-starved-by-clip-load',
-    claim: 'LIVE: while concurrent clip reads over 6 distinct cold changes contend for the single-slot clip budget, a newly written source file is still observed on the public events feed within the deadline; some reads may return the transient shed envelope, which is the shared bound working rather than capture starvation',
-    evidence: { distinct_cold_changes: coldSeqs.length, concurrent_reads: resolved.length, computed, shed, new_change_seq: newSeq, capture_ms: captureMs },
+    claim: 'LIVE: while concurrent clip reads over 6 distinct cold changes contend for the single-slot clip budget, at least one of those reads is measurably in flight (its own [start,end] wall-clock span overlaps the capture write\'s) while a newly written source file is still observed on the public events feed within the deadline; some reads may return the transient shed envelope, which is the shared bound working rather than capture starvation',
+    evidence: {
+      distinct_cold_changes: coldSeqs.length, concurrent_reads: resolved.length,
+      computed: computedReads.length, shed, overlapping_with_capture: overlapping.length,
+      new_change_seq: newSeq, capture_span: captureSpan,
+    },
   };
 }
 

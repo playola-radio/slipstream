@@ -135,19 +135,29 @@ export async function runSaturation(opts: SaturateOptions): Promise<AdmissionTra
 }
 
 const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isNonNegativeInt = (v: unknown): v is number => isFiniteNumber(v) && Number.isInteger(v) && v >= 0;
 
 /** A supplied trace must carry the full config (C/Q/W/D) and every count field as
- * finite numbers; otherwise the invariant check would silently skip a bound (e.g.
- * a trace missing config.Q could smuggle an unbounded queueMax past the gate). */
+ * non-negative integers, and the counts must be internally consistent; otherwise
+ * the invariant check would silently skip a bound (e.g. a trace missing config.Q
+ * could smuggle an unbounded queueMax past the gate) or wave through a physically
+ * impossible trace (e.g. an `ok` result with nothing ever admitted or active). */
 function isValidTrace(t: unknown): t is AdmissionTrace {
   if (typeof t !== 'object' || t === null) return false;
   const trace = t as Record<string, unknown>;
   const cfg = trace.config;
   if (typeof cfg !== 'object' || cfg === null) return false;
   const c = cfg as Record<string, unknown>;
-  if (!(['C', 'Q', 'W', 'D'] as const).every((k) => isFiniteNumber(c[k]))) return false;
+  if (!(['C', 'Q', 'W', 'D'] as const).every((k) => isNonNegativeInt(c[k]))) return false;
   const fields = ['submitted', 'admitted', 'overloaded', 'ok', 'timeouts', 'errors', 'activeMax', 'queueMax'] as const;
-  return fields.every((f) => isFiniteNumber(trace[f]));
+  if (!fields.every((f) => isNonNegativeInt(trace[f]))) return false;
+
+  const { submitted, admitted, overloaded, ok, timeouts, errors, activeMax, queueMax } = trace as unknown as AdmissionTrace;
+  if (admitted + overloaded !== submitted) return false; // every submission is admitted xor overloaded
+  if (ok + timeouts + errors !== admitted) return false; // every admitted unit settles exactly one way
+  if (ok > 0 && activeMax === 0) return false; // a completed compute must have run at some point
+  if (admitted > 0 && activeMax === 0 && queueMax === 0) return false; // admitted work must have run or waited
+  return true;
 }
 
 export class AdmissionArgError extends Error {}

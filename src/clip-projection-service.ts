@@ -195,22 +195,30 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
+    // Only the coalescing leader's `run` is ever invoked (the budget calls it
+    // once per flight); a coalesced waiter never sees this flip, so only the
+    // leader writes the cache entry — waiters would otherwise redundantly
+    // re-store the identical value the leader already cached.
+    let isLeader = false;
     const outcome = await budget.admit<ClipProjection>({
       workload: 'clip',
       localConcurrency: CONCURRENCY,
       key,
-      run: () => compute({
-        storeDir: opts.storeDir,
-        before: req.before,
-        after: req.after,
-        opts: { changeSeq: req.changeSeq, language: req.language },
-      }),
+      run: () => {
+        isLeader = true;
+        return compute({
+          storeDir: opts.storeDir,
+          before: req.before,
+          after: req.after,
+          opts: { changeSeq: req.changeSeq, language: req.language },
+        });
+      },
     });
 
     switch (outcome.kind) {
       case 'ok':
         // Availability, overload, and timeout dispositions are never cached.
-        if (cacheable(outcome.value)) cache.set(key, outcome.value);
+        if (isLeader && cacheable(outcome.value)) cache.set(key, outcome.value);
         return stamp(outcome.value, req.changeSeq);
       case 'timeout':
         return transient(req.changeSeq, 'timeout');

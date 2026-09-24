@@ -162,6 +162,49 @@ describe('runAdmission CLI', () => {
     assert.equal(s.out.length, 0);
   });
 
+  it('rejects an impossible trace: an ok result with nothing admitted or active', async () => {
+    // ok=1 claims one compute actually ran and completed, but admitted=0 and
+    // activeMax=0 claim nothing was ever let through the budget — internally
+    // contradictory. Finiteness alone lets this pass; it must be USAGE.
+    const path = await tmpTrace(JSON.stringify({
+      config: { C: 2, Q: 8, W: 8, D: 100 },
+      submitted: 1, admitted: 0, overloaded: 0, ok: 1, timeouts: 0, errors: 0, activeMax: 0, queueMax: 0,
+    }));
+    const s = sink();
+    assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
+    assert.equal(s.out.length, 0);
+  });
+
+  it('rejects a trace with a negative count field', async () => {
+    const path = await tmpTrace(JSON.stringify({
+      config: { C: 2, Q: 8, W: 8, D: 100 },
+      submitted: 1, admitted: 1, overloaded: 0, ok: 1, timeouts: 0, errors: 0, activeMax: -1, queueMax: 0,
+    }));
+    const s = sink();
+    assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
+    assert.equal(s.out.length, 0);
+  });
+
+  it('rejects a trace where admitted exceeds submitted', async () => {
+    const path = await tmpTrace(JSON.stringify({
+      config: { C: 2, Q: 8, W: 8, D: 100 },
+      submitted: 1, admitted: 2, overloaded: 0, ok: 1, timeouts: 0, errors: 0, activeMax: 1, queueMax: 0,
+    }));
+    const s = sink();
+    assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
+    assert.equal(s.out.length, 0);
+  });
+
+  it('rejects a trace where admitted + overloaded does not equal submitted', async () => {
+    const path = await tmpTrace(JSON.stringify({
+      config: { C: 2, Q: 8, W: 8, D: 100 },
+      submitted: 5, admitted: 2, overloaded: 1, ok: 2, timeouts: 0, errors: 0, activeMax: 1, queueMax: 1,
+    }));
+    const s = sink();
+    assert.equal(await runAdmission(s.io(['--check-trace', path])), EXIT.USAGE);
+    assert.equal(s.out.length, 0);
+  });
+
   it('is reachable through main', async () => {
     const out: string[] = [];
     const code = await main({ argv: ['admission', '--saturate', '--clip', '2', '--synthetic', '2', '--job-ms', '60'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
