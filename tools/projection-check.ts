@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Two subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Three subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
@@ -13,6 +13,12 @@
  *    exactly one canonical envelope. Exit 0 = envelope produced (with --check it
  *    matched the fixture's expected.json); 1 = --check mismatch (envelope still
  *    printed); 2 = bad args, missing fixture, unreadable/malformed input.
+ *  - `swift-parse`: the Swift-grammar feasibility checker (SWIFT-GRAMMAR.md).
+ *    `swift-parse --fixture <name>` or `swift-parse --file <path|->` loads the
+ *    pinned grammar in the isolated host and prints one JSON report (artifact
+ *    provenance, root type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte
+ *    spans, timings). Exit 0 = clean; 1 = parse errors (report still printed);
+ *    2 = bad input or an artifact/host failure (diagnostic on stderr, no report).
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -48,6 +54,8 @@ import {
   interfaceToLine,
   parseInterfaceInput,
 } from './interface-projection-oracle.ts';
+import { runSwiftParseChild, swiftFixturePath, SwiftFixtureError } from './swift-parse.ts';
+import type { HostResult } from './swift-parse-host.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -384,6 +392,14 @@ export interface InterfaceIO {
   readStdin: () => Promise<Uint8Array>;
 }
 
+export interface SwiftParseIO {
+  argv: readonly string[];
+  stdout: (line: string) => void;
+  stderr: (line: string) => void;
+  cwd: string;
+  readStdin: () => Promise<Uint8Array>;
+}
+
 type InterfaceArgs = { fixture: string; check: boolean } | { input: string };
 
 function parseInterfaceArgs(argv: readonly string[]): InterfaceArgs {
@@ -464,6 +480,85 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
   return EXIT.PASS;
 }
 
+/** Bad input for `swift-parse` (missing/unreadable source, invalid UTF-8) —
+ * distinct from ArgError so both map to exit 2 but read clearly. */
+export class SwiftParseInputError extends Error {}
+
+type SwiftParseSelector = { fixture: string } | { file: string };
+
+function parseSwiftParseArgs(argv: readonly string[]): SwiftParseSelector {
+  let input: SwiftParseSelector | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (flag !== '--fixture' && flag !== '--file') throw new ArgError(`unknown swift-parse argument '${flag}'`);
+    const value = argv[++i];
+    if (value === undefined) throw new ArgError(`${flag} requires a value`);
+    if (input) throw new ArgError('swift-parse takes exactly one of --fixture <name> / --file <path|->');
+    input = flag === '--fixture' ? { fixture: value } : { file: value };
+  }
+  if (!input) throw new ArgError('swift-parse requires --fixture <name> or --file <path|->');
+  return input;
+}
+
+/** `projection-check swift-parse`: load the pinned Swift grammar in the isolated
+ * host, parse one source, and print a JSON report (artifact provenance, root
+ * type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte spans, timings). All
+ * input is read and decoded before parsing, so an exit-2 run never prints a
+ * partial report. Exit 0 = clean parse; 1 = parse produced ERROR/MISSING nodes;
+ * 2 = bad input or an artifact/host failure. */
+export async function runSwiftParseCheck(io: SwiftParseIO): Promise<number> {
+  let source: string;
+  try {
+    const input = parseSwiftParseArgs(io.argv);
+    let bytes: Uint8Array;
+    if ('fixture' in input) {
+      let path: string;
+      try {
+        path = swiftFixturePath(input.fixture);
+      } catch (err) {
+        if (err instanceof SwiftFixtureError) throw new SwiftParseInputError(err.message);
+        throw err;
+      }
+      bytes = await readFile(path).catch(() => { throw new SwiftParseInputError(`no fixture named '${input.fixture}'`); });
+    } else if (input.file === '-') {
+      bytes = await io.readStdin();
+    } else {
+      bytes = await readFile(resolve(io.cwd, input.file)).catch((err: NodeJS.ErrnoException) => {
+        throw new SwiftParseInputError(`cannot read Swift file: ${err.code ?? err.message}`);
+      });
+    }
+    try {
+      source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      throw new SwiftParseInputError('input is not valid UTF-8');
+    }
+  } catch (err) {
+    if (!(err instanceof ArgError) && !(err instanceof SwiftParseInputError)) throw err;
+    io.stderr(`swift-parse: ${err.message}`);
+    return EXIT.USAGE;
+  }
+
+  let res: Extract<HostResult, { op: 'parse' }>;
+  try {
+    res = await runSwiftParseChild<Extract<HostResult, { op: 'parse' }>>({ op: 'parse', source });
+  } catch (err) {
+    // A host/artifact failure (sha mismatch, ABI reject, crash) is not a clean
+    // parse-error result — surface it as exit 2, never as a passing report.
+    io.stderr(`swift-parse: artifact/host failed: ${(err as Error).message}`);
+    return EXIT.USAGE;
+  }
+
+  io.stdout(JSON.stringify({
+    artifact: res.provenance,
+    rootType: res.result.rootType,
+    clean: res.result.clean,
+    byteLength: res.result.byteLength,
+    diagnostics: res.result.diagnostics,
+    timings: res.timings,
+  }));
+  return res.result.clean ? EXIT.PASS : EXIT.FAIL;
+}
+
 async function readAllStdin(): Promise<Uint8Array> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -474,8 +569,9 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
   const [sub, ...rest] = io.argv;
   if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
+  if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub !== 'acceptance') {
-    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', or 'interface'`);
+    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', or 'swift-parse'`);
     return EXIT.USAGE;
   }
   const controller = new AbortController();

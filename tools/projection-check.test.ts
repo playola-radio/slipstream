@@ -12,12 +12,14 @@ import {
   runModule,
   runFold,
   runInterface,
+  runSwiftParseCheck,
   main,
   EXIT,
   ArgError,
 } from './projection-check.ts';
 import { gitHead, writeQaEnv, QA_ENV_FORMAT, type QaEnv } from './qa-support.ts';
 import { prepareRoot } from './qa/safety.ts';
+import { EXPECTED_SHA256, EXPECTED_ABI } from '../src/swift-grammar.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 describe('runModule resource cleanup', () => {
@@ -555,5 +557,108 @@ describe('interface subcommand', () => {
     const code = await main({ argv: ['interface', '--fixture', 'unchanged'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     assert.equal(code, EXIT.PASS);
     assert.equal(JSON.parse(out[0]!).status, 'ready');
+  });
+});
+
+describe('swift-parse subcommand', () => {
+  // Each case spawns the isolated --liftoff-only host that actually loads the
+  // Swift grammar, so these are slower than the pure fold cases.
+  async function swift(argv: string[], stdin = ''): Promise<{ code: number; out: string[]; err: string[] }> {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runSwiftParseCheck({
+      argv,
+      stdout: (l) => out.push(l),
+      stderr: (l) => err.push(l),
+      cwd: process.cwd(),
+      readStdin: async () => new TextEncoder().encode(stdin),
+    });
+    return { code, out, err };
+  }
+
+  const tmpDirs: string[] = [];
+  after(async () => {
+    for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true });
+  });
+  async function tmpSwift(content: string | Uint8Array): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'swift-cli-'));
+    tmpDirs.push(dir);
+    const path = join(dir, 'input.swift');
+    await writeFile(path, content);
+    return path;
+  }
+
+  it('prints artifact provenance, root, clean=true and timings for a clean fixture (exit 0)', async () => {
+    const { code, out, err } = await swift(['--fixture', 'top-level-func']);
+    assert.equal(code, EXIT.PASS, err.join('\n'));
+    assert.equal(out.length, 1);
+    const report = JSON.parse(out[0]!);
+    assert.equal(report.artifact.sha256, EXPECTED_SHA256);
+    assert.equal(report.artifact.abiVersion, EXPECTED_ABI);
+    assert.equal(report.artifact.grammar.license, 'MIT');
+    assert.equal(report.artifact.wrapper.license, 'Unlicense');
+    assert.equal(report.rootType, 'source_file');
+    assert.equal(report.clean, true);
+    assert.deepEqual(report.diagnostics, []);
+    assert.equal(typeof report.timings.initAndLoadMs, 'number');
+    assert.equal(typeof report.timings.firstParseMs, 'number');
+  });
+
+  it('reports ERROR diagnostics with byte spans and exits 1 for a known grammar gap', async () => {
+    const { code, out } = await swift(['--fixture', 'preview-macro']);
+    assert.equal(code, EXIT.FAIL);
+    const report = JSON.parse(out[0]!);
+    assert.equal(report.clean, false);
+    assert.ok(report.diagnostics.length >= 1);
+    const d = report.diagnostics[0];
+    assert.equal(typeof d.byteStart, 'number');
+    assert.equal(typeof d.byteEnd, 'number');
+    assert.ok(d.kind === 'error' || d.kind === 'missing');
+  });
+
+  it('parses Swift from a --file path', async () => {
+    const path = await tmpSwift('func f() {}\n');
+    const { code, out } = await swift(['--file', path]);
+    assert.equal(code, EXIT.PASS);
+    assert.equal(JSON.parse(out[0]!).clean, true);
+  });
+
+  it('parses Swift from stdin with --file -', async () => {
+    const { code, out } = await swift(['--file', '-'], 'let x = 1\n');
+    assert.equal(code, EXIT.PASS);
+    assert.equal(JSON.parse(out[0]!).clean, true);
+  });
+
+  const usage: Array<[string, string[]]> = [
+    ['no selector', []],
+    ['both selectors', ['--fixture', 'top-level-func', '--file', '-']],
+    ['a repeated selector', ['--fixture', 'top-level-func', '--fixture', 'methods']],
+    ['a selector without a value', ['--fixture']],
+    ['an unknown flag', ['--pretty']],
+    ['a missing fixture', ['--fixture', 'no-such-case']],
+    ['a fixture name that escapes the corpus', ['--fixture', '../v1']],
+    ['a missing file', ['--file', '/nonexistent/slipstream-swift-input.swift']],
+  ];
+  for (const [name, argv] of usage) {
+    it(`exits 2 with nothing on stdout for ${name}`, async () => {
+      const { code, out, err } = await swift(argv);
+      assert.equal(code, EXIT.USAGE);
+      assert.deepEqual(out, []);
+      assert.ok(err.length > 0);
+    });
+  }
+
+  it('exits 2 on invalid UTF-8 input', async () => {
+    const path = await tmpSwift(new Uint8Array([0x66, 0xc3, 0x28, 0x0a]));
+    const { code, out } = await swift(['--file', path]);
+    assert.equal(code, EXIT.USAGE);
+    assert.deepEqual(out, []);
+  });
+
+  it('is reachable through main', async () => {
+    const out: string[] = [];
+    const code = await main({ argv: ['swift-parse', '--fixture', 'top-level-func'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
+    assert.equal(code, EXIT.PASS);
+    assert.equal(JSON.parse(out[0]!).clean, true);
   });
 });
