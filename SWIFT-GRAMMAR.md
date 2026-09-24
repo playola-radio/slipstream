@@ -99,6 +99,15 @@ check.
 > Whether production wires Swift in-process, keeps the isolated child, or does
 > something else is **T5b.2's** decision, informed by this finding.
 
+**Platform scope (honest).** The delayed abort was observed on **darwin (arm64,
+Node 24.11.0)**. On **ubuntu CI** the same parse under a *default* launch does
+**not** abort within the 15 s window — it loads and survives, exactly as the
+`--liftoff-only` run does. So the OOM is a darwin-specific phenomenon as far as
+this PR has measured, and the negative-control test that asserts the abort is
+gated to darwin. The `--liftoff-only` isolation and the load guard are kept
+uniform across platforms as a conservative, darwin-motivated precaution; whether
+Linux needs them at all is uncharacterized here and left to T5b.2.
+
 ## Cancellation
 
 A parse runs inside a terminable `worker_thread`. A synchronous parse cannot be

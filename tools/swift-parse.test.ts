@@ -103,7 +103,13 @@ test('survives past the observed OOM window under --liftoff-only', async () => {
   assert.equal(r.result.clean, true);
 });
 
-test('negative control: the default Node launch aborts on the same parse', async () => {
+// The delayed V8 tier-up OOM was observed empirically on darwin (arm64, Node
+// 24.11.0); on ubuntu CI the default launch does NOT reproduce it — the same
+// parse loads and survives the hold there (the `survive` test above passes on
+// Linux too). So this negative control, which asserts the ABORT, is darwin-only;
+// the --liftoff-only isolation is a darwin-motivated precaution applied
+// uniformly. See SWIFT-GRAMMAR.md.
+test('negative control: the default Node launch aborts on the same parse', { skip: process.platform !== 'darwin' ? 'the V8 tier-up OOM is a darwin-only observation; the default launch does not abort on Linux CI' : false }, async () => {
   await assert.rejects(
     runSwiftParseChild(
       { op: 'survive', source: 'func f() {}\n', holdMs: 2_800 },
