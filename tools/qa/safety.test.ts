@@ -218,6 +218,23 @@ describe('safety', () => {
       const marker = await readOwnerMarker(root);
       assert.equal(marker?.run_id, 'run-winner');
     });
+
+    it('adopts a kept root under --reuse even when the launch nonce differs (keep→reuse)', async () => {
+      const root = join(base, 'prep-reuse-adopt');
+      // A --keep run mints its ownership id and leaves the marker behind.
+      await prepareRoot(root, 'run-keep');
+      const before = await readOwnerMarker(root);
+      // A later --reuse spawn arrives with a DIFFERENT launch nonce (harness-proc
+      // mints a fresh nonce per process for its readiness handshake). It must adopt
+      // the kept root rather than refuse it as a concurrent claimant.
+      const { store, worktree } = await prepareRoot(root, 'run-reuse-nonce', { reuse: true });
+      assert.equal(store, join(root, 'store'));
+      assert.equal(worktree, join(root, 'worktree'));
+      // Ownership is left exactly as the keep run wrote it — no silent takeover.
+      const after = await readOwnerMarker(root);
+      assert.equal(after?.run_id, 'run-keep');
+      assert.equal(after?.created_at_ms, before?.created_at_ms);
+    });
   });
 
   describe('mayDeleteRoot', () => {

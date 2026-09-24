@@ -26,6 +26,7 @@ import {
   evaluateRoot,
   prepareRoot,
   mayDeleteRoot,
+  readOwnerMarker,
   type DaemonLiveness,
 } from './qa/safety.ts';
 import { getScenario, scenarioNames } from './qa/scenarios.ts';
@@ -173,9 +174,14 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   }
 
   // The launch nonce (if a parent supplied one) IS the run_id, so the env this
-  // child publishes can be told apart from any stale predecessor's env.
+  // child publishes can be told apart from any stale predecessor's env. Under
+  // `--reuse` this nonce is fresh per spawn and so differs from the id the keep
+  // run stamped into the owner marker; `prepareRoot({ reuse })` adopts the kept
+  // root rather than mistaking the fresh nonce for a concurrent claimant.
   const runId = args.runId ?? randomUUID();
-  const { store, worktree } = await prepareRoot(args.root, runId);
+  const { store, worktree } = await prepareRoot(args.root, runId, { reuse: args.reuse });
+  const owner = await readOwnerMarker(args.root);
+  if (owner === null) throw new Error(`QA root ${args.root} lost its ownership marker after preparation`);
   const daemonCommit = await gitHead(io.cwd).catch(() => 'unknown');
   const daemonDirty = await gitIsDirty(io.cwd).catch(() => true); // unknown reads as dirty, never a false-clean claim
   const envPath = join(args.root, QA_ENV_NAME);
@@ -233,7 +239,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
         io.stderr(`qa-daemon: shutdown failed: ${(err as Error).message}; retaining ${args.root}`);
       }
     }
-    await markStopped(envPath).catch(() => {});
+    await markStopped(envPath, runId).catch(() => {});
     if (!args.keep && !args.reuse && !teardownFailed) {
       try {
         if (await mayDeleteRoot(args.root, runId)) await rm(args.root, { recursive: true, force: true });
@@ -332,6 +338,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       format: QA_ENV_FORMAT,
       state: 'ready',
       run_id: runId,
+      owner_run_id: owner.run_id,
       daemon_commit: daemonCommit,
       daemon_dirty: daemonDirty,
       store,
@@ -405,8 +412,19 @@ async function readRuntimeDescriptorPath(store: string): Promise<string | null> 
   return newest?.path ?? null;
 }
 
-async function markStopped(envPath: string): Promise<void> {
+/** Mark THIS run's published qa-env.json as stopped, guarded by run_id. A run
+ * only ever relabels the env it itself published. Two `--reuse` runs can slip
+ * past the liveness refusal (each mints a fresh nonce and adopts the same kept
+ * marker) and contend for the one control socket; the loser's `startDaemon`
+ * fails and its cleanup must NOT rewrite the winner's still-live env as
+ * `stopped` and strand the winner's readiness wait. A mismatched env is left
+ * untouched — a no-op, never a false stop for another run. (This is the
+ * documented concurrent-`--reuse` behavior: the liveness refusal handles the
+ * common case; beyond it the runs degrade to pre-5a86f14 semantics rather than
+ * a new lock, and neither corrupts the other's readiness metadata.) */
+export async function markStopped(envPath: string, runId: string): Promise<void> {
   const env = await readQaEnv(envPath);
+  if (env.run_id !== runId) return;
   await writeQaEnv(envPath, { ...env, state: 'stopped' });
 }
 
