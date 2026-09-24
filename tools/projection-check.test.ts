@@ -13,6 +13,7 @@ import {
   runFold,
   runInterface,
   runSwiftParseCheck,
+  runSwiftMeasure,
   main,
   EXIT,
   ArgError,
@@ -660,5 +661,35 @@ describe('swift-parse subcommand', () => {
     const code = await main({ argv: ['swift-parse', '--fixture', 'top-level-func'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     assert.equal(code, EXIT.PASS);
     assert.equal(JSON.parse(out[0]!).clean, true);
+  });
+});
+
+describe('swift-measure subcommand', () => {
+  it('reports cold start and first/warm parse for small/medium/large (exit 0)', async () => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runSwiftMeasure({ argv: [], stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+    assert.equal(code, EXIT.PASS, err.join('\n'));
+    assert.equal(out.length, 1);
+    const report = JSON.parse(out[0]!);
+    assert.equal(report.artifact.sha256, EXPECTED_SHA256);
+    assert.equal(typeof report.initAndLoadMs, 'number');
+    assert.deepEqual(report.parses.map((p: { label: string }) => p.label), ['small', 'medium', 'large']);
+    for (const p of report.parses) {
+      assert.equal(p.clean, true, `${p.label} should parse clean`);
+      assert.equal(typeof p.firstParseMs, 'number');
+      assert.equal(typeof p.warmParseMs, 'number');
+      assert.ok(p.byteLength > 0);
+    }
+    // Sizes are ordered by construction; the whole point is a size sweep.
+    const [s, m, l] = report.parses;
+    assert.ok(s.byteLength < m.byteLength && m.byteLength < l.byteLength, 'byte sizes must increase small→large');
+  });
+
+  it('exits 2 on an unexpected argument', async () => {
+    const err: string[] = [];
+    const code = await runSwiftMeasure({ argv: ['--nope'], stdout: () => {}, stderr: (l) => err.push(l) });
+    assert.equal(code, EXIT.USAGE);
+    assert.ok(err.length > 0);
   });
 });

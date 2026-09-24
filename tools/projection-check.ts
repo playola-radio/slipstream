@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Three subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Four subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
@@ -19,6 +19,10 @@
  *    provenance, root type, `clean`, ERROR/MISSING diagnostics with UTF-8 byte
  *    spans, timings). Exit 0 = clean; 1 = parse errors (report still printed);
  *    2 = bad input or an artifact/host failure (diagnostic on stderr, no report).
+ *  - `swift-measure`: cold start (init + language load) and first/warm parse time
+ *    for small/medium/large representative sources, as one JSON report. Numbers
+ *    are measurements, not budgets (D7). Exit 0 = all clean; 2 = artifact/host
+ *    failure. Takes no arguments.
  *
  * `acceptance` contract (kept deliberately narrow):
  *  - stdout carries EXACTLY one JSON report on a run that executed checks; all
@@ -482,7 +486,7 @@ export async function runInterface(io: InterfaceIO): Promise<number> {
 
 /** Bad input for `swift-parse` (missing/unreadable source, invalid UTF-8) —
  * distinct from ArgError so both map to exit 2 but read clearly. */
-export class SwiftParseInputError extends Error {}
+class SwiftParseInputError extends Error {}
 
 type SwiftParseSelector = { fixture: string } | { file: string };
 
@@ -559,6 +563,44 @@ export async function runSwiftParseCheck(io: SwiftParseIO): Promise<number> {
   return res.result.clean ? EXIT.PASS : EXIT.FAIL;
 }
 
+/** Three representative Swift sources of increasing size, for the cold/warm
+ * measurement the brief requires (small / medium / large). Synthetic and
+ * deterministic so the byte sizes are stable across machines; the timings are
+ * not (they are the point). */
+function representativeSwiftSources(): { label: string; source: string }[] {
+  const small = 'func greet(name: String) -> String { return name }\n';
+  const medium =
+    'import Foundation\n\nstruct Widget {\n' +
+    Array.from({ length: 40 }, (_, i) => `  func step${i}(_ x: Int) -> Int { return x + ${i} }`).join('\n') +
+    '\n}\n';
+  const large =
+    'import Foundation\n\n' +
+    Array.from({ length: 4000 }, (_, i) => `func f${i}(_ a: Int, _ b: Int) -> Int { let c = a + b; return c * ${i} }`).join('\n') +
+    '\n';
+  return [{ label: 'small', source: small }, { label: 'medium', source: medium }, { label: 'large', source: large }];
+}
+
+/** `projection-check swift-measure`: load the pinned grammar once in the isolated
+ * host and report cold start (init + language load) plus first/warm parse time
+ * for small/medium/large representative sources. Prints one JSON report; the
+ * numbers are measurements, not budgets (D7). Exit 0 = all parsed clean; 2 = an
+ * artifact/host failure. Takes no arguments. */
+export async function runSwiftMeasure(io: { argv: readonly string[]; stdout: (l: string) => void; stderr: (l: string) => void }): Promise<number> {
+  if (io.argv.length > 0) {
+    io.stderr(`swift-measure: unexpected argument '${io.argv[0]}' (takes none)`);
+    return EXIT.USAGE;
+  }
+  let res: Extract<HostResult, { op: 'measure' }>;
+  try {
+    res = await runSwiftParseChild<Extract<HostResult, { op: 'measure' }>>({ op: 'measure', sources: representativeSwiftSources() });
+  } catch (err) {
+    io.stderr(`swift-measure: artifact/host failed: ${(err as Error).message}`);
+    return EXIT.USAGE;
+  }
+  io.stdout(JSON.stringify({ artifact: res.provenance, initAndLoadMs: res.initAndLoadMs, parses: res.parses }));
+  return res.parses.every((p) => p.clean) ? EXIT.PASS : EXIT.FAIL;
+}
+
 async function readAllStdin(): Promise<Uint8Array> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -570,8 +612,9 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
   if (sub === 'fold') return runFold({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub === 'interface') return runInterface({ ...io, argv: rest, readStdin: readAllStdin });
   if (sub === 'swift-parse') return runSwiftParseCheck({ ...io, argv: rest, readStdin: readAllStdin });
+  if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr });
   if (sub !== 'acceptance') {
-    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', or 'swift-parse'`);
+    io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'swift-parse', or 'swift-measure'`);
     return EXIT.USAGE;
   }
   const controller = new AbortController();
