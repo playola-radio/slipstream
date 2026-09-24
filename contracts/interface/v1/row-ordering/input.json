@@ -1,0 +1,99 @@
+{
+  "change_seq": "5",
+  "language": "typescript",
+  "language_version": "typescript.v1",
+  "before": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "gone",
+          "guards": []
+        },
+        "display_name": "gone",
+        "signature": "function gone(): void",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 21
+        }
+      },
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "bgone",
+          "guards": []
+        },
+        "display_name": "bgone",
+        "signature": "function bgone(): void",
+        "span": {
+          "byte_start": 30,
+          "byte_end": 52
+        }
+      },
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "chg",
+          "guards": []
+        },
+        "display_name": "chg",
+        "signature": "function chg(x = 1): void",
+        "span": {
+          "byte_start": 60,
+          "byte_end": 85
+        }
+      }
+    ]
+  },
+  "after": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "chg",
+          "guards": []
+        },
+        "display_name": "chg",
+        "signature": "function chg(x = 2): void",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 25
+        }
+      },
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "znew",
+          "guards": []
+        },
+        "display_name": "znew",
+        "signature": "function znew(): void",
+        "span": {
+          "byte_start": 30,
+          "byte_end": 51
+        }
+      },
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "anew",
+          "guards": []
+        },
+        "display_name": "anew",
+        "signature": "function anew(): void",
+        "span": {
+          "byte_start": 60,
+          "byte_end": 81
+        }
+      }
+    ]
+  }
+}

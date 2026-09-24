@@ -1,0 +1,28 @@
+{
+  "change_seq": "5",
+  "language": "typescript",
+  "language_version": "typescript.v1",
+  "before": {
+    "status": "complete",
+    "declarations": [
+      {
+        "identity": {
+          "kind": "function",
+          "scope": [],
+          "name": "f",
+          "guards": []
+        },
+        "display_name": "f",
+        "signature": "function f(): void",
+        "span": {
+          "byte_start": 0,
+          "byte_end": 18
+        }
+      }
+    ]
+  },
+  "after": {
+    "status": "incomplete",
+    "reason": "after-parse-error"
+  }
+}

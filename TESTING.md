@@ -197,6 +197,46 @@ evidence, coverage, or gaps. Those three components, plus attribution revisions 
 rejections, are therefore proven only by the FIXTURE corpus claim. The report labels
 each claim LIVE or FIXTURE.
 
+### Interface projection oracle (`interface`) and the `T5a.1` check
+
+`node tools/projection-check.ts interface` is the `interface.v1` oracle
+(`INTERFACE-PROJECTION.md`). It reads a hand-written `input.json` (two synthetic
+per-side extraction results plus dispositions) and prints one canonical envelope.
+Exit codes:
+
+- `0`: an envelope was produced (any `status`); with `--check`, it matched the
+  fixture's `expected.json`.
+- `1`: `--check` mismatch. The actual envelope is still printed, for diffing.
+- `2`: unusable input or arguments. Nothing goes to stdout.
+
+```
+node tools/projection-check.ts interface --fixture rename            # a corpus case
+node tools/projection-check.ts interface --fixture rename --check    # compare to expected.json
+node tools/projection-check.ts interface --input path/to/input.json  # an arbitrary input
+cat input.json | node tools/projection-check.ts interface --input -  # from stdin
+```
+
+The corpus is `contracts/interface/v1/<case>/{input.json,expected.json}`. Unlike
+the display-fold corpus, each **`input.json` is hand-written but its
+`expected.json` is produced by the checker** and pinned as a regression + schema
+fixture — the independent correctness proof lives in `src/interface-projection.test.ts`
+(hand-written assertions over status, change kinds, and ordering). To add a case,
+write `input.json`, run `node tools/projection-check.ts interface --fixture <case>
+> contracts/interface/v1/<case>/expected.json`, then `npm run test:tools`. The
+corpus test discovers every case directory and additionally validates each
+`expected.json` against `contracts/interface/v1/schema.json`.
+
+`npm run qa:check -- --pr T5a.1` runs the live + fixture claims:
+
+- LIVE: interface.v1 has no public surface yet — its schema route is `404`
+  (control: `clip.v3` serves `200`) and the per-change interfaces route is `404`;
+- FIXTURE: every corpus case builds to its expected envelope, every
+  `expected.json` validates against the schema, and reordering two change rows
+  changes the bytes (so D8 row order is a checked property).
+
+The `interface.v1` schema is **stored but not served** — it becomes reachable
+only when a later PR adds it to the schema allowlist in `src/store-reader.ts`.
+
 ### Cleanup
 
 `qa:daemon` removes its owned root on a clean default shutdown (retained under
