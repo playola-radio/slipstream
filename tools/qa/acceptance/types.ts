@@ -22,6 +22,8 @@ export interface AcceptanceModule {
   /** Restrict the module to a platform (T-QA needs macOS FSEvents). A mismatch is
    * a not-run, never a pass. */
   requiresPlatform?: NodeJS.Platform;
+  /** Set false for a self-contained module that never touches the QA daemon. */
+  needsDaemon?: boolean;
   /** Assert every claim; throw on any failure. Returns the evidence per claim. */
   run(ctx: AcceptanceContext): Promise<{ assertions: Assertion[] }>;
 }

@@ -57,6 +57,22 @@ export async function runSwiftParseChild<T extends HostResult = HostResult>(
   request: HostRequest,
   opts: RunChildOpts = {},
 ): Promise<T> {
+  return runSwiftHost<T>([], JSON.stringify(request), opts);
+}
+
+/** Parse a named file in the isolated host. The checker passes only the path,
+ * so it never builds a second full source string or JSON copy in its process. */
+export async function runSwiftParseFile<T extends HostResult = HostResult>(path: string, opts: RunChildOpts = {}): Promise<T> {
+  return runSwiftHost<T>(['--parse-file', path], '', opts);
+}
+
+/** Forward stdin bytes directly to the isolated host. This keeps the checker's
+ * one input buffer out of JSON serialization and decoding. */
+export async function runSwiftParseStdin<T extends HostResult = HostResult>(source: Uint8Array, opts: RunChildOpts = {}): Promise<T> {
+  return runSwiftHost<T>(['--parse-stdin'], source, opts);
+}
+
+async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: string | Uint8Array, opts: RunChildOpts): Promise<T> {
   // An already-aborted signal must never launch work (the abort listener below
   // only fires on FUTURE aborts).
   if (opts.signal?.aborted) {
@@ -67,7 +83,7 @@ export async function runSwiftParseChild<T extends HostResult = HostResult>(
   const unisolated = opts.liftoffOnly === false;
   const execArgv = unisolated ? [] : ['--liftoff-only'];
   const env = unisolated ? { ...process.env, [SWIFT_UNISOLATED_ENV]: '1' } : process.env;
-  const child = spawn(process.execPath, [...execArgv, HOST_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env });
+  const child = spawn(process.execPath, [...execArgv, HOST_PATH, ...hostArgs], { stdio: ['pipe', 'pipe', 'pipe'], env });
 
   let stdout = '';
   let stderr = '';
@@ -87,7 +103,7 @@ export async function runSwiftParseChild<T extends HostResult = HostResult>(
   opts.signal?.addEventListener('abort', onAbort, { once: true });
 
   try {
-    child.stdin.end(JSON.stringify(request));
+    child.stdin.end(input);
     const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
       child.on('error', reject);
       child.on('close', (c, s) => resolve([c, s]));

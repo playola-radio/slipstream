@@ -624,6 +624,13 @@ describe('swift-parse subcommand', () => {
     assert.equal(JSON.parse(out[0]!).clean, true);
   });
 
+  it('passes a file path to the isolated host without reading its source in the checker', async () => {
+    const path = await tmpSwift('func f() {}\n');
+    const { code, out, err } = await swift(['--file', path]);
+    assert.equal(code, EXIT.PASS, err.join('\n'));
+    assert.equal(JSON.parse(out[0]!).clean, true);
+  });
+
   it('parses Swift from stdin with --file -', async () => {
     const { code, out } = await swift(['--file', '-'], 'let x = 1\n');
     assert.equal(code, EXIT.PASS);

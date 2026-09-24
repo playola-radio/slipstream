@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { runSwiftParseChild, swiftFixturePath, SwiftChildError, SwiftFixtureError } from './swift-parse.ts';
 import { EXPECTED_SHA256, EXPECTED_ABI } from '../src/swift-grammar.ts';
 import type { HostResult } from './swift-parse-host.ts';
+import { runInWorker } from './swift-parse-host.ts';
 
 // End-to-end coverage for loading and parsing the Swift grammar. Every case runs
 // inside the isolated --liftoff-only child (the test runner itself never loads
@@ -29,6 +30,16 @@ test('reports ERROR diagnostics for malformed Swift', async () => {
   assert.equal(r.result.clean, false);
   assert.ok(r.result.diagnostics.length >= 1);
   assert.ok(r.result.diagnostics.some((d) => d.kind === 'error' || d.kind === 'missing'));
+});
+
+test('reports a clean result for a valid synthetic tree larger than the former diagnostic budget', async () => {
+  // One declaration produces several Tree-sitter nodes. This intentionally
+  // exceeds the former 500,000-node diagnostic-walk cap without containing an
+  // error: a large valid file must still receive its parse report.
+  const source = Array.from({ length: 125_000 }, (_, i) => `let value${i} = ${i}\n`).join('');
+  const r = only('parse', await runSwiftParseChild({ op: 'parse', source }, { deadlineMs: 60_000 }));
+  assert.equal(r.result.clean, true);
+  assert.deepEqual(r.result.diagnostics, []);
 });
 
 test('diagnostic spans are UTF-8 byte offsets, not UTF-16 indices', async () => {
@@ -83,6 +94,13 @@ test('an already-aborted signal never launches work', async () => {
       return true;
     },
   );
+});
+
+test('a worker startup error rejects the cancellation started-wait promptly', async () => {
+  const crashingWorker = new URL('data:text/javascript,throw new Error("startup failed")');
+  const parse = runInWorker('func f() {}\n', crashingWorker);
+  await assert.rejects(parse.started, /startup failed/);
+  await parse.worker.terminate();
 });
 
 test('cancelling mid-stdin-write rejects cleanly, never crashes the caller with EPIPE', async () => {

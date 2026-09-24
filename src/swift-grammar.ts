@@ -272,14 +272,6 @@ export interface SwiftParseResult {
   byteLength: number;
 }
 
-class SwiftTraversalError extends Error {}
-
-/** Cap on nodes visited during diagnostic traversal. A pathological tree that
- * blows the cap throws (never returns a truncated `clean:true`); wall-clock
- * cancellation of such input is demonstrated separately via a terminable
- * worker. */
-const MAX_NODES = 500_000;
-
 /** Parse Swift source and collect its ERROR/MISSING diagnostics with byte spans.
  * Visits EVERY node (including anonymous missing tokens), so no nested defect is
  * hidden. `clean` is true only when the whole tree is free of ERROR/MISSING. */
@@ -289,14 +281,12 @@ export function parseSwiftSource(language: Language, source: string): SwiftParse
   try {
     parser.setLanguage(language);
     tree = parser.parse(source);
-    if (!tree) throw new SwiftTraversalError('parser returned no tree');
+    if (!tree) throw new Error('parser returned no tree');
 
     const table = buildUtf16ToByteTable(source);
     const diagnostics: SwiftDiagnostic[] = [];
     const stack: Node[] = [tree.rootNode];
-    let visited = 0;
     while (stack.length) {
-      if (++visited > MAX_NODES) throw new SwiftTraversalError(`node budget ${MAX_NODES} exhausted`);
       const node = stack.pop()!;
       if (node.isError || node.isMissing) {
         const { byteStart, byteEnd } = utf16RangeToByteRange(table, node.startIndex, node.endIndex);

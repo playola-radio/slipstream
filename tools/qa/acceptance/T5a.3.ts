@@ -28,6 +28,25 @@ type ParseResult = Extract<HostResult, { op: 'parse' }>;
 type SurviveResult = Extract<HostResult, { op: 'survive' }>;
 type CancelResult = Extract<HostResult, { op: 'cancel-demo' }>;
 
+const REQUIRED_CORPUS_CASES = [
+  'argument-labels', 'async-throws', 'attributes-mainactor', 'bom',
+  'conditional-compilation', 'crlf', 'default-args', 'extension-members',
+  'generics-where', 'init', 'malformed-stray-token', 'malformed-truncated',
+  'malformed-unclosed-brace', 'methods', 'preview-macro',
+  'protocol-requirements', 'swiftui-view', 'top-level-func',
+  'unicode-astral', 'unicode-cjk', 'unicode-combining',
+] as const;
+
+export function assertRequiredCorpusCases(names: readonly string[]): void {
+  const found = new Set(names);
+  const missing = REQUIRED_CORPUS_CASES.filter((name) => !found.has(name));
+  if (missing.length > 0) fail(`missing required corpus cases: ${missing.join(', ')}`);
+}
+
+export function hasV8OomSignature(stderr: string): boolean {
+  return /Fatal process out of memory|\bZone\b/i.test(stderr);
+}
+
 /** The on-disk expected envelope for a corpus case: a parse result plus a
  * `byteSlice` per diagnostic and the honest known-gap manifest fields. */
 export interface ExpectedCase {
@@ -119,8 +138,8 @@ export function checkFixtureAgainstExpected(
   }
 }
 
-async function artifactClaim(): Promise<Assertion> {
-  const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source: 'func greet(name: String) -> String { return name }\n' });
+async function artifactClaim(signal: AbortSignal): Promise<Assertion> {
+  const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source: 'func greet(name: String) -> String { return name }\n' }, { signal });
   const p = r.provenance;
   if (p.sha256 !== EXPECTED_SHA256) fail(`artifact sha256 ${p.sha256} != pinned ${EXPECTED_SHA256}`);
   if (p.abiVersion !== EXPECTED_ABI) fail(`artifact ABI ${p.abiVersion} != pinned ${EXPECTED_ABI}`);
@@ -138,12 +157,12 @@ async function artifactClaim(): Promise<Assertion> {
   };
 }
 
-async function byteSpanClaim(): Promise<Assertion> {
+async function byteSpanClaim(signal: AbortSignal): Promise<Assertion> {
   // The astral emoji is 2 UTF-16 units but 4 UTF-8 bytes, so the malformed
   // 'func f( {' that follows must be reported starting at byte 15, not index 13.
   const source = 'let e = "\u{1F600}"\nfunc f( {\n';
   const bytes = Buffer.from(source, 'utf8');
-  const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source });
+  const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source }, { signal });
   const err = r.result.diagnostics.find((d) => d.kind === 'error') ?? fail('expected an ERROR diagnostic for the malformed tail');
   if (err.byteStart !== 15) fail(`ERROR byteStart=${err.byteStart}, expected 15 (UTF-8 bytes, not the UTF-16 index 13)`);
   const slice = bytes.subarray(err.byteStart, err.byteEnd).toString('utf8');
@@ -155,14 +174,15 @@ async function byteSpanClaim(): Promise<Assertion> {
   };
 }
 
-async function corpusClaim(): Promise<Assertion> {
+async function corpusClaim(signal: AbortSignal): Promise<Assertion> {
   const names = await listSwiftFixtures();
   if (names.length === 0) fail('the Swift corpus is empty');
+  assertRequiredCorpusCases(names);
   const gaps: string[] = [];
   for (const name of names) {
     const bytes = await readFile(swiftFixturePath(name, 'input.swift'));
     const expected = JSON.parse(await readFile(swiftFixturePath(name, 'expected.json'), 'utf8')) as ExpectedCase;
-    const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source: bytes.toString('utf8') });
+    const r = await runSwiftParseChild<ParseResult>({ op: 'parse', source: bytes.toString('utf8') }, { signal });
     checkFixtureAgainstExpected(name, bytes, expected, r.result);
     if (expected.knownGap) gaps.push(name);
   }
@@ -173,11 +193,11 @@ async function corpusClaim(): Promise<Assertion> {
   };
 }
 
-async function cancellationClaim(): Promise<Assertion> {
+async function cancellationClaim(signal: AbortSignal): Promise<Assertion> {
   const pathological = 'func f() {\n' + '  if x {\n'.repeat(200_000);
   const r = await runSwiftParseChild<CancelResult>(
     { op: 'cancel-demo', pathologicalSource: pathological, cleanSource: 'struct S { func m() {} }\n' },
-    { deadlineMs: 60_000 },
+    { deadlineMs: 60_000, signal },
   );
   if (!r.startedBeforeCancel) fail('the pathological parse never started, so cancellation proves nothing');
   // Read after teardown: the worker's completion flag was still unset once the
@@ -193,11 +213,11 @@ async function cancellationClaim(): Promise<Assertion> {
   };
 }
 
-async function oomSurvivalClaim(): Promise<Assertion> {
+async function oomSurvivalClaim(signal: AbortSignal): Promise<Assertion> {
   const holdMs = 2_800;
   const survived = await runSwiftParseChild<SurviveResult>(
     { op: 'survive', source: 'func f() {}\n', holdMs },
-    { deadlineMs: 15_000 },
+    { deadlineMs: 15_000, signal },
   );
   if (survived.heldMs !== holdMs || !survived.result.clean) fail(`--liftoff-only host did not survive the OOM window: ${JSON.stringify(survived)}`);
   // Negative control: the same parse on a default launch aborts the process. It
@@ -207,7 +227,7 @@ async function oomSurvivalClaim(): Promise<Assertion> {
   const V8_FATAL_SIGNALS = new Set<NodeJS.Signals>(['SIGTRAP', 'SIGABRT', 'SIGILL', 'SIGSEGV', 'SIGBUS']);
   let controlDetail: SwiftChildError['detail'] | null = null;
   try {
-    await runSwiftParseChild<SurviveResult>({ op: 'survive', source: 'func f() {}\n', holdMs }, { deadlineMs: 15_000, liftoffOnly: false });
+    await runSwiftParseChild<SurviveResult>({ op: 'survive', source: 'func f() {}\n', holdMs }, { deadlineMs: 15_000, liftoffOnly: false, signal });
   } catch (err) {
     if (!(err instanceof SwiftChildError)) throw err;
     controlDetail = err.detail;
@@ -216,24 +236,28 @@ async function oomSurvivalClaim(): Promise<Assertion> {
   if (controlDetail.signal === null || !V8_FATAL_SIGNALS.has(controlDetail.signal)) {
     fail(`the negative control did not abort with a V8 fatal signal (got code=${controlDetail.code}, signal=${controlDetail.signal}); a deadline SIGKILL or clean exit-2 is not proof of the OOM`);
   }
+  if (!hasV8OomSignature(controlDetail.stderr)) {
+    fail('the negative control did not report the observed V8 out-of-memory signature');
+  }
   return {
     id: 'swift-oom-survival',
     claim: 'under --liftoff-only the host parses and stays alive past the observed V8 out-of-memory window, while the same parse on a default Node launch aborts the process with a V8 fatal signal (the negative control)',
-    evidence: { heldMs: survived.heldMs, control: { code: controlDetail.code, signal: controlDetail.signal } },
+    evidence: { heldMs: survived.heldMs, control: { code: controlDetail.code, signal: controlDetail.signal, v8_oom_signature: true } },
   };
 }
 
 export const t5a3: AcceptanceModule = {
   id: 'T5a.3',
   requiresPlatform: 'darwin',
-  async run() {
+  needsDaemon: false,
+  async run(ctx) {
     return {
       assertions: [
-        await artifactClaim(),
-        await byteSpanClaim(),
-        await corpusClaim(),
-        await cancellationClaim(),
-        await oomSurvivalClaim(),
+        await artifactClaim(ctx.signal),
+        await byteSpanClaim(ctx.signal),
+        await corpusClaim(ctx.signal),
+        await cancellationClaim(ctx.signal),
+        await oomSurvivalClaim(ctx.signal),
       ],
     };
   },

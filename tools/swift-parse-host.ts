@@ -8,6 +8,8 @@
  * test runner, or the daemon.
  */
 import { Worker } from 'node:worker_threads';
+import { readFile } from 'node:fs/promises';
+import { isMainModule } from '../src/entrypoint.ts';
 import { loadSwiftLanguage, parseSwiftSource, type ArtifactProvenance, type SwiftParseResult } from '../src/swift-grammar.ts';
 import type { WorkerMessage } from './swift-parse-worker.ts';
 
@@ -36,6 +38,16 @@ async function readStdin(): Promise<string> {
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
 }
 
+async function readRequest(): Promise<HostRequest> {
+  const [mode, path] = process.argv.slice(2);
+  if (mode === '--parse-file') {
+    if (path === undefined) throw new Error('--parse-file requires a path');
+    return { op: 'parse', source: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await readFile(path)) };
+  }
+  if (mode === '--parse-stdin') return { op: 'parse', source: await readStdin() };
+  return JSON.parse(await readStdin()) as HostRequest;
+}
+
 /** Run one Swift parse in a fresh terminable worker, resolving when the parse
  * finishes (`done`) — or rejecting if the worker errors. Returns a `cancel`
  * that hard-terminates the worker (a synchronous parse cannot be stopped from
@@ -45,25 +57,43 @@ async function readStdin(): Promise<string> {
  * only fire immediately before it; the caller proves mid-flight cancellation by
  * reading `finished()` (shared memory, immune to this process's event-loop
  * scheduling), not by trusting `started` alone or by racing a `done` message. */
-function runInWorker(source: string): {
+export function runInWorker(source: string, workerUrl: URL = WORKER_URL): {
   done: Promise<SwiftParseResult>;
   started: Promise<void>;
   finished: () => boolean;
   cancel: () => Promise<number>;
   worker: Worker;
 } {
-  const worker = new Worker(WORKER_URL);
+  const worker = new Worker(workerUrl);
   const progress = new Int32Array(new SharedArrayBuffer(4));
   let onStarted!: () => void;
-  const started = new Promise<void>((res) => { onStarted = res; });
+  let rejectStarted!: (err: Error) => void;
+  const started = new Promise<void>((res, reject) => { onStarted = res; rejectStarted = reject; });
+  let settled = false;
+  const fail = (err: Error): void => {
+    if (settled) return;
+    settled = true;
+    rejectStarted(err);
+    rejectDone(err);
+  };
+  let rejectDone!: (err: Error) => void;
   const done = new Promise<SwiftParseResult>((resolve, reject) => {
+    rejectDone = reject;
     worker.on('message', (msg: WorkerMessage) => {
       if (msg.type === 'started') onStarted();
-      else if (msg.type === 'done') resolve(msg.result);
-      else reject(new Error(msg.message));
+      else if (msg.type === 'done') {
+        settled = true;
+        resolve(msg.result);
+      } else fail(new Error(msg.message));
     });
-    worker.on('error', reject);
+    worker.on('error', fail);
+    worker.on('exit', (code) => {
+      if (code !== 0) fail(new Error(`Swift parse worker exited before completing (code=${code})`));
+    });
   });
+  // The cancellation path intentionally does not await `done`; mark its
+  // rejection observed while preserving the promise for normal callers.
+  void done.catch(() => {});
   worker.postMessage({ source, progress });
   return {
     done,
@@ -75,7 +105,7 @@ function runInWorker(source: string): {
 }
 
 async function main(): Promise<number> {
-  const request = JSON.parse(await readStdin()) as HostRequest;
+  const request = await readRequest();
 
   if (request.op === 'cancel-demo') {
     const first = runInWorker(request.pathologicalSource);
@@ -153,7 +183,9 @@ function print(result: HostResult): void {
   process.stdout.write(JSON.stringify(result) + '\n');
 }
 
-main().then(
-  (code) => process.stdout.write('', () => process.exit(code)),
-  (err) => { process.stderr.write(`swift-parse-host: ${(err as Error).stack ?? err}\n`); process.exit(2); },
-);
+if (isMainModule(import.meta.url, process.argv[1] ?? '')) {
+  main().then(
+    (code) => process.stdout.write('', () => process.exit(code)),
+    (err) => { process.stderr.write(`swift-parse-host: ${(err as Error).stack ?? err}\n`); process.exit(2); },
+  );
+}

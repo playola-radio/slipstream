@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkFixtureAgainstExpected, type ExpectedCase } from './T5a.3.ts';
+import { checkFixtureAgainstExpected, assertRequiredCorpusCases, hasV8OomSignature, t5a3, type ExpectedCase } from './T5a.3.ts';
+import type { AcceptanceContext } from './types.ts';
 import type { SwiftParseResult } from '../../../src/swift-grammar.ts';
 
 // The corpus cross-check's honesty rules are pure, so they are proven here with
@@ -119,5 +120,45 @@ describe('checkFixtureAgainstExpected', () => {
     assert.doesNotThrow(() => checkFixtureAgainstExpected('bom-kept', bom, base, result));
     const trimmed: ExpectedCase = { ...base, diagnostics: [{ ...base.diagnostics[0]!, byteSlice: 'x' }] };
     assert.throws(() => checkFixtureAgainstExpected('bom-trimmed', bom, trimmed, result), /slices/);
+  });
+});
+
+describe('assertRequiredCorpusCases', () => {
+  it('accepts the complete pinned corpus-case set', () => {
+    assert.doesNotThrow(() => assertRequiredCorpusCases([
+      'argument-labels', 'async-throws', 'attributes-mainactor', 'bom',
+      'conditional-compilation', 'crlf', 'default-args', 'extension-members',
+      'generics-where', 'init', 'malformed-stray-token', 'malformed-truncated',
+      'malformed-unclosed-brace', 'methods', 'preview-macro',
+      'protocol-requirements', 'swiftui-view', 'top-level-func',
+      'unicode-astral', 'unicode-cjk', 'unicode-combining',
+    ]));
+  });
+
+  it('rejects a missing required corpus case', () => {
+    assert.throws(
+      () => assertRequiredCorpusCases(['top-level-func']),
+      /missing required corpus cases: .*preview-macro/,
+    );
+  });
+});
+
+describe('T5a.3 self-contained lifecycle', () => {
+  it('declares that it does not need a QA daemon', () => {
+    assert.equal(t5a3.needsDaemon, false);
+  });
+
+  it('does not launch a Swift child after its context has been aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const ctx = { worktree: '', sessionId: '', reader: {} as AcceptanceContext['reader'], signal: controller.signal };
+    await assert.rejects(t5a3.run(ctx), /aborted before start/);
+  });
+});
+
+describe('hasV8OomSignature', () => {
+  it('requires the observed V8 OOM evidence, not merely a fatal signal', () => {
+    assert.equal(hasV8OomSignature('Fatal process out of memory: Zone'), true);
+    assert.equal(hasV8OomSignature('fatal signal SIGTRAP from another crash'), false);
   });
 });
