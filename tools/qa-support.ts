@@ -82,6 +82,10 @@ export interface RawResponse { status: number; headers: Headers; body: Buffer }
 export interface ReaderClient {
   /** GET a path. With `auth: false`, omit the bearer token (used to prove 401). */
   raw(path: string, opts?: { auth?: boolean; signal?: AbortSignal }): Promise<RawResponse>;
+  /** GET a path and return the live {@link Response} WITHOUT consuming its body,
+   * so a caller can assert the status/headers of a streaming (SSE) reply before
+   * it ends. The caller must cancel the body or abort the signal. */
+  open(path: string, opts?: { auth?: boolean; signal?: AbortSignal }): Promise<Response>;
   sessions(): Promise<SessionEntry[]>;
   finite(sessionId: string, after: bigint, signal?: AbortSignal): Promise<FiniteEvents>;
   blob(sha256: string, signal?: AbortSignal): Promise<Buffer>;
@@ -105,6 +109,13 @@ export function createReaderClient(url: string, token: string): ReaderClient {
     });
     const body = Buffer.from(await res.arrayBuffer());
     return { status: res.status, headers: res.headers, body };
+  }
+
+  async function open(path: string, opts: { auth?: boolean; signal?: AbortSignal } = {}): Promise<Response> {
+    return fetch(url + path, {
+      headers: opts.auth === false ? {} : authHeaders,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
   }
 
   async function sessions(): Promise<SessionEntry[]> {
@@ -148,7 +159,7 @@ export function createReaderClient(url: string, token: string): ReaderClient {
     }
   }
 
-  return { raw, sessions, finite, blob, follow };
+  return { raw, open, sessions, finite, blob, follow };
 }
 
 export function parseNdjson(text: string): AnyRecord[] {

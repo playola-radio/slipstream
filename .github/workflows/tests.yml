@@ -23,6 +23,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history so the display-fold immutability gate can resolve the
+          # PR's base commit and diff released contract files against it.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -41,3 +45,15 @@ jobs:
 
       - name: Run tool tests
         run: npm run test:tools
+
+      - name: Check display-fold release immutability (pull request)
+        if: github.event_name == 'pull_request'
+        run: npm run check:fold-release -- --base ${{ github.event.pull_request.base.sha }}
+
+      - name: Check display-fold release immutability (push)
+        if: github.event_name == 'push'
+        # `before` is the pre-push tip of this branch — the right baseline for what
+        # THIS push changed. It's all-zeros for a brand-new branch/force-created ref,
+        # which the checker already fails closed on (unresolved base = non-zero exit),
+        # so this never silently skips the gate.
+        run: npm run check:fold-release -- --base ${{ github.event.before }}

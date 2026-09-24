@@ -1,0 +1,9 @@
+# The display-fold release fingerprint and corpus hashes are over exact file
+# bytes, so these files must check out with LF endings on every platform (a
+# CRLF-converting checkout would otherwise fail an unchanged release). When the
+# fold's import closure grows in a future contract version, add the new file here.
+src/attribution.ts   text eol=lf
+src/display-fold.ts  text eol=lf
+src/event.ts         text eol=lf
+src/snapshot.ts      text eol=lf
+contracts/display-fold/** text eol=lf

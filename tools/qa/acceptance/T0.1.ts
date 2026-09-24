@@ -31,9 +31,10 @@ const EMPTY_FOLD = '{"contract":"display-fold.v1","result":"ok","state":{"attrib
 const BASELINED_TYPE = 'slipstream.file.baselined.v1';
 const ATTRIBUTION_TYPE = 'slipstream.change.attribution.v1';
 const SCHEMAS_DIR = fileURLToPath(new URL('../../../schemas/', import.meta.url));
-/** Headers the finite replay sent before T0.1 (plus what node:http adds itself). */
+/** Headers the finite replay is allowed to send (plus what node:http adds itself).
+ * `slipstream-fold-contract` was added by T0.2; every other header predates T0.1. */
 const PRE_EXISTING_HEADERS = new Set([
-  'cache-control', 'content-type', 'slipstream-durable-seq',
+  'cache-control', 'content-type', 'slipstream-durable-seq', 'slipstream-fold-contract',
   'content-length', 'transfer-encoding', 'date', 'connection', 'keep-alive',
 ]);
 
@@ -242,7 +243,7 @@ async function noNewSurfaceClaim(ctx: AcceptanceContext, events: AnyRecord[]): P
   if (res.status !== 200) fail(`finite replay returned ${res.status}`);
   const headers = [...res.headers.keys()].sort();
   const unexpected = headers.filter((h) => !PRE_EXISTING_HEADERS.has(h));
-  if (unexpected.length > 0) fail(`finite replay sent headers that did not exist before T0.1: ${unexpected.join(', ')}`);
+  if (unexpected.length > 0) fail(`finite replay sent an unexpected header: ${unexpected.join(', ')}`);
 
   const schemaTypes = new Set((await readdir(SCHEMAS_DIR)).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -'.json'.length)));
   const liveTypes = [...new Set(events.map((e) => e.type as string))].sort();
@@ -250,7 +251,7 @@ async function noNewSurfaceClaim(ctx: AcceptanceContext, events: AnyRecord[]): P
   if (unknown.length > 0) fail(`live stream carried event types with no published schema: ${unknown.join(', ')}`);
   return {
     id: 'no-new-surface',
-    claim: 'LIVE: the finite replay sends only its pre-existing headers, and every live event type is one of the published schemas',
+    claim: 'LIVE: the finite replay sends only its allowed headers (pre-existing plus the T0.2 slipstream-fold-contract), and every live event type is one of the published schemas',
     evidence: { headers, live_types: liveTypes, schema_types: schemaTypes.size },
   };
 }

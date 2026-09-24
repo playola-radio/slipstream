@@ -6,6 +6,7 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
+import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createCas } from './cas.ts';
 import { createHealth } from './health.ts';
 import { createBoundaryRegistry } from './boundary-registry.ts';
@@ -60,6 +61,7 @@ describe('http-reader core', () => {
   it('rejects a missing bearer with 401', async () => {
     const res = await fetch(`${srv.url}/v1/sessions`, { headers: { host: `127.0.0.1:${srv.port}` } });
     assert.equal(res.status, 401);
+    assert.equal(res.headers.get('slipstream-fold-contract'), null);
   });
 
   it('rejects a foreign origin with 403', async () => {
@@ -110,6 +112,7 @@ describe('http-reader events (finite)', () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('content-type'), 'application/x-ndjson; charset=utf-8');
     assert.equal(res.headers.get('slipstream-durable-seq'), '2');
+    assert.equal(res.headers.get('slipstream-fold-contract'), DISPLAY_FOLD_CONTRACT);
     const text = await res.text();
     const lines = text.split('\n').filter(Boolean);
     assert.deepEqual(lines.map((l) => JSON.parse(l).seq), ['1', '2']);
@@ -119,6 +122,7 @@ describe('http-reader events (finite)', () => {
     const res = await GET(srv, `/v1/sessions/${UUID}/events?after=2`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('slipstream-durable-seq'), '2');
+    assert.equal(res.headers.get('slipstream-fold-contract'), DISPLAY_FOLD_CONTRACT);
     assert.equal((await res.text()), '');
   });
 
@@ -135,6 +139,7 @@ describe('http-reader events (finite)', () => {
     const res = await GET(srv, `/v1/sessions/${UUID}/events?after=99`);
     assert.equal(res.status, 409);
     assert.equal(res.headers.get('slipstream-durable-seq'), '2');
+    assert.equal(res.headers.get('slipstream-fold-contract'), null);
   });
 
   it('410 for a tombstoned session', async () => {
@@ -442,6 +447,7 @@ describe('http-reader SSE follow', () => {
       signal: ac.signal,
     });
     assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+    assert.equal(res.headers.get('slipstream-fold-contract'), DISPLAY_FOLD_CONTRACT);
 
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();

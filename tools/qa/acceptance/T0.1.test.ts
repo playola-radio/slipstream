@@ -14,6 +14,7 @@ function record(seq: bigint, extra: Record<string, unknown> = {}): AnyRecord {
 function fakeReader(finite: AnyRecord[], durable: bigint, sse: AnyRecord[]): ReaderClient {
   return {
     raw: async () => { throw new Error('unused'); },
+    open: async () => { throw new Error('unused'); },
     sessions: async () => { throw new Error('unused'); },
     blob: async () => { throw new Error('unused'); },
     finite: async (): Promise<FiniteEvents> => ({ events: finite, durableSeq: durable }),

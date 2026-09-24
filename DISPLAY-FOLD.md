@@ -208,17 +208,77 @@ curl -s -H "authorization: Bearer $TOKEN" "$URL/v1/sessions/$SID/events?after=0"
   code.
 - Cases that expect a rejection count as passing when the fold rejects as specified.
 
-## Not in this version (T0.2)
+## Response header (T0.2)
 
-T0.2 adds:
+Every **successful** `/v1/sessions/:id/events` reply is labelled with the display
+rules it should be interpreted under (DA-2 — the header describes how to read *this*
+history, not a promise about future ones):
 
-- the `Slipstream-Fold-Contract: display-fold.v1` response header on finite and SSE
-  replies;
-- immutable released manifests and implementation fingerprints;
-- the CI change gate.
+```
+Slipstream-Fold-Contract: display-fold.v1
+```
 
-Until then the reader sends no contract header. A client learns the contract only
-from this document and the oracle.
+- It is present on every finite `200` (including an empty/caught-up replay) and on
+  the SSE `200` (`follow=true`), stamped in the response head before any event byte.
+- It is **absent** on every error (`400/401/404/409/410/500`) and on all other
+  routes (session list, blobs, schemas).
+- The value comes from the single `DISPLAY_FOLD_CONTRACT` constant in
+  `src/display-fold.ts`; there is no second string literal to drift.
+- Bodies, framing, frame ids, and reconnect params are byte-for-byte unchanged; the
+  header is purely additive.
+
+## Release discipline (T0.2)
+
+The released rules are frozen so an edit cannot silently change what the header
+promises. A version is released by a **manifest** at
+`contracts/display-fold/v1/manifest.json` recording:
+
+- the contract id and its canonical-output format;
+- the event versions it interprets (`file.changed`, `change.attribution`,
+  `harness.evidence`, `enrichment.coverage`, `capture.gap`, all `v1`);
+- the **display dependency list** — the exact static import closure of
+  `src/display-fold.ts`;
+- an **implementation fingerprint** (`sha256:…`) over the raw bytes of that closure
+  (a hash-of-hashes: each dep's SHA-256 with its path, hashed together);
+- the **corpus**: every case name with the SHA-256 of its `input.ndjson` and
+  `expected.json`.
+
+Two gates enforce it:
+
+1. **Fingerprint change gate** — recomputes the closure, fingerprint, and corpus
+   hashes and fails if any differ from the manifest. It walks imports with the
+   TypeScript parser (not a regex) and fails closed: any import in the closure that
+   is not an explicit relative `.ts` path — a bare/`node:` specifier, a dynamic
+   `import()`, a `require`, a triple-slash directive, or an unresolved path — is a
+   violation, and `src/attribution-scoring.ts` must never enter the closure (D9).
+   This gate runs inside `npm test` (via `src/fold-release.test.ts`).
+2. **Immutability gate** — fails if any file of an already-released contract version
+   is modified, deleted, or type-changed relative to the base branch. Adding a new
+   version directory (or the initial manifest for a not-yet-released version) is
+   allowed. It needs git and runs in CI on pull requests.
+
+Both are exposed by the checker:
+
+```sh
+node tools/projection-check.ts fold-release [--root <dir>] [--base <ref>]
+npm run check:fold-release           # same, base defaults to origin/develop
+```
+
+It prints one JSON result. Exit `0` = both gates pass; `1` = a gate failed; `2` =
+bad args or a base ref that does not resolve to a commit (a missing base never
+silently passes).
+
+### Releasing display-fold.v2
+
+The v1 corpus and rules are **frozen**. To change display behaviour:
+
+1. Add `src/display-fold.ts` v2 behaviour behind a new `display-fold.v2` contract id
+   (do not edit v1 semantics or its corpus).
+2. Create `contracts/display-fold/v2/` with its own corpus and `manifest.json`.
+3. Stamp v2 on the reader replies for histories it governs.
+
+Never edit a released manifest or corpus — the immutability gate will reject it, and
+that is the point.
 
 ## Honesty
 
@@ -269,3 +329,31 @@ Architected with Codex (consult mode), then refined:
 **Deviation from the consult:** timestamp range checks apply only to evidence
 `timestamp.at_ms`, the one timestamp the fold reads. Unread timestamps are not
 validated, which keeps the contract minimal and forward-compatible.
+
+## Decision record (T0.2 Codex consult, 2026-09-24)
+
+Architected with Codex (consult mode) before implementing the header and gates:
+
+1. **Header placement.** Stamp only the two `writeHead(200)` sites in the events
+   handler (finite + SSE); every error path replies before those lines, so it stays
+   unstamped. An empty replay (`after == H`, including `after=0/H=0` when the log
+   exists) still reaches the finite `writeHead`, so it is stamped too.
+2. **Fingerprint.** Hash-of-hashes over the closure's raw bytes: SHA-256 per file
+   (lowercase hex), joined as `"<hex>  <relpath>\n"` in code-unit path order, then
+   hashed. Corpus hashes cover the **exact discovered file set** (both files per
+   case; a stray or missing file fails), not just the manifest's listed entries.
+3. **Import closure.** Use the TypeScript parser API (`ts.createSourceFile` + AST),
+   never a regex — it sees `import type`, re-exports, side-effect imports, and
+   `import('…')` type nodes. Fail closed on dynamic `import()`, `require`,
+   import-equals-require, triple-slash directives, parse errors, and any
+   non-relative or non-`.ts` specifier.
+4. **Immutability base.** Do not bake a stale default that silently passes when it
+   goes missing. Resolve the base to a commit (`rev-parse --verify`); a missing base
+   in a git tree exits `2`. Compare the base against **both `HEAD` and the working
+   tree** (`git diff <base> HEAD` ∪ `git diff <base>`), so neither a committed change
+   that is locally reverted nor an uncommitted edit escapes — rejecting Modified/
+   Deleted/Type-changed released files and allowing Additions. This naturally permits
+   this PR to add v1's first manifest while the already-committed v1 corpus stays frozen.
+   CI passes the PR base SHA explicitly with full history; a non-git tree (a
+   throwaway test copy) reports immutability as not-applicable and is driven by the
+   fingerprint gate alone.
