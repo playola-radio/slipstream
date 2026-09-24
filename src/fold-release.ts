@@ -217,6 +217,9 @@ export function loadManifest(root: string): FoldManifest {
   if (!m || m.contract !== CONTRACT_ID || !Array.isArray(m.display_dependencies) || !Array.isArray(m.corpus)) {
     throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: not a display-fold.v1 manifest`);
   }
+  if (typeof m.implementation_fingerprint !== 'string') {
+    throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: implementation_fingerprint must be a string`);
+  }
   if (!m.display_dependencies.every((d) => typeof d === 'string')) {
     throw new FoldReleaseError(`${CONTRACT_DIR}/manifest.json: display_dependencies must be a list of strings`);
   }

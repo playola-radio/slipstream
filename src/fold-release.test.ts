@@ -136,9 +136,21 @@ describe('fold-release fingerprint gate', () => {
     const root = await stageTree();
     try {
       const p = join(root, 'contracts/display-fold/v1/manifest.json');
-      await writeFile(p, JSON.stringify({ contract: 'display-fold.v1', display_dependencies: ['src/display-fold.ts'], corpus: [null] }));
+      await writeFile(p, JSON.stringify({ contract: 'display-fold.v1', display_dependencies: ['src/display-fold.ts'], implementation_fingerprint: 'sha256:x', corpus: [null] }));
       const failures = checkFingerprintGate(root);
       assert.ok(failures.some((f) => /corpus entry/.test(f)), failures.join('\n'));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a gate failure (never throws) on a non-string implementation_fingerprint', async () => {
+    const root = await stageTree();
+    try {
+      const p = join(root, 'contracts/display-fold/v1/manifest.json');
+      await writeFile(p, JSON.stringify({ contract: 'display-fold.v1', display_dependencies: ['src/display-fold.ts'], implementation_fingerprint: { toString: null }, corpus: [] }));
+      const failures = checkFingerprintGate(root);
+      assert.ok(failures.some((f) => /implementation_fingerprint must be a string/.test(f)), failures.join('\n'));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
