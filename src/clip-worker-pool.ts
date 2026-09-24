@@ -33,6 +33,19 @@ export function createClipWorkerPool(): ClipWorkerPool {
   let current: { id: number; resolve: (v: ClipProjection) => void } | null = null;
   let jobId = 0;
   let closed = false;
+  // Terminations started by cancel()/error (fire-and-forget from the caller's
+  // point of view) but not yet complete. close() must await these too — the
+  // worker they belong to is no longer `current` by the time close() runs
+  // (cancel() has already spawned and installed its replacement), so awaiting
+  // only the current worker would let shutdown finish while the actual
+  // CPU-heavy worker is still mid-terminate.
+  const pendingTerminations = new Set<Promise<unknown>>();
+
+  const trackTermination = (w: Worker): void => {
+    const p = w.terminate().catch(() => {});
+    pendingTerminations.add(p);
+    p.finally(() => pendingTerminations.delete(p));
+  };
 
   const spawn = (): Worker => {
     const w = new Worker(WORKER_URL);
@@ -45,7 +58,7 @@ export function createClipWorkerPool(): ClipWorkerPool {
     w.on('error', () => {
       const cur = current;
       current = null;
-      w.terminate().catch(() => {});
+      trackTermination(w);
       if (!closed) worker = spawn();
       if (cur) cur.resolve(workerErrorResult());
     });
@@ -69,7 +82,8 @@ export function createClipWorkerPool(): ClipWorkerPool {
       if (settled || current === null) return;
       current.resolve(workerErrorResult());
       current = null;
-      worker.terminate().catch(() => {});
+      const stale = worker;
+      trackTermination(stale);
       if (!closed) worker = spawn();
     };
     return { promise, cancel };
@@ -81,6 +95,7 @@ export function createClipWorkerPool(): ClipWorkerPool {
     current = null;
     if (cur) cur.resolve(workerErrorResult());
     await worker.terminate().catch(() => {});
+    await Promise.all(pendingTerminations);
   };
 
   return { run, close };

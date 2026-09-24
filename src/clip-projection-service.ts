@@ -8,11 +8,13 @@
  *    projection_version, language) so identical inputs across changes reuse one result,
  *    bounded by entry count AND estimated bytes. change_seq is response-only and
  *    is stamped on the way out, never part of the key.
- *  - Bounded admission: at most `concurrency` computes run at once behind a
- *    bounded queue; excess is returned immediately as `skipped`/`overloaded`
- *    (never a silent stall), so a burst of cold-cache requests cannot starve
- *    capture. The CPU itself runs off the shared event loop in a worker.
- *  - In-flight coalescing: identical concurrent requests share one compute.
+ *  - Bounded admission via the shared projection budget: at most `concurrency`
+ *    computes run at once behind a bounded queue; excess is returned immediately
+ *    as `skipped`/`overloaded` (never a silent stall), so a burst of cold-cache
+ *    requests cannot starve capture. The deadline is measured from admission
+ *    (queue wait included). Coalescing and the deadline live in the budget so
+ *    the same bound covers a future interface-projection workload too. The CPU
+ *    itself runs off the shared event loop in a worker.
  *  - Revalidate-on-hit: a cache hit is dropped if a referenced blob is gone
  *    (GC'd), so a stale result never masquerades as available.
  *
@@ -26,8 +28,9 @@ import {
   CLIP_PROJECTION_VERSION,
   type ClipProjection,
 } from './clip-projection.ts';
-import { type ClipJob, type ClipSnapshot } from './clip-blob-reader.ts';
+import { type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
+import { createProjectionAdmission } from './projection-admission.ts';
 import type { ClipLanguage } from './clip-language.ts';
 
 export interface ClipRequest {
@@ -67,8 +70,6 @@ const DEFAULTS = {
 
 /** Reasons that are transient or availability-dependent — never cached. */
 const UNCACHEABLE_REASONS = new Set(['overloaded', 'timeout', 'worker-error']);
-
-const DEADLINE = Symbol('deadline');
 
 function sideTag(s: ClipSnapshot): string {
   if (s.kind === 'content') return `content:${s.sha256}`;
@@ -151,8 +152,6 @@ class LruCache {
   }
 }
 
-interface Task { key: string; job: ClipJob; settle: (v: ClipProjection) => void }
-
 export function createClipProjectionService(opts: ClipServiceOptions): ClipProjectionService {
   const queueLimit = opts.queueLimit ?? DEFAULTS.queueLimit;
   const deadlineMs = opts.deadlineMs ?? DEFAULTS.deadlineMs;
@@ -164,49 +163,22 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
     opts.cacheEntries ?? DEFAULTS.cacheEntries,
     opts.cacheBytes ?? DEFAULTS.cacheBytes,
   );
-  const inFlight = new Map<string, Promise<ClipProjection>>();
-
-  let active = 0;
-  const queue: Task[] = [];
-  // Every admitted request occupies one of `maxPending` slots until it settles —
-  // whether it starts a compute, waits in the queue, or coalesces onto an
-  // in-flight compute. This bounds coalesced waiters too, so a burst of identical
-  // requests can't accumulate unbounded promises (and HTTP responses) outside the
-  // queue limit.
-  const maxPending = CONCURRENCY + queueLimit;
-  let pending = 0;
+  // Concurrency, queue, coalesced-waiter bound, and the admission-time deadline
+  // live in the shared budget. Clip's own budget uses C = CONCURRENCY (1) and
+  // W = Q = queueLimit, so the outstanding ceiling stays C + queueLimit exactly
+  // (coalesced waiters counted), reproducing the prior `maxPending` bound. The
+  // budget is workload-agnostic so a future interface service can share one
+  // instance; wiring that shared instance is a later step (see ADMISSION.md).
+  const budget = createProjectionAdmission({
+    C: CONCURRENCY,
+    Q: queueLimit,
+    W: queueLimit,
+    D: deadlineMs,
+  });
   let closed = false;
 
   const stamp = (value: ClipProjection, changeSeq: string): ClipProjection =>
     ({ ...value, change_seq: changeSeq });
-
-  const raceDeadline = (p: Promise<ClipProjection>): Promise<ClipProjection | typeof DEADLINE> => {
-    let timer: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<typeof DEADLINE>((resolve) => {
-      timer = setTimeout(() => resolve(DEADLINE), deadlineMs);
-      timer.unref(); // a pending deadline must never hold the process open
-    });
-    return Promise.race([p.finally(() => clearTimeout(timer)), timeout]);
-  };
-
-  const runTask = (task: Task): void => {
-    active++;
-    const handle = compute(task.job);
-    raceDeadline(handle.promise)
-      .then((outcome) => {
-        const value = outcome === DEADLINE
-          ? (handle.cancel(), transient(task.job.opts.changeSeq, 'timeout'))
-          : outcome;
-        if (cacheable(value)) cache.set(task.key, value);
-        task.settle(value);
-      })
-      .catch(() => task.settle(transient(task.job.opts.changeSeq, 'worker-error')))
-      .finally(() => {
-        active--;
-        const next = queue.shift();
-        if (next) runTask(next);
-      });
-  };
 
   const blobsPresent = async (req: ClipRequest): Promise<boolean> => {
     for (const sha of contentShas(req)) if (!(await hasBlob(sha))) return false;
@@ -223,39 +195,48 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
-    // Admit before attaching, whether we start, queue, or coalesce. Excess is
-    // skipped immediately, never queued or coalesced unboundedly, so a burst
-    // cannot stall behind the worker or accumulate waiters off the queue.
-    if (pending >= maxPending) return transient(req.changeSeq, 'overloaded');
-    pending++;
-    try {
-      const flight = inFlight.get(key);
-      if (flight) return stamp(await flight, req.changeSeq);
+    // Only the coalescing leader's `run` is ever invoked (the budget calls it
+    // once per flight); a coalesced waiter never sees this flip, so only the
+    // leader writes the cache entry — waiters would otherwise redundantly
+    // re-store the identical value the leader already cached.
+    let isLeader = false;
+    const outcome = await budget.admit<ClipProjection>({
+      workload: 'clip',
+      localConcurrency: CONCURRENCY,
+      key,
+      run: () => {
+        isLeader = true;
+        return compute({
+          storeDir: opts.storeDir,
+          before: req.before,
+          after: req.after,
+          opts: { changeSeq: req.changeSeq, language: req.language },
+        });
+      },
+    });
 
-      const job: ClipJob = {
-        storeDir: opts.storeDir,
-        before: req.before,
-        after: req.after,
-        opts: { changeSeq: req.changeSeq, language: req.language },
-      };
-      const p = new Promise<ClipProjection>((resolve) => {
-        const task: Task = { key, job, settle: resolve };
-        if (active < CONCURRENCY) runTask(task); else queue.push(task);
-      });
-      inFlight.set(key, p);
-      void p.finally(() => inFlight.delete(key));
-      return stamp(await p, req.changeSeq);
-    } finally {
-      pending--;
+    switch (outcome.kind) {
+      case 'ok':
+        // Availability, overload, and timeout dispositions are never cached.
+        if (isLeader && cacheable(outcome.value)) cache.set(key, outcome.value);
+        return stamp(outcome.value, req.changeSeq);
+      case 'timeout':
+        return transient(req.changeSeq, 'timeout');
+      case 'overloaded':
+        return transient(req.changeSeq, 'overloaded');
+      // A closed budget or a failed compute both surface as worker-error, the
+      // reason the service has always used for "no result from the worker".
+      default:
+        return transient(req.changeSeq, 'worker-error');
     }
   };
 
   const close = async (): Promise<void> => {
     closed = true;
-    // Drain the queue: tasks that never reached the worker settle explicitly
-    // rather than hang. Active work is settled by the pool close below (it
-    // resolves the in-flight worker promise), which unblocks each awaiting get.
-    for (const task of queue.splice(0)) task.settle(transient(task.job.opts.changeSeq, 'worker-error'));
+    // Settle everything admitted to this service's budget, then terminate the
+    // worker. (The budget here is private to this service; closing it never
+    // affects another workload.)
+    await budget.close();
     await pool?.close();
   };
 

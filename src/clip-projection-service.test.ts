@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { createCas } from './cas.ts';
 import { createClipProjectionService, type ClipRequest } from './clip-projection-service.ts';
 import { CLIP_PROJECTION_VERSION, type ClipProjection } from './clip-projection.ts';
@@ -140,6 +141,32 @@ test('identical concurrent requests coalesce onto one compute', async () => {
   assert.equal(calls, 1);
   assert.equal(r1.change_seq, '1');
   assert.equal(r2.change_seq, '2'); // coalesced waiter still gets its own change_seq
+  await svc.close();
+});
+
+test('a coalesced waiter does not redundantly re-write the leader\'s cache entry', async (t) => {
+  // LruCache.set() is the only caller of JSON.stringify in this module's hot
+  // path, so counting calls to it is a precise proxy for "how many times was
+  // this key written to the cache" without reaching into cache internals.
+  const stringifyCalls: unknown[] = [];
+  const realStringify = JSON.stringify;
+  t.mock.method(JSON, 'stringify', (v: unknown) => { stringifyCalls.push(v); return realStringify(v); });
+
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const compute: ClipCompute = (job) => {
+    calls++;
+    return { promise: gate.then(() => fallback(job.opts.changeSeq)), cancel: () => {} };
+  };
+  const svc = createClipProjectionService({ storeDir: STORE, compute, hasBlob: alwaysPresent });
+  const p1 = svc.get(contentReq('1', 1));
+  const p2 = svc.get(contentReq('2', 1));
+  const p3 = svc.get(contentReq('3', 1)); // three coalesced callers, one compute
+  release();
+  await Promise.all([p1, p2, p3]);
+  assert.equal(calls, 1);
+  assert.equal(stringifyCalls.length, 1, 'the cache entry for the shared key must be written exactly once, not once per coalesced waiter');
   await svc.close();
 });
 
@@ -337,6 +364,56 @@ test('default worker pool computes a real projection from on-disk blobs', { time
   const r2 = await svc.get({ changeSeq: '6', before, after });
   assert.equal(r2.change_seq, '6');
   assert.equal(r2.status, 'fallback');
+});
+
+test('close awaits the busy worker terminated by admission cancellation, not just its replacement', async (t) => {
+  // Reproduces: close() amid a running compute cancels the busy worker via
+  // budget.close() (fire-and-forget), which spawns a replacement synchronously.
+  // If close() then awaits only the CURRENT worker (the untouched replacement),
+  // it resolves before the original worker's real termination completes.
+  const terminated: Array<() => void> = [];
+  const realTerminate = Worker.prototype.terminate;
+  let calls = 0;
+  t.mock.method(Worker.prototype, 'terminate', function (this: Worker) {
+    calls++;
+    const isFirst = calls === 1;
+    return new Promise((resolve) => {
+      const finish = () => resolve(realTerminate.call(this));
+      if (isFirst) terminated.push(finish); else finish();
+    });
+  });
+
+  const storeDir = await mkdtemp(join(tmpdir(), 'slip-clipsvc-close-'));
+  const svc = createClipProjectionService({ storeDir, deadlineMs: 60_000 });
+  const cas = await createCas(join(storeDir, 'blobs'));
+  const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
+  const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
+  const before: ClipSnapshot = { kind: 'content', sha256: beforeRef.sha256, size: beforeRef.size };
+  const after: ClipSnapshot = { kind: 'content', sha256: afterRef.sha256, size: afterRef.size };
+
+  let closePromise: Promise<void> | undefined;
+  try {
+    const pending = svc.get({ changeSeq: '1', before, after }); // admitted, running
+    // Give the job a tick to actually reach the worker before closing.
+    await new Promise((r) => setTimeout(r, 0));
+
+    let closed = false;
+    closePromise = svc.close().then(() => { closed = true; });
+    // The original worker's terminate() is held open; close() must not have
+    // resolved yet — it may only resolve once that termination completes.
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(closed, false, 'close() resolved before the busy worker actually terminated');
+    assert.equal(terminated.length, 1);
+
+    terminated[0]!(); // let the original worker's termination complete
+    await closePromise;
+    assert.equal(closed, true);
+    await pending;
+  } finally {
+    terminated[0]?.(); // always release the held termination so the real worker actually exits
+    await closePromise?.catch(() => {});
+    await rm(storeDir, { recursive: true, force: true });
+  }
 });
 
 test('capture proceeds while projection admission is saturated', async () => {

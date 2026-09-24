@@ -5,5 +5,6 @@ import { t01 } from './T0.1.ts';
 import { t02 } from './T0.2.ts';
 import { t5a1 } from './T5a.1.ts';
 import { t5a3 } from './T5a.3.ts';
+import { t5b1 } from './T5b.1.ts';
 
-export const MODULES: readonly AcceptanceModule[] = [tqa, t01, t02, t5a1, t5a3];
+export const MODULES: readonly AcceptanceModule[] = [tqa, t01, t02, t5a1, t5a3, t5b1];
