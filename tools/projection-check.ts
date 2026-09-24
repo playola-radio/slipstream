@@ -152,6 +152,11 @@ export async function runAcceptance(io: RunIO): Promise<number> {
   const mods = selectedModules(args.selection, io.stderr);
   if (mods === null) return EXIT.USAGE;
 
+  // An already-aborted signal wins over platform gating and setup: the caller asked
+  // to stop, so report INTERRUPTED before doing any work. Otherwise a darwin-only
+  // module in the selection would return USAGE on Linux before the abort is seen.
+  if (io.signal.aborted) return EXIT.INTERRUPTED;
+
   const head = await gitHead(io.cwd).catch(() => 'unknown');
 
   // Precondition: platform gate. A module that cannot run here is not skipped-as-pass.
