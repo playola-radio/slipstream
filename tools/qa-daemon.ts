@@ -180,7 +180,17 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
 
   const controller = new AbortController();
   let daemon: Awaited<ReturnType<typeof startDaemon>> | null = null;
+  // The in-flight `startDaemon()` promise, tracked separately from `daemon` so a
+  // signal arriving while it is still pending can await its outcome instead of
+  // seeing `daemon === null` and wrongly concluding there is nothing to stop.
+  // `startDaemon` binds a real control socket internally before it resolves, so
+  // skipping this would leak that socket and report a false clean exit(0).
+  let starting: ReturnType<typeof startDaemon> | null = null;
   let stopping = false;
+  // The in-flight shutdown, so any code path that observes `stopping === true`
+  // can await the SAME cleanup a signal already triggered instead of racing it
+  // with a second cleanup or reading `exitCode` before shutdown has set it.
+  let shutdownComplete: Promise<number> | null = null;
   let readyResolve: (() => void) | null = null;
   let exitCode = 0;
 
@@ -189,8 +199,25 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   // is deleted only when it still carries THIS run's marker. Returns whether any
   // teardown step failed (a failure retains the root and is reported honestly).
   const performCleanup = async (): Promise<boolean> => {
+    // Every exit path funnels through here exactly once; removing the handlers
+    // here (rather than only inside `shutdown`) also covers the thrown-error and
+    // gate-failure returns, which never signal at all. Without this, a listener
+    // leaks onto `process` for the life of the host process — harmless for the
+    // real one-shot CLI entrypoint, but a real leak for any caller (tests, or a
+    // future in-process embedding) that invokes `runQaDaemon` more than once.
+    process.removeListener('SIGINT', shutdown);
+    process.removeListener('SIGTERM', shutdown);
     controller.abort();
     let teardownFailed = false;
+    if (daemon === null && starting !== null) {
+      try {
+        daemon = await starting;
+      } catch {
+        // startDaemon itself failed; its own catch block will run performCleanup
+        // again once the rejection propagates, so there is nothing to stop here.
+        daemon = null;
+      }
+    }
     if (daemon !== null) {
       try {
         await daemon.stop();
@@ -217,10 +244,11 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   const shutdown = (): void => {
     if (stopping) return;
     stopping = true;
-    void performCleanup().then((teardownFailed) => {
+    shutdownComplete = performCleanup().then((teardownFailed) => {
       exitCode = teardownFailed ? 1 : 0;
       if (readyResolve !== null) readyResolve();
       else process.exit(exitCode); // signalled before ready: no keep-alive waiter to release
+      return exitCode;
     });
   };
   process.on('SIGINT', shutdown);
@@ -245,7 +273,15 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   // performCleanup themselves) are exempt; everything else funnels through
   // this catch so there is exactly one cleanup per failure.
   try {
-    daemon = await startDaemon({ storeDir: store });
+    starting = startDaemon({ storeDir: store });
+    daemon = await starting;
+    starting = null;
+    // A signal that arrived while startDaemon was in flight already handed the
+    // daemon to performCleanup (see the `starting` handoff above) — continuing
+    // here would race a concurrent daemon.stop() and drive a live socket through
+    // attach/bootstrap/awaitEventType after shutdown has already claimed it. Await
+    // the SAME shutdown so the exit code reflects its actual teardown outcome.
+    if (stopping) return await shutdownComplete!;
 
     // Attach the sandbox worktree with an explicitly synthetic identity. `qa` is a
     // capture SCOPE marker, never a claim of authorship.

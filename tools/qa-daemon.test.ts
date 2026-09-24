@@ -1,10 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join, resolve } from 'node:path';
-import { mkdtemp, rm, chmod } from 'node:fs/promises';
+import { mkdtemp, rm, chmod, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { parseArgs, curlCommands, probeStoreLiveness, runQaDaemon, ArgError } from './qa-daemon.ts';
+import { setImmediate as setImmediateP } from 'node:timers/promises';
 import { prepareRoot } from './qa/safety.ts';
 
 describe('qa-daemon parseArgs', () => {
@@ -104,6 +105,51 @@ describe('runQaDaemon startup-failure cleanup', () => {
       );
     } finally {
       await chmod(worktree, 0o700).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('stops the daemon when a signal arrives WHILE startDaemon is still pending', async () => {
+    const root = join(await mkdtemp(join(tmpdir(), 'ss-qa-d-')), 'root');
+    const runId = randomUUID();
+    const { store } = await prepareRoot(root, runId);
+    const sockPath = join(store, 'control.sock');
+    // A signal arriving before `readyResolve` is set makes qa-daemon call
+    // `process.exit()` directly (by design, for a real Ctrl-C) — fatal to the
+    // test worker. Stub it so the process keeps running and we can observe the
+    // exit code it would have used instead.
+    const realExit = process.exit;
+    const exitCalls: Array<number | undefined> = [];
+    process.exit = ((code?: number) => { exitCalls.push(code); }) as never;
+    try {
+      const sink = { out: [] as string[], err: [] as string[] };
+      const runPromise = runQaDaemon({
+        home: tmpdir(),
+        argv: ['--root', root, '--reuse', '--run-id', runId],
+        stdout: (l) => sink.out.push(l),
+        stderr: (l) => sink.err.push(l),
+        cwd: process.cwd(),
+      });
+      // startDaemon() binds its control socket file partway through its own
+      // startup, well before its promise resolves (it still awaits reader setup
+      // afterward) — polling for that file lands the signal precisely inside the
+      // "startDaemon in flight" window, which a fixed event-loop-turn count can't
+      // reliably hit.
+      for (;;) {
+        try { await lstat(sockPath); break; } catch { /* not yet bound */ }
+        await setImmediateP();
+      }
+      process.emit('SIGINT');
+      const resolvedExitCode = await runPromise;
+      assert.deepEqual(exitCalls, [0], 'a signal mid-startup is still reported as a clean, managed shutdown');
+      assert.equal(resolvedExitCode, 0);
+      assert.equal(
+        await probeStoreLiveness(store),
+        'none',
+        'the daemon startDaemon had already created must be stopped, not leaked because `daemon` was still null when the signal fired',
+      );
+    } finally {
+      process.exit = realExit;
       await rm(root, { recursive: true, force: true }).catch(() => {});
     }
   });
