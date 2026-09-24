@@ -58,6 +58,10 @@ describe('startQaDaemon keep → stop → reuse', () => {
       try {
         // Distinct nonces prove this is the cross-nonce path, not a same-id retry.
         assert.notEqual(reuse.env.run_id, keep.env.run_id);
+        // The retained marker identity travels separately, so --env sandbox
+        // validation can prove ownership without weakening the fresh-nonce
+        // readiness handshake.
+        assert.equal(reuse.env.owner_run_id, keep.env.owner_run_id);
         // --reuse starts a fresh session against the retained store.
         assert.notEqual(reuse.env.session_id, sessionA);
       } finally {

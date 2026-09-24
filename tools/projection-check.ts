@@ -81,13 +81,14 @@ import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.
  * `env.worktree` — a mistaken or stale env file could point acceptance checks
  * (which write and delete files) at an unrelated, unowned worktree.
  */
-async function validateEnvSandbox(env: { worktree: string; run_id: string }): Promise<string | null> {
+async function validateEnvSandbox(env: { worktree: string; run_id: string; owner_run_id?: string }): Promise<string | null> {
   const root = dirname(env.worktree);
   const overlap = await checkRootAgainstRealStore(root);
   if (overlap) return overlap.message;
   const marker = await readOwnerMarker(root);
-  if (marker === null || marker.run_id !== env.run_id) {
-    return `${root} has no ownership marker matching run_id ${env.run_id}; refusing to run against an unowned worktree`;
+  const ownerRunId = env.owner_run_id ?? env.run_id;
+  if (marker === null || marker.run_id !== ownerRunId) {
+    return `${root} has no ownership marker matching owner_run_id ${ownerRunId}; refusing to run against an unowned worktree`;
   }
   // An owned parent root does not vouch for the worktree ENTRY: if it is (or has
   // become) a symlink, the acceptance modules' writes and deletes follow it out of

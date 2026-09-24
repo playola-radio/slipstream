@@ -438,6 +438,9 @@ export const QA_ENV_NAME = 'qa-env.json';
 export interface QaEnv {
   format: typeof QA_ENV_FORMAT;
   state: 'ready' | 'stopped';
+  /** The root marker's owner. It differs from `run_id` only after `--reuse`:
+   * `run_id` remains the fresh per-spawn readiness nonce. */
+  owner_run_id?: string;
   run_id: string;
   daemon_commit: string;
   /** Whether `daemon_commit`'s checkout had uncommitted changes when this daemon

@@ -229,6 +229,32 @@ describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
     assert.ok(sink.err.some((l) => /ownership marker/.test(l)));
   });
 
+  it('accepts a reused env whose fresh launch nonce differs from its retained owner marker', async () => {
+    const head = await gitHead(process.cwd());
+    const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
+    tmpDirs.push(dir);
+    const root = join(dir, 'root');
+    const { store, worktree } = await prepareRoot(root, 'run-kept-owner');
+    const env: QaEnv = {
+      format: QA_ENV_FORMAT, state: 'ready', run_id: 'run-fresh-reuse-nonce', owner_run_id: 'run-kept-owner', daemon_commit: head, daemon_dirty: false,
+      store, worktree, descriptor_path: join(store, 'runtime', 'x.json'),
+      url: 'http://127.0.0.1:1', token: 'fake-token', session_id: 'qa:run-fresh-reuse-nonce',
+      ready_through_seq: '0', scenario: null,
+    };
+    const path = join(dir, 'qa-env.json');
+    await writeQaEnv(path, env);
+    const sink = { out: [] as string[], err: [] as string[] };
+    const code = await runAcceptance({
+      argv: ['--pr', 'T-QA', '--env', path],
+      stdout: (l) => sink.out.push(l),
+      stderr: (l) => sink.err.push(l),
+      cwd: process.cwd(),
+      signal: new AbortController().signal,
+    });
+    assert.equal(code, EXIT.FAIL, 'a valid sandbox reaches the unavailable-daemon check rather than failing validation');
+    assert.ok(!sink.err.some((l) => /ownership marker/.test(l)));
+  });
+
   it('refuses a missing or malformed --env file with USAGE and a message, not a stack trace or lost report', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
     tmpDirs.push(dir);

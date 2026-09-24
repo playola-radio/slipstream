@@ -26,6 +26,7 @@ import {
   evaluateRoot,
   prepareRoot,
   mayDeleteRoot,
+  readOwnerMarker,
   type DaemonLiveness,
 } from './qa/safety.ts';
 import { getScenario, scenarioNames } from './qa/scenarios.ts';
@@ -179,6 +180,8 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
   // root rather than mistaking the fresh nonce for a concurrent claimant.
   const runId = args.runId ?? randomUUID();
   const { store, worktree } = await prepareRoot(args.root, runId, { reuse: args.reuse });
+  const owner = await readOwnerMarker(args.root);
+  if (owner === null) throw new Error(`QA root ${args.root} lost its ownership marker after preparation`);
   const daemonCommit = await gitHead(io.cwd).catch(() => 'unknown');
   const daemonDirty = await gitIsDirty(io.cwd).catch(() => true); // unknown reads as dirty, never a false-clean claim
   const envPath = join(args.root, QA_ENV_NAME);
@@ -335,6 +338,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       format: QA_ENV_FORMAT,
       state: 'ready',
       run_id: runId,
+      owner_run_id: owner.run_id,
       daemon_commit: daemonCommit,
       daemon_dirty: daemonDirty,
       store,
