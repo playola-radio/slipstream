@@ -1,0 +1,4 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"restart"}}
+{"source":"urn:slipstream:session:a","seq":"4","type":"slipstream.session.started.v2","data":{}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.capture.gap.v2","data":{"anything":"new"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.file.changed.v2","data":{"path":"a.ts"}}

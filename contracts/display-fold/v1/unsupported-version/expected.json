@@ -1,0 +1,6 @@
+{
+  "contract": "display-fold.v1",
+  "result": "unsupported",
+  "error": { "reason": "unsupported-event-version", "source": "urn:slipstream:session:a", "seq": "2",
+             "type": "slipstream.file.changed.v2" }
+}

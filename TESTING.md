@@ -67,6 +67,142 @@ Rule of thumb: if you reach for a mock, the answer is almost always the fake
 `Platform`. Anything internal (CAS, log, reader, snapshot logic) uses the real
 one — a bug there is a bug we want the test to catch.
 
+## Live QA harness (`npm run qa:daemon` / `npm run qa:check`)
+
+This is **live-daemon acceptance**, complementary to — not a replacement for —
+`npm test`, `npm run test:os`, and `npm run typecheck`. Where the unit tiers prove
+capture correctness against real bytes, the QA harness proves the *whole public
+path* end to end: a real daemon, the runtime-descriptor bootstrap, and the HTTP
+reader (finite + SSE), exactly as an external client (e.g. the macOS viewer)
+would consume them. It consumes only the public reader API and the descriptor —
+never a daemon back channel — and it never changes daemon/reader behavior.
+
+### `npm run qa:daemon` — a one-command local Slipstream
+
+Starts a real in-process daemon under an **owner-only sandbox root** (default
+`~/.slipstream-qa/local`, with sibling `store/` and `worktree/`), attaches the
+sandbox worktree with a synthetic identity (harness `qa`, session `qa:<run-id>`),
+discovers the reader's URL + token from `<store>/runtime/*.json`, optionally seeds
+a scenario of real files, and prints paste-ready curl commands. It writes an
+owner-only `<root>/qa-env.json` (`{format:"slipstream-qa.v1", state, run_id,
+daemon_commit, store, worktree, descriptor_path, url, token, session_id,
+ready_through_seq, scenario}`) — QA bookkeeping, not a substitute for the
+descriptor bootstrap.
+
+```
+npm run qa:daemon -- --scenario T-QA     # seed a real create+modify, then idle for curling
+npm run qa:daemon -- --root ./sandbox    # override the root
+npm run qa:daemon -- --keep              # retain the root after Ctrl-C
+npm run qa:daemon -- --reuse             # reuse a harness-owned root; new session, retained history
+```
+
+Flags: `--root <dir>`, `--scenario <name>`, `--keep`, `--reuse`. Default mode
+requires a **fresh** root and removes it on Ctrl-C / SIGTERM; `--keep` and
+`--reuse` retain it, and a failed shutdown always retains it and reports why.
+
+Safety (mirrors the daemon's own posture): an ownership marker in the root,
+canonical-path checks that **refuse `~/.slipstream` and any overlapping path**, and
+a control-socket liveness probe that refuses a root whose daemon is live or whose
+ownership is ambiguous. The harness never deletes anything it did not create.
+
+**Point the macOS client at it:** use the printed `store` path — the client
+bootstraps from `<store>/runtime/*.json` the same way the harness does. For
+example, after `npm run qa:daemon`, the descriptor is the newest JSON under
+`<root>/store/runtime/`, and the reader lives at the printed URL.
+
+### `npm run qa:check` — acceptance runner
+
+Runs registered acceptance modules against a live daemon and prints exactly one
+JSON report to stdout (`slipstream-qa-report.v1`); all progress goes to stderr and
+**the bearer token is never printed**.
+
+```
+npm run qa:check -- --all                       # run every registered check
+npm run qa:check -- --pr T-QA                    # run one check
+npm run qa:check -- --pr T-QA --env <qa-env.json> # run against an already-running qa:daemon
+```
+
+The tool writes exactly one JSON report to its own stdout, but `npm run` prepends
+a run banner to stdout. To parse the report, run with `--silent` or invoke the
+tool directly:
+
+```
+npm run --silent qa:check -- --all        # clean JSON on stdout
+node tools/projection-check.ts acceptance --all
+```
+
+Without `--env`, the runner starts its own isolated daemon from the current
+checkout. With `--env`, it runs against the daemon that wrote that env file and
+**rejects it if `daemon_commit` differs from the checked-out HEAD**. Exit codes:
+`0` all assertions passed, `1` a check ran and failed (assertion / durability
+deadline / cleanup), `2` bad args / missing check / wrong platform / stale daemon
+revision, `130` interrupted. A skipped check never counts as passing.
+
+### Acceptance-module contract
+
+A module lives at `tools/qa/acceptance/<ID>.ts` and exports an object with `id`, an
+optional seed `scenario`, an optional `requiresPlatform`, and
+`run({worktree, sessionId, reader, signal}): Promise<{assertions: Array<{id, claim,
+evidence}>}>`. The runner owns lifecycle (start/attach/deadlines/printing); `run`
+only writes real files into `worktree`, awaits their exact public observation via
+`tools/qa-support.ts`, and throws on any failed claim. Register it in
+`tools/qa/acceptance/registry.ts`.
+
+**How "ready" is proven (the durability core, `awaitObservedChange`):** after a
+real write, the harness awaits a public `file.changed` record matching the
+worktree-relative path, `observation: "watcher"`, and the expected before/after
+snapshot tags; requires that record's seq ≤ the finite response's
+`slipstream-durable-seq`; and independently re-computes the SHA-256 and fetches the
+served blob to compare exact bytes. A rising high-water alone proves nothing; a
+timeout FAILS. The `T-QA` negative-control assertion exercises exactly this: an
+intentionally wrong expected hash must hit the deadline rather than report ready.
+
+### Display fold oracle (`fold`) and the `T0.1` check
+
+`node tools/projection-check.ts fold` is the `display-fold.v1` oracle
+(`DISPLAY-FOLD.md`). It prints one canonical JSON envelope. Exit codes:
+
+- `0`: the fold is `ok`.
+- `1`: the fold refused. The envelope is still printed.
+- `2`: unusable input or arguments. Nothing goes to stdout.
+
+```
+node tools/projection-check.ts fold --fixture revision-and-gap   # a corpus case
+node tools/projection-check.ts fold --events events.ndjson       # an NDJSON file
+ENV=~/.slipstream-qa/local/qa-env.json                            # a live qa:daemon session
+curl -s -H "authorization: Bearer $(node -p "require('$ENV').token")" \
+  "$(node -p "require('$ENV').url")/v1/sessions/$(node -p "require('$ENV').session_id")/events?after=0" \
+  | node tools/projection-check.ts fold --events -
+```
+
+The corpus is `contracts/display-fold/v1/<case>/{input.ndjson,expected.json}`.
+Every `expected.json` is **written by hand**. Never regenerate one by running the
+fold: a generated expectation would only prove the code agrees with itself. To add a
+case, write both files and run `npm run test:tools`. The corpus test picks up every
+case directory automatically.
+
+`npm run qa:check -- --pr T0.1` runs the live claims against a real session that
+baselined files and then captured changes:
+
+- the D1 empty fold of the history before the first attribution;
+- the published attributions reproduced exactly (they arrive after the grace
+  window);
+- determinism;
+- prefix/SSE agreement through the durable seq;
+- the negative control;
+- no new headers or event types.
+
+A live QA session publishes only `unknown` attributions and never publishes
+evidence, coverage, or gaps. Those three components, plus attribution revisions and
+rejections, are therefore proven only by the FIXTURE corpus claim. The report labels
+each claim LIVE or FIXTURE.
+
+### Cleanup
+
+`qa:daemon` removes its owned root on a clean default shutdown (retained under
+`--keep`/`--reuse` or on a failed shutdown). `qa:check` spawns each daemon under a
+throwaway temp root and tears it down after the run, including on failure.
+
 ## Two test tiers
 
 - **Deterministic tier — `npm test`** (`src/**/!(*.os).test.ts`). Everything

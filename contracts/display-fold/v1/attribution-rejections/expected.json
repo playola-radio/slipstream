@@ -1,0 +1,15 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [
+      { "source": "urn:slipstream:session:a", "change_seq": "1", "attribution_seq": "3", "policy_seq": "2",
+        "status": "unknown", "reason": "no-matching-evidence", "evidence_seqs": [], "excluded_conflicts": [] },
+      { "source": "urn:slipstream:session:a", "change_seq": "8", "attribution_seq": "10", "policy_seq": "2",
+        "status": "unknown", "reason": "observation-interval-unavailable", "evidence_seqs": [] }
+    ],
+    "evidence": [],
+    "coverage": [],
+    "gaps": []
+  }
+}

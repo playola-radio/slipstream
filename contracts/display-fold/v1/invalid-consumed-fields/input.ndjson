@@ -1,0 +1,6 @@
+{"source":"urn:slipstream:session:b","seq":"1","type":"slipstream.harness.evidence.v1","data":{"evidence_key":{"harness":"codex","harness_session_id":"cx","record_id":"r1"},"adapter_version":"test/1","timestamp":{"at_ms":5,"basis":"tool-end"},"file_scope":{"kind":"paths","paths":["a.ts"]}}}
+{"source":"urn:slipstream:session:a","seq":"5","type":"slipstream.change.attribution.v1","data":{"change_seq":5,"policy_seq":"1","status":"heuristic","reason":"single-candidate","evidence_seqs":[]}}
+{"source":"urn:slipstream:session:a","seq":"4","type":7,"data":{}}
+{"source":"urn:slipstream:session:a","seq":"3","type":"slipstream.enrichment.coverage.v1","data":{"harness":"claude-code","state":"bogus"}}
+{"source":"urn:slipstream:session:a","seq":"2","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"unknown-reason"}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"session"},"reason":"restart"}}

@@ -1,0 +1,2 @@
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"path","path":"caf\u00e9"},"reason":"coalesced"}}
+{"source":"urn:slipstream:session:a","seq":"1","type":"slipstream.capture.gap.v1","data":{"scope":{"kind":"path","path":"cafe\u0301"},"reason":"coalesced"}}

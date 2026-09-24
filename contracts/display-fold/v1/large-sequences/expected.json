@@ -1,0 +1,20 @@
+{
+  "contract": "display-fold.v1",
+  "result": "ok",
+  "state": {
+    "attributions": [
+      { "source": "urn:slipstream:session:a", "change_seq": "18446744073709551617", "attribution_seq": "18446744073709551618",
+        "policy_seq": "1", "status": "heuristic", "reason": "single-candidate", "evidence_seqs": ["9", "18446744073709551616"] }
+    ],
+    "evidence": [
+      { "source": "urn:slipstream:session:a", "harness": "codex", "harness_session_id": "cx", "record_id": "r1",
+        "evidence_seqs": ["9007199254740993"], "min_at_ms": 5, "max_at_ms": 5, "known_paths": ["a.ts"], "conflicted": false }
+    ],
+    "coverage": [],
+    "gaps": [
+      { "source": "urn:slipstream:session:a", "seq": "2", "reason": "coalesced", "scope": { "kind": "session" } },
+      { "source": "urn:slipstream:session:a", "seq": "10", "reason": "coalesced", "scope": { "kind": "session" } },
+      { "source": "urn:slipstream:session:a", "seq": "18446744073709551619", "reason": "restart", "scope": { "kind": "session" } }
+    ]
+  }
+}
