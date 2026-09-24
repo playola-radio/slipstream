@@ -21,7 +21,7 @@ import { checkFingerprintGate } from '../src/fold-release.ts';
 export const FOLD_RELEASE_EXIT = { PASS: 0, FAIL: 1, USAGE: 2 } as const;
 
 /** The integration branch releases are frozen against when no `--base` is given. */
-export const DEFAULT_BASE = 'origin/briankeane/vienna';
+export const DEFAULT_BASE = 'origin/develop';
 const PROTECTED_PREFIX = 'contracts/display-fold/';
 
 interface FoldReleaseArgs { root: string; base: string }

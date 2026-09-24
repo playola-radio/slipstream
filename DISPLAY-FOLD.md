@@ -261,7 +261,7 @@ Both are exposed by the checker:
 
 ```sh
 node tools/projection-check.ts fold-release [--root <dir>] [--base <ref>]
-npm run check:fold-release           # same, base defaults to origin/briankeane/vienna
+npm run check:fold-release           # same, base defaults to origin/develop
 ```
 
 It prints one JSON result. Exit `0` = both gates pass; `1` = a gate failed; `2` =

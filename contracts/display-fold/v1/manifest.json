@@ -14,7 +14,7 @@
     "src/event.ts",
     "src/snapshot.ts"
   ],
-  "implementation_fingerprint": "sha256:28829d7efe42a3f0a6090306eaa5a3efae36047431a544bfe0b9b2b0d40f65d2",
+  "implementation_fingerprint": "sha256:d8709377a7247a988780cd3c9bfc9216de9cf1a46bf55abdef9d6e8b182f48ce",
   "corpus": [
     {
       "case": "attribution-rejections",
@@ -40,6 +40,11 @@
       "case": "coverage-replacement",
       "input_sha256": "704c10624a30bf4ade7cb552b951ed560604f4e619f4e940739bd4283ffe7fcc",
       "expected_sha256": "29cf7cb9166554549abc0dc700c00dfdaea521875c9cb6d01929f90ff0b368ce"
+    },
+    {
+      "case": "dotted-consumed-version",
+      "input_sha256": "6c2383c695c121d9906f0ea1dac701675481387421c9ecd4191ff3395841d0ac",
+      "expected_sha256": "70d7dcd5cee8ff6b6b6c67815b405d8230c36712ff29ebea15f5b3dff4054575"
     },
     {
       "case": "empty",
