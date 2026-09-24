@@ -155,4 +155,15 @@ describe('fold-release fingerprint gate', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('fails and names the case when a corpus case directory holds a stray nested directory', async () => {
+    const root = await stageTree();
+    try {
+      await mkdir(join(root, 'contracts/display-fold/v1/empty/nested'), { recursive: true });
+      const failures = checkFingerprintGate(root);
+      assert.ok(failures.some((f) => /empty/.test(f) && /unexpected/.test(f)), failures.join('\n'));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

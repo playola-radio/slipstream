@@ -184,8 +184,8 @@ function computeCorpus(root: string): CorpusEntry[] {
     if (!CASE_NAME.test(name)) throw new FoldReleaseError(`${CONTRACT_DIR}/${name}: invalid corpus case name`);
     const dir = join(base, name);
     const files = readdirSync(dir, { withFileTypes: true });
-    const extra = files.filter((e) => !e.isDirectory() && !CORPUS_FILES.includes(e.name as (typeof CORPUS_FILES)[number]));
-    if (extra.length) throw new FoldReleaseError(`${CONTRACT_DIR}/${name}: unexpected file '${extra[0]!.name}'`);
+    const extra = files.filter((e) => !CORPUS_FILES.includes(e.name as (typeof CORPUS_FILES)[number]));
+    if (extra.length) throw new FoldReleaseError(`${CONTRACT_DIR}/${name}: unexpected ${extra[0]!.isDirectory() ? 'directory' : 'file'} '${extra[0]!.name}'`);
     const read = (f: (typeof CORPUS_FILES)[number]): string => {
       try {
         return sha256Hex(readFileSync(join(dir, f)));
