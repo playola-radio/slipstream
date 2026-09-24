@@ -291,6 +291,13 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       socketPath: daemon.socketPath,
       request: { v: 1, verb: 'attach', worktree, harness: 'qa', harness_session_id: `qa:${runId}` },
     });
+    // A signal can land anywhere in this in-flight window, not only during
+    // startDaemon (the check above). Once shutdown has begun it has already claimed
+    // the daemon and aborted the controller, so this attach round-trip may have
+    // failed only because the socket was closing underneath it. Defer to the SAME
+    // managed shutdown so the exit code reflects its teardown, instead of reporting
+    // an attach-failure code for what is really a clean interrupt.
+    if (stopping) return await shutdownComplete!;
     if (!attach.ok) {
       io.stderr(`qa-daemon: attach failed (${attach.code}): ${attach.message}`);
       await performCleanup();
@@ -304,6 +311,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
 
     // Ready = the attached session's baseline is durably published.
     const baseline = await awaitEventType(reader, sessionId, BASELINE_COMPLETED_TYPE, 0n);
+    if (stopping) return await shutdownComplete!;
     let readyThroughSeq = baseline.durableSeq;
 
     if (args.scenario !== null) {
@@ -312,6 +320,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       readyThroughSeq = await scenario.seed({
         worktree, sessionId, reader, signal: controller.signal, after: baseline.seq,
       });
+      if (stopping) return await shutdownComplete!;
     }
 
     const env: QaEnv = {

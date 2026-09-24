@@ -30,6 +30,7 @@ import {
   rmMkdtempRoot,
   type CheckResult,
   type ReaderClient,
+  type QaEnv,
 } from './qa-support.ts';
 import { startQaDaemon, type QaDaemonHandle } from './qa/harness-proc.ts';
 import { checkRootAgainstRealStore, readOwnerMarker } from './qa/safety.ts';
@@ -184,6 +185,31 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     io.stderr(`qa-check: this checkout has uncommitted changes; the report's commit ${head} does not fully describe the code under test`);
   }
 
+  // Validate the operator-supplied --env BEFORE the platform gate. The --env
+  // contract (fresh commit) and the sandbox-ownership safety check depend only on
+  // the env file, not on which modules run or on this host's platform, so they must
+  // run first. If they came after the gate, a darwin-only module in the selection
+  // would make a stale or unowned --env return the gate's USAGE on Linux instead of
+  // being refused for the real reason — and the sandbox safety check would never run.
+  let env: QaEnv | null = null;
+  if (args.env !== null) {
+    env = await readQaEnv(args.env);
+    if (env.daemon_commit !== head) {
+      io.stderr(`qa-check: --env daemon_commit ${env.daemon_commit} does not match HEAD ${head}; refusing to run against a stale daemon`);
+      return EXIT.USAGE;
+    }
+    if (env.daemon_dirty) {
+      io.stderr(`qa-check: --env daemon at ${env.daemon_commit} had uncommitted changes when it started; the commit match does not fully describe the code it runs`);
+    }
+    // Sandbox gate: a matching commit is not proof the worktree is a harness-owned
+    // sandbox. Refuse the same way qa-daemon.ts refuses at startup.
+    const refusal = await validateEnvSandbox(env);
+    if (refusal !== null) {
+      io.stderr(`qa-check: ${refusal}`);
+      return EXIT.USAGE;
+    }
+  }
+
   // Precondition: platform gate. A module that cannot run here is not skipped-as-pass.
   for (const mod of mods) {
     if (mod.requiresPlatform !== undefined && process.platform !== mod.requiresPlatform) {
@@ -205,23 +231,8 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     let sessionId: string;
 
     try {
-      if (args.env !== null) {
-        // Operator-supplied daemon: verify it was built from this checkout.
-        const env = await readQaEnv(args.env);
-        if (env.daemon_commit !== head) {
-          io.stderr(`qa-check: --env daemon_commit ${env.daemon_commit} does not match HEAD ${head}; refusing to run against a stale daemon`);
-          return EXIT.USAGE;
-        }
-        if (env.daemon_dirty) {
-          io.stderr(`qa-check: --env daemon at ${env.daemon_commit} had uncommitted changes when it started; the commit match does not fully describe the code it runs`);
-        }
-        // Sandbox gate: a matching commit is not proof the worktree is a harness-
-        // owned sandbox. Refuse the same way qa-daemon.ts refuses at startup.
-        const refusal = await validateEnvSandbox(env);
-        if (refusal !== null) {
-          io.stderr(`qa-check: ${refusal}`);
-          return EXIT.USAGE;
-        }
+      if (env !== null) {
+        // Operator-supplied daemon, already validated above (fresh commit + sandbox).
         reader = createReaderClient(env.url, env.token);
         worktree = env.worktree;
         sessionId = env.session_id;

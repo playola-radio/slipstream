@@ -248,7 +248,12 @@ describe('runAcceptance --env sandbox validation (no daemon needed)', () => {
     assert.equal(sink.out.length, 0);
   });
 
-  it('accepts an --env worktree with a valid, matching ownership marker (passes the sandbox gate, then fails for lack of a live daemon)', async () => {
+  // Unlike the refusal cases above (pure, platform-independent validation), this
+  // case must reach actual module EXECUTION to prove the sandbox gate passed — and
+  // T-QA requires the darwin FSEvents watcher, so on Linux the platform gate (which
+  // correctly runs after --env validation) refuses it before execution. Scope this
+  // to darwin, where the module can run, exactly as production allows it to.
+  it('accepts an --env worktree with a valid, matching ownership marker (passes the sandbox gate, then fails for lack of a live daemon)', { skip: process.platform !== 'darwin' ? 'T-QA module execution requires the darwin FSEvents watcher' : false }, async () => {
     const head = await gitHead(process.cwd());
     const dir = await mkdtemp(join(tmpdir(), 'slipstream-qa-check-env-'));
     tmpDirs.push(dir);
