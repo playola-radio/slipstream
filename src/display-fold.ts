@@ -79,9 +79,11 @@ const ATTRIBUTION = 'slipstream.change.attribution.v1';
 const EVIDENCE = 'slipstream.harness.evidence.v1';
 const COVERAGE = 'slipstream.enrichment.coverage.v1';
 const GAP = 'slipstream.capture.gap.v1';
-/** A family this contract interprets, at any version. Only `v1` is supported. */
+/** A family this contract interprets, at any version — including a dotted suffix
+ * like `v1.0`, which must be refused as unsupported rather than silently treated
+ * as an unrelated, unknown type. Only an exact `1` is supported. */
 const CONSUMED_FAMILY =
-  /^slipstream\.(?:file\.changed|change\.attribution|harness\.evidence|enrichment\.coverage|capture\.gap)\.v([^.]+)$/;
+  /^slipstream\.(?:file\.changed|change\.attribution|harness\.evidence|enrichment\.coverage|capture\.gap)\.v(.+)$/;
 const SEQ = /^[1-9][0-9]*$/;
 
 const HARNESSES = ['claude-code', 'codex'];

@@ -1,9 +1,12 @@
 # Stage T upstream prerequisites — design spec
 
 **Status:** design complete; the four shaping decisions (DA-1…DA-4) and all T0 decisions
-(D1…D11) are **RATIFIED by Brian 2026-09-23** — see Part 4. No production code in this
-PR. Architected via Codex consult against the `briankeane/vienna` tree; captured and
-adjudicated here.
+(D1…D11) are **RATIFIED by Brian 2026-09-23** — see Part 4. This document itself is a
+design-only artifact and adds no production code. It has since been merged alongside the
+T0.1 `display-fold.v1` implementation (`src/display-fold.ts`, `src/attribution-engine.ts`)
+that the ratified design describes — see `IMPLEMENTATION_PLAN.md`'s Stage T status for
+what has actually shipped. Architected via Codex consult against the `briankeane/vienna`
+tree; captured and adjudicated here.
 
 ## Purpose
 
@@ -528,5 +531,5 @@ comparison — not a semantic API-analysis system.**
 
 ---
 
-*End of design. No production code in this PR. Part 4, including DA-1…DA-4 and D1…D11,
-is fully ratified.*
+*End of design. This document adds no production code itself. Part 4, including DA-1…DA-4
+and D1…D11, is fully ratified.*

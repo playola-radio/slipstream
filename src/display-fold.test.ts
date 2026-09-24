@@ -95,7 +95,15 @@ describe('foldDisplay', () => {
   });
 
   it('reports any non-"1" version of a consumed family as unsupported', () => {
-    for (const type of ['slipstream.capture.gap.v01', 'slipstream.capture.gap.v2', 'slipstream.harness.evidence.vNext']) {
+    for (const type of [
+      'slipstream.capture.gap.v01',
+      'slipstream.capture.gap.v2',
+      'slipstream.harness.evidence.vNext',
+      // Dotted versions (a consumed family with a "v1.0"-shaped suffix) must be
+      // refused as unsupported, never silently dropped as an unknown type.
+      'slipstream.capture.gap.v1.0',
+      'slipstream.change.attribution.v1.1',
+    ]) {
       const r = foldDisplay([rec(A, '1', type, {})]);
       assert.deepEqual(r, {
         contract: 'display-fold.v1',
