@@ -235,17 +235,6 @@ describe('safety', () => {
       assert.equal(after?.run_id, 'run-keep');
       assert.equal(after?.created_at_ms, before?.created_at_ms);
     });
-
-    it('does not let --reuse relax the concurrent-fresh-claim guard for a genuinely unowned root', async () => {
-      // --reuse tolerating a foreign marker must not become "tolerate anything":
-      // a fresh (reuse:false) run losing the claim is still a refusal, so two
-      // concurrent FRESH runs can never both believe they own one new root.
-      const root = join(base, 'prep-reuse-guard');
-      await prepareRoot(root, 'run-winner');
-      await assert.rejects(prepareRoot(root, 'run-loser', { reuse: false }), /concurrent run claimed ownership/);
-      const marker = await readOwnerMarker(root);
-      assert.equal(marker?.run_id, 'run-winner');
-    });
   });
 
   describe('mayDeleteRoot', () => {

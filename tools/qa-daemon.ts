@@ -236,7 +236,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
         io.stderr(`qa-daemon: shutdown failed: ${(err as Error).message}; retaining ${args.root}`);
       }
     }
-    await markStopped(envPath).catch(() => {});
+    await markStopped(envPath, runId).catch(() => {});
     if (!args.keep && !args.reuse && !teardownFailed) {
       try {
         if (await mayDeleteRoot(args.root, runId)) await rm(args.root, { recursive: true, force: true });
@@ -408,8 +408,19 @@ async function readRuntimeDescriptorPath(store: string): Promise<string | null> 
   return newest?.path ?? null;
 }
 
-async function markStopped(envPath: string): Promise<void> {
+/** Mark THIS run's published qa-env.json as stopped, guarded by run_id. A run
+ * only ever relabels the env it itself published. Two `--reuse` runs can slip
+ * past the liveness refusal (each mints a fresh nonce and adopts the same kept
+ * marker) and contend for the one control socket; the loser's `startDaemon`
+ * fails and its cleanup must NOT rewrite the winner's still-live env as
+ * `stopped` and strand the winner's readiness wait. A mismatched env is left
+ * untouched — a no-op, never a false stop for another run. (This is the
+ * documented concurrent-`--reuse` behavior: the liveness refusal handles the
+ * common case; beyond it the runs degrade to pre-5a86f14 semantics rather than
+ * a new lock, and neither corrupts the other's readiness metadata.) */
+export async function markStopped(envPath: string, runId: string): Promise<void> {
   const env = await readQaEnv(envPath);
+  if (env.run_id !== runId) return;
   await writeQaEnv(envPath, { ...env, state: 'stopped' });
 }
 

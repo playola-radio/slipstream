@@ -4,9 +4,10 @@ import { join, resolve } from 'node:path';
 import { mkdtemp, rm, chmod, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { parseArgs, curlCommands, probeStoreLiveness, runQaDaemon, ArgError } from './qa-daemon.ts';
+import { parseArgs, curlCommands, probeStoreLiveness, runQaDaemon, markStopped, ArgError } from './qa-daemon.ts';
 import { setImmediate as setImmediateP } from 'node:timers/promises';
 import { prepareRoot } from './qa/safety.ts';
+import { writeQaEnv, readQaEnv, QA_ENV_FORMAT, QA_ENV_NAME, type QaEnv } from './qa-support.ts';
 
 describe('qa-daemon parseArgs', () => {
   const home = '/home/u';
@@ -62,6 +63,43 @@ describe('qa-daemon curlCommands', () => {
     assert.ok(cmds[0]!.includes('/v1/sessions'));
     assert.ok(cmds[1]!.includes('/v1/sessions/qa:1/events?after=0'));
     assert.ok(cmds[2]!.includes('follow=true') && cmds[2]!.includes('curl -N'));
+  });
+});
+
+describe('markStopped run_id guard', () => {
+  const envFor = (runId: string): QaEnv => ({
+    format: QA_ENV_FORMAT,
+    state: 'ready',
+    run_id: runId,
+    daemon_commit: 'deadbeef',
+    daemon_dirty: false,
+    store: '/tmp/store',
+    worktree: '/tmp/worktree',
+    descriptor_path: '/tmp/runtime/d.json',
+    url: 'http://127.0.0.1:9',
+    token: 'T',
+    session_id: 'qa:1',
+    ready_through_seq: '3',
+    scenario: null,
+  });
+
+  it('marks stopped only the env this run published, never another run\'s live env', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ss-qa-ms-'));
+    const envPath = join(dir, QA_ENV_NAME);
+    try {
+      // A concurrent --reuse winner published this ready env under its own nonce.
+      await writeQaEnv(envPath, envFor('run-winner'));
+
+      // A losing run's cleanup must NOT relabel the winner's still-live env.
+      await markStopped(envPath, 'run-loser');
+      assert.equal((await readQaEnv(envPath)).state, 'ready', 'a foreign run must not mark the env stopped');
+
+      // The owning run does mark its own env stopped.
+      await markStopped(envPath, 'run-winner');
+      assert.equal((await readQaEnv(envPath)).state, 'stopped');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
