@@ -321,6 +321,64 @@ test('a compute that rejects after its deadline settles timeout, not error', asy
   await budget.close();
 });
 
+test('flight keys are injective across delimiter-bearing workloads and keys', async () => {
+  // Regression: a bare delimiter join collides (a, "b\0c") with ("a\0b", c); the
+  // length-prefixed key must keep them as two separate computes.
+  const budget = createProjectionAdmission({ C: 2, Q: 8, W: 8, D: 60_000 });
+  let bothRan = 0;
+  const first = budget.admit<string>({
+    workload: 'a', localConcurrency: 2, key: 'b\u0000c',
+    run: () => { bothRan++; return { promise: Promise.resolve('first'), cancel: () => {} }; },
+  });
+  const second = budget.admit<string>({
+    workload: 'a\u0000b', localConcurrency: 2, key: 'c',
+    run: () => { bothRan++; return { promise: Promise.resolve('second'), cancel: () => {} }; },
+  });
+  assert.deepEqual(await first, { kind: 'ok', value: 'first' });
+  assert.deepEqual(await second, { kind: 'ok', value: 'second' });
+  assert.equal(bothRan, 2); // neither coalesced onto the other
+  await budget.close();
+});
+
+test('a reentrant close inside run() does not leak an unhandled rejection', async () => {
+  // Regression: on reentrant settle the returned handle is untracked; its late
+  // rejection must be absorbed, not escape as an unhandledRejection that crashes.
+  const caught: unknown[] = [];
+  const onUnhandled = (e: unknown): void => { caught.push(e); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const budget = createProjectionAdmission({ C: 1, Q: 4, W: 4, D: 60_000 });
+    const outcome = await budget.admit<string>({
+      workload: 'clip', localConcurrency: 1,
+      run: () => {
+        void budget.close(); // settles this very unit reentrantly, mid-run
+        return { promise: Promise.reject(new Error('worker died after close')), cancel: () => {} };
+      },
+    });
+    assert.deepEqual(outcome, { kind: 'closed' });
+    await later(10); // let any stray rejection surface
+    assert.deepEqual(caught, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('a synchronous throw after the deadline settles timeout, not error', async () => {
+  // Regression: run()'s catch unconditionally settled error; a throw after the
+  // deadline must settle timeout, mirroring the async rejection path.
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 1, D: 20 });
+  const outcome = await budget.admit<string>({
+    workload: 'clip', localConcurrency: 1,
+    run: () => {
+      const until = Date.now() + 40;
+      while (Date.now() < until) { /* spin past the deadline before throwing */ }
+      throw new Error('worker died synchronously');
+    },
+  });
+  assert.deepEqual(outcome, { kind: 'timeout' });
+  await budget.close();
+});
+
 test('a rejected compute promise settles error, releasing the slot', async () => {
   const budget = createProjectionAdmission({ C: 1, Q: 1, W: 1, D: 1000 });
   const first = await budget.admit<string>({

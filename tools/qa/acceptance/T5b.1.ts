@@ -146,6 +146,11 @@ async function captureNotStarvedClaim(ctx: AcceptanceContext, startCursor: bigin
 
   const computed = resolved.filter((s) => s === 'ready' || s === 'fallback').length;
   const shed = resolved.filter((s) => s !== 'ready' && s !== 'fallback').length;
+  // The load only tests starvation if real projection work actually ran alongside
+  // capture; if every read were shed, no clip CPU would have contended at all.
+  if (computed < 1) {
+    fail('capture-not-starved exercised no real projection work: every clip read was shed, so clip CPU never contended with capture');
+  }
   return {
     id: 'capture-not-starved-by-clip-load',
     claim: 'LIVE: while concurrent clip reads over 6 distinct cold changes contend for the single-slot clip budget, a newly written source file is still observed on the public events feed within the deadline; some reads may return the transient shed envelope, which is the shared bound working rather than capture starvation',

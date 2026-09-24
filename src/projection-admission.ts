@@ -103,9 +103,11 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   let waiters = 0;
   // Flights are keyed by (workload, key), never key alone: two workloads may reuse
   // the same coalescing key for unrelated computes, and a waiter must never receive
-  // another workload's result (its declared result type differs).
+  // another workload's result (its declared result type differs). The composite is
+  // length-prefixed so the encoding is injective even if a workload or key contains
+  // the delimiter — `(a, bc)` and `(ab, c)` never collide.
   const inFlight = new Map<string, Flight>();
-  const flightKey = (workload: string, key: string): string => `${workload}\u0000${key}`;
+  const flightKey = (workload: string, key: string): string => `${workload.length}:${workload}${key}`;
   const live = new Set<Unit>();
   let closed = false;
   let pumping = false;
@@ -166,13 +168,19 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     try {
       handle = unit.run();
     } catch {
+      if (unit.state === 'settled') return; // reentrant settle already resolved it
+      // A synchronous throw after the deadline is a timeout, mirroring the async path.
+      if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
       settle(unit, { kind: 'error' });
       return;
     }
     // run() may have settled this unit reentrantly (e.g. it closed the budget). The
     // handle it returned is then untracked, so cancel it and stop — never install it.
+    // Absorb any late settlement of its promise so it cannot become an unhandled
+    // rejection now that no handler is attached.
     if (unit.state === 'settled') {
       try { handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
+      handle.promise.catch(() => {});
       return;
     }
     unit.handle = handle;
