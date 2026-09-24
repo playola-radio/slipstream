@@ -12,6 +12,7 @@ function fakeReader(durable: bigint, script: (after: bigint) => bigint[]): Reade
   for (let s = 1n; s <= durable; s++) finiteEvents.push({ seq: s.toString() });
   return {
     raw: async () => { throw new Error('unused'); },
+    open: async () => { throw new Error('unused'); },
     sessions: async () => { throw new Error('unused'); },
     blob: async () => { throw new Error('unused'); },
     finite: async (_sid, after): Promise<FiniteEvents> => ({
