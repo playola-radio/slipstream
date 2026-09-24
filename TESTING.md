@@ -277,6 +277,35 @@ known-gap manifest, mid-flight cancellation (confirmed unfinished at
 termination), and OOM survival whose default-launch negative control must abort
 with a V8 fatal signal.
 
+### Fold-contract header and release gates (`fold-release`, `T0.2`)
+
+`node tools/projection-check.ts fold-release [--root <dir>] [--base <ref>]` (also
+`npm run check:fold-release`) runs the two `display-fold.v1` release gates and prints
+one JSON result. Exit `0` = both pass; `1` = a gate failed; `2` = bad args or a base
+ref that does not resolve.
+
+- **Fingerprint change gate** — recomputes the fold's import closure, its
+  implementation fingerprint, and the corpus content hashes and compares them to
+  `contracts/display-fold/v1/manifest.json`. This gate also runs inside `npm test`
+  (via `src/fold-release.test.ts`), so a stray edit to `src/display-fold.ts` or its
+  closure fails the ordinary test run with a message telling you to release v2.
+- **Immutability gate** — diffs released contract files against the base branch and
+  rejects any modification/deletion/type-change; additions are allowed. It needs git
+  and runs in CI on pull requests (`.github/workflows/tests.yml`, with
+  `fetch-depth: 0` so the PR base commit resolves).
+
+`npm run qa:check -- --pr T0.2` proves the header live and the checker's behaviour:
+
+- the `Slipstream-Fold-Contract: display-fold.v1` header on the finite `200`, an
+  empty replay, and the SSE `200`, and its absence on `401`/`409`;
+- the response body is byte-stable and still folds under the advertised contract;
+- FIXTURE controls: the checker exits `1` (naming the case) on an altered corpus
+  fixture, a changed dependency, or an unlisted closure import, and `0` on a clean
+  copy — all over throwaway trees, never the real one.
+
+See `DISPLAY-FOLD.md` for the header rules, the manifest shape, and how to release
+`display-fold.v2`.
+
 ### Cleanup
 
 `qa:daemon` removes its owned root on a clean default shutdown (retained under
