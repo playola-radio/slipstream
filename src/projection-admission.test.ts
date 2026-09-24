@@ -104,7 +104,12 @@ test('a per-workload concurrency cap holds under a shared C greater than one', a
   await budget.close();
 });
 
-test('a request that expires while queued settles timeout and never runs', async () => {
+test('a request that expires while queued settles timeout and never runs', async (t) => {
+  // Mock both setTimeout AND Date so the deadline timer and the absolute-deadline
+  // check advance in lockstep: with real clocks the running unit's timer and the
+  // queued unit's timer are due within microseconds and the dispatch/expiry order
+  // races. A single deterministic tick past the shared deadline removes the flake.
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const budget = createProjectionAdmission({ C: 1, Q: 4, W: 4, D: 40 });
   const g = gate();
   let queuedRan = false;
@@ -112,11 +117,12 @@ test('a request that expires while queued settles timeout and never runs', async
     workload: 'clip', localConcurrency: 1, key: 'run',
     run: () => ({ promise: g.promise, cancel: () => {} }),
   });
-  const queued = await budget.admit<string>({
+  const queued = budget.admit<string>({
     workload: 'clip', localConcurrency: 1, key: 'wait',
     run: () => { queuedRan = true; return { promise: Promise.resolve('v'), cancel: () => {} }; },
   });
-  assert.deepEqual(queued, { kind: 'timeout' });
+  t.mock.timers.tick(41); // past the shared deadline: running frees its slot, queued expires unrun
+  assert.deepEqual(await queued, { kind: 'timeout' });
   assert.equal(queuedRan, false);
   g.resolve('done');
   await running;

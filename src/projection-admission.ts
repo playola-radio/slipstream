@@ -187,7 +187,9 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     handle.promise.then(
       (value) => {
         if (unit.state === 'settled') return; // late completion ignored
-        if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
+        // A finished result is never discarded for lateness: the deadline bounds
+        // WAITING (its timer already fired 'timeout' if it elapsed), not completed
+        // work. Returning a slow-but-real projection beats throwing it away.
         settle(unit, { kind: 'ok', value });
       },
       () => {
