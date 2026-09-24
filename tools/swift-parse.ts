@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { SWIFT_UNISOLATED_ENV } from '../src/swift-grammar.ts';
 import type { HostRequest, HostResult } from './swift-parse-host.ts';
 
 export const SWIFT_CORPUS_DIR = fileURLToPath(new URL('../contracts/swift-syntax/v1/', import.meta.url));
@@ -39,11 +40,12 @@ export class SwiftChildError extends Error {
   }
 }
 
-export interface RunChildOpts {
+interface RunChildOpts {
   deadlineMs?: number;
   signal?: AbortSignal;
   /** Default true. Set false ONLY for the negative control that proves the
-   * default launch aborts (the child is expected to crash). */
+   * default launch aborts (the child is expected to crash). This also passes the
+   * isolation-guard escape env so the child reaches the load before aborting. */
   liftoffOnly?: boolean;
 }
 
@@ -55,9 +57,17 @@ export async function runSwiftParseChild<T extends HostResult = HostResult>(
   request: HostRequest,
   opts: RunChildOpts = {},
 ): Promise<T> {
+  // An already-aborted signal must never launch work (the abort listener below
+  // only fires on FUTURE aborts).
+  if (opts.signal?.aborted) {
+    throw new SwiftChildError('swift-parse child aborted before start', { code: null, signal: null, stderr: '' });
+  }
+
   const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
-  const execArgv = opts.liftoffOnly === false ? [] : ['--liftoff-only'];
-  const child = spawn(process.execPath, [...execArgv, HOST_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const unisolated = opts.liftoffOnly === false;
+  const execArgv = unisolated ? [] : ['--liftoff-only'];
+  const env = unisolated ? { ...process.env, [SWIFT_UNISOLATED_ENV]: '1' } : process.env;
+  const child = spawn(process.execPath, [...execArgv, HOST_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env });
 
   let stdout = '';
   let stderr = '';
@@ -65,6 +75,11 @@ export async function runSwiftParseChild<T extends HostResult = HostResult>(
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', (d: string) => { stdout += d; });
   child.stderr.on('data', (d: string) => { stderr += d; });
+  // Terminating the child while its stdin still holds buffered input emits EPIPE
+  // on the write side; swallow it so a cancellation never escapes the
+  // SwiftChildError contract as an uncaught error. The real cause is reported
+  // from the close/deadline path below.
+  child.stdin.on('error', () => {});
 
   const timer = setTimeout(() => { killed = 'deadline'; child.kill('SIGKILL'); }, deadlineMs);
   let killed: 'deadline' | 'abort' | null = null;

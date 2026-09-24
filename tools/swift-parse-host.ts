@@ -19,16 +19,16 @@ export type HostRequest =
   | { op: 'measure'; sources: { label: string; source: string }[] }
   | { op: 'cancel-demo'; pathologicalSource: string; cleanSource: string };
 
-export interface ParseTimings {
+interface ParseTimings {
   initAndLoadMs: number;
   firstParseMs: number;
 }
 
 export type HostResult =
   | { op: 'parse'; provenance: ArtifactProvenance; result: SwiftParseResult; timings: ParseTimings }
-  | { op: 'survive'; provenance: ArtifactProvenance; result: SwiftParseResult; heldMs: number }
+  | { op: 'survive'; result: SwiftParseResult; heldMs: number }
   | { op: 'measure'; provenance: ArtifactProvenance; initAndLoadMs: number; parses: { label: string; byteLength: number; clean: boolean; firstParseMs: number; warmParseMs: number }[] }
-  | { op: 'cancel-demo'; provenance: ArtifactProvenance; startedBeforeCancel: boolean; cancelled: boolean; replacement: { clean: boolean; rootType: string } };
+  | { op: 'cancel-demo'; startedBeforeCancel: boolean; inProgressAtCancel: boolean; terminateMs: number; replacement: { clean: boolean; rootType: string } };
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -38,8 +38,11 @@ async function readStdin(): Promise<string> {
 
 /** Run one Swift parse in a fresh terminable worker, resolving when the parse
  * finishes (`done`) — or rejecting if the worker errors. Returns a `cancel`
- * that hard-terminates the worker (a running parse cannot be stopped from
- * inside), plus a `started` promise that resolves once the parse is under way. */
+ * that hard-terminates the worker (a synchronous parse cannot be stopped from
+ * inside), plus a `started` promise that resolves when the worker is about to
+ * block in the parse. Because the parse is synchronous, `started` can only fire
+ * immediately before it — the caller proves mid-flight cancellation by checking
+ * `done` is still pending, not by trusting `started` alone. */
 function runInWorker(source: string): {
   done: Promise<SwiftParseResult>;
   started: Promise<void>;
@@ -66,20 +69,29 @@ async function main(): Promise<number> {
 
   if (request.op === 'cancel-demo') {
     const first = runInWorker(request.pathologicalSource);
-    // Prove the parse actually started, then hard-terminate it mid-flight.
     await first.started;
-    const startedBeforeCancel = true;
+    // Completion-race guard: a synchronous parse can only be terminated from
+    // outside, so `started` is posted just before the parse blocks the worker.
+    // Terminating unconditionally would prove nothing if the parse had already
+    // finished — so watch `first.done` and confirm it is STILL pending after a
+    // beat. `inProgressAtCancel:false` means the pathological input was too small
+    // to interrupt; the acceptance check treats that as a failure, never a pass.
+    let doneSettled = false;
+    first.done.then(() => { doneSettled = true; }, () => { doneSettled = true; });
+    await new Promise((res) => setTimeout(res, 150));
+    const inProgressAtCancel = !doneSettled;
+    const t = performance.now();
     await first.cancel();
+    const terminateMs = performance.now() - t;
     // The runtime recovers: a replacement worker parses clean input to completion.
     const second = runInWorker(request.cleanSource);
     const result = await second.done;
     await second.worker.terminate();
-    const loaded = await loadSwiftLanguage();
     print({
       op: 'cancel-demo',
-      provenance: loaded.provenance,
-      startedBeforeCancel,
-      cancelled: true,
+      startedBeforeCancel: true,
+      inProgressAtCancel,
+      terminateMs,
       replacement: { clean: result.clean, rootType: result.rootType },
     });
     return 0;
@@ -116,7 +128,7 @@ async function main(): Promise<number> {
   // load-bearing proof that --liftoff-only actually prevents the delayed crash.
   const result = parseSwiftSource(loaded.language, request.source);
   await new Promise((res) => setTimeout(res, request.holdMs));
-  print({ op: 'survive', provenance: loaded.provenance, result, heldMs: request.holdMs });
+  print({ op: 'survive', result, heldMs: request.holdMs });
   return 0;
 }
 

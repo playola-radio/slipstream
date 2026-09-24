@@ -52,9 +52,32 @@ test('cancels an in-progress parse and recovers in a replacement worker', async 
     { deadlineMs: 60_000 },
   ));
   assert.equal(r.startedBeforeCancel, true);
-  assert.equal(r.cancelled, true);
+  assert.equal(r.inProgressAtCancel, true, 'the pathological parse must still be running when terminated');
+  assert.ok(r.terminateMs >= 0, 'termination time must be measured');
   assert.equal(r.replacement.clean, true);
   assert.equal(r.replacement.rootType, 'source_file');
+});
+
+test('an already-aborted signal never launches work', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runSwiftParseChild({ op: 'parse', source: 'func f() {}\n' }, { signal: controller.signal }),
+    (err: unknown) => {
+      assert.ok(err instanceof SwiftChildError, 'expected SwiftChildError');
+      assert.match(err.message, /aborted before start/);
+      return true;
+    },
+  );
+});
+
+test('cancelling mid-stdin-write rejects cleanly, never crashes the caller with EPIPE', async () => {
+  // A ~10MB request that the deadline kills while stdin is still draining used to
+  // surface an uncaught `write EPIPE`; it must now come back as a SwiftChildError.
+  await assert.rejects(
+    runSwiftParseChild({ op: 'parse', source: 'x'.repeat(10_000_000) }, { deadlineMs: 1 }),
+    SwiftChildError,
+  );
 });
 
 test('survives past the observed OOM window under --liftoff-only', async () => {
@@ -74,7 +97,10 @@ test('negative control: the default Node launch aborts on the same parse', async
     ),
     (err: unknown) => {
       assert.ok(err instanceof SwiftChildError, 'expected SwiftChildError');
-      assert.ok(err.detail.signal !== null || (err.detail.code ?? 0) !== 0, 'expected abnormal exit');
+      // A V8 fatal OOM kills via a signal (observed SIGTRAP), never a clean
+      // exit-2 (signal null) and never our deadline SIGKILL.
+      assert.ok(err.detail.signal !== null, 'expected a fatal signal, not a clean exit');
+      assert.notEqual(err.detail.signal, 'SIGKILL', 'a SIGKILL would be our deadline, not the OOM');
       return true;
     },
   );
