@@ -15,6 +15,7 @@ describe('T5a.1', () => {
         paths.push(path);
         return response(path === '/v1/schemas/projections/clip.v3' ? 200 : 404);
       },
+      open: async () => { throw new Error('unused'); },
       finite: async () => ({
         durableSeq: 7n,
         events: [
@@ -36,6 +37,7 @@ describe('T5a.1', () => {
   it('fails clearly when the session has no file.changed event', async () => {
     const reader: ReaderClient = {
       raw: async (path) => response(path === '/v1/schemas/projections/clip.v3' ? 200 : 404),
+      open: async () => { throw new Error('unused'); },
       finite: async () => ({ durableSeq: 1n, events: [{ seq: '1', type: 'slipstream.session.started.v1' }] }),
       sessions: async () => { throw new Error('unused'); },
       blob: async () => { throw new Error('unused'); },
