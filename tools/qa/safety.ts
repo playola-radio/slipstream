@@ -11,7 +11,8 @@
  *    harness never reuses a root whose daemon is still live or whose ownership
  *    is ambiguous, and never deletes a root it did not create.
  */
-import { lstat, mkdir, open, readFile, readdir, realpath, rename } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readFile, readdir, realpath, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { defaultDaemonStore } from '../../src/daemon-location.ts';
 import { FILE_MODE } from '../../src/storage.ts';
@@ -82,9 +83,14 @@ export async function checkRootAgainstRealStore(
   return null;
 }
 
-/** Write the harness ownership marker atomically, owner-only. Its presence is
- * the sole license to later delete the root. */
-export async function writeOwnerMarker(root: string, runId: string): Promise<void> {
+/** Claim the harness ownership marker atomically, owner-only: first-writer-wins.
+ * Its presence is the sole license to later delete the root. Returns `false`
+ * without touching the existing marker if a concurrent claimant already won —
+ * `link()` either creates the destination or fails, so two racing invocations
+ * can never have one silently clobber the other's marker (unlike `rename`,
+ * which always succeeds and would let the second claimant overwrite the
+ * first's ownership out from under it). */
+export async function writeOwnerMarker(root: string, runId: string): Promise<boolean> {
   const marker: OwnerMarker = {
     format: OWNER_FORMAT,
     run_id: runId,
@@ -92,7 +98,7 @@ export async function writeOwnerMarker(root: string, runId: string): Promise<voi
     pid: process.pid,
   };
   const path = join(root, OWNER_MARKER_NAME);
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${randomUUID()}.tmp`;
   const handle = await open(tmp, 'wx', FILE_MODE);
   try {
     await handle.writeFile(Buffer.from(JSON.stringify(marker), 'utf8'));
@@ -100,7 +106,15 @@ export async function writeOwnerMarker(root: string, runId: string): Promise<voi
   } finally {
     await handle.close();
   }
-  await rename(tmp, path);
+  try {
+    await link(tmp, path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw err;
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
 }
 
 /** Read and validate the ownership marker. Any missing/foreign/malformed file
@@ -210,10 +224,24 @@ async function assertRealDir(path: string): Promise<void> {
 /** Create the sandbox layout under an approved root: the marker, the store dir,
  * and the worktree dir. Idempotent for `--reuse` (dirs may already exist). The
  * store and worktree must be real directories — a symlinked one is refused so
- * neither a write nor the later cleanup can escape the sandbox. */
+ * neither a write nor the later cleanup can escape the sandbox.
+ *
+ * Claiming the marker is unconditional and atomic (`writeOwnerMarker`'s
+ * first-writer-wins `link`), never a check-then-act: two concurrent callers
+ * racing on the same fresh root must not both believe they own it. A losing
+ * claim is only tolerated when the marker that won is already ours (a retry
+ * of a prior successful claim under the same `runId`, e.g. `--reuse`) — any
+ * other winner means a second run genuinely raced us, and we refuse rather
+ * than proceed to write into or later delete a root we do not own. */
 export async function prepareRoot(root: string, runId: string): Promise<{ store: string; worktree: string }> {
   await mkdir(root, { recursive: true, mode: 0o700 });
-  if ((await readOwnerMarker(root)) === null) await writeOwnerMarker(root, runId);
+  const claimed = await writeOwnerMarker(root, runId);
+  if (!claimed) {
+    const marker = await readOwnerMarker(root);
+    if (marker === null || marker.run_id !== runId) {
+      throw new Error(`refusing QA root ${root}: a concurrent run claimed ownership first`);
+    }
+  }
   const store = join(root, 'store');
   const worktree = join(root, 'worktree');
   await assertRealDir(store);

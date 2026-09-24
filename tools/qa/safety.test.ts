@@ -97,6 +97,18 @@ describe('safety', () => {
       await writeFile(join(root, OWNER_MARKER_NAME), 'not json');
       assert.equal(await readOwnerMarker(root), null);
     });
+
+    it('is first-writer-wins: a second concurrent claim never overwrites the first', async () => {
+      const root = join(base, 'race');
+      await mkdir(root);
+      const first = await writeOwnerMarker(root, 'run-first');
+      assert.equal(first, true);
+      const second = await writeOwnerMarker(root, 'run-second');
+      assert.equal(second, false);
+      // The original claimant's marker must survive untouched.
+      const marker = await readOwnerMarker(root);
+      assert.equal(marker?.run_id, 'run-first');
+    });
   });
 
   describe('evaluateRoot', () => {
@@ -184,6 +196,27 @@ describe('safety', () => {
       await mkdir(elsewhere, { recursive: true });
       await symlink(elsewhere, join(root, 'worktree'));
       await assert.rejects(prepareRoot(root, 'run-p'), /symlink/i);
+    });
+
+    it('is idempotent under --reuse: a retry with the same runId keeps the original marker', async () => {
+      const root = join(base, 'prep-reuse');
+      await prepareRoot(root, 'run-same');
+      const before = await readOwnerMarker(root);
+      const { store, worktree } = await prepareRoot(root, 'run-same');
+      assert.equal(store, join(root, 'store'));
+      assert.equal(worktree, join(root, 'worktree'));
+      const after = await readOwnerMarker(root);
+      assert.equal(after?.created_at_ms, before?.created_at_ms);
+    });
+
+    it('refuses a second concurrent claimant instead of silently taking over ownership', async () => {
+      const root = join(base, 'prep-race');
+      await prepareRoot(root, 'run-winner');
+      // A second, distinct run racing on the same (now-owned) root must refuse
+      // rather than proceed as if it had claimed it.
+      await assert.rejects(prepareRoot(root, 'run-loser'), /concurrent run claimed ownership/);
+      const marker = await readOwnerMarker(root);
+      assert.equal(marker?.run_id, 'run-winner');
     });
   });
 
