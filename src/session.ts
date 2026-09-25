@@ -841,8 +841,6 @@ export async function startCapture(
     const id = queued.data.question_id;
     reservedQuestions.add(id);
     try {
-      assertOwnership();
-      questionReady();
       const attempted_at_ms = now();
       await appendEvent({ type: 'slipstream.question.dispatch_attempted.v1', occurred_at_ms: attempted_at_ms,
         data: { question_id: id, queued_seq: queued.seq, attempted_at_ms } });

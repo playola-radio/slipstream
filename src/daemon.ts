@@ -417,8 +417,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // symlinked or relative declared path must report the same durable root in
       // status rather than the caller's raw string (locked design, decision 5).
       resolvedWorktree = await realpath(worktree);
-      resolvedTranscript = rootTranscript === undefined ? undefined : await realpath(rootTranscript);
-      if (resolvedTranscript !== undefined && harness === 'codex') {
+      if (rootTranscript !== undefined) {
+        if (harness !== 'codex') throw new RootIdentityError('root_transcript is only supported for Codex');
+        try { resolvedTranscript = await realpath(rootTranscript); }
+        catch { throw new RootIdentityError('root Codex transcript cannot be resolved'); }
         await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
       }
       const transcript = transcriptRuntimeFrom(opts.config);

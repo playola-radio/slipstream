@@ -82,6 +82,10 @@ describe('daemon control verbs', () => {
       await writeFile(rootTranscript, rootMeta('9.9.9'));
       const unsupported = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: rootTranscript });
       assert.equal(unsupported.ok === false && unsupported.code, 'IDENTITY_UNRESOLVED');
+      const missing = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: join(store, 'missing.jsonl') });
+      assert.equal(missing.ok === false && missing.code, 'IDENTITY_UNRESOLVED');
+      const wrongHarness = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: rootTranscript });
+      assert.equal(wrongHarness.ok === false && wrongHarness.code, 'IDENTITY_UNRESOLVED');
       await writeFile(rootTranscript, rootMeta('0.154.0', 'different-chat'));
       const mismatch = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: rootTranscript });
       assert.equal(mismatch.ok === false && mismatch.code, 'IDENTITY_UNRESOLVED');

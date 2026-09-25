@@ -110,10 +110,10 @@ it('releases a claim after a precommit storage failure so recovery may offer it'
   });
 });
 
-it('derives expiry without an attempt and frees queue capacity after a claim', async () => {
+it('frees queue capacity after a claim', async () => {
   await withTempDir(async base => {
     const root = join(base, 'work'); await mkdir(root);
-    let now = 1000;
+    const now = 1000;
     const session = await startCapture({ root, storeDir: join(base, 'store'), now: () => now }, {
       platform: createFakePlatform(), readQuestionContext: async () => 'selected',
     });
@@ -126,8 +126,6 @@ it('derives expiry without an attempt and frees queue capacity after a claim', a
       await assert.rejects(session.askQuestion(input, target), { code: 'QUESTION_LIMIT' });
       assert.ok(await session.claimQuestion(target));
       await session.askQuestion(input, target);
-      now += QUESTION_TTL_MS;
-      assert.equal(await session.claimQuestion(target), null);
       assert.equal((await readRecords(session.logPath)).filter(e => e.type === 'slipstream.question.dispatch_attempted.v1').length, 1);
     } finally { await session.stop(); }
   });

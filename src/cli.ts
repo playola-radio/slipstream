@@ -456,7 +456,8 @@ async function main(): Promise<void> {
 
   if (args.command === 'codex-hook') {
     try {
-      const output = await codexPostToolUse(await readHookInput(), args.store);
+      const deadlineAtMs = Date.now() + 1000;
+      const output = await codexPostToolUse(await readHookInput(process.stdin, deadlineAtMs), args.store, deadlineAtMs);
       if (output) process.stdout.write(output);
     } catch { /* Hooks must never interrupt the agent or log callback content. */ }
     return;

@@ -73,6 +73,16 @@ describe('control-client', () => {
     });
   });
 
+  it('bounds a slow response by an absolute deadline shared with earlier hook work', async () => {
+    await withServer((sock) => { void readOneRequest(sock).catch(() => {}); }, async (socketPath) => {
+      const started = Date.now();
+      await assert.rejects(sendControlRequest({ socketPath, request: REQ,
+        connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs: started + 80,
+      }), OutcomeUnknownError);
+      assert.ok(Date.now() - started < 500);
+    });
+  });
+
   it('raises OUTCOME UNKNOWN when the connection drops after the request was sent', async () => {
     await withServer((sock) => {
       void readOneRequest(sock).then(() => sock.destroy()); // close without responding

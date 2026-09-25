@@ -69,10 +69,11 @@ export const f2Delivery: AcceptanceModule = {
           const queued = JSON.parse(ask.stdout) as { question_id: string };
           const callback = { hook_event_name: 'PostToolUse', session_id: harnessSessionId,
             cwd: worktreeAlias, transcript_path: transcript, tool_name: 'Bash' };
-          for (const negative of [{ ...callback, agent_id: null },
+          const negativeCallbacks = [{ ...callback, agent_id: null },
             { ...callback, agent_id: 'child', agent_type: 'explore', transcript_path: inputPath },
             { ...callback, session_id: randomUUID() }, { ...callback, transcript_path: inputPath },
-            { ...callback, cwd: store }]) {
+            { ...callback, cwd: store }];
+          for (const negative of negativeCallbacks) {
             const result = await cli(['hook', 'codex', 'post-tool-use', '--store', store], negative);
             if (result.code !== 0 || result.stdout !== '') throw new Error('negative Codex callback emitted context');
           }
@@ -103,10 +104,10 @@ export const f2Delivery: AcceptanceModule = {
           if (attempts.length !== 1 || attempts[0]!.data?.question_id !== queued.question_id) {
             throw new Error('public reader did not expose exactly one matching durable attempt');
           }
-          return { assertions: [{ id: 'F2-live',
-            claim: 'LIVE: a canonical worktree alias reached the root Codex callback after a public durable attempt; child, other chat, other transcript, wrong worktree, Claude and stale hooks received none',
+          return { assertions: [{ id: 'F2-wire',
+            claim: 'A simulated root Codex callback through the real CLI and daemon claimed a real observed change after a public durable attempt; simulated child, other chat, other transcript, wrong worktree, Claude and stale hooks received none',
             evidence: { capture_session_id: sessionId, question_id: queued.question_id,
-              attempt_seq: attempts[0]!.seq, negative_callbacks: 7, repeated_emissions: 0,
+              attempt_seq: attempts[0]!.seq, negative_callbacks: negativeCallbacks.length + 2, repeated_emissions: 0,
               canonical_worktree: await realpath(worktree) },
           }] };
         } finally { await rm(inputPath, { force: true }); }
