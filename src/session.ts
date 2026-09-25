@@ -187,9 +187,11 @@ export async function startCapture(
   const now = opts.now ?? Date.now;
   const committedQuestions = new Map<string, { body: string; result: QuestionAccepted }>();
   const inflightQuestions = new Map<string, { body: string; promise: Promise<QuestionAccepted> }>();
-  const queuedQuestions = new Map<string, QuestionQueuedEvent>();
-  const attemptedQuestions = new Set<string>();
   const reservedQuestions = new Set<string>();
+  // Questions not yet attempted. Removed once dispatch is attempted (durably
+  // consumed either way) so eligibility counting and claim lookup scan only
+  // outstanding questions, not every question ever queued by a long-lived capture.
+  const unattemptedQuestions = new Map<string, QuestionQueuedEvent>();
   let currentTaskId: string | undefined;
   const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
   const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
@@ -201,13 +203,12 @@ export async function startCapture(
 
   const seedTaskState = (rec: RecoveredSession): void => {
     committedQuestions.clear();
-    queuedQuestions.clear();
-    attemptedQuestions.clear();
+    unattemptedQuestions.clear();
     for (const event of rec.questions) {
       committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
-      queuedQuestions.set(event.data.question_id, event);
+      unattemptedQuestions.set(event.data.question_id, event);
     }
-    for (const event of rec.questionAttempts) attemptedQuestions.add(event.data.question_id);
+    for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -238,8 +239,8 @@ export async function startCapture(
     onCommitted: (event) => {
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
-      if (event.type === 'slipstream.question.queued.v1') queuedQuestions.set(event.data.question_id, event);
-      if (event.type === 'slipstream.question.dispatch_attempted.v1') attemptedQuestions.add(event.data.question_id);
+      if (event.type === 'slipstream.question.queued.v1') unattemptedQuestions.set(event.data.question_id, event);
+      if (event.type === 'slipstream.question.dispatch_attempted.v1') unattemptedQuestions.delete(event.data.question_id);
       if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1') producer?.noteCommitted(event);
     },
   };
@@ -805,7 +806,13 @@ export async function startCapture(
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
     // A reservation covers source reads as well as append, bounding concurrent scans.
-    const eligible = [...queuedQuestions.values()].filter(q => now() < q.data.expires_at_ms && !attemptedQuestions.has(q.data.question_id)).length;
+    // An expired-but-never-attempted entry can never become eligible again, so it
+    // is dropped here rather than kept forever awaiting a claim that will not come.
+    let eligible = 0;
+    for (const [id, q] of unattemptedQuestions) {
+      if (now() < q.data.expires_at_ms) eligible += 1;
+      else unattemptedQuestions.delete(id);
+    }
     const reserved = [...inflightQuestions.keys()].filter(id => !committedQuestions.has(id)).length;
     if (eligible + reserved >= QUESTION_LIMIT) throw new QuestionError('QUESTION_LIMIT', 'at most 16 unexpired questions may be queued');
     // Defer starting I/O until the in-flight reservation is installed synchronously.
@@ -832,11 +839,11 @@ export async function startCapture(
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {
     assertOwnership();
     questionReady();
-    const queued = [...queuedQuestions.values()].find(q => q.data.target.harness === target.harness
+    const queued = [...unattemptedQuestions.values()].find(q => q.data.target.harness === target.harness
       && q.data.target.harness_session_id === target.harness_session_id
       && q.data.target.worktree === target.worktree
       && now() < q.data.expires_at_ms
-      && !attemptedQuestions.has(q.data.question_id) && !reservedQuestions.has(q.data.question_id));
+      && !reservedQuestions.has(q.data.question_id));
     if (!queued) return null;
     const id = queued.data.question_id;
     reservedQuestions.add(id);

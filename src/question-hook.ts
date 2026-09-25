@@ -37,7 +37,10 @@ export async function codexPostToolUse(input: unknown, storeDir: string, deadlin
       context.selected_text,
       `END SELECTED SOURCE ${q.question_id}`,
     ].join('\n');
-    if (Buffer.byteLength(additionalContext, 'utf8') > MAX_CONTEXT_BYTES || Date.now() >= deadlineAtMs) return null;
+    if (Buffer.byteLength(additionalContext, 'utf8') > MAX_CONTEXT_BYTES) return null;
+    // The daemon already durably committed the dispatch attempt for this question
+    // (it will never be offered again), so a deadline crossed while merely
+    // formatting an already-claimed reply must not discard it.
     return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext } });
   } catch { return null; }
 }
