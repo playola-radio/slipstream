@@ -811,8 +811,9 @@ real-OS-only; fake conformance can never rescue a failing real probe.
 
 ## D1: Durable question submission (2026-09-25)
 
-**Status**: Implemented on the D1 review branch; Brian’s merge and independent
-cumulative QA are required before D2 begins.
+**Status**: Merged into `develop` through PRs #33 and #34 at
+`1434899ad21e8f471da65fbe034c9a25ffc18b4b`. The D1 worker reported its
+required checks green; D2 is a separate Codex delivery slice.
 
 Brian approved the additive ask/send slice. D1 queues a normalized question tied
 to an immutable captured file-change snapshot through the existing owner-only
@@ -826,3 +827,15 @@ only durability. Hook delivery (D2), the Swift ask composer (S1), and answer UI
 are deferred. The frozen display-fold.v1 dependencies and fixtures stay unchanged:
 `src/public-events.ts` adds the new event alongside the released event catalogue.
 No capture, attribution, or existing success criterion changes.
+
+## D2: Codex hook delivery (2026-09-25)
+
+**Status**: Implementation in progress on the Codex delivery branch. D2
+acceptance requires terminal and Conductor live runs; Claude routing and delivery
+remain blocked by their own runtime proof. No four-path milestone is claimed.
+
+Codex root identity is bound explicitly at attach. A PostToolUse claim must match
+the harness session, canonical worktree and bound root transcript, with both
+agent properties omitted. One oldest eligible question is reserved and a public
+dispatch-attempt event is durably appended before the hook response. The event
+does not prove receipt or an answer. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).

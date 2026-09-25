@@ -417,3 +417,11 @@ complete queued event through authenticated HTTP. Wrong context must return
 `INVALID_CONTEXT` and add no question. Its negative-control tests run the same
 checker against suppressed/corrupted records and acknowledgments. F1-ask owns and cleans up a separate disposable daemon with a synthetic Codex
 binding; it never rebinds an operator-supplied `--env` daemon. It proves durable queueing, not hook delivery.
+
+`npm run qa:check -- --pr F2-delivery` uses a disposable real daemon and OS
+watcher. It queues from a captured source through `ask`, exercises the production
+Codex hook CLI with root and negative callbacks, and checks the public durable
+dispatch-attempt event. This verifies the daemon, socket and hook output contract;
+it simulates callback input. A separate running-agent test must inspect the real
+agent's answer and ordinary hook trust before claiming Terminal or Conductor
+delivery acceptance.

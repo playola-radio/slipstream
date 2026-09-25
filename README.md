@@ -88,6 +88,14 @@ to an agent or answered. Read `slipstream.question.queued.v1` through the existi
 authenticated `GET /v1/sessions/<id>/events` endpoint; its self-contained schema is
 available at `GET /v1/schemas/slipstream.question.queued.v1`.
 
+Codex delivery requires an explicit root transcript binding at `attach` and a
+trusted `PostToolUse` hook configured before the chat starts. See
+[the delivery contract](docs/ask-agent/contract.md#d2-boundary--codex-only)
+for the control fields and Terminal/Conductor setup. The public
+`slipstream.question.dispatch_attempted.v1` event means the daemon committed an
+attempt before answering the hook; it does not confirm receipt or an answer.
+Claude question delivery remains disabled pending its own routing proof.
+
 Retry with the **same request ID, capture ID and input**. Same-ID/body retries
 return the original result without extending the 30-minute TTL. A changed body
 returns `REQUEST_CONFLICT`; more than 16 unexpired questions returns
