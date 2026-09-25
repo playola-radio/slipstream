@@ -50,6 +50,15 @@ interface AskRejected {
 
 Protocol framing/version/invalid request_id errors use `PROTOCOL`; text errors use `INVALID_QUESTION`; invalid source identity, range, or unavailable source use `INVALID_CONTEXT`. A broken/unhealthy store uses `STORAGE_UNAVAILABLE` rather than pretending source is empty. `CAPTURE_NOT_READY` retains existing readiness semantics. A mismatched/replaced/inactive capture is `SESSION_NOT_SELECTED`, never an invitation to auto-retarget.
 
+For `ask`, `STORAGE_UNAVAILABLE` is conservatively **outcome unknown**: an append
+may already be committed even when its acknowledgment failed. Keep the original
+request ID, capture ID and normalized body; retry those unchanged after recovery.
+Never generate a new ID or retarget a replacement capture. The CLI preserves the
+JSON error code, adds same-ID retry guidance, and exits 3 for this case as well as
+lost/malformed post-send replies. Other domain rejections exit 1; local file or
+syntax errors exit 2.
+
+
 ## Source validation and normalization
 
 The daemon, not the app, derives selected source text:

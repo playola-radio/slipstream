@@ -93,9 +93,10 @@ return the original result without extending the 30-minute TTL. A changed body
 returns `REQUEST_CONFLICT`; more than 16 unexpired questions returns
 `QUESTION_LIMIT`. Other domain errors are `INVALID_QUESTION`, `INVALID_CONTEXT`,
 `SESSION_NOT_SELECTED`, `CAPTURE_NOT_READY`, and `STORAGE_UNAVAILABLE`. Errors
-print structured JSON on stderr (exit 1); local input errors exit 2. A lost or
-malformed response after transmission exits 3: the outcome is unknown and the
-record may already be committed. A new capture never resumes an old queue; inspect
+print structured JSON on stderr (exit 1); local file/syntax errors exit 2.
+`STORAGE_UNAVAILABLE`, or a lost/malformed response after transmission, exits 3:
+the outcome is unknown and the record may already be committed. Preserve the same
+request ID, capture ID and input when retrying. A new capture never resumes an old queue; inspect
 the old public log by `request_id` rather than retargeting a retry.
 
 The control wire request is `{v:1,verb:"ask",session_id,request_id,text,context}`

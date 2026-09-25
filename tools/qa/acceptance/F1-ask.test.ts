@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertAskAcknowledgment, assertQueuedQuestion } from './F1-ask.ts';
+import { assertAskAcknowledgment, assertQueuedQuestion, f1Ask } from './F1-ask.ts';
 
 const expected = {
   sessionId: '11111111-1111-4111-8111-111111111111',
   requestId: '22222222-2222-4222-8222-222222222222',
   questionId: '33333333-3333-4333-8333-333333333333',
+  seq: '43',
   text: 'What changed?',
   target: { harness: 'codex' as const, harness_session_id: 'harness-1', worktree: '/qa/worktree' },
   context: {
@@ -42,6 +43,9 @@ function queuedEvent(data: Record<string, unknown> = {}): Record<string, unknown
 }
 
 describe('F1-ask queued-event checker', () => {
+  it('owns its disposable daemon instead of rebinding a caller-provided acceptance daemon', () => {
+    assert.equal(f1Ask.needsDaemon, false);
+  });
   it('rejects an absent queued record and a corrupted identity or selected context', () => {
     assert.throws(() => assertQueuedQuestion([], expected), /exactly one queued/i);
     assert.throws(

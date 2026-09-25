@@ -415,6 +415,5 @@ verified by `npm run check:fold-release`.
 store, submits through the CLI, retries the same request ID, then verifies the
 complete queued event through authenticated HTTP. Wrong context must return
 `INVALID_CONTEXT` and add no question. Its negative-control tests run the same
-checker against suppressed/corrupted records and acknowledgments. F1-ask replaces
-the disposable QA attach binding with a synthetic Codex binding and runs last in
-the cumulative registry. It proves durable queueing, not hook delivery.
+checker against suppressed/corrupted records and acknowledgments. F1-ask owns and cleans up a separate disposable daemon with a synthetic Codex
+binding; it never rebinds an operator-supplied `--env` daemon. It proves durable queueing, not hook delivery.

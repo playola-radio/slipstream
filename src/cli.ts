@@ -24,7 +24,7 @@
  *   slipstream delete <session-id> [--store <dir>]
  *   slipstream gc     [--store <dir>]
  */
-import { readFile, lstat } from 'node:fs/promises';
+import { readFile, open, lstat, constants } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
@@ -32,7 +32,8 @@ import { startReaderServer } from './http-reader.ts';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { isValidSessionId } from './store-reader.ts';
-import type { ResponseEnvelope } from './control-protocol.ts';
+import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts';
+import { QUESTION_TTL_MS } from './questions.ts';
 import { runTui } from './tui.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
@@ -40,14 +41,8 @@ import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
 
 interface AskInput {
-  text: string;
-  context: {
-    change_seq: string;
-    path: string;
-    snapshot_sha256: string;
-    line_start: number;
-    line_end: number;
-  };
+  text: unknown;
+  context: unknown;
 }
 
 type Args =
@@ -285,42 +280,32 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 async function readAskInput(path: string): Promise<AskInput> {
   let value: unknown;
   try {
-    value = JSON.parse(await readFile(path, 'utf8'));
+    const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    let bytes: Buffer;
+    try {
+      if (!(await handle.stat()).isFile()) throw new Error('input is not a regular file');
+      const buffer = Buffer.alloc(MAX_MESSAGE_BYTES + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (chunk.bytesRead === 0) break;
+        bytesRead += chunk.bytesRead;
+      }
+      if (bytesRead > MAX_MESSAGE_BYTES) throw new Error('input exceeds the control message byte cap');
+      bytes = buffer.subarray(0, bytesRead);
+    } finally { await handle.close(); }
+    value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch (err) {
     const detail = err instanceof SyntaxError ? 'input is not valid JSON' : `could not read input: ${(err as Error).message}`;
     throw new Error(detail);
   }
-  if (!isPlainObject(value) || Object.keys(value).length !== 2 || !('text' in value) || !('context' in value)) {
+  if (!isPlainObject(value)) {
     throw new Error('input must be an object with text and context');
   }
-  if (typeof value.text !== 'string' || !isPlainObject(value.context)) {
-    throw new Error('input text must be a string and context must be an object');
-  }
-  const context = value.context;
-  const fields = ['change_seq', 'path', 'snapshot_sha256', 'line_start', 'line_end'];
-  if (Object.keys(context).length !== fields.length || fields.some((field) => !(field in context))) {
-    throw new Error('input context must contain exactly change_seq, path, snapshot_sha256, line_start, and line_end');
-  }
-  if (
-    typeof context.change_seq !== 'string' || !/^[1-9][0-9]*$/.test(context.change_seq)
-    || typeof context.path !== 'string' || context.path.length === 0
-    || typeof context.snapshot_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(context.snapshot_sha256)
-    || !Number.isInteger(context.line_start) || !Number.isInteger(context.line_end)
-  ) {
-    throw new Error('input context has invalid field values');
-  }
-  return {
-    text: value.text,
-    context: {
-      change_seq: context.change_seq, path: context.path, snapshot_sha256: context.snapshot_sha256,
-      line_start: context.line_start as number, line_end: context.line_end as number,
-    },
-  };
+  return { text: value.text, context: value.context };
 }
 
-const ASK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ASK_SEQ_RE = /^[1-9][0-9]*$/;
-const QUESTION_TTL_MS = 1_800_000;
 
 function isAskAcknowledgment(res: ResponseEnvelope, sessionId: string, requestId: string): boolean {
   if (!res.ok) return true;
@@ -328,7 +313,7 @@ function isAskAcknowledgment(res: ResponseEnvelope, sessionId: string, requestId
   const queuedAt = r.queued_at_ms;
   const expiresAt = r.expires_at_ms;
   return r.session_id === sessionId && r.request_id === requestId
-    && typeof r.question_id === 'string' && ASK_UUID_RE.test(r.question_id)
+    && typeof r.question_id === 'string' && isValidSessionId(r.question_id)
     && typeof r.seq === 'string' && ASK_SEQ_RE.test(r.seq)
     && typeof queuedAt === 'number' && Number.isSafeInteger(queuedAt) && queuedAt >= 0
     && typeof expiresAt === 'number' && Number.isSafeInteger(expiresAt) && expiresAt >= 0
@@ -345,9 +330,14 @@ async function runAskControl(store: string, request: AskInput & {
       throw new OutcomeUnknownError('daemon reply was not a valid ask acknowledgment');
     }
     // Ask responses are an API surface. Preserve all durable acknowledgment or
-    // rejection metadata verbatim, without rendering submitted source text.
-    (res.ok ? console.log : console.error)(JSON.stringify(res));
-    if (!res.ok) process.exitCode = 1;
+    // rejection metadata, without rendering submitted source text.
+    if (!res.ok && res.code === 'STORAGE_UNAVAILABLE') {
+      console.error(JSON.stringify({ ...res, message: `${res.message}; outcome unknown; ${retryGuidance('ask')}` }));
+      process.exitCode = 3;
+    } else {
+      (res.ok ? console.log : console.error)(JSON.stringify(res));
+      if (!res.ok) process.exitCode = 1;
+    }
   } catch (err) {
     if (err instanceof OutcomeUnknownError) {
       console.error(`slipstream: outcome unknown — ${err.message}`);

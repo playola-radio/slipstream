@@ -61,3 +61,56 @@ UUID version. Capture IDs follow the existing v4 contract; request IDs accept
 standard versions 1–8 and the RFC variant. Generated question IDs remain v4.
 No hook/claim infrastructure, dispatcher schema, reply transport, or answer UI
 is added. Architecture review evidence is retained in the local worktree context.
+
+## D1 final review dispositions (2026-09-25)
+
+The correctness review passed; challenge and excess audit ran independently and
+concurrently on the committed diff. Their findings were resolved together:
+
+- **Uncertain storage outcome (A4/A10):** `STORAGE_UNAVAILABLE` may follow a
+  committed append. The CLI preserves its structured error, reports uncertainty,
+  exits 3, and requires the same request/capture/body. The contract documents this
+  for future clients. Source size inconsistent with recorded metadata is storage
+  corruption; a legitimately recorded oversized snapshot is invalid context.
+- **Unicode/input bounds (A3/A4):** reject lone surrogates in question text/path;
+  retain valid surrogate pairs. CLI reads only bounded regular files, parses JSON,
+  and leaves semantic admission to the daemon.
+- **Source scan (A3):** retain the existing asynchronous finite log cursor and
+  16-reservation bound. An additional offset index has no measured justification
+  in D1; its memory/recovery machinery would expand the agreed implementation.
+- **Shutdown and clock (A10):** retain the explicit contract: admitted operations
+  drain, lost replies are unknown, old captures are never retargeted, and expiry
+  is derived from `now < expires_at_ms`. Abort-on-shutdown and monotonic expiry
+  would change those specified semantics. D2 must preserve the eligibility rule.
+- **Error precedence (A4/A9):** normalize before session readiness checks; delete
+  the daemon's duplicate capture-ID validation. The existing detached/ownership
+  gates still apply before admission. Unexpected infrastructure errors retain the
+  existing daemon error mapper rather than adding a second generic taxonomy.
+- **F1 isolation:** the live module owns and removes its entire disposable daemon,
+  files and store, including when the runner receives `--env`. Remove shared
+  context/store plumbing, optional expected identity fields, unused imports and
+  the dead JSON branch of the attach-output parser.
+- **Acknowledgment validation (A4/A10):** retain strict durable identity and
+  timestamp checks: a generic successful envelope does not prove queue acceptance.
+  Reuse the existing v4 ID validator for generated question IDs and the shared TTL
+  constant. The audit's request-ID concern does not apply to question IDs.
+- **Post-append checks (A10):** remove the redundant daemon check and dead event
+  type guard (use an append overload); retain session surrender and supplied store
+  ownership checks, because the session also has callers without that callback.
+- **Source integrity (A3):** retain exact envelope id/source and recorded-size
+  checks. They verify the live immutable reference and distinguish inconsistent
+  storage metadata from an invalid user selection; startup recovery is not a
+  substitute for validation at admission.
+- **Redundant validation/copying:** remove duplicate range/size checks from the
+  source-selection helper, impossible path-shape rejections before exact source
+  matching, and the session's second target copy. Retain the frozen accepted
+  result for A4/A10: a direct first caller must not mutate cached retry identity.
+- **Tests:** consolidate malformed-ack cases, remove duplicate guidance and
+  out-of-layer validation assertions, and rename the readiness-loss test. Retain
+  capacity/concurrency tests at the session boundary that owns reservations;
+  daemon tests separately cover socket loss, detach, shutdown and restart. The
+  additional 17-socket fixture would repeat the same capacity algorithm.
+
+All schema fields map to the named queued-event contract; neither review found
+schema/database excess. Delivery, claim indexing, receipts and answer UI remain
+outside this branch.

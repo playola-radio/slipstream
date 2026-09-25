@@ -811,7 +811,8 @@ real-OS-only; fake conformance can never rescue a failing real probe.
 
 ## D1: Durable question submission (2026-09-25)
 
-**Status**: In Progress — implementation and acceptance under review.
+**Status**: Implemented on the D1 review branch; Brian’s merge and independent
+cumulative QA are required before D2 begins.
 
 Brian approved the additive ask/send slice. D1 queues a normalized question tied
 to an immutable captured file-change snapshot through the existing owner-only

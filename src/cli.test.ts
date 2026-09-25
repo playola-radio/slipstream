@@ -23,7 +23,7 @@ describe('cli ask', () => {
     assert.equal(parseArgs(['ask', '--store', '/s', '--store', '/other', '--session', ASK_SESSION, '--request-id', ASK_REQUEST, '--input', '/q']), null);
   });
 
-  it('sends validated file input and prints only the structured acknowledgment', async () => {
+  it('sends file input and prints only the structured acknowledgment', async () => {
     const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -81,55 +81,75 @@ describe('cli ask', () => {
     }
   });
 
-  it('rejects malformed ask input locally with exit code 2', async () => {
+  it('rejects invalid JSON, non-objects, non-regular files, and oversized input locally', async () => {
     const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const { execFile } = await import('node:child_process');
+    const { MAX_MESSAGE_BYTES } = await import('./control-protocol.ts');
     const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-bad-'));
     const input = join(dir, 'question.json');
-    await writeFile(input, '{not JSON');
     try {
-      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        execFile(process.execPath, ['src/cli.ts', 'ask', '--store', join(dir, 'store'), '--session', ASK_SESSION,
-          '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, _stdout, stderr) =>
-          resolve({ code: error && typeof error.code === 'number' ? error.code : 0, stderr }));
-      });
-      assert.equal(result.code, 2);
-      assert.match(result.stderr, /input.*valid JSON/i);
+      for (const item of [
+        { path: input, body: '{not JSON' },
+        { path: input, body: '[]' },
+        { path: input, body: ' '.repeat(MAX_MESSAGE_BYTES + 1) },
+        { path: '/dev/zero' },
+        { path: dir },
+      ]) {
+        if (item.body !== undefined) await writeFile(input, item.body);
+        const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+          execFile(process.execPath, ['src/cli.ts', 'ask', '--store', join(dir, 'store'), '--session', ASK_SESSION,
+            '--request-id', ASK_REQUEST, '--input', item.path], { timeout: 5000 }, (error, stdout, stderr) =>
+            resolve({ code: error?.code ?? 0, stdout, stderr }));
+        });
+        assert.equal(result.code, 2);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /input/i);
+      }
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
-  it('treats a malformed post-send acknowledgment as outcome unknown and preserves retry identity', async () => {
+  it('leaves semantic admission to the daemon and makes storage uncertainty retry-safe', async () => {
     const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const { createServer } = await import('node:net');
     const { execFile } = await import('node:child_process');
-    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-unknown-'));
-    const store = join(dir, 'store'); const input = join(dir, 'question.json');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-error-'));
+    const store = join(dir, 's'); const input = join(dir, 'question.json');
     await mkdir(store, { mode: 0o700 });
-    await writeFile(input, JSON.stringify({ text: 'Question', context: {
-      change_seq: '1', path: 'x.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
-    } }));
-    const server = createServer((socket) => {
-      socket.once('data', () => socket.end(JSON.stringify({ v: 1, ok: true, seq: '1' }) + '\n'));
-    });
-    await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+    const body = { text: 'Question', context: { change_seq: 'bad' }, target: 'spoof', session_id: 'spoof' };
+    await writeFile(input, JSON.stringify(body));
     try {
-      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
-          '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, _stdout, stderr) =>
-          resolve({ code: error && typeof error.code === 'number' ? error.code : 0, stderr }));
-      });
-      assert.equal(result.code, 3);
-      assert.match(result.stderr, /outcome unknown/i);
-      assert.match(result.stderr, /same --request-id, --session, and input body/i);
-      assert.match(result.stderr, /do not retarget an old capture/i);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(dir, { recursive: true, force: true });
-    }
+      for (const code of ['INVALID_CONTEXT', 'STORAGE_UNAVAILABLE']) {
+        let received: unknown;
+        const server = createServer((socket) => socket.once('data', (chunk) => {
+          received = JSON.parse(chunk.toString());
+          socket.end(JSON.stringify({ v: 1, ok: false, code, message: 'fixture failure' }) + '\n');
+        }));
+        await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+        try {
+          const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+            execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
+              '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, stdout, stderr) =>
+              resolve({ code: error?.code ?? 0, stdout, stderr }));
+          });
+          assert.equal(result.code, code === 'STORAGE_UNAVAILABLE' ? 3 : 1);
+          assert.equal(result.stdout, '');
+          const reply = JSON.parse(result.stderr);
+          assert.equal(reply.code, code);
+          assert.equal(reply.ok, false);
+          assert.match(reply.message, /fixture failure/);
+          if (code === 'STORAGE_UNAVAILABLE') {
+            assert.match(reply.message, /outcome unknown/);
+            assert.match(reply.message, /same --request-id, --session, and input body/i);
+          }
+          assert.deepEqual(received, { v: 1, verb: 'ask', session_id: ASK_SESSION,
+            request_id: ASK_REQUEST, text: body.text, context: body.context });
+        } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+      }
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
   it('treats malformed durable identity and timestamps in an acknowledgment as outcome unknown', async () => {
@@ -151,6 +171,7 @@ describe('cli ask', () => {
       queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
     };
     const invalid = [
+      { v: 1, ok: true, seq: '1' },
       { ...good, question_id: '' },
       { ...good, seq: '07' },
       { ...good, queued_at_ms: -1 },
@@ -169,6 +190,8 @@ describe('cli ask', () => {
           });
           assert.equal(result.code, 3);
           assert.match(result.stderr, /outcome unknown/i);
+          assert.match(result.stderr, /same --request-id, --session, and input body/i);
+          assert.match(result.stderr, /do not retarget an old capture/i);
         } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
       }
     } finally { await rm(dir, { recursive: true, force: true }); }
@@ -282,11 +305,7 @@ describe('cli retryGuidance (unknown-outcome recovery)', () => {
   it('keeps the status hint for attach-state verbs', () => {
     assert.match(retryGuidance('detach'), /slipstream status/);
   });
-  it('preserves ask request identity when its outcome is unknown', () => {
-    const guidance = retryGuidance('ask');
-    assert.match(guidance, /same --request-id, --session, and input body/i);
-    assert.match(guidance, /do not retarget an old capture/i);
-  });
+
 });
 
 describe('cli parseArgs (maintenance commands)', () => {

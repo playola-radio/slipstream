@@ -1,4 +1,3 @@
-import { isAbsolute } from 'node:path';
 import type { ControlErrorCode } from './control-protocol.ts';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
@@ -49,7 +48,7 @@ export function normalizeAsk(value: unknown): QuestionRequest {
     || typeof req.request_id !== 'string' || !UUID.test(req.request_id)) {
     throw new QuestionError('PROTOCOL', 'ask requires canonical lowercase session_id and request_id UUIDs');
   }
-  if (typeof req.text !== 'string') throw new QuestionError('INVALID_QUESTION', 'question text is required');
+  if (typeof req.text !== 'string' || /[\uD800-\uDFFF]/u.test(req.text)) throw new QuestionError('INVALID_QUESTION', 'question text is required');
   const text = req.text.trim();
   if (Buffer.byteLength(text) < 1 || Buffer.byteLength(text) > 8192) {
     throw new QuestionError('INVALID_QUESTION', 'question must contain 1–8192 UTF-8 bytes after trimming');
@@ -57,7 +56,7 @@ export function normalizeAsk(value: unknown): QuestionRequest {
   const ctx = record(req.context);
   if (typeof ctx.change_seq !== 'string' || !/^[1-9][0-9]*$/.test(ctx.change_seq)) invalidContext('change_seq must be a canonical positive decimal string');
   if (typeof ctx.path !== 'string' || Buffer.byteLength(ctx.path) < 1 || Buffer.byteLength(ctx.path) > 4096
-    || ctx.path.includes('\0') || isAbsolute(ctx.path) || /(^|[\\/])\.\.([\\/]|$)/.test(ctx.path)) invalidContext('context path must be a relative source path of at most 4096 UTF-8 bytes');
+    || /[\uD800-\uDFFF]/u.test(ctx.path)) invalidContext('context path must be a relative source path of at most 4096 UTF-8 bytes');
   if (typeof ctx.snapshot_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(ctx.snapshot_sha256)) invalidContext('snapshot_sha256 must be a lowercase SHA-256');
   if (!validRange(ctx.line_start, ctx.line_end)) invalidContext('select 1–200 source lines using inclusive positive integer bounds');
   return { session_id: req.session_id, request_id: req.request_id, text, context: {
@@ -73,13 +72,13 @@ export function questionBody(req: Pick<QuestionRequest, 'text' | 'context'>): st
 }
 
 export function selectSource(bytes: Buffer, range: Pick<QuestionContext, 'line_start' | 'line_end'>): string {
-  if (bytes.length > MAX_SOURCE_BYTES || bytes.includes(0)) invalidContext('source is oversized or contains NUL');
+  if (bytes.includes(0)) invalidContext('source contains NUL');
   let text: string;
   try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
   catch { return invalidContext('source is not valid UTF-8'); }
   const lines = text === '' ? [] : text.split('\n');
   if (text.endsWith('\n')) lines.pop();
-  if (!validRange(range.line_start, range.line_end) || range.line_end > lines.length) invalidContext('line range does not exist in the recorded snapshot');
+  if (range.line_end > lines.length) invalidContext('line range does not exist in the recorded snapshot');
   const selected = lines.slice(range.line_start - 1, range.line_end).join('\n');
   if (Buffer.byteLength(selected) > 16384) invalidContext('selected source exceeds 16384 UTF-8 bytes');
   return selected;
@@ -130,7 +129,7 @@ export async function readQuestionContext(input: QuestionSourceInput): Promise<s
         if (bytesRead === 0) break;
         total += bytesRead;
       }
-      if (total > MAX_SOURCE_BYTES) invalidContext('source blob exceeds 1 MiB');
+      if (total > MAX_SOURCE_BYTES) throw new QuestionError('STORAGE_UNAVAILABLE', 'recorded source blob exceeds its declared size');
       bytes = buffer.subarray(0, total);
     } finally { await handle.close(); }
   } catch (err) {

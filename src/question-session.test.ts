@@ -89,7 +89,7 @@ it('rebuilds question dedup from a commit followed by ambiguous append failure',
     } };
   } });
 });
-it('drains admitted source reads on stop and does not append after readiness loss', async () => {
+it('does not append after readiness is lost during an admitted source read', async () => {
   let release!: () => void; let entered!: () => void;
   const started = new Promise<void>(r => { entered = r; });
   const gate = new Promise<void>(r => { release = r; });

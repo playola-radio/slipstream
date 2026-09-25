@@ -25,7 +25,8 @@ export interface QuestionQueuedEvent {
   data: QuestionQueuedData;
 }
 export type PublicEvent = AnyEvent | QuestionQueuedEvent;
-export type PublicEventInput = EventInput | { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
+export type QuestionQueuedInput = { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
+export type PublicEventInput = EventInput | QuestionQueuedInput;
 export function buildPublicEnvelope(input: PublicEventInput, seq: bigint, sessionId: string): PublicEvent {
   if (input.type !== 'slipstream.question.queued.v1') return buildEnvelope(input, seq, sessionId);
   return {

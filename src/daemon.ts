@@ -567,9 +567,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (state === 'attaching' || state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is not ready to accept questions');
       return errFields('SESSION_NOT_SELECTED', 'no active session');
     }
-    if (!nonEmptyString(req.session_id) || req.session_id !== current.id) {
-      return errFields('SESSION_NOT_SELECTED', 'question is not addressed to the selected capture');
-    }
     if (current.harness !== 'claude-code' && current.harness !== 'codex') {
       return errFields('SESSION_NOT_SELECTED', 'the selected capture has no supported question target');
     }
@@ -589,10 +586,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     inflightTasks.add(promise);
     try {
       const result = await promise;
-      // A concurrent lock loss makes a successful append unsafe to acknowledge.
-      // Teardown may have dropped the socket; a caller that loses the reply keeps
-      // its id and retries the same request against the same capture.
-      if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'daemon storage ownership was lost before acknowledgment');
       return { ...result };
     } catch (err) {
       if (err instanceof QuestionError) return errFields(err.code, err.message);

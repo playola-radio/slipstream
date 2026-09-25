@@ -19,7 +19,7 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { PublicEvent, PublicEventInput, QuestionQueuedData } from './public-events.ts';
+import type { PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
@@ -333,6 +333,7 @@ export async function startCapture(
   // keeps health's durable_seq current and, on a storage fault, suspends capture
   // and kicks off the recovery supervisor before rethrowing.
   function appendEvent(input: EventInput): Promise<AnyEvent>;
+  function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -781,10 +782,10 @@ export async function startCapture(
   };
 
   const askQuestion = async (input: unknown, target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<QuestionAccepted> => {
-    assertOwnership();
-    questionReady();
     const req = normalizeAsk(input);
     if (req.session_id !== sessionId) throw new QuestionError('SESSION_NOT_SELECTED', 'question addresses a different capture');
+    assertOwnership();
+    questionReady();
     const body = questionBody(req);
     const settled = committedQuestions.get(req.request_id);
     const pending = inflightQuestions.get(req.request_id);
@@ -796,7 +797,6 @@ export async function startCapture(
     const eligible = [...committedQuestions.values()].filter(q => now() < q.result.expires_at_ms).length;
     const reserved = [...inflightQuestions.keys()].filter(id => !committedQuestions.has(id)).length;
     if (eligible + reserved >= QUESTION_LIMIT) throw new QuestionError('QUESTION_LIMIT', 'at most 16 unexpired questions may be queued');
-    const copiedTarget = { ...target };
     // Defer starting I/O until the in-flight reservation is installed synchronously.
     const promise = Promise.resolve().then(async (): Promise<QuestionAccepted> => {
       const selected_text = await deps.readQuestionContext({ storeDir, logPath, sessionId,
@@ -805,11 +805,10 @@ export async function startCapture(
       questionReady();
       const queued_at_ms = now();
       const event = await appendEvent({ type: 'slipstream.question.queued.v1', occurred_at_ms: queued_at_ms,
-        data: { question_id: randomUUID(), request_id: req.request_id, target: copiedTarget, text: req.text,
+        data: { question_id: randomUUID(), request_id: req.request_id, target, text: req.text,
           context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS } });
       if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
       assertOwnership();
-      if (event.type !== 'slipstream.question.queued.v1') throw new Error('unexpected question append result');
       const result = questionResult(event);
       committedQuestions.set(req.request_id, { body, result });
       return result;

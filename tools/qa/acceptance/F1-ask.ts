@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { writeFile, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { awaitObservedChange, type AnyRecord, type Assertion } from '../../qa-support.ts';
+import { awaitObservedChange, createReaderClient, mkdtempRoot, rmMkdtempRoot, type AnyRecord } from '../../qa-support.ts';
+import { startQaDaemon } from '../harness-proc.ts';
 import type { AcceptanceContext, AcceptanceModule } from './types.ts';
 
 const exec = promisify(execFile);
@@ -26,13 +27,13 @@ type Target = { harness: 'codex'; harness_session_id: string; worktree: string }
 export interface QueuedQuestionExpectation {
   sessionId: string;
   requestId: string;
-  questionId?: string;
+  questionId: string;
   text: string;
   context: QuestionContext;
   target: Target;
-  seq?: string;
-  queuedAtMs?: number;
-  expiresAtMs?: number;
+  seq: string;
+  queuedAtMs: number;
+  expiresAtMs: number;
 }
 
 function fail(message: string): never { throw new Error(message); }
@@ -55,10 +56,10 @@ export function assertQueuedQuestion(events: readonly AnyRecord[], expected: Que
   if (data.session_id !== expected.sessionId) fail('queued event session_id does not match the selected session');
   if (data.request_id !== expected.requestId) fail('queued event request_id does not match the CLI request');
   if (typeof data.question_id !== 'string' || !UUID_RE.test(data.question_id)) fail('queued event has no canonical question_id');
-  if (expected.questionId !== undefined && data.question_id !== expected.questionId) fail('queued event question_id does not match acknowledgment');
+  if (data.question_id !== expected.questionId) fail('queued event question_id does not match acknowledgment');
   if (event.subject !== `question/${data.question_id}`) fail('queued event subject does not match question_id');
   if (data.text !== expected.text) fail('queued event text does not match normalized CLI input');
-  if (event.seq !== expected.seq && expected.seq !== undefined) fail('queued event seq does not match CLI acknowledgment');
+  if (event.seq !== expected.seq) fail('queued event seq does not match CLI acknowledgment');
   const target = object(data.target, 'queued event target');
   for (const key of ['harness', 'harness_session_id', 'worktree'] as const) {
     if (target[key] !== expected.target[key]) fail(`queued event target.${key} does not match the attached target`);
@@ -73,26 +74,23 @@ export function assertQueuedQuestion(events: readonly AnyRecord[], expected: Que
   if (typeof queuedAt !== 'number' || typeof expiresAt !== 'number'
     || !Number.isSafeInteger(queuedAt) || !Number.isSafeInteger(expiresAt)) fail('queued event timestamps are not safe integers');
   if (expiresAt !== queuedAt + QUESTION_TTL_MS) fail('queued event expiry is not exactly the queue TTL after queued_at_ms');
-  if (expected.queuedAtMs !== undefined && queuedAt !== expected.queuedAtMs) fail('queued event queued_at_ms does not match acknowledgment');
-  if (expected.expiresAtMs !== undefined && expiresAt !== expected.expiresAtMs) fail('queued event expires_at_ms does not match acknowledgment');
+  if (queuedAt !== expected.queuedAtMs) fail('queued event queued_at_ms does not match acknowledgment');
+  if (expiresAt !== expected.expiresAtMs) fail('queued event expires_at_ms does not match acknowledgment');
   return event;
 }
 
-function fields(stdout: string): Record<string, unknown> {
-  try { return object(JSON.parse(stdout), 'CLI acknowledgment'); }
-  catch {
-    const out: Record<string, unknown> = {};
-    for (const line of stdout.trim().split('\n')) {
-      const match = /^([a-z_]+): (.*)$/.exec(line);
-      if (match) out[match[1]!] = match[2]!;
-    }
-    return out;
+function lineFields(stdout: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const line of stdout.trim().split('\n')) {
+    const match = /^([a-z_]+): (.*)$/.exec(line);
+    if (match) out[match[1]!] = match[2]!;
   }
+  return out;
 }
 
 async function cli(args: string[]): Promise<Record<string, unknown>> {
   const { stdout } = await exec(process.execPath, ['src/cli.ts', ...args], { timeout: 15_000 });
-  return fields(stdout);
+  return lineFields(stdout);
 }
 
 async function ask(store: string, sessionId: string, requestId: string, input: string): Promise<Record<string, unknown>> {
@@ -154,27 +152,53 @@ async function expectInvalidContext(store: string, sessionId: string, requestId:
 
 export const f1Ask: AcceptanceModule = {
   id: 'F1-ask',
+  // This module owns its disposable qa-daemon so an operator's --env daemon is
+  // never detached or rebound by F1's required codex identity exercise.
+  needsDaemon: false,
   async run(ctx) {
+    const root = await mkdtempRoot('slipstream-qa-f1-');
+    let handle: Awaited<ReturnType<typeof startQaDaemon>> | null = null;
+    try {
+      handle = await startQaDaemon({ root });
+      return await runLive(ctx.signal, {
+        store: handle.env.store,
+        worktree: handle.env.worktree,
+        reader: createReaderClient(handle.env.url, handle.env.token),
+      });
+    } finally {
+      try { await handle?.stop(); }
+      finally { await rmMkdtempRoot(root); }
+    }
+  },
+};
+
+async function runLive(signal: AbortSignal, live: {
+  store: string;
+  worktree: string;
+  reader: AcceptanceContext['reader'];
+}): Promise<{ assertions: Array<{ id: string; claim: string; evidence: unknown }> }> {
     // qa-daemon's normal `qa` harness is deliberately not a D1 target. Rebind
     // this disposable capture through public control with a supported identity.
-    const store = ctx.store ?? fail('F1-ask requires the runner to provide its disposable store');
+    const { store, worktree, reader } = live;
     await cli(['detach', '--store', store]);
     const harnessSessionId = `f1-${randomUUID()}`;
     const attached = await cli([
-      'attach', ctx.worktree, '--store', store, '--harness', 'codex',
+      'attach', worktree, '--store', store, '--harness', 'codex',
       '--harness-session-id', harnessSessionId,
     ]);
     const sessionId = typeof attached.session_id === 'string' ? attached.session_id : fail('attach did not return a session_id');
-    const target: Target = { harness: 'codex', harness_session_id: harnessSessionId, worktree: await realpath(ctx.worktree) };
+    const target: Target = { harness: 'codex', harness_session_id: harnessSessionId, worktree: await realpath(worktree) };
     const path = `F1-ask-${randomUUID()}.swift`;
+    const sourcePath = join(worktree, path);
     const bytes = Buffer.from('first line\nsecond line\n', 'utf8');
-    const before = (await ctx.reader.finite(sessionId, 0n, ctx.signal)).durableSeq;
-    await writeFile(join(ctx.worktree, path), bytes);
-    const change = await awaitObservedChange(ctx.reader, sessionId, {
+    try {
+    const before = (await reader.finite(sessionId, 0n, signal)).durableSeq;
+    await writeFile(sourcePath, bytes);
+    const change = await awaitObservedChange(reader, sessionId, {
       relPath: path,
       before: { kind: 'absent' },
       after: { kind: 'content', bytes },
-    }, before, { signal: ctx.signal });
+    }, before, { signal });
     if (change.after.kind !== 'content') fail('real captured change has no content snapshot');
 
     const requestId = randomUUID();
@@ -189,7 +213,7 @@ export const f1Ask: AcceptanceModule = {
       const first = assertAskAcknowledgment(await ask(store, sessionId, requestId, inputPath), sessionId, requestId, false);
       const retry = assertAskAcknowledgment(await ask(store, sessionId, requestId, inputPath), sessionId, requestId, true);
       sameAcknowledgment(first, retry);
-      const { events } = await ctx.reader.finite(sessionId, 0n, ctx.signal);
+      const { events } = await reader.finite(sessionId, 0n, signal);
       const selected = 'first line\nsecond line';
       const event = assertQueuedQuestion(events, {
         sessionId, requestId, text, target, seq: first.seq, questionId: first.questionId,
@@ -203,7 +227,7 @@ export const f1Ask: AcceptanceModule = {
       try {
         await expectInvalidContext(store, sessionId, randomUUID(), badPath);
       } finally { await rm(badPath, { force: true }); }
-      const afterBad = await ctx.reader.finite(sessionId, 0n, ctx.signal);
+      const afterBad = await reader.finite(sessionId, 0n, signal);
       if (afterBad.events.filter((candidate) => candidate.type === QUESTION_TYPE).length !== count) {
         fail('invalid source context created a queued question');
       }
@@ -213,5 +237,5 @@ export const f1Ask: AcceptanceModule = {
         evidence: { change_seq: change.seq.toString(), question_seq: event.seq, request_id: requestId, queued_events: count },
       }] };
     } finally { await rm(inputPath, { force: true }); }
-  },
-};
+    } finally { await rm(sourcePath, { force: true }); }
+}
