@@ -279,6 +279,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
     let reader: ReaderClient;
     let worktree: string;
     let sessionId: string;
+    let store: string;
 
     try {
       if (!needsDaemon) {
@@ -287,11 +288,13 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         reader = {} as ReaderClient;
         worktree = '';
         sessionId = '';
+        store = '';
       } else if (env !== null) {
         // Operator-supplied daemon, already validated above (fresh commit + sandbox).
         reader = createReaderClient(env.url, env.token);
         worktree = env.worktree;
         sessionId = env.session_id;
+        store = env.store;
       } else {
         // Isolated harness: spawn our own daemon from the current checkout.
         ephemeralRoot = await mkdtempRoot('slipstream-qa-check-');
@@ -299,6 +302,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
         reader = createReaderClient(handle.env.url, handle.env.token);
         worktree = handle.env.worktree;
         sessionId = handle.env.session_id;
+        store = handle.env.store;
       }
     } catch (err) {
       // Failure to stand up the daemon is a failed check, not a usage error.
@@ -310,7 +314,7 @@ export async function runAcceptance(io: RunIO): Promise<number> {
       continue;
     }
 
-    const ctx: AcceptanceContext = { worktree, sessionId, reader, signal: io.signal };
+    const ctx: AcceptanceContext = { store, worktree, sessionId, reader, signal: io.signal };
     const result = await runModule(mod, ctx, io.stderr);
     checks.push(result);
     if (result.result === 'failed') sawFailure = true;

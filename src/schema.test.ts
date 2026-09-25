@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildEnvelope, EVENT_TYPES, type EventInput } from './event.ts';
+import { PUBLIC_EVENT_TYPES } from './public-events.ts';
 import { loadAllSchemas, loadSchema, validate } from './schema.ts';
 
 const SHA = 'a'.repeat(64);
@@ -109,7 +110,7 @@ describe('schema', () => {
   describe('the schemas/ directory', () => {
     it('has exactly one schema file per v1 event type', async () => {
       const schemas = await loadAllSchemas();
-      assert.deepEqual(new Set(schemas.keys()), new Set(EVENT_TYPES));
+      assert.deepEqual(new Set(schemas.keys()), new Set(PUBLIC_EVENT_TYPES));
     });
 
     it('names each schema by its own type const', async () => {

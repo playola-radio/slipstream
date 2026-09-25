@@ -9,6 +9,8 @@ import {
 import { readTombstone, blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
 import { StorageError } from './storage.ts';
 import { LogCorruptError } from './log-reader.ts';
+import { createCas } from './cas.ts';
+import { createLog } from './log.ts';
 
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
@@ -151,6 +153,47 @@ describe('maintenance: mark-and-sweep blob reclamation', () => {
     assert.equal(await exists(blobPath(dir, HEX_LIVE)), true);
     assert.equal(await exists(blobPath(dir, HEX_FUTURE)), true, 'a nested content snapshot is still marked');
     assert.equal(await exists(blobPath(dir, HEX_DEAD)), false);
+  });
+
+  it('recognizes a queued question while retaining blobs referenced by a changed record', async () => {
+    const dir = await emptyStore();
+    await mkdir(join(dir, 'sessions', A), { recursive: true });
+    const cas = await createCas(join(dir, 'blobs'));
+    const live = await cas.put(Buffer.from('live source', 'utf8'));
+    const dead = await cas.put(Buffer.from('dead source', 'utf8'));
+    const log = await createLog({ filePath: sessionLogPath(dir, A), sessionId: A });
+    try {
+      await log.append({
+        type: 'slipstream.question.queued.v1',
+        occurred_at_ms: 1789657200123,
+        data: {
+          question_id: '4a32f01b-4e43-4f78-bb25-d7d4b4a8c030',
+          request_id: '8ed82b30-2dd8-4f6d-9c5d-4b6e5b89c567',
+          target: { harness: 'codex', harness_session_id: 'harness-session', worktree: '/tmp/worktree' },
+          text: 'Why did this change?',
+          context: {
+            change_seq: '2', path: 'src/a.ts', snapshot_sha256: live.sha256,
+            line_start: 1, line_end: 1, selected_text: 'live source',
+          },
+          queued_at_ms: 1789657200123,
+          expires_at_ms: 1789659000123,
+        },
+      });
+      await log.append({
+        type: 'slipstream.file.changed.v1',
+        occurred_at_ms: 1789657200124,
+        data: {
+          path: 'src/a.ts', before: { kind: 'absent' },
+          after: { kind: 'content', sha256: live.sha256, size: live.size }, observation: 'watcher',
+        },
+      });
+    } finally {
+      await log.close();
+    }
+
+    assert.equal(await reclaimUnreferencedBlobs(dir, NEVER_ABORT), 1);
+    assert.equal(await cas.has(live.sha256), true, 'the changed record keeps its source blob live');
+    assert.equal(await cas.has(dead.sha256), false, 'an unreferenced blob is swept');
   });
 
   it('aborts (deletes nothing) when the log tail rewinds below its high-water', async () => {

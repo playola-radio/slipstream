@@ -5,6 +5,9 @@
 import type { ReaderClient, Assertion } from '../../qa-support.ts';
 
 export interface AcceptanceContext {
+  /** The harness-owned disposable daemon store. Modules may use it only to
+   * invoke public control clients against their own live daemon. */
+  store?: string;
   /** The attached sandbox worktree — write real files here to drive capture. */
   worktree: string;
   /** The attached session's id (capture scope, never authorship). */

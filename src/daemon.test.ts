@@ -6,12 +6,18 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
 import { blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
-import { sendControlRequest } from './control-client.ts';
+import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
+import { createLog } from './log.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
 const IDENTITY = { harness: 'claude-code', harness_session_id: 'abc123' };
+const ASK_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const ASK_CONTEXT = {
+  change_seq: '1', path: 'src/example.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
+};
 
 /** Read a field off a response envelope. Ok responses carry open-ended fields
  * that the typed union does not enumerate; a test reads them positionally. */
@@ -229,6 +235,172 @@ describe('daemon control verbs', () => {
       const dt = await call({ verb: 'detach' });
       assert.equal(dt.ok === false && dt.code, 'SESSION_NOT_SELECTED');
     });
+  });
+
+  it('rejects ask when no capture is selected', async () => {
+    await withDaemon(async ({ call }) => {
+      const res = await call({
+        verb: 'ask', session_id: ASK_ID, request_id: ASK_REQUEST,
+        text: 'What changed?', context: ASK_CONTEXT,
+      });
+      assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED');
+    });
+  });
+
+  it('queues an ask against the selected capture, copies its target, and coalesces retries', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-wt-'));
+    let sourceInput: unknown;
+    const daemon = await startDaemon({
+      storeDir: store,
+      captureDependencies: {
+        platform: createFakePlatform(), enumerate: async () => {},
+        readQuestionContext: async (input) => { sourceInput = input; return 'historic selected source'; },
+      },
+    });
+    const call = (req: CallRequest) => sendControlRequest({
+      socketPath: daemon.socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs: 5000,
+    });
+    try {
+      const attached = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const sessionId = rec(attached).session_id!;
+      const ask = { verb: 'ask', session_id: sessionId, request_id: ASK_REQUEST,
+        text: 'What changed?', context: ASK_CONTEXT,
+        // A client cannot supply or override routing identity.
+        harness: 'codex', harness_session_id: 'attacker', worktree: '/elsewhere' };
+      const first = await call(ask);
+      assert.equal(first.ok, true);
+      const duplicate = await call(ask);
+      assert.equal(rec(duplicate).duplicate, true);
+      assert.equal(rec(first).question_id, rec(duplicate).question_id);
+      const conflict = await call({ ...ask, text: 'Different question' });
+      assert.equal(conflict.ok === false && conflict.code, 'REQUEST_CONFLICT');
+      const source = sourceInput as { sessionId: string; boundary: bigint; context: unknown };
+      assert.equal(source.sessionId, sessionId);
+      assert.ok(source.boundary >= 1n);
+      assert.deepEqual(source.context, ASK_CONTEXT);
+      const lines = (await readFile(sessionLogPath(store, sessionId), 'utf8')).trim().split('\n')
+        .map((line) => JSON.parse(line)) as Array<Record<string, unknown>>;
+      const event = lines.find((line) => line.type === 'slipstream.question.queued.v1')!;
+      const data = event.data as Record<string, unknown>;
+      assert.deepEqual(data.target, { ...IDENTITY, worktree: await realpath(worktree) });
+      assert.deepEqual((data.context as Record<string, unknown>).selected_text, 'historic selected source');
+      assert.equal(lines.filter((line) => line.type === 'slipstream.question.queued.v1').length, 1);
+    } finally {
+      await daemon.stop();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('drains an admitted source read through detach, then refuses the old capture after reattach', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-drain-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-drain-wt-'));
+    let releaseRead!: () => void; let enteredRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const entered = new Promise<void>((resolve) => { enteredRead = resolve; });
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {},
+      readQuestionContext: async () => { enteredRead(); await readGate; return 'recorded source'; },
+    } });
+    const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs: 5000 });
+    try {
+      const attached = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const oldId = rec(attached).session_id!;
+      const askP = call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
+      await entered;
+      let detached = false;
+      const detachP = call({ verb: 'detach' }).then((r) => { detached = true; return r; });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(detached, false, 'detach must drain the admitted source read');
+      releaseRead();
+      assert.equal((await askP).ok, true);
+      assert.equal((await detachP).ok, true);
+      const fresh = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const oldRetry = await call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
+      assert.equal(oldRetry.ok === false && oldRetry.code, 'SESSION_NOT_SELECTED');
+      assert.notEqual(rec(fresh).session_id, oldId);
+    } finally { releaseRead?.(); await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
+  });
+
+  it('preserves one queued event when the reply times out and the same id is retried', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-retry-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-retry-wt-'));
+    let releaseRead!: () => void; let enteredRead!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const entered = new Promise<void>((resolve) => { enteredRead = resolve; });
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {},
+      readQuestionContext: async () => { enteredRead(); await gate; return 'recorded source'; },
+    } });
+    const reqBase = (id: string): CallRequest => ({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
+    try {
+      const attached = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      const id = rec(attached).session_id!;
+      const unknown = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...reqBase(id) }, responseTimeoutMs: 10 });
+      await entered;
+      await assert.rejects(unknown, OutcomeUnknownError);
+      releaseRead();
+      const retry = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...reqBase(id) } });
+      assert.equal(retry.ok, true);
+      assert.equal(rec(retry).duplicate, true);
+      const events = (await readFile(sessionLogPath(store, id), 'utf8')).split('\n').filter(Boolean);
+      assert.equal(events.filter((line) => JSON.parse(line).type === 'slipstream.question.queued.v1').length, 1);
+    } finally { releaseRead?.(); await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
+  });
+
+  it('drains an admitted append during shutdown before releasing the daemon store', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-stop-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-stop-wt-'));
+    let releaseAppend!: () => void; let enteredAppend!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseAppend = resolve; });
+    const entered = new Promise<void>((resolve) => { enteredAppend = resolve; });
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'recorded source',
+      createLog: async (opts) => {
+        const log = await createLog(opts);
+        return { ...log, append: async (input) => {
+          if (input.type === 'slipstream.question.queued.v1') { enteredAppend(); await gate; }
+          return log.append(input);
+        } };
+      },
+    } });
+    try {
+      const attached = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      const id = rec(attached).session_id!;
+      const ask = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT } });
+      // Shutdown destroys the socket before the append gate opens; attach a
+      // rejection handler now so Node never treats the expected unknown outcome
+      // as unhandled while the stop assertion is in progress.
+      void ask.catch(() => {});
+      await entered;
+      let stopped = false;
+      const stop = daemon.stop().then(() => { stopped = true; });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(stopped, false, 'shutdown must drain the admitted append');
+      releaseAppend();
+      await assert.rejects(ask, OutcomeUnknownError);
+      await stop;
+      const events = (await readFile(sessionLogPath(store, id), 'utf8')).split('\n').filter(Boolean);
+      assert.equal(events.filter((line) => JSON.parse(line).type === 'slipstream.question.queued.v1').length, 1);
+    } finally { releaseAppend?.(); await daemon.stop().catch(() => {}); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
+  });
+
+  it('does not retarget an old ask after a daemon restart and new attach', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-restart-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-restart-wt-'));
+    const deps = { platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'recorded source' };
+    let daemon = await startDaemon({ storeDir: store, captureDependencies: deps });
+    try {
+      const attach = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      const oldId = rec(attach).session_id!;
+      await daemon.stop();
+      daemon = await startDaemon({ storeDir: store, captureDependencies: { ...deps, platform: createFakePlatform() } });
+      const fresh = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      assert.notEqual(rec(fresh).session_id, oldId);
+      const old = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT } });
+      assert.equal(old.ok === false && old.code, 'SESSION_NOT_SELECTED');
+    } finally { await daemon.stop().catch(() => {}); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
 
   it('detaches back to detached and keeps the session readable at its final seq', async () => {

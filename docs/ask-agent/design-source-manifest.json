@@ -1,0 +1,11 @@
+{
+  "source": "/Users/brian/Documents/design/features/ask-agent",
+  "exported_at": "2026-09-25T14:05:53.178Z",
+  "sha256": {
+    "exports/full-screen-dropdown-closed--yDIp9.png": "5fce6ff89cbccd1bd77b52e90c7066ffb068bf5a561e5c5d8daca8c4d9360ad6",
+    "exports/full-screen-dropdown-open--OY4ZN.png": "1534d1e9359671a23fcf0f1b0546f5031c53ca494aba44c56170b5a66225e27f",
+    "exports/modal-dropdown-closed--U3qs1P.png": "583dc2239537e2ad511539795e3808bcd3e22ed4d8a4f7bd72703c80028f8a11",
+    "exports/modal-dropdown-open--Q8o5Lh.png": "0292d5130fe254ab1c7333fd7971407a2c863929fe3b3286d46b320e8f4b9891",
+    "pen-nodes.json": "e496ba623baa91f6c8b83168d220af84557bf4d1581d8f788a88c041a7883a91"
+  }
+}
