@@ -1,5 +1,6 @@
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
+import { chmod, lstat, unlink, realpath, open } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
@@ -58,6 +59,41 @@ export interface DaemonOptions {
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
+const SUPPORTED_CODEX_VERSIONS = new Set(['0.154.0', '0.155.1']);
+const MAX_CODEX_META_BYTES = 64 * 1024;
+
+class RootIdentityError extends Error {}
+
+/** Verify the selected transcript's own first record once at attach. It binds
+ * the reported session and worktree without treating either as authorship. */
+async function verifyCodexRootTranscript(path: string, sessionId: string, worktree: string): Promise<void> {
+  try {
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let bytes: Buffer;
+    try {
+      if (!(await handle.stat()).isFile()) throw new Error('transcript is not a file');
+      const buffer = Buffer.alloc(MAX_CODEX_META_BYTES + 1);
+      let total = 0; let end = -1;
+      while (total < buffer.length && end < 0) {
+        const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+        if (bytesRead === 0) break;
+        end = buffer.subarray(total, total + bytesRead).indexOf(0x0a);
+        if (end >= 0) end += total;
+        total += bytesRead;
+      }
+      if (end < 0 || end > MAX_CODEX_META_BYTES) throw new Error('transcript metadata exceeds limit');
+      bytes = buffer.subarray(0, end);
+    } finally { await handle.close(); }
+    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as Record<string, unknown>;
+    const payload = record.payload as Record<string, unknown> | undefined;
+    if (record.type !== 'session_meta' || !payload
+      || payload.originator !== 'codex_sdk_ts'
+      || (payload.source !== 'exec' && payload.source !== 'vscode')
+      || !SUPPORTED_CODEX_VERSIONS.has(String(payload.cli_version))
+      || payload.session_id !== sessionId || typeof payload.cwd !== 'string'
+      || await realpath(payload.cwd) !== worktree) throw new Error('transcript metadata does not match selected root');
+  } catch { throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime'); }
+}
 
 /** Build the per-session transcript runtime from resolved config: only harnesses
  * the operator declared `configured` are read. */
@@ -188,7 +224,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const registry = createBoundaryRegistry();
   let state: DaemonState = 'detached';
   let current:
-    | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string }
+    | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string }
     | undefined;
   const inflightTasks = new Set<Promise<unknown>>();
   const connections = new Set<Socket>();
@@ -347,6 +383,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       fields.worktree = current.worktree;
       fields.harness = current.harness;
       fields.harness_session_id = current.harnessSessionId;
+      if (current.rootTranscript) fields.root_transcript = current.rootTranscript;
       fields.durable_seq = current.session.health.snapshot().durable_seq;
     }
     return fields;
@@ -370,14 +407,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     worktree: string,
     harness: string,
     harnessSessionId: string,
+    rootTranscript?: string,
   ): Promise<Record<string, unknown> | ErrorFields> {
     let session: CaptureSession;
     let resolvedWorktree: string;
+    let resolvedTranscript: string | undefined;
     try {
       // Canonicalize before binding: capture resolves the root with realpath, so a
       // symlinked or relative declared path must report the same durable root in
       // status rather than the caller's raw string (locked design, decision 5).
       resolvedWorktree = await realpath(worktree);
+      resolvedTranscript = rootTranscript === undefined ? undefined : await realpath(rootTranscript);
+      if (resolvedTranscript !== undefined && harness === 'codex') {
+        await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
+      }
       const transcript = transcriptRuntimeFrom(opts.config);
       session = await startCapture(
         {
@@ -396,6 +439,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       registry.freeze(id, 0n);
       if (state === 'attaching') state = 'detached';
       if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
+      if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
       return errFields('CAPTURE_NOT_READY', (err as Error).message);
     }
     if (torn || compromised || sessionCompromised || state !== 'attaching') {
@@ -412,7 +456,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
     registry.activate(id, liveBoundary(session.health));
-    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId };
+    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript };
     state = 'active';
     return { session_id: id };
   }
@@ -423,6 +467,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // identity refuses attachment rather than guessing. Semantic verification
       // that the declared harness is a live real process is the P4 forwarder's job.
       return errFields('IDENTITY_UNRESOLVED', 'attach requires non-empty worktree, harness, and harness_session_id');
+    }
+    if (req.root_transcript !== undefined && !nonEmptyString(req.root_transcript)) {
+      return errFields('IDENTITY_UNRESOLVED', 'root_transcript must be a non-empty existing path');
     }
     if (state !== 'detached') {
       if (state === 'active') return errFields('SESSION_ACTIVE', 'a session is already attached; detach it first');
@@ -443,7 +490,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // dir on disk, so the reader never over-publishes an uncommitted record from a
     // session that momentarily appears on disk mid-startup.
     registry.reserve(id);
-    const p = startAndActivate(id, req.worktree, req.harness, req.harness_session_id);
+    const p = startAndActivate(id, req.worktree, req.harness, req.harness_session_id, req.root_transcript as string | undefined);
     attachInFlight = p;
     try {
       return await p;
@@ -596,6 +643,41 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  async function claimQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (compromised || torn || state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    if (state !== 'active' || !current) return errFields('SESSION_NOT_SELECTED', 'no active capture');
+    if (current.harness !== 'codex' || !current.rootTranscript || req.harness !== 'codex'
+      || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)
+      || !nonEmptyString(req.transcript_path)
+      || Object.hasOwn(req, 'agent_id') || Object.hasOwn(req, 'agent_type')) {
+      return errFields('IDENTITY_UNRESOLVED', 'unsupported or incomplete root Codex identity');
+    }
+    const binding = current;
+    let worktree: string; let transcript: string;
+    try { [worktree, transcript] = await Promise.all([realpath(req.worktree), realpath(req.transcript_path)]); }
+    catch { return errFields('IDENTITY_UNRESOLVED', 'identity path cannot be resolved'); }
+    if (compromised || torn || sessionCompromised || state !== 'active' || current !== binding
+      || req.harness_session_id !== binding.harnessSessionId
+      || worktree !== binding.worktree || transcript !== binding.rootTranscript) {
+      return errFields('SESSION_NOT_SELECTED', 'the callback is not the selected root session');
+    }
+    const promise = binding.session.claimQuestion({ harness: 'codex', harness_session_id: binding.harnessSessionId,
+      worktree: binding.worktree }, () => {
+      if (compromised || sessionCompromised || current !== binding) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+      }
+    });
+    inflightTasks.add(promise);
+    try {
+      const result = await promise;
+      return result === null ? { question: null } : { question: result };
+    } catch (err) {
+      if (err instanceof QuestionError) return errFields(err.code, err.message);
+      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
+      return errFields('CAPTURE_NOT_READY', (err as Error).message);
+    } finally { inflightTasks.delete(promise); }
+  }
+
   /** Admit and run a detached-only maintenance op. Admission is synchronous through
    * claiming `maintenanceInFlight`, so it cannot interleave with attach (which sets
    * `state` synchronously and refuses while the slot is held). The op runs only in
@@ -705,6 +787,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'detach': outcome = await detach(); break;
       case 'begin_task': outcome = await beginTask(req); break;
       case 'ask': outcome = await ask(req); break;
+      case 'claim_question': outcome = await claimQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };

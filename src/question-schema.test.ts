@@ -39,6 +39,16 @@ function queuedQuestion(): Record<string, unknown> {
 }
 
 describe('slipstream.question.queued.v1 schema', () => {
+  it('validates a durable dispatch attempt with the same public question identity', async () => {
+    const event = buildPublicEnvelope({ type: 'slipstream.question.dispatch_attempted.v1',
+      occurred_at_ms: 1789657200123,
+      data: { question_id: QUESTION, queued_seq: '4', attempted_at_ms: 1789657200123 },
+    }, 5n, SESSION);
+    assert.equal(event.subject, `question/${QUESTION}`);
+    assert.deepEqual(validate(await loadSchema(event.type), event), []);
+    const bad = { ...event, data: { ...event.data, queued_seq: 4 } };
+    assert.ok(validate(await loadSchema(event.type), bad).length > 0);
+  });
   it('accepts the durable D1 record and additive future fields', async () => {
     const event = queuedQuestion();
     event.future_envelope_field = true;

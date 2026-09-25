@@ -65,6 +65,48 @@ async function withDaemon(
 }
 
 describe('daemon control verbs', () => {
+  it('binds a Codex root transcript and refuses child, other chat, Claude, or absent identity claims', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-wt-'));
+    const rootTranscript = join(store, 'root.jsonl');
+    const otherTranscript = join(store, 'other.jsonl');
+    const rootMeta = (version: string, session = 'root') => JSON.stringify({ type: 'session_meta', payload: {
+      session_id: session, cwd: worktree, originator: 'codex_sdk_ts', source: 'exec', cli_version: version,
+    } }) + '\n';
+    await writeFile(rootTranscript, rootMeta('0.154.0')); await writeFile(otherTranscript, rootMeta('0.154.0', 'other'));
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'selected',
+    } });
+    const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+    try {
+      await writeFile(rootTranscript, rootMeta('9.9.9'));
+      const unsupported = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: rootTranscript });
+      assert.equal(unsupported.ok === false && unsupported.code, 'IDENTITY_UNRESOLVED');
+      await writeFile(rootTranscript, rootMeta('0.154.0', 'different-chat'));
+      const mismatch = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: rootTranscript });
+      assert.equal(mismatch.ok === false && mismatch.code, 'IDENTITY_UNRESOLVED');
+      await writeFile(rootTranscript, rootMeta('0.154.0'));
+      const attach = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: rootTranscript });
+      assert.equal(attach.ok, true);
+      assert.equal(rec(await call({ verb: 'status' })).root_transcript, await realpath(rootTranscript));
+      const session_id = rec(attach).session_id;
+      assert.equal((await call({ verb: 'ask', session_id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).ok, true);
+      const identity = { verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: rootTranscript };
+      for (const bad of [
+        { ...identity, agent_id: null }, { ...identity, agent_type: '' },
+        { ...identity, transcript_path: otherTranscript }, { ...identity, harness_session_id: 'second-chat' },
+        { ...identity, worktree: store },
+        { ...identity, harness: 'claude-code' }, { ...identity, transcript_path: undefined },
+      ]) assert.equal((await call(bad)).ok, false);
+      const accepted = await call(identity);
+      assert.equal(accepted.ok, true);
+      assert.equal((rec(accepted).question as unknown as Record<string, unknown>).question_id,
+        rec(await call({ verb: 'ask', session_id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).question_id);
+      assert.equal(rec(await call(identity)).question, null);
+      assert.equal((await call({ verb: 'detach' })).ok, true);
+      assert.equal((await call(identity)).ok, false);
+    } finally { await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
+  });
   it('reports a detached state and a reader url before any attach', async () => {
     await withDaemon(async ({ daemon, call }) => {
       const res = await call({ verb: 'status' });
