@@ -305,6 +305,17 @@ async function readAskInput(path: string): Promise<AskInput> {
   return { text: value.text, context: value.context };
 }
 
+/** The input-file cap alone is insufficient because routing fields are added
+ * afterwards. Reject locally before opening the control socket when the actual
+ * framed request would exceed the daemon's line cap. */
+function assertAskRequestFitsControlLine(request: AskInput & {
+  verb: 'ask'; session_id: string; request_id: string;
+}): void {
+  if (Buffer.byteLength(JSON.stringify({ v: 1, ...request }), 'utf8') > MAX_MESSAGE_BYTES) {
+    throw new Error('ask request exceeds the control message byte cap');
+  }
+}
+
 const ASK_SEQ_RE = /^[1-9][0-9]*$/;
 
 function isAskAcknowledgment(res: ResponseEnvelope, sessionId: string, requestId: string): boolean {
@@ -474,6 +485,10 @@ async function main(): Promise<void> {
     let input: AskInput;
     try {
       input = await readAskInput(args.inputPath);
+      assertAskRequestFitsControlLine({
+        verb: 'ask', session_id: args.sessionId, request_id: args.requestId,
+        text: input.text, context: input.context,
+      });
     } catch (err) {
       console.error(`slipstream: ${(err as Error).message}`);
       process.exitCode = 2;

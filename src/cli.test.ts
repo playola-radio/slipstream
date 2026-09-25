@@ -110,6 +110,29 @@ describe('cli ask', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
+  it('rejects an ask input whose routed control envelope would exceed the line cap', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFile } = await import('node:child_process');
+    const { MAX_MESSAGE_BYTES } = await import('./control-protocol.ts');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-envelope-'));
+    const input = join(dir, 'question.json');
+    const context = { change_seq: '1', path: 'x.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1 };
+    const overhead = Buffer.byteLength(JSON.stringify({ text: '', context }));
+    await writeFile(input, JSON.stringify({ text: 'x'.repeat(MAX_MESSAGE_BYTES - overhead), context }));
+    try {
+      const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+        execFile(process.execPath, ['src/cli.ts', 'ask', '--store', join(dir, 'store'), '--session', ASK_SESSION,
+          '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, stdout, stderr) =>
+          resolve({ code: error?.code ?? 0, stdout, stderr }));
+      });
+      assert.equal(result.code, 2);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /control message byte cap/i);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
   it('leaves semantic admission to the daemon and makes storage uncertainty retry-safe', async () => {
     const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
