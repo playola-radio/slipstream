@@ -1,6 +1,6 @@
 # Queue contract for the ask/send slice
 
-Status: D1 queue contract ready for implementation; D2 hook-claim identity contract deliberately not frozen until P0. Based on Claude architecture consultation and source-verified corrections in decisions.md.
+Status: D1 queue merged through PRs #33/#34 at `1434899ad21e8f471da65fbe034c9a25ffc18b4b`. This branch implements the Codex D2 claim contract below. Claude delivery remains disabled until its own routing proof. Based on the prior Claude architecture consultation, source-verified corrections in decisions.md, and the reported Codex routing proof.
 
 ## Boundary
 
@@ -100,10 +100,95 @@ Use the existing single append/durability boundary; never append straight to eve
 - A full daemon restart/detach/new attach makes the old queue ineligible. Never resume or migrate it to the new capture. A retry addressed to the old session returns `SESSION_NOT_SELECTED`; retain uncertainty about whether the old log contains a commit. The public reader can inspect the old log by request_id, but this slice adds no dedicated lookup endpoint or UI.
 - Pre-transmission transport failure means unavailable. Any timeout/drop/malformed reply after transmission is outcome unknown. The client preserves the same request ID and draft for retry; it never silently creates a fresh request to resolve uncertainty.
 
-## D2 boundary — not ready until the routing proof
+## D2 boundary — Codex only
 
 Name reserved for the later public event: `slipstream.question.dispatch_attempted.v1`. It is written before a claim reply; it proves an attempt, not receipt or model emission. D2 supplies its schema when its claim contract is finalized. No speculative dispatcher or unused dispatch schema in D1.
 
 D2 offers at most one oldest eligible question per hook call, records an attempt before replying, and never automatically offers that question again after commit. Concurrent claims must have one winner. Failure after attempt commit is explicitly unconfirmed. Persisted attempt records rebuild the eligibility index during in-process recovery. Hook failures are silent exit 0, with a 300 ms connect / 1000 ms total budget and bounded additional context.
 
-The claim identity fields and main-agent discriminator are an explicit P0 dependency. Session-ID-only or cwd-only routing is prohibited, and declaring subagents “unsupported” cannot excuse delivering to one. Do not publish a claim API with an undefined evidence object or enable a harness until its discriminator/socket access are proven. Product hooks inject the question/context only; answer artifacts belong to QA, not a production reply channel.
+The reported Conductor routing proof established this Codex discriminator: root
+PostToolUse omits both `agent_id` and `agent_type`; a child includes both and
+has a different transcript. `session_id` and `cwd` alone do not distinguish
+them. The raw P0 routing report was absent from the D2 handoff, so independent
+D2 live acceptance must carry its own evidence. Claude remains disabled.
+
+### Concrete attach and claim protocol
+
+`attach` accepts an optional `root_transcript` path in addition to its existing
+`worktree`, `harness`, and `harness_session_id`. For Codex delivery it is
+required. The daemon resolves it to a canonical path at attach, reads at most
+64 KiB of its first `session_meta` record, and requires the selected session ID,
+canonical cwd, `codex_sdk_ts` originator, observed `exec`/`vscode` source, and
+an observed supported CLI version (`0.154.0` or `0.155.1`). A missing, malformed,
+oversize or mismatched record fails attachment. The daemon holds the canonical
+path in the active binding. Existing capture-only attaches continue to work but cannot
+claim. `slipstream attach <worktree> --store <dir> --harness codex
+--harness-session-id <root-hook-session-id> --root-transcript <root-hook-transcript-path>`
+sets the binding. Use the root callback's identity, never the first callback that
+arrives after attach. The active `status` response includes `root_transcript`
+when set. The queued event retains the D1 target shape; each fresh capture has
+its own queue, so no old queue is rebound to a new transcript.
+
+The Codex PostToolUse adapter sends one owner-only control request:
+
+```json
+{"v":1,"verb":"claim_question","harness":"codex","harness_session_id":"<hook session_id>","worktree":"<hook cwd>","transcript_path":"<hook transcript_path>"}
+```
+
+Both `agent_id` and `agent_type` must be **omitted** in the callback and the
+control request. Present `null`, empty, partial or other values fail closed.
+The daemon canonicalizes the callback paths, checks the complete active binding
+after that asynchronous work, and admits one claim under the capture lifetime.
+Missing identity, wrong capture, other chat, another worktree, child, Claude, or
+unbound capture cannot claim. A matching empty queue replies
+`{"v":1,"ok":true,"question":null}`. A successful reply carries one `question`
+object with the queued event's data plus `queued_seq`. No status reply or hook
+output is proof of model receipt.
+
+Before returning a question, the daemon appends
+`slipstream.question.dispatch_attempted.v1` through the session's serialized,
+durable writer. Its `subject` is `question/<question_id>` and its data is
+`{session_id, question_id, queued_seq, attempted_at_ms}`. It records an attempt
+before response. A committed attempt is never automatically offered again;
+socket/output loss after commit is unconfirmed. In-process recovery rebuilds
+attempted IDs from the valid durable prefix. A precommit failure releases the
+reservation. Expiry is derived from the queued deadline; no timer or expiry
+event is added.
+
+The adapter accepts only a bounded Codex `PostToolUse` callback with a nonempty
+`session_id`, `cwd` and `transcript_path`, and both agent fields absent. It uses
+the existing Unix socket client with 300 ms connect and 700 ms reply deadlines,
+emits only `hookSpecificOutput` with `hookEventName: PostToolUse` and
+`additionalContext`, and caps that context at 32 KiB. Selected source is included
+verbatim; an overlarge context is never truncated. Parse, socket, daemon,
+timeout, identity and malformed-response failures exit 0 with no stdout. It
+neither logs question/source bytes nor writes reply artifacts.
+
+### Startup installation
+
+The verified prototype ran on Codex CLI `0.154.0` in Terminal and `0.155.1`
+in Conductor; the latter used normal user hook trust. D2 pins these observed
+versions at attach. A newer version needs fresh root/child and socket proof
+before being added to that allowlist. Unknown or changed callback identity
+shapes produce no delivery until retested.
+The later P0 root/child report did not include its raw runtime version in the
+D2 handoff; acceptance must record it before claiming Conductor support.
+
+Register a synchronous `PostToolUse` command hook before starting the Codex
+chat, using the absolute Node 24 executable and this checkout's absolute
+`src/cli.ts` path:
+
+```json
+{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/absolute/node /absolute/slipstream/src/cli.ts hook codex post-tool-use --store /absolute/private/store","timeout":3}]}]}}
+```
+
+Merge this entry into the existing `.codex/hooks.json` rather than replacing
+other hooks. In Terminal, use the project hook file Codex loads for that
+checkout. For Conductor linked worktrees, put the hook definition in the
+repository's **main checkout** `.codex/hooks.json`; linked-worktree definitions
+were not loaded in the earlier probe. Review and trust this exact command through
+Codex's normal hook trust flow before the chat starts. The hook's ability to
+connect to the daemon's external Unix socket depends on the selected sandbox
+configuration. Installation does not bypass trust, launch an agent, or enable
+Claude delivery. This slice has no global automatic installer or Conductor API
+dependency.

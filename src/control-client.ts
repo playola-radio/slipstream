@@ -31,6 +31,8 @@ export interface ControlRequestOptions {
   connectTimeoutMs?: number;
   /** Deadline to receive the response (after the request is sent). */
   responseTimeoutMs?: number;
+  /** Optional absolute deadline shared with work done before this request. */
+  deadlineAtMs?: number;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 2000;
@@ -64,6 +66,11 @@ function isResponseEnvelope(value: unknown): value is ResponseEnvelope {
 export function sendControlRequest(opts: ControlRequestOptions): Promise<ResponseEnvelope> {
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   const responseTimeoutMs = opts.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+  if (opts.deadlineAtMs !== undefined && opts.deadlineAtMs <= Date.now()) {
+    return Promise.resolve(daemonUnavailable('daemon request deadline elapsed before connecting'));
+  }
+  const remaining = (phaseTimeoutMs: number): number => opts.deadlineAtMs === undefined
+    ? phaseTimeoutMs : Math.min(phaseTimeoutMs, Math.max(0, opts.deadlineAtMs - Date.now()));
 
   return new Promise<ResponseEnvelope>((resolve, reject) => {
     const decoder = createLineDecoder();
@@ -88,17 +95,21 @@ export function sendControlRequest(opts: ControlRequestOptions): Promise<Respons
         ? finish(() => reject(new OutcomeUnknownError(message)))
         : finish(() => resolve(daemonUnavailable(message)));
 
-    timer = setTimeout(() => failTransport('daemon did not respond before the deadline'), connectTimeoutMs);
+    timer = setTimeout(() => failTransport('daemon did not respond before the deadline'), remaining(connectTimeoutMs));
 
     sock.on('connect', () => {
       // The connection is up: from here on, bytes may reach the daemon, so any
       // later fault is ambiguous, not proof of nothing sent. Flip `sent` before
       // the write starts and re-arm the timer as a response deadline.
       clearTimeout(timer);
+      if (opts.deadlineAtMs !== undefined && opts.deadlineAtMs <= Date.now()) {
+        failTransport('daemon request deadline elapsed before transmission');
+        return;
+      }
       sent = true;
       timer = setTimeout(
         () => failTransport('no response before the deadline; the request may have committed'),
-        responseTimeoutMs,
+        remaining(responseTimeoutMs),
       );
       sock.write(encodeMessage(opts.request), (err) => {
         if (err) failTransport(`control write failed: ${err.message}`);

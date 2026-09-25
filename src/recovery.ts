@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
 import { fsyncDir } from './storage.ts';
 import { sourceFor, type AnyEvent } from './event.ts';
-import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent } from './public-events.ts';
+import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
@@ -48,6 +48,7 @@ export interface RecoveredSession {
    * and reconstructs outstanding work without re-attributing settled changes. */
   attributionEvents: AnyEvent[];
   questions: QuestionQueuedEvent[];
+  questionAttempts: QuestionDispatchAttemptedEvent[];
 }
 
 /** The envelope constraints every record must satisfy, regardless of type — so an
@@ -120,6 +121,7 @@ export async function recoverSession(
   const taskDeclarations = new Map<string, { taskId: string; title: string; seq: string }>();
   const attributionEvents: AnyEvent[] = [];
   const questions: QuestionQueuedEvent[] = [];
+  const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
   let root: string | undefined;
@@ -257,6 +259,15 @@ export async function recoverSession(
         questions.push(event);
         break;
       }
+      case 'slipstream.question.dispatch_attempted.v1': {
+        if (event.subject !== `question/${event.data.question_id}`
+          || !questions.some(q => q.data.question_id === event.data.question_id && q.seq === event.data.queued_seq)
+          || questionAttempts.some(a => a.data.question_id === event.data.question_id)) {
+          throw new CorruptLogError(`${at}: dispatch attempt has no unique queued question`);
+        }
+        questionAttempts.push(event);
+        break;
+      }
       case 'slipstream.task.started.v1': {
         // Replayed in order: the last committed declaration is the current task,
         // and its request_id indexes the committed result so a replayed duplicate
@@ -312,5 +323,6 @@ export async function recoverSession(
     taskDeclarations,
     attributionEvents,
     questions,
+    questionAttempts,
   };
 }

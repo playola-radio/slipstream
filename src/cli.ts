@@ -34,6 +34,7 @@ import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { isValidSessionId } from './store-reader.ts';
 import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts';
 import { QUESTION_TTL_MS } from './questions.ts';
+import { codexPostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
@@ -52,7 +53,8 @@ type Args =
   | { command: 'start'; store: string; configPath?: string; overrides: ConfigOverrides }
   | { command: 'status'; store: string }
   | { command: 'detach'; store: string }
-  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string }
+  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string; rootTranscript?: string }
+  | { command: 'codex-hook'; store: string }
   | { command: 'ask'; store: string; sessionId: string; requestId: string; inputPath: string }
   | { command: 'delete'; store: string; sessionId: string }
   | { command: 'gc'; store: string };
@@ -195,15 +197,17 @@ function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>,
   let store: string | undefined;
   let harness: string | undefined;
   let harnessSessionId: string | undefined;
+  let rootTranscript: string | undefined;
   let sawDir = false;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
-    if (arg === '--store' || arg === '--harness' || arg === '--harness-session-id') {
+    if (arg === '--store' || arg === '--harness' || arg === '--harness-session-id' || arg === '--root-transcript') {
       const value = rest[++i];
       if (value === undefined || value.startsWith('--')) return null;
       if (arg === '--store') store = resolve(value);
       else if (arg === '--harness') harness = value;
-      else harnessSessionId = value;
+      else if (arg === '--harness-session-id') harnessSessionId = value;
+      else rootTranscript = resolve(value);
     }
     else if (!arg.startsWith('--')) {
       if (sawDir) return null; // a second positional worktree is a usage error, not a silent override
@@ -212,7 +216,7 @@ function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>,
     }
     else return null; // unknown flag
   }
-  return { dir, store: store ?? DEFAULT_DAEMON_STORE, harness, harnessSessionId };
+  return { dir, store: store ?? DEFAULT_DAEMON_STORE, harness, harnessSessionId, ...(rootTranscript ? { rootTranscript } : {}) };
 }
 
 export function parseArgs(argv: string[]): Args | null {
@@ -236,6 +240,10 @@ export function parseArgs(argv: string[]): Args | null {
     const parsed = parseAttach(argv.slice(1));
     if (!parsed) return null;
     return { command: 'attach', ...parsed };
+  }
+  if (command === 'hook' && argv[1] === 'codex' && argv[2] === 'post-tool-use') {
+    const store = parseStoreOnly(argv.slice(3));
+    return store === null ? null : { command: 'codex-hook', store };
   }
   if (command === 'delete') {
     const parsed = parseDelete(argv.slice(1));
@@ -261,7 +269,8 @@ function usage(): void {
   console.error('       slipstream serve  [dir] [--store <dir>]');
   console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
-  console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id>');
+  console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id> [--root-transcript <path>]');
+  console.error('       slipstream hook codex post-tool-use --store <dir>');
   console.error('       slipstream status [--store <dir>]');
   console.error('       slipstream detach [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
@@ -445,6 +454,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.command === 'codex-hook') {
+    try {
+      const deadlineAtMs = Date.now() + 1000;
+      const output = await codexPostToolUse(await readHookInput(process.stdin, deadlineAtMs), args.store, deadlineAtMs);
+      if (output) process.stdout.write(output);
+    } catch { /* Hooks must never interrupt the agent or log callback content. */ }
+    return;
+  }
+
   if (args.command === 'start') {
     const configIO: ConfigIO = { readFile: (p) => readFile(p, 'utf8').then((s) => s).catch(() => undefined) };
     const { config, warnings } = await loadConfig({
@@ -507,6 +525,7 @@ async function main(): Promise<void> {
       worktree: args.dir,
       harness: args.harness,
       harness_session_id: args.harnessSessionId,
+      root_transcript: args.rootTranscript,
     });
     return;
   }

@@ -6,6 +6,14 @@ const ASK_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 describe('cli ask', () => {
+  it('parses an explicit Codex hook store and root transcript attachment', () => {
+    assert.deepEqual(parseArgs(['hook', 'codex', 'post-tool-use', '--store', '/s']),
+      { command: 'codex-hook', store: '/s' });
+    assert.deepEqual(parseArgs(['attach', '/work', '--store', '/s', '--harness', 'codex',
+      '--harness-session-id', 'root', '--root-transcript', '/transcript.jsonl']),
+      { command: 'attach', dir: '/work', store: '/s', harness: 'codex',
+        harnessSessionId: 'root', rootTranscript: '/transcript.jsonl' });
+  });
   it('parses the required store, capture session, request id, and input flags', () => {
     assert.deepEqual(parseArgs([
       'ask', '--store', '/s', '--session', ASK_SESSION,
