@@ -102,6 +102,10 @@ export function sendControlRequest(opts: ControlRequestOptions): Promise<Respons
       // later fault is ambiguous, not proof of nothing sent. Flip `sent` before
       // the write starts and re-arm the timer as a response deadline.
       clearTimeout(timer);
+      if (opts.deadlineAtMs !== undefined && opts.deadlineAtMs <= Date.now()) {
+        failTransport('daemon request deadline elapsed before transmission');
+        return;
+      }
       sent = true;
       timer = setTimeout(
         () => failTransport('no response before the deadline; the request may have committed'),

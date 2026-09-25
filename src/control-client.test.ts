@@ -77,9 +77,9 @@ describe('control-client', () => {
     await withServer((sock) => { void readOneRequest(sock).catch(() => {}); }, async (socketPath) => {
       const started = Date.now();
       await assert.rejects(sendControlRequest({ socketPath, request: REQ,
-        connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs: started + 80,
+        connectTimeoutMs: 1000, responseTimeoutMs: 5000, deadlineAtMs: started + 500,
       }), OutcomeUnknownError);
-      assert.ok(Date.now() - started < 500);
+      assert.ok(Date.now() - started < 2000);
     });
   });
 
