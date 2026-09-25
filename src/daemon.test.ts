@@ -107,6 +107,32 @@ describe('daemon control verbs', () => {
       assert.equal((await call(identity)).ok, false);
     } finally { await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
+
+  it('does not carry an unattempted question into a fresh capture after daemon restart', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-restart-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-restart-wt-'));
+    const transcript = join(store, 'root.jsonl');
+    await writeFile(transcript, JSON.stringify({ type: 'session_meta', payload: {
+      session_id: 'root', cwd: worktree, originator: 'codex_sdk_ts', source: 'exec', cli_version: '0.154.0',
+    } }) + '\n');
+    const deps = { platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'selected' };
+    let daemon = await startDaemon({ storeDir: store, captureDependencies: deps });
+    try {
+      const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+      const attach = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: transcript });
+      assert.equal(attach.ok, true);
+      const oldId = rec(attach).session_id;
+      assert.equal((await call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).ok, true);
+      await daemon.stop();
+      daemon = await startDaemon({ storeDir: store, captureDependencies: { ...deps, platform: createFakePlatform() } });
+      const again = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+      const fresh = await again({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: transcript });
+      assert.notEqual(rec(fresh).session_id, oldId);
+      const claim = await again({ verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: transcript });
+      assert.equal(claim.ok, true);
+      assert.equal(rec(claim).question, null);
+    } finally { await daemon.stop().catch(() => {}); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
+  });
   it('reports a detached state and a reader url before any attach', async () => {
     await withDaemon(async ({ daemon, call }) => {
       const res = await call({ verb: 'status' });
