@@ -3,6 +3,7 @@ import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
+import { QuestionError } from './questions.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
@@ -556,6 +557,45 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  /** Queue a question on the selected capture. `askQuestion` installs its own
+   * request reservation synchronously; install the daemon-level lifetime promise
+   * in the same turn so detach and shutdown drain source reads and appends. */
+  async function ask(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'daemon storage ownership is unavailable');
+    if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture is wedged; its storage is no longer trustworthy');
+    if (state !== 'active' || !current) {
+      if (state === 'attaching' || state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is not ready to accept questions');
+      return errFields('SESSION_NOT_SELECTED', 'no active session');
+    }
+    if (current.harness !== 'claude-code' && current.harness !== 'codex') {
+      return errFields('SESSION_NOT_SELECTED', 'the selected capture has no supported question target');
+    }
+    // No await may appear before this call and registration: detach/shutdown must
+    // see any source verification admitted before they change state.
+    const binding = current;
+    const { session, harness, harnessSessionId, worktree } = binding;
+    const promise = session.askQuestion(req, {
+      harness: harness as HarnessName,
+      harness_session_id: harnessSessionId,
+      worktree,
+    }, () => {
+      if (compromised || sessionCompromised || current !== binding) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+      }
+    });
+    inflightTasks.add(promise);
+    try {
+      const result = await promise;
+      return { ...result };
+    } catch (err) {
+      if (err instanceof QuestionError) return errFields(err.code, err.message);
+      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
+      return errFields('CAPTURE_NOT_READY', (err as Error).message);
+    } finally {
+      inflightTasks.delete(promise);
+    }
+  }
+
   /** Admit and run a detached-only maintenance op. Admission is synchronous through
    * claiming `maintenanceInFlight`, so it cannot interleave with attach (which sets
    * `state` synchronously and refuses while the slot is held). The op runs only in
@@ -664,6 +704,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'attach': outcome = await attach(req); break;
       case 'detach': outcome = await detach(); break;
       case 'begin_task': outcome = await beginTask(req); break;
+      case 'ask': outcome = await ask(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };

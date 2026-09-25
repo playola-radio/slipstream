@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { readdir, readFile, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EVENT_TYPES } from './event.ts';
+import { PUBLIC_EVENT_TYPES as EVENT_TYPES } from './public-events.ts';
 import { LogCorruptError } from './log-reader.ts';
 
 export interface SessionInfo { id: string; durableSeq: bigint; removed: boolean }

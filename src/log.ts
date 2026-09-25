@@ -1,6 +1,6 @@
 import { open, stat, type FileHandle } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { buildEnvelope, type AnyEvent, type EventInput } from './event.ts';
+import { buildPublicEnvelope as buildEnvelope, type PublicEvent as AnyEvent, type PublicEventInput as EventInput } from './public-events.ts';
 import { FILE_MODE, StorageError, fsyncDir, writeAll } from './storage.ts';
 
 export interface Log {

@@ -18,7 +18,7 @@ import { createFakePlatform } from './fake-platform.ts';
 import type { Snapshot } from '../snapshot.ts';
 
 /** Every record on disk is a full CloudEvents envelope. */
-export type LoggedRecord = AnyEvent;
+export type LoggedRecord = import('../public-events.ts').PublicEvent;
 export type FileChangedEvent = CloudEvent<'slipstream.file.changed.v1'>;
 
 const TEST_SESSION_ID = '00000000-0000-4000-8000-000000000000';

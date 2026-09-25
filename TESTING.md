@@ -400,3 +400,20 @@ Boundary fixtures:
   OS would never deliver.
 - `describePlatformContract(label, makeHarness)` (`src/test/platform-contract.ts`)
   — the shared contract, run against both real and fake drivers.
+
+
+### D1 question queue
+
+`questions.test.ts`, `question-session.test.ts`, and the daemon/CLI/schema/recovery
+suites cover immutable source identity, byte limits, retry coalescing, 16-slot
+admission, injected-clock expiry, ownership/draining and ambiguous-commit recovery.
+The question clock is explicitly injected for TTL tests; fault-injection wrappers
+still use real durable logs and blobs. Existing frozen display contracts are
+verified by `npm run check:fold-release`.
+
+`npm run qa:check -- --pr F1-ask` captures a real source edit in a T-QA disposable
+store, submits through the CLI, retries the same request ID, then verifies the
+complete queued event through authenticated HTTP. Wrong context must return
+`INVALID_CONTEXT` and add no question. Its negative-control tests run the same
+checker against suppressed/corrupted records and acknowledgments. F1-ask owns and cleans up a separate disposable daemon with a synthetic Codex
+binding; it never rebinds an operator-supplied `--env` daemon. It proves durable queueing, not hook delivery.

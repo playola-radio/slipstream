@@ -2,6 +2,202 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseArgs, retryGuidance } from './cli.ts';
 
+const ASK_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+describe('cli ask', () => {
+  it('parses the required store, capture session, request id, and input flags', () => {
+    assert.deepEqual(parseArgs([
+      'ask', '--store', '/s', '--session', ASK_SESSION,
+      '--request-id', ASK_REQUEST, '--input', '/question.json',
+    ]), {
+      command: 'ask', store: '/s', sessionId: ASK_SESSION,
+      requestId: ASK_REQUEST, inputPath: '/question.json',
+    });
+  });
+
+  it('rejects missing, duplicate, and non-canonical ask identity flags', () => {
+    assert.equal(parseArgs(['ask', '--store', '/s', '--session', ASK_SESSION, '--request-id', ASK_REQUEST]), null);
+    assert.equal(parseArgs(['ask', '--store', '/s', '--session', ASK_SESSION.toUpperCase(), '--request-id', ASK_REQUEST, '--input', '/q']), null);
+    assert.equal(parseArgs(['ask', '--store', '/s', '--session', ASK_SESSION, '--request-id', ASK_REQUEST.toUpperCase(), '--input', '/q']), null);
+    assert.equal(parseArgs(['ask', '--store', '/s', '--store', '/other', '--session', ASK_SESSION, '--request-id', ASK_REQUEST, '--input', '/q']), null);
+  });
+
+  it('sends file input and prints only the structured acknowledgment', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createServer } = await import('node:net');
+    const { execFile } = await import('node:child_process');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-'));
+    const store = join(dir, 'store'); const input = join(dir, 'question.json');
+    await mkdir(store, { mode: 0o700 });
+    await writeFile(input, JSON.stringify({
+      text: 'What changed?',
+      context: {
+        change_seq: '9007199254740993', path: 'src/example.ts',
+        snapshot_sha256: 'a'.repeat(64), line_start: 2, line_end: 4,
+      },
+    }));
+    let received: Record<string, unknown> | undefined;
+    const server = createServer((socket) => {
+      let text = '';
+      socket.on('data', (chunk) => { text += chunk.toString('utf8'); });
+      socket.on('end', () => undefined);
+      socket.once('data', () => {
+        received = JSON.parse(text) as Record<string, unknown>;
+        socket.end(JSON.stringify({
+          v: 1, ok: true, session_id: ASK_SESSION, request_id: ASK_REQUEST,
+          question_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', seq: '7',
+          queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
+        }) + '\n');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+    try {
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
+          '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, stdout, stderr) =>
+          resolve({ code: error && typeof error.code === 'number' ? error.code : 0, stdout, stderr }));
+      });
+      assert.equal(result.code, 0);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        v: 1, ok: true, session_id: ASK_SESSION, request_id: ASK_REQUEST,
+        question_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', seq: '7',
+        queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
+      });
+      assert.equal(result.stderr, '');
+      assert.deepEqual(received, {
+        v: 1, verb: 'ask', session_id: ASK_SESSION, request_id: ASK_REQUEST,
+        text: 'What changed?',
+        context: {
+          change_seq: '9007199254740993', path: 'src/example.ts',
+          snapshot_sha256: 'a'.repeat(64), line_start: 2, line_end: 4,
+        },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid JSON, non-objects, non-regular files, and oversized input locally', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFile } = await import('node:child_process');
+    const { MAX_MESSAGE_BYTES } = await import('./control-protocol.ts');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-bad-'));
+    const input = join(dir, 'question.json');
+    try {
+      for (const item of [
+        { path: input, body: '{not JSON' },
+        { path: input, body: '[]' },
+        { path: input, body: ' '.repeat(MAX_MESSAGE_BYTES + 1) },
+        { path: '/dev/zero' },
+        { path: dir },
+      ]) {
+        if (item.body !== undefined) await writeFile(input, item.body);
+        const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+          execFile(process.execPath, ['src/cli.ts', 'ask', '--store', join(dir, 'store'), '--session', ASK_SESSION,
+            '--request-id', ASK_REQUEST, '--input', item.path], { timeout: 5000 }, (error, stdout, stderr) =>
+            resolve({ code: error?.code ?? 0, stdout, stderr }));
+        });
+        assert.equal(result.code, 2);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /input/i);
+      }
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('leaves semantic admission to the daemon and makes storage uncertainty retry-safe', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createServer } = await import('node:net');
+    const { execFile } = await import('node:child_process');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-error-'));
+    const store = join(dir, 's'); const input = join(dir, 'question.json');
+    await mkdir(store, { mode: 0o700 });
+    const body = { text: 'Question', context: { change_seq: 'bad' }, target: 'spoof', session_id: 'spoof' };
+    await writeFile(input, JSON.stringify(body));
+    try {
+      for (const code of ['INVALID_CONTEXT', 'STORAGE_UNAVAILABLE']) {
+        let received: unknown;
+        const server = createServer((socket) => socket.once('data', (chunk) => {
+          received = JSON.parse(chunk.toString());
+          socket.end(JSON.stringify({ v: 1, ok: false, code, message: 'fixture failure' }) + '\n');
+        }));
+        await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+        try {
+          const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+            execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
+              '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, stdout, stderr) =>
+              resolve({ code: error?.code ?? 0, stdout, stderr }));
+          });
+          assert.equal(result.code, code === 'STORAGE_UNAVAILABLE' ? 3 : 1);
+          assert.equal(result.stdout, '');
+          const reply = JSON.parse(result.stderr);
+          assert.equal(reply.code, code);
+          assert.equal(reply.ok, false);
+          assert.match(reply.message, /fixture failure/);
+          if (code === 'STORAGE_UNAVAILABLE') {
+            assert.match(reply.message, /outcome unknown/);
+            assert.match(reply.message, /same --request-id, --session, and input body/i);
+          }
+          assert.deepEqual(received, { v: 1, verb: 'ask', session_id: ASK_SESSION,
+            request_id: ASK_REQUEST, text: body.text, context: body.context });
+        } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+      }
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('treats malformed durable identity and timestamps in an acknowledgment as outcome unknown', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createServer } = await import('node:net');
+    const { execFile } = await import('node:child_process');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-invalid-ack-'));
+    const store = join(dir, 's');
+    const input = join(dir, 'question.json');
+    await mkdir(store, { mode: 0o700 });
+    await writeFile(input, JSON.stringify({ text: 'Question', context: {
+      change_seq: '1', path: 'x.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
+    } }));
+    const good = {
+      v: 1, ok: true, session_id: ASK_SESSION, request_id: ASK_REQUEST,
+      question_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', seq: '7',
+      queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
+    };
+    const invalid = [
+      { v: 1, ok: true, seq: '1' },
+      { ...good, question_id: '' },
+      { ...good, seq: '07' },
+      { ...good, queued_at_ms: -1 },
+      { ...good, queued_at_ms: 10.5 },
+      { ...good, expires_at_ms: 1_800_009 },
+    ];
+    try {
+      for (const reply of invalid) {
+        const server = createServer((socket) => socket.once('data', () => socket.end(JSON.stringify(reply) + '\n')));
+        await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+        try {
+          const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+            execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
+              '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, _stdout, stderr) =>
+              resolve({ code: error && typeof error.code === 'number' ? error.code : 0, stderr }));
+          });
+          assert.equal(result.code, 3);
+          assert.match(result.stderr, /outcome unknown/i);
+          assert.match(result.stderr, /same --request-id, --session, and input body/i);
+          assert.match(result.stderr, /do not retarget an old capture/i);
+        } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+      }
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('cli', () => {
   describe('parseArgs', () => {
     it('rejects --store without a following value', () => {
@@ -109,6 +305,7 @@ describe('cli retryGuidance (unknown-outcome recovery)', () => {
   it('keeps the status hint for attach-state verbs', () => {
     assert.match(retryGuidance('detach'), /slipstream status/);
   });
+
 });
 
 describe('cli parseArgs (maintenance commands)', () => {

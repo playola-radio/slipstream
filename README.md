@@ -47,3 +47,60 @@ A headless local daemon (TypeScript/Node) captures bytes and writes an
 append-only event log; a browser client (React + Monaco) renders the feed. The
 MCP server is a thin stdio forwarder per agent session — verified necessary,
 since each session spawns its own server process — and the daemon owns the store.
+
+
+## Queue a question about a captured change
+
+With the shared daemon running (`slipstream start`) and explicitly attached to a
+Claude Code or Codex session, an independent local client can queue a question:
+
+```sh
+slipstream ask --store /path/to/store --session <capture-uuid> \
+  --request-id <caller-generated-lowercase-uuid> --input question.json
+```
+
+`question.json` contains the question and immutable after-snapshot identity read
+from the public events API (sequence numbers are decimal strings):
+
+```json
+{
+  "text": "Why is this check needed?",
+  "context": {
+    "change_seq": "42",
+    "path": "src/example.ts",
+    "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "line_start": 3,
+    "line_end": 5
+  }
+}
+```
+
+The example hash is a placeholder: use the actual change's `after.sha256`. The
+daemon validates the durable event and original blob, derives the selected text,
+and copies the explicit attach target. It never reads the current working file
+or accepts client-supplied authorship. Only after-content up to 1 MiB is eligible;
+select at most 200 lines / 16 KiB. Questions are trimmed and capped at 8192 UTF-8
+bytes. `serve` has no attach/control path and does not support `ask`.
+
+Success prints JSON `{v:1,ok:true,session_id,request_id,question_id,seq,
+queued_at_ms,expires_at_ms,duplicate}`. It means **durably queued**, not delivered
+to an agent or answered. Read `slipstream.question.queued.v1` through the existing
+authenticated `GET /v1/sessions/<id>/events` endpoint; its self-contained schema is
+available at `GET /v1/schemas/slipstream.question.queued.v1`.
+
+Retry with the **same request ID, capture ID and input**. Same-ID/body retries
+return the original result without extending the 30-minute TTL. A changed body
+returns `REQUEST_CONFLICT`; more than 16 unexpired questions returns
+`QUESTION_LIMIT`. Other domain errors are `INVALID_QUESTION`, `INVALID_CONTEXT`,
+`SESSION_NOT_SELECTED`, `CAPTURE_NOT_READY`, and `STORAGE_UNAVAILABLE`. Errors
+print structured JSON on stderr (exit 1); local file/syntax errors exit 2.
+`STORAGE_UNAVAILABLE`, or a lost/malformed response after transmission, exits 3:
+the outcome is unknown and the record may already be committed. Preserve the same
+request ID, capture ID and input when retrying. A new capture never resumes an old queue; inspect
+the old public log by `request_id` rather than retargeting a retry.
+
+The control wire request is `{v:1,verb:"ask",session_id,request_id,text,context}`
+over the owner-only `<store>/control.sock` using existing NDJSON framing. No
+harness identity is required from the client. Full details, limits and lifecycle:
+[queue contract](docs/ask-agent/contract.md). This release provides queueing only;
+hook delivery and receiving-answer UI remain separate work.

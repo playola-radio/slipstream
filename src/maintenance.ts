@@ -6,7 +6,7 @@ import {
   blobPath, isValidHex, listSessions, onDiskHighWater, sessionLogPath, tombstonePath,
 } from './store-reader.ts';
 import { openLogCursor, LogCorruptError } from './log-reader.ts';
-import { EVENT_TYPES } from './event.ts';
+import { PUBLIC_EVENT_TYPES as EVENT_TYPES } from './public-events.ts';
 
 /**
  * Store maintenance for detached-only session deletion + GC (Stage 3, P5).

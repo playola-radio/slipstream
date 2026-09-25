@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
 import { fsyncDir } from './storage.ts';
-import { EVENT_TYPES, sourceFor, type AnyEvent, type EventType } from './event.ts';
+import { sourceFor, type AnyEvent } from './event.ts';
+import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
@@ -46,6 +47,7 @@ export interface RecoveredSession {
    * order, so a resumed session rebuilds the attribution producer's projections
    * and reconstructs outstanding work without re-attributing settled changes. */
   attributionEvents: AnyEvent[];
+  questions: QuestionQueuedEvent[];
 }
 
 /** The envelope constraints every record must satisfy, regardless of type — so an
@@ -117,6 +119,7 @@ export async function recoverSession(
   const storageGapSeqByEpisode = new Map<string, string>();
   const taskDeclarations = new Map<string, { taskId: string; title: string; seq: string }>();
   const attributionEvents: AnyEvent[] = [];
+  const questions: QuestionQueuedEvent[] = [];
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
   let root: string | undefined;
@@ -156,9 +159,9 @@ export async function recoverSession(
     const at = `record ${i + 1}`;
     if (line.length === 0) throw new CorruptLogError(`${at}: blank terminated line`);
 
-    let event: AnyEvent;
+    let event: PublicEvent;
     try {
-      event = JSON.parse(line) as AnyEvent;
+      event = JSON.parse(line) as PublicEvent;
     } catch {
       throw new CorruptLogError(`${at}: invalid JSON`);
     }
@@ -189,7 +192,7 @@ export async function recoverSession(
       throw new CorruptLogError(`${at}: first record must be session.started, got ${event.type}`);
     }
 
-    if (!EVENT_TYPES.includes(event.type as EventType)) {
+    if (!PUBLIC_EVENT_TYPES.includes(event.type)) {
       continue; // forward-compat: unknown type, seq still advanced
     }
     const schema = schemas.get(event.type) as JsonSchema;
@@ -249,6 +252,11 @@ export async function recoverSession(
         }
         break;
       }
+      case 'slipstream.question.queued.v1': {
+        if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
+        questions.push(event);
+        break;
+      }
       case 'slipstream.task.started.v1': {
         // Replayed in order: the last committed declaration is the current task,
         // and its request_id indexes the committed result so a replayed duplicate
@@ -303,5 +311,6 @@ export async function recoverSession(
     currentTaskId,
     taskDeclarations,
     attributionEvents,
+    questions,
   };
 }

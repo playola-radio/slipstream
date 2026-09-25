@@ -19,6 +19,8 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
+import type { PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent } from './public-events.ts';
+import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
 import type { TranscriptFileIO } from './transcript/file-reader.ts';
@@ -65,6 +67,8 @@ export interface CaptureOptions {
    * session runs a coverage watcher that reads those harnesses' transcripts for
    * this worktree, ingesting evidence and disclosing coverage. */
   transcript?: TranscriptRuntime;
+  /** Server clock for question TTL; no timers or expiry records. */
+  now?: () => number;
 }
 
 export interface BeginTaskInput {
@@ -111,6 +115,7 @@ export interface CaptureSession {
    * adapters onto this seam; A1 exercises it with fake evidence.
    */
   ingestEvidence(evidence: NormalizedEvidence): Promise<IngestOutcome>;
+  askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   stop(): Promise<void>;
 }
 
@@ -118,9 +123,10 @@ interface CaptureDependencies {
   createLog: typeof createLog;
   platform: Platform;
   enumerate: typeof enumerate;
+  readQuestionContext: typeof readQuestionContext;
 }
 
-const defaultDependencies: CaptureDependencies = { createLog, platform: createPlatform(), enumerate };
+const defaultDependencies: CaptureDependencies = { createLog, platform: createPlatform(), enumerate, readQuestionContext };
 
 /** A relative path escapes its base only via a leading `..` segment (or when it
  * comes back absolute); a filename that merely starts with `..`, like
@@ -177,6 +183,9 @@ export async function startCapture(
   // The two maps are the idempotency index keyed by `request_id`: `committedTasks`
   // replays a settled result, `inflightTasks` coalesces concurrent duplicates.
   // Both the pointer and the committed index are rebuilt from the log on recovery.
+  const now = opts.now ?? Date.now;
+  const committedQuestions = new Map<string, { body: string; result: QuestionAccepted }>();
+  const inflightQuestions = new Map<string, { body: string; promise: Promise<QuestionAccepted> }>();
   let currentTaskId: string | undefined;
   const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
   const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
@@ -187,6 +196,10 @@ export async function startCapture(
   let producer: AttributionProducer | undefined;
 
   const seedTaskState = (rec: RecoveredSession): void => {
+    committedQuestions.clear();
+    for (const event of rec.questions) {
+      committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
+    }
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -217,7 +230,7 @@ export async function startCapture(
     onCommitted: (event) => {
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
-      producer?.noteCommitted(event);
+      if (event.type !== 'slipstream.question.queued.v1') producer?.noteCommitted(event);
     },
   };
 
@@ -319,7 +332,10 @@ export async function startCapture(
   // The single append path used everywhere except inside a recovery attempt: it
   // keeps health's durable_seq current and, on a storage fault, suspends capture
   // and kicks off the recovery supervisor before rethrowing.
-  const appendEvent = async (input: EventInput): Promise<AnyEvent> => {
+  function appendEvent(input: EventInput): Promise<AnyEvent>;
+  function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
+  function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
+  async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
       throw new StorageError(
         'lock',
@@ -413,7 +429,7 @@ export async function startCapture(
   const reconcile = async (
     state: ReconcileState,
     gapSeq: string,
-    append: (input: EventInput) => Promise<AnyEvent>,
+    append: (input: EventInput) => Promise<PublicEvent>,
   ): Promise<void> => {
     const current = new Map<string, Snapshot>();
     const newUnknownDirs = new Set<string>();
@@ -516,7 +532,7 @@ export async function startCapture(
       producer?.start(rec.attributionEvents);
       await producer?.ensurePolicy(enrichmentPolicy);
 
-      const rawAppend = async (input: EventInput): Promise<AnyEvent> => {
+      const rawAppend = async (input: EventInput): Promise<PublicEvent> => {
         // If the lock was lost mid-recovery, stop writing: another process now
         // owns the log. This bounds — it cannot fully prevent — the residual, as
         // an append already awaiting its fsync when surrender flips still lands.
@@ -757,6 +773,51 @@ export async function startCapture(
     }
   };
 
+  const questionReady = (): void => {
+    if (stopped) throw new QuestionError('CAPTURE_NOT_READY', 'capture is stopping');
+    if (surrendered || health.snapshot().state === 'failing' || health.snapshot().state === 'recovering') {
+      throw new QuestionError('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    }
+    if (health.snapshot().state !== 'healthy') throw new QuestionError('CAPTURE_NOT_READY', 'capture is not ready');
+  };
+
+  const askQuestion = async (input: unknown, target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<QuestionAccepted> => {
+    const req = normalizeAsk(input);
+    if (req.session_id !== sessionId) throw new QuestionError('SESSION_NOT_SELECTED', 'question addresses a different capture');
+    assertOwnership();
+    questionReady();
+    const body = questionBody(req);
+    const settled = committedQuestions.get(req.request_id);
+    const pending = inflightQuestions.get(req.request_id);
+    const existing = settled ?? pending;
+    if (existing && existing.body !== body) throw new QuestionError('REQUEST_CONFLICT', 'request_id was used for a different question or context');
+    if (settled) return { ...settled.result, duplicate: true };
+    if (pending) return { ...await pending.promise, duplicate: true };
+    // A reservation covers source reads as well as append, bounding concurrent scans.
+    const eligible = [...committedQuestions.values()].filter(q => now() < q.result.expires_at_ms).length;
+    const reserved = [...inflightQuestions.keys()].filter(id => !committedQuestions.has(id)).length;
+    if (eligible + reserved >= QUESTION_LIMIT) throw new QuestionError('QUESTION_LIMIT', 'at most 16 unexpired questions may be queued');
+    // Defer starting I/O until the in-flight reservation is installed synchronously.
+    const promise = Promise.resolve().then(async (): Promise<QuestionAccepted> => {
+      const selected_text = await deps.readQuestionContext({ storeDir, logPath, sessionId,
+        boundary: BigInt(health.snapshot().durable_seq), context: req.context });
+      assertOwnership();
+      questionReady();
+      const queued_at_ms = now();
+      const event = await appendEvent({ type: 'slipstream.question.queued.v1', occurred_at_ms: queued_at_ms,
+        data: { question_id: randomUUID(), request_id: req.request_id, target, text: req.text,
+          context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS } });
+      if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+      assertOwnership();
+      const result = questionResult(event);
+      committedQuestions.set(req.request_id, { body, result });
+      return result;
+    });
+    inflightQuestions.set(req.request_id, { body, promise });
+    try { return await promise; }
+    finally { inflightQuestions.delete(req.request_id); }
+  };
+
   const doStop = async (): Promise<void> => {
     stopped = true;
     // Stop feeding the engine immediately: if the watcher unsubscribe below
@@ -780,6 +841,7 @@ export async function startCapture(
     // Fence the attribution generation and flush its in-flight appends before the
     // log closes: a stale evaluation must never append after the log is gone.
     await producer?.stop().catch(record);
+    await Promise.allSettled([...inflightQuestions.values()].map(q => q.promise));
     await underlying.close().catch(record);
     await lock.release().catch(record);
     if (firstError !== undefined) throw firstError;
@@ -795,6 +857,7 @@ export async function startCapture(
     blobsDir,
     health,
     beginTask,
+    askQuestion,
     ingestEvidence,
     stop: () => (stopPromise ??= doStop()),
   };

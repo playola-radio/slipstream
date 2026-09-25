@@ -72,7 +72,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | # | Decision | Choice |
 |---|---|---|
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
-| Q2 | Question/comment loop | Not in MVP; schema must make it purely additive |
+| Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); delivery and answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
 | Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
@@ -716,8 +716,10 @@ pivot forces are marked ⚠ **pending Brian's ratification** — not enacted her
 3 is still In Progress** (P4 real-session acceptance + PR and P5's PR to `develop`
 remain). Stage T / Stage 5 must not silently discharge those.
 
-**Explicitly not in this MVP**: question/answer loop, review or approval
+**Explicitly not in this MVP**: answer display and reply transport, review or approval
 workflow, automatic installer, launcher replacement, historical content import.
+The additive ask/send re-scope approved by Brian on 2026-09-25 starts with D1
+durable question submission below; queue acceptance does not promise delivery.
 
 **Status**: Not Started (reshaped; gated on S5.0 + the ⚠ ratifications).
 
@@ -805,3 +807,22 @@ real-OS-only; fake conformance can never rescue a failing real probe.
 **Success Criteria**: `npm test` runs the deterministic tier (`src/**/*.test.ts` excluding `*.os.test.ts`); `npm run test:os` runs `src/**/*.os.test.ts`; `.github/workflows/tests.yml` runs the deterministic tier on ubuntu AND macos (portability proof, resolves the red macos-only workaround); `TESTING.md` documents the two tiers, the fake, and the contract discipline.
 **Tests**: CI green on both OSes; `test:os` green locally on the Mac.
 **Status**: Complete. `package.json` scripts split the tiers via the `!(*.os)` extglob; `tests.yml` runs `npm test` on an ubuntu+macos matrix with a type-check step; `TESTING.md` documents the boundary, the fake, the contract, and the two tiers. `npm test` = 75 green, `npm run test:os` = 7 green, typecheck clean locally.
+
+
+## D1: Durable question submission (2026-09-25)
+
+**Status**: Implemented on the D1 review branch; Brian’s merge and independent
+cumulative QA are required before D2 begins.
+
+Brian approved the additive ask/send slice. D1 queues a normalized question tied
+to an immutable captured file-change snapshot through the existing owner-only
+control socket. Its public queued event is readable through the GET-only reader.
+Same-ID retries coalesce and replay the original durable result, including after
+in-process storage recovery. Capacity is 16 unexpired questions; TTL is 30 minutes.
+
+Contract and scope: [docs/ask-agent/contract.md](docs/ask-agent/contract.md) and
+[docs/ask-agent/spec.md](docs/ask-agent/spec.md). Queue acceptance acknowledges
+only durability. Hook delivery (D2), the Swift ask composer (S1), and answer UI
+are deferred. The frozen display-fold.v1 dependencies and fixtures stay unchanged:
+`src/public-events.ts` adds the new event alongside the released event catalogue.
+No capture, attribution, or existing success criterion changes.
