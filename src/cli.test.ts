@@ -110,6 +110,53 @@ describe('cli ask', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
+  it('allows an ask request exactly at the routed control line cap and rejects one byte over before connecting', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createServer } = await import('node:net');
+    const { execFile } = await import('node:child_process');
+    const { MAX_MESSAGE_BYTES } = await import('./control-protocol.ts');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-ask-envelope-'));
+    const store = join(dir, 'store');
+    const input = join(dir, 'question.json');
+    const context = { change_seq: '1', path: 'x.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1 };
+    const envelope = { v: 1, verb: 'ask', session_id: ASK_SESSION, request_id: ASK_REQUEST, text: '', context };
+    const textLength = MAX_MESSAGE_BYTES - Buffer.byteLength(JSON.stringify(envelope));
+    let connections = 0;
+    const server = createServer((socket) => {
+      connections++;
+      socket.once('data', () => socket.end(JSON.stringify({
+        v: 1, ok: true, session_id: ASK_SESSION, request_id: ASK_REQUEST,
+        question_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', seq: '7',
+        queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
+      }) + '\n'));
+    });
+    await mkdir(store, { mode: 0o700 });
+    await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+    try {
+      const cases: Array<[number, number]> = [[textLength, 0], [textLength + 1, 2]];
+      for (const [length, expectedCode] of cases) {
+        await writeFile(input, JSON.stringify({ text: 'x'.repeat(length), context }));
+        const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
+          execFile(process.execPath, ['src/cli.ts', 'ask', '--store', store, '--session', ASK_SESSION,
+            '--request-id', ASK_REQUEST, '--input', input], { timeout: 5000 }, (error, stdout, stderr) =>
+            resolve({ code: error?.code ?? 0, stdout, stderr }));
+        });
+        assert.equal(result.code, expectedCode);
+        if (expectedCode === 0) assert.equal(JSON.parse(result.stdout).ok, true);
+        else {
+          assert.equal(result.stdout, '');
+          assert.match(result.stderr, /control message byte cap/i);
+        }
+      }
+      assert.equal(connections, 1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('leaves semantic admission to the daemon and makes storage uncertainty retry-safe', async () => {
     const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
