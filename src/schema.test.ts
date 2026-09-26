@@ -190,5 +190,11 @@ describe('schema', () => {
       assert.ok(validate({ enum: [1, 2] }, 3).length > 0);
       assert.ok(validate({ type: 'integer', minimum: 0 }, -1).length > 0);
     });
+
+    it('enforces string length bounds in code points', () => {
+      assert.ok(validate({ type: 'string', minLength: 1 }, '').length > 0);
+      assert.ok(validate({ type: 'string', maxLength: 2 }, 'abc').length > 0);
+      assert.deepEqual(validate({ type: 'string', minLength: 2, maxLength: 2 }, '😀é'), []);
+    });
   });
 });

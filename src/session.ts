@@ -241,7 +241,8 @@ export async function startCapture(
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') unattemptedQuestions.set(event.data.question_id, event);
       if (event.type === 'slipstream.question.dispatch_attempted.v1') unattemptedQuestions.delete(event.data.question_id);
-      if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1') producer?.noteCommitted(event);
+      if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
+        && event.type !== 'slipstream.question.answered.v1') producer?.noteCommitted(event);
     },
   };
 
