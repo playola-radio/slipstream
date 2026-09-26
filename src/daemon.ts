@@ -702,6 +702,39 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     } finally { inflightTasks.delete(promise); }
   }
 
+  /** Record an answer returned through the selected harness session's MCP tool.
+   * Like begin_task, the caller's triple must equal the binding after the realpath
+   * await; with no transcript or agent id this proves the call came through the
+   * selected harness session, not which agent in it wrote the answer. */
+  async function answerQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)) {
+      return errFields('IDENTITY_UNRESOLVED', 'answer_question requires harness, harness_session_id, and worktree');
+    }
+    if (compromised || torn || state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    if (state !== 'active' || !current) return errFields('SESSION_NOT_SELECTED', 'no active capture');
+    const binding = current;
+    let worktree: string;
+    try { worktree = await identityRealpath(req.worktree); } catch { worktree = req.worktree; }
+    if (compromised || torn || sessionCompromised || state !== 'active' || current !== binding
+      || req.harness !== binding.harness || req.harness_session_id !== binding.harnessSessionId || worktree !== binding.worktree) {
+      return errFields('SESSION_NOT_SELECTED', 'the caller is not the selected harness session');
+    }
+    const promise = binding.session.answerQuestion({ question_id: req.question_id, text: req.text },
+      { harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId, worktree: binding.worktree }, () => {
+        if (compromised || sessionCompromised || current !== binding) {
+          throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+        }
+      });
+    inflightTasks.add(promise);
+    try {
+      return { ...await promise };
+    } catch (err) {
+      if (err instanceof QuestionError) return errFields(err.code, err.message);
+      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
+      return errFields('CAPTURE_NOT_READY', (err as Error).message);
+    } finally { inflightTasks.delete(promise); }
+  }
+
   /** Admit and run a detached-only maintenance op. Admission is synchronous through
    * claiming `maintenanceInFlight`, so it cannot interleave with attach (which sets
    * `state` synchronously and refuses while the slot is held). The op runs only in
@@ -812,6 +845,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'begin_task': outcome = await beginTask(req); break;
       case 'ask': outcome = await ask(req); break;
       case 'claim_question': outcome = await claimQuestion(req); break;
+      case 'answer_question': outcome = await answerQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };
