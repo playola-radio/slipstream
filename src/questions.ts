@@ -5,10 +5,11 @@ import { createHash } from 'node:crypto';
 import { openLogCursor } from './log-reader.ts';
 import { blobPath } from './store-reader.ts';
 import { sourceFor } from './event.ts';
-import type { QuestionQueuedEvent } from './public-events.ts';
+import type { QuestionAnsweredEvent, QuestionQueuedEvent } from './public-events.ts';
 export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
+export const MAX_ANSWER_BYTES = 16 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface QuestionContext {
@@ -155,4 +156,27 @@ export function questionResult(event: QuestionQueuedEvent): QuestionAccepted {
   const d = event.data;
   return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
     seq: event.seq, queued_at_ms: d.queued_at_ms, expires_at_ms: d.expires_at_ms, duplicate: false });
+}
+
+/** Answer text is stored verbatim, so it is checked but never trimmed. Unpaired
+ * surrogates are refused for the same reason as in question text. */
+export function assertAnswerText(text: unknown): asserts text is string {
+  if (typeof text !== 'string' || !/\S/u.test(text) || /[\uD800-\uDFFF]/u.test(text)
+    || Buffer.byteLength(text, 'utf8') > MAX_ANSWER_BYTES) {
+    throw new QuestionError('INVALID_ANSWER', `answer text must contain a non-whitespace character and be at most ${MAX_ANSWER_BYTES} UTF-8 bytes`);
+  }
+}
+
+export interface AnswerAccepted {
+  session_id: string;
+  question_id: string;
+  event_id: string;
+  seq: string;
+  answered_at_ms: number;
+  duplicate: boolean;
+}
+export function answerResult(event: QuestionAnsweredEvent): AnswerAccepted {
+  const d = event.data;
+  return Object.freeze({ session_id: d.session_id, question_id: d.question_id, event_id: event.seq, seq: event.seq,
+    answered_at_ms: d.answered_at_ms, duplicate: false });
 }
