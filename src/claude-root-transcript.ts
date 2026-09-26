@@ -18,8 +18,9 @@ function record(value: unknown): Record<string, unknown> | null {
 /**
  * Verify the explicit root transcript from complete, bounded startup records.
  * Claude can write cwd-less preamble lines before the first user/attachment
- * record, and may still be writing the last line while attach reads. No skipped
- * line can hide conflicting identity or an unsupported runtime.
+ * record, and may still be writing the last line while attach reads. Every
+ * complete bounded line is parsed; the first identity record fixes the root
+ * cwd, while later cwd values can drift after a shell cd.
  */
 export async function verifyClaudeRootTranscript(path: string, sessionId: string, worktree: string): Promise<ClaudeRootResult> {
   let handle;
@@ -67,6 +68,7 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
         entrypoint = parsed.entrypoint;
       } else if ((Object.hasOwn(parsed, 'version') && parsed.version !== version)
         || (Object.hasOwn(parsed, 'entrypoint') && parsed.entrypoint !== entrypoint)
+        || (Object.hasOwn(parsed, 'userType') && parsed.userType !== 'external')
         || (Object.hasOwn(parsed, 'isSidechain') && parsed.isSidechain !== false)) {
         return { ok: false, reason: 'mismatch' };
       }

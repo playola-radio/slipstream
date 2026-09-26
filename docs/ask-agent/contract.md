@@ -215,7 +215,15 @@ canonical worktree, external user, root `isSidechain:false`, and an observed
 runtime/entrypoint pair: Terminal Claude Code `2.1.283`/`sdk-cli` or Conductor
 Claude Code `2.1.280`/`sdk-ts`. Missing, truncated, contradictory, or newer
 unverified metadata fails closed; test a newer runtime before adding it. The
-callback must later match the selected harness, session ID, canonical worktree,
+head bounds are strict even after an identity record: a large early attachment
+or too many startup records can make an established chat impossible to attach.
+Select the root shortly after its first tool call. An unresolved path may also
+be mistyped; check it before retrying. The verifier pins the first identity
+record's cwd. Later transcript cwd can drift after `cd`; the hook still requires
+the callback's cwd to exactly match the attached worktree, so return to that
+directory before a queued question can be delivered.
+
+The callback must later match the selected harness, session ID, canonical worktree,
 and root transcript. Both `agent_id` and `agent_type` must be absent. A child,
 other root, wrong worktree, cross-harness claim, stale capture, or partial
 identity gets no question. Changing the chat with `/clear` creates a new

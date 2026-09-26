@@ -102,7 +102,9 @@ export const f3ClaudeDelivery: AcceptanceModule = {
               throw new Error('selected root callback did not receive the queued question and exact source');
             }
             const repeated = await cli(['hook', 'claude-code', 'post-tool-use', '--store', store], callback);
-            if (repeated.stdout !== '') throw new Error('Claude question emitted twice');
+            if (repeated.code !== 0 || repeated.stderr !== '' || repeated.stdout !== '') {
+              throw new Error('repeated Claude callback emitted context or logged data');
+            }
             const pending = await cli(['ask', '--store', store, '--session', sessionId,
               '--request-id', randomUUID(), '--input', inputPath]);
             if (pending.code !== 0) throw new Error('could not queue a stale-hook control');
@@ -118,7 +120,7 @@ export const f3ClaudeDelivery: AcceptanceModule = {
             return { assertions: [{ id: 'F3-wire', claim: 'A selected Claude root claimed an observed source through the real CLI and daemon after one public durable attempt; child, other root, wrong worktree, Codex, repeat and stale callbacks received none',
               evidence: { capture_session_id: sessionId, question_id: queued.question_id,
                 attempt_seq: attempts[0]!.seq, negative_callbacks: negatives.length + 2,
-                repeated_emissions: 0, canonical_worktree: await realpath(worktree) } }] };
+                canonical_worktree: await realpath(worktree) } }] };
           } finally { await rm(inputPath, { force: true }); }
         } finally { await rm(sourcePath, { force: true }); }
       } finally { await rm(transcript, { force: true }); await rm(otherTranscript, { force: true }); }

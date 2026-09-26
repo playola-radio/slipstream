@@ -428,7 +428,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         try { resolvedTranscript = await realpath(rootTranscript); }
         catch {
           throw new RootIdentityError(harness === 'claude-code'
-            ? 'root Claude transcript is not yet available; retry attach after the first root tool call'
+            ? 'root Claude transcript is unavailable; check its path or retry attach after the first root tool call'
             : 'root Codex transcript cannot be resolved');
         }
         if (harness === 'codex') {
@@ -438,7 +438,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           if (!verified.ok) {
             throw new RootIdentityError(verified.reason === 'not-yet'
               ? 'root Claude transcript has no complete identity yet; retry attach after the first root tool call'
-              : `root Claude transcript identity is ${verified.reason}`);
+              : verified.reason === 'gap'
+                ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
+                : `root Claude transcript identity is ${verified.reason}`);
           }
         }
       }

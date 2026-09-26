@@ -52,6 +52,7 @@ it('fails closed on unavailable, incomplete, malformed, and contradictory bounde
     await check(line(preamble()) + '{bad}\n' + line(identity(root)), 'gap');
     await check(Buffer.concat([Buffer.from(line(preamble())), Buffer.from([0xff, 0x0a]), Buffer.from(line(identity(root)))]), 'gap');
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), version: '2.1.999' }), 'mismatch');
+    await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), userType: 'internal' }), 'mismatch');
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), sessionId: 'other' }), 'mismatch');
     await check(line(preamble()) + line({ ...identity(root), version: '2.1.999' }), 'unsupported-version');
     await check(line(preamble()) + line({ ...identity(root), cwd: dir }), 'mismatch');

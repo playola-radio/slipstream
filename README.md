@@ -94,6 +94,8 @@ Codex and Claude Code delivery require an explicit root transcript binding at
 for the control fields and setup. The public
 `slipstream.question.dispatch_attempted.v1` event means the daemon committed an
 attempt before answering the hook; it does not confirm receipt or an answer.
+Attach Claude shortly after its first root tool call, and keep the chat's
+current directory at the attached worktree when claiming a question.
 
 Retry with the **same request ID, capture ID and input**. Same-ID/body retries
 return the original result without extending the 30-minute TTL. A changed body

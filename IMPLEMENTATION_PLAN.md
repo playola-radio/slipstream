@@ -845,8 +845,14 @@ does not prove receipt or an answer. Contract: [docs/ask-agent/contract.md](docs
 `2.1.283` delivery passed on an explicitly attached root: a child callback
 stayed silent, the selected root received the question once and continued,
 another root could not claim a second queued question, and `/clear` created a
-new session whose root could not claim the old queue. Conductor app acceptance
-and full gates remain pending.
+new session whose root could not claim the old queue. Conductor app Claude Code
+`2.1.280` passed a child-barrier delivery: the child callback stayed silent,
+the selected root received the question once, the public log recorded one
+attempt, and its answer included the question ID and recorded nonce before
+continuing. A 24,542-byte eligible context also reached the app without
+truncation; the full selected source and final end marker appeared in the host
+hook record. The full local gate suite passed. The distinct Conductor root
+negative and review fixes remain pending.
 
 D3 adds bounded Claude root transcript verification at attach and a Claude
 Code `PostToolUse` command using the D2 claim/attempt contract. Supported
