@@ -8,6 +8,7 @@ import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts
 import { blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
+import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
@@ -171,6 +172,42 @@ describe('daemon control verbs', () => {
       assert.equal(oldEvents.filter(e => e.type === 'slipstream.question.dispatch_attempted.v1').length, 0);
     } finally {
       release();
+      await daemon.stop();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers a maximal accepted question verbatim through queue, durable attempt, and the Claude hook', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-max-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-max-wt-'));
+    const transcript = join(store, 'root.jsonl');
+    await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: 'root', cwd: worktree,
+      version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+    const selected = '€'.repeat(5461) + 'x';
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => selected,
+    } });
+    const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+    try {
+      const attached = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript });
+      assert.equal(attached.ok, true);
+      // Synthetic protocol-boundary path: the widest accepted path with the widest JSON escaping.
+      const path = '\u0001'.repeat(4096);
+      const ask = await call({ verb: 'ask', session_id: rec(attached).session_id, request_id: ASK_REQUEST, text: 'Q'.repeat(8192),
+        context: { ...ASK_CONTEXT, path, line_start: 1, line_end: 200 } });
+      assert.equal(ask.ok, true);
+      const id = rec(ask).question_id;
+      const output = await claudePostToolUse({ hook_event_name: 'PostToolUse', session_id: 'root', cwd: worktree,
+        transcript_path: transcript }, store);
+      const context = JSON.parse(output!).hookSpecificOutput.additionalContext as string;
+      assert.ok(Buffer.byteLength(context) <= 32 * 1024);
+      assert.ok(context.includes(`BEGIN SOURCE PATH ${id}\n${path}\nEND SOURCE PATH ${id}\n`));
+      assert.ok(context.endsWith(`\nBEGIN SELECTED SOURCE ${id}\n${selected}\nEND SELECTED SOURCE ${id}`));
+      const events = (await readFile(sessionLogPath(store, rec(attached).session_id!), 'utf8')).trim().split('\n')
+        .map(s => JSON.parse(s) as { type: string; data: { question_id?: string } });
+      assert.deepEqual(events.filter(e => e.type === 'slipstream.question.dispatch_attempted.v1').map(e => e.data.question_id), [id]);
+    } finally {
       await daemon.stop();
       await rm(store, { recursive: true, force: true });
       await rm(worktree, { recursive: true, force: true });
