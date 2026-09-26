@@ -879,8 +879,20 @@ added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
 `answerQuestion`, the `answer_question` control verb, the forwarder tool
 `slipstream_answer_question`, the delivery-text instruction, and the
 `reply_to_question_id` follow-up field. Unit suites and the synthetic
-`F4-answer` acceptance check pass. Live re-runs of the answer proof and the
-Codex review gates are pending before the PR.
+`F4-answer` acceptance check pass. Codex review, challenge and excess audit ran;
+their findings are fixed (the ask CLI and the delivered text now carry the
+follow-up link, and the tool only reports "recorded" for a complete ack).
+
+Live answer proof re-run against this branch on 2026-09-26:
+- Claude Code 2.1.283 (Terminal): PASS. The root answered two questions, a
+  subagent answered a third, a non-selected session got
+  `SESSION_NOT_SELECTED`, and an undispatched question stayed queued.
+- Codex CLI 0.155.1 (Conductor's bundled binary): PASS, child rejected. The root
+  answered two questions; a subagent and a non-selected session got
+  `SESSION_NOT_SELECTED`. The installed Codex 0.157.1 is outside the daemon's
+  attach allowlist (`0.154.0`, `0.155.1`) and fails closed at attach, so it
+  was not used; widening the pin needs its own probe.
+- The Conductor checks passed earlier (O5).
 
 An agent returns an answer only by calling the forwarder tool; a chat reply or
 transcript line is never an answer. The daemon records one immutable
