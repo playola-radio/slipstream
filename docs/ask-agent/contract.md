@@ -1,7 +1,7 @@
 # Queue contract for the ask/send slice
 
-Status: D1 queueing, D2 Codex delivery, and S1 Swift sending are merged. D3
-adds Claude Code delivery through the same public question and attempt events.
+Status: D1 queueing, D2 Codex delivery, S1 Swift sending, and D3 Claude Code
+delivery through the same public question and attempt events are merged.
 Answer return remains a separate slice.
 
 ## Boundary
@@ -164,7 +164,14 @@ The adapter accepts only a bounded Codex `PostToolUse` callback with a nonempty
 the existing Unix socket client with 300 ms connect and 700 ms reply deadlines,
 emits only `hookSpecificOutput` with `hookEventName: PostToolUse` and
 `additionalContext`, and caps that context at 32 KiB. Selected source is included
-verbatim; an overlarge context is never truncated. Parse, socket, daemon,
+verbatim between question-ID markers and is never truncated. The path normally
+appears JSON-escaped on the `Source:` line. Escaping can expand an accepted
+4096-byte path up to sixfold, so when that form would exceed the cap the context
+instead carries the raw path between `BEGIN SOURCE PATH <id>` and
+`END SOURCE PATH <id>` lines, labelled untrusted data. With accepted daemon
+limits (question 8192 bytes, path 4096 bytes, source 16384 bytes) the raw form
+always fits; the markers are framing, not a security boundary. A reply outside
+those limits gets no output. Parse, socket, daemon,
 timeout, identity and malformed-response failures exit 0 with no stdout. It
 neither logs question/source bytes nor writes reply artifacts.
 
@@ -214,7 +221,10 @@ Attachment reads a bounded, complete transcript head (at most 64 records,
 canonical worktree, external user, root `isSidechain:false`, and an observed
 runtime/entrypoint pair: Terminal Claude Code `2.1.283`/`sdk-cli` or Conductor
 Claude Code `2.1.280`/`sdk-ts`. Missing, truncated, contradictory, or newer
-unverified metadata fails closed; test a newer runtime before adding it. The
+unverified metadata fails closed; test a newer runtime before adding it. A
+record still being written inside the bounded head, including one after a valid
+identity record, makes attach fail as retryable (`IDENTITY_UNRESOLVED`); retry
+once the record is complete. Verification runs only at attach. The
 head bounds are strict even after an identity record: a large early attachment
 or too many startup records can make an established chat impossible to attach.
 Select the root shortly after its first tool call. An unresolved path may also

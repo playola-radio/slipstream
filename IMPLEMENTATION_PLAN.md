@@ -72,7 +72,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | # | Decision | Choice |
 |---|---|---|
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
-| Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery merged, Claude delivery D3 in progress, answer UI deferred |
+| Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery and Claude delivery D3 merged, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
 | Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
@@ -841,7 +841,7 @@ does not prove receipt or an answer. Contract: [docs/ask-agent/contract.md](docs
 
 ## D3: Claude Code hook delivery (2026-09-25)
 
-**Status**: Implementation and acceptance in progress. Terminal Claude Code
+**Status**: Merged into `develop` (PR #36). Terminal Claude Code
 `2.1.283` delivery passed on an explicitly attached root: a child callback
 stayed silent, the selected root received the question once and continued,
 another root could not claim a second queued question, and `/clear` created a
@@ -851,8 +851,19 @@ the selected root received the question once, the public log recorded one
 attempt, and its answer included the question ID and recorded nonce before
 continuing. A 24,542-byte eligible context also reached the app without
 truncation; the full selected source and final end marker appeared in the host
-hook record. The full local gate suite passed. The distinct Conductor root
-negative and review fixes remain pending.
+hook record. In a separate Conductor app run against a different selected root,
+two unrelated app-root callbacks produced zero emissions and zero public
+attempts. Earlier direct-binary probes on both runtimes emitted a 32,700-byte
+context with the final marker present.
+
+A post-merge follow-up fixes two defects found by independent checks. Attach now
+returns retryable `not-yet` when a record inside the bounded head is still being
+written after a valid identity record; previously it could succeed before the
+next record was complete. The shared Codex/Claude hook formatter no longer
+truncates selected source: when JSON escaping would push a long path past
+32 KiB, the path moves to a delimited raw block and the source stays verbatim.
+The overflow cases are synthetic protocol-boundary fixtures; no captured macOS
+path has been shown to reach them.
 
 D3 adds bounded Claude root transcript verification at attach and a Claude
 Code `PostToolUse` command using the D2 claim/attempt contract. Supported
