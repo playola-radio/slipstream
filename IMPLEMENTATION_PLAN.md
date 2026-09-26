@@ -871,3 +871,28 @@ observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
 `2.1.280`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
 capture source, Swift UI, launcher, hook installer or automatic hook trust is
 added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+## D4: Answer return (2026-09-26)
+
+**Status**: In Progress. Daemon slice implemented on
+`briankeane/d4-daemon-answer-contract`: answered event and recovery, session
+`answerQuestion`, the `answer_question` control verb, the forwarder tool
+`slipstream_answer_question`, the delivery-text instruction, and the
+`reply_to_question_id` follow-up field. Unit suites and the synthetic
+`F4-answer` acceptance check pass. Live re-runs of the answer proof and the
+Codex review gates are pending before the PR.
+
+An agent returns an answer only by calling the forwarder tool; a chat reply or
+transcript line is never an answer. The daemon records one immutable
+`slipstream.question.answered.v1` per dispatched question, only from the harness
+session the question was dispatched to. It proves the answer came through that
+session, not from its root agent: Codex subagents are rejected, but a Claude
+Code subagent shares the root's MCP server and is accepted (owner decision O1;
+a root-only witness is a later follow-up). There is no timeout, expiry,
+"received" or "delivered" fact. The owner decisions are summarized as B1–B6 in
+[docs/ask-agent/spec.md](docs/ask-agent/spec.md); the contract is
+[docs/ask-agent/contract.md](docs/ask-agent/contract.md) ("Answer return").
+
+Release gate: the Swift client's tolerance patch (Swift brief S0) must be
+released no later than this, or the current viewer shows an "Unsupported event"
+marker for each answer.
