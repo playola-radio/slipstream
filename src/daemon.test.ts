@@ -65,6 +65,113 @@ async function withDaemon(
 }
 
 describe('daemon control verbs', () => {
+  it('attaches only to a verified Claude root and lets only that root claim once', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-wt-'));
+    const otherWorktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-other-'));
+    const transcript = join(store, 'root.jsonl');
+    const otherTranscript = join(store, 'other.jsonl');
+    const meta = (id = 'root') => JSON.stringify({ type: 'user', sessionId: id, cwd: worktree,
+      version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n';
+    const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'selected',
+    } });
+    const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+    try {
+      const attachReq = { verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript };
+      const missing = await call(attachReq);
+      assert.equal(missing.ok === false && missing.code, 'IDENTITY_UNRESOLVED');
+      await writeFile(transcript, JSON.stringify({ type: 'queue-operation', sessionId: 'root' }) + '\n');
+      const preamble = await call(attachReq);
+      assert.equal(preamble.ok === false && preamble.code, 'IDENTITY_UNRESOLVED');
+      await writeFile(transcript, JSON.stringify({ type: 'queue-operation', sessionId: 'root' }) + '\n' + meta());
+      await writeFile(otherTranscript, meta('other'));
+      const attached = await call(attachReq);
+      assert.equal(attached.ok, true);
+      const captureId = rec(attached).session_id!;
+      assert.equal(rec(await call({ verb: 'status' })).root_transcript, await realpath(transcript));
+      const ask = await call({ verb: 'ask', session_id: captureId, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(ask.ok, true);
+      const identity = { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript };
+      const negatives = [
+        { ...identity, agent_id: null }, { ...identity, agent_type: null },
+        { ...identity, agent_id: 'child', agent_type: 'general-purpose' },
+        { ...identity, agent_id: '' }, { ...identity, agent_type: '' },
+        { ...identity, harness: 'codex' }, { ...identity, harness_session_id: 'other' },
+        { ...identity, worktree: otherWorktree }, { ...identity, transcript_path: otherTranscript },
+      ];
+      for (const bad of negatives) assert.equal((await call(bad)).ok, false);
+      const claims = await Promise.all(Array.from({ length: 8 }, () => call(identity)));
+      const delivered = claims.filter(r => r.ok && rec(r).question !== null);
+      assert.equal(delivered.length, 1);
+      assert.equal((rec(delivered[0]!).question as unknown as Record<string, unknown>).question_id, rec(ask).question_id);
+      assert.equal(rec(await call(identity)).question, null);
+      const events = (await readFile(sessionLogPath(store, captureId), 'utf8')).trim().split('\n').map(s => JSON.parse(s) as { type: string; data: { question_id?: string } });
+      const attempts = events.filter(e => e.type === 'slipstream.question.dispatch_attempted.v1');
+      assert.equal(attempts.length, 1);
+      assert.equal(attempts[0]!.data.question_id, rec(ask).question_id);
+      assert.equal((await call({ verb: 'detach' })).ok, true);
+      assert.equal((await call(identity)).ok, false);
+      const captureOnly = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root' });
+      assert.equal(captureOnly.ok, true);
+      assert.equal((await call({ verb: 'ask', session_id: rec(captureOnly).session_id, request_id: ASK_REQUEST,
+        text: 'Why?', context: ASK_CONTEXT })).ok, true);
+      assert.equal((await call(identity)).ok, false);
+    } finally {
+      await daemon.stop();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+      await rm(otherWorktree, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a Claude claim when the selected capture changes while callback paths resolve', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-race-'));
+    const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-race-wt-'));
+    const transcript = join(store, 'root.jsonl');
+    await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: 'root', cwd: worktree,
+      version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+    let hold = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    const daemon = await startDaemon({ storeDir: store, identityRealpath: async path => {
+      if (hold && path === worktree) { hold = false; entered(); await held; }
+      return realpath(path);
+    }, captureDependencies: { platform: createFakePlatform(), enumerate: async () => {},
+      readQuestionContext: async () => 'selected' } });
+    const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+    const attach = { verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript };
+    const claim = { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript };
+    try {
+      const first = await call(attach);
+      assert.equal(first.ok, true);
+      assert.equal((await call({ verb: 'ask', session_id: rec(first).session_id, request_id: ASK_REQUEST,
+        text: 'Why?', context: ASK_CONTEXT })).ok, true);
+      hold = true;
+      const stale = call(claim);
+      await Promise.race([entering, new Promise((_, reject) => setTimeout(() => reject(new Error('claim did not enter path resolution')), 1000))]);
+      assert.equal((await call({ verb: 'detach' })).ok, true);
+      const second = await call(attach);
+      assert.equal(second.ok, true);
+      assert.equal((await call({ verb: 'ask', session_id: rec(second).session_id, request_id: ASK_REQUEST,
+        text: 'Why?', context: ASK_CONTEXT })).ok, true);
+      release();
+      const result = await stale;
+      assert.equal(result.ok === false && result.code, 'SESSION_NOT_SELECTED');
+      assert.equal((await call(claim)).ok, true);
+      const oldEvents = (await readFile(sessionLogPath(store, rec(first).session_id!), 'utf8')).trim().split('\n')
+        .map(s => JSON.parse(s) as { type: string });
+      assert.equal(oldEvents.filter(e => e.type === 'slipstream.question.dispatch_attempted.v1').length, 0);
+    } finally {
+      release();
+      await daemon.stop();
+      await rm(store, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
   it('binds a Codex root transcript and refuses child, other chat, Claude, or absent identity claims', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-wt-'));

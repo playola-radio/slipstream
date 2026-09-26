@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
 import { QuestionError } from './questions.ts';
+import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
@@ -53,6 +54,8 @@ export interface DaemonOptions {
   storeDir: string;
   /** Injected capture dependencies (tests drive a fake platform through here). */
   captureDependencies?: Parameters<typeof startCapture>[1];
+  /** Allows an identity-path resolution race to be exercised deterministically. */
+  identityRealpath?: (path: string) => Promise<string>;
   /** The resolved enrichment + transcript config (Fork 4). Absent means built-in
    * defaults: no harness is `configured`, so no transcript is read. */
   config?: ResolvedConfig;
@@ -197,6 +200,7 @@ async function bindControl(server: Server, socketPath: string): Promise<void> {
 
 export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const storeDir = opts.storeDir;
+  const identityRealpath = opts.identityRealpath ?? realpath;
   const socketPath = join(storeDir, 'control.sock');
 
   await mkdirpDurable(storeDir);
@@ -418,10 +422,27 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // status rather than the caller's raw string (locked design, decision 5).
       resolvedWorktree = await realpath(worktree);
       if (rootTranscript !== undefined) {
-        if (harness !== 'codex') throw new RootIdentityError('root_transcript is only supported for Codex');
+        if (harness !== 'codex' && harness !== 'claude-code') {
+          throw new RootIdentityError('root_transcript requires a supported harness');
+        }
         try { resolvedTranscript = await realpath(rootTranscript); }
-        catch { throw new RootIdentityError('root Codex transcript cannot be resolved'); }
-        await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
+        catch {
+          throw new RootIdentityError(harness === 'claude-code'
+            ? 'root Claude transcript is unavailable; check its path or retry attach after the first root tool call'
+            : 'root Codex transcript cannot be resolved');
+        }
+        if (harness === 'codex') {
+          await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
+        } else {
+          const verified = await verifyClaudeRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
+          if (!verified.ok) {
+            throw new RootIdentityError(verified.reason === 'not-yet'
+              ? 'root Claude transcript has no complete identity yet; retry attach after the first root tool call'
+              : verified.reason === 'gap'
+                ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
+                : `root Claude transcript identity is ${verified.reason}`);
+          }
+        }
       }
       const transcript = transcriptRuntimeFrom(opts.config);
       session = await startCapture(
@@ -648,22 +669,23 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function claimQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn || state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
     if (state !== 'active' || !current) return errFields('SESSION_NOT_SELECTED', 'no active capture');
-    if (current.harness !== 'codex' || !current.rootTranscript || req.harness !== 'codex'
+    if ((current.harness !== 'codex' && current.harness !== 'claude-code')
+      || !current.rootTranscript || req.harness !== current.harness
       || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)
       || !nonEmptyString(req.transcript_path)
       || Object.hasOwn(req, 'agent_id') || Object.hasOwn(req, 'agent_type')) {
-      return errFields('IDENTITY_UNRESOLVED', 'unsupported or incomplete root Codex identity');
+      return errFields('IDENTITY_UNRESOLVED', 'unsupported or incomplete root identity');
     }
     const binding = current;
     let worktree: string; let transcript: string;
-    try { [worktree, transcript] = await Promise.all([realpath(req.worktree), realpath(req.transcript_path)]); }
+    try { [worktree, transcript] = await Promise.all([identityRealpath(req.worktree), identityRealpath(req.transcript_path)]); }
     catch { return errFields('IDENTITY_UNRESOLVED', 'identity path cannot be resolved'); }
     if (compromised || torn || sessionCompromised || state !== 'active' || current !== binding
       || req.harness_session_id !== binding.harnessSessionId
       || worktree !== binding.worktree || transcript !== binding.rootTranscript) {
       return errFields('SESSION_NOT_SELECTED', 'the callback is not the selected root session');
     }
-    const promise = binding.session.claimQuestion({ harness: 'codex', harness_session_id: binding.harnessSessionId,
+    const promise = binding.session.claimQuestion({ harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId,
       worktree: binding.worktree }, () => {
       if (compromised || sessionCompromised || current !== binding) {
         throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');

@@ -34,7 +34,7 @@ import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { isValidSessionId } from './store-reader.ts';
 import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts';
 import { QUESTION_TTL_MS } from './questions.ts';
-import { codexPostToolUse, readHookInput } from './question-hook.ts';
+import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
@@ -55,6 +55,7 @@ type Args =
   | { command: 'detach'; store: string }
   | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string; rootTranscript?: string }
   | { command: 'codex-hook'; store: string }
+  | { command: 'claude-hook'; store: string }
   | { command: 'ask'; store: string; sessionId: string; requestId: string; inputPath: string }
   | { command: 'delete'; store: string; sessionId: string }
   | { command: 'gc'; store: string };
@@ -245,6 +246,10 @@ export function parseArgs(argv: string[]): Args | null {
     const store = parseStoreOnly(argv.slice(3));
     return store === null ? null : { command: 'codex-hook', store };
   }
+  if (command === 'hook' && argv[1] === 'claude-code' && argv[2] === 'post-tool-use') {
+    const store = parseStoreOnly(argv.slice(3));
+    return store === null ? null : { command: 'claude-hook', store };
+  }
   if (command === 'delete') {
     const parsed = parseDelete(argv.slice(1));
     if (!parsed) return null;
@@ -271,6 +276,7 @@ function usage(): void {
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
   console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id> [--root-transcript <path>]');
   console.error('       slipstream hook codex post-tool-use --store <dir>');
+  console.error('       slipstream hook claude-code post-tool-use --store <dir>');
   console.error('       slipstream status [--store <dir>]');
   console.error('       slipstream detach [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
@@ -454,10 +460,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args.command === 'codex-hook') {
+  if (args.command === 'codex-hook' || args.command === 'claude-hook') {
     try {
       const deadlineAtMs = Date.now() + 1000;
-      const output = await codexPostToolUse(await readHookInput(process.stdin, deadlineAtMs), args.store, deadlineAtMs);
+      const callback = await readHookInput(process.stdin, deadlineAtMs);
+      const output = await (args.command === 'codex-hook' ? codexPostToolUse : claudePostToolUse)(callback, args.store, deadlineAtMs);
       if (output) process.stdout.write(output);
     } catch { /* Hooks must never interrupt the agent or log callback content. */ }
     return;

@@ -20,6 +20,13 @@ it('claims oldest queued question once and commits attempt before returning cont
       await writeFile(join(root, 'a.ts'), 'one\ntwo\n'); platform.observe('a.ts');
       const change = (await waitForRecords(session.logPath, records => records.some(e => e.type === 'slipstream.file.changed.v1')))
         .find(e => e.type === 'slipstream.file.changed.v1')!;
+      // A reader can see the appended line before fsync finishes and health
+      // advances its durable boundary. ask correctly refuses that earlier state.
+      const deadline = Date.now() + 8000;
+      while (BigInt(session.health.snapshot().durable_seq) < BigInt(change.seq)) {
+        assert.ok(Date.now() < deadline, 'source change must become durable');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
       assert.equal(change.data.after.kind, 'content');
       const request = { session_id: session.sessionId, request_id: randomUUID(), text: 'Why?', context: {
         change_seq: change.seq, path: 'a.ts', snapshot_sha256: change.data.after.sha256, line_start: 1, line_end: 2,
