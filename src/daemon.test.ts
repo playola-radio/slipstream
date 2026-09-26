@@ -307,7 +307,7 @@ describe('daemon control verbs', () => {
       const context = JSON.parse(output!).hookSpecificOutput.additionalContext as string;
       assert.ok(Buffer.byteLength(context) <= 32 * 1024);
       assert.ok(context.includes(`BEGIN SOURCE PATH ${id}\n${path}\nEND SOURCE PATH ${id}\n`));
-      assert.ok(context.endsWith(`\nBEGIN SELECTED SOURCE ${id}\n${selected}\nEND SELECTED SOURCE ${id}`));
+      assert.ok(context.endsWith(`\nBEGIN SELECTED SOURCE ${id}\n${selected}\nEND SELECTED SOURCE ${id}\nReturn your answer by calling the slipstream_answer_question tool with question_id ${id} and your complete answer as text. A chat reply alone does not reach the user.`));
       const events = (await readFile(sessionLogPath(store, rec(attached).session_id!), 'utf8')).trim().split('\n')
         .map(s => JSON.parse(s) as { type: string; data: { question_id?: string } });
       assert.deepEqual(events.filter(e => e.type === 'slipstream.question.dispatch_attempted.v1').map(e => e.data.question_id), [id]);
