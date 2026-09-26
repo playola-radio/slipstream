@@ -49,6 +49,41 @@ describe('slipstream.question.queued.v1 schema', () => {
     const bad = { ...event, data: { ...event.data, queued_seq: 4 } };
     assert.ok(validate(await loadSchema(event.type), bad).length > 0);
   });
+  it('validates a durable answer with the same public question identity', async () => {
+    const event = buildPublicEnvelope({ type: 'slipstream.question.answered.v1',
+      occurred_at_ms: 1789657200123,
+      data: { question_id: QUESTION, attempt_seq: '5', text: 'Because.', answered_at_ms: 1789657200123 },
+    }, 6n, SESSION);
+    assert.equal(event.id, '6');
+    assert.equal(event.subject, `question/${QUESTION}`);
+    assert.equal(event.time, '2026-09-17T15:00:00.123Z');
+    assert.deepEqual(event.data, { question_id: QUESTION, attempt_seq: '5', text: 'Because.', answered_at_ms: 1789657200123, session_id: SESSION });
+    assert.deepEqual(validate(await loadSchema(event.type), event), []);
+    assert.deepEqual(foldDisplay([event]), { contract: 'display-fold.v1', result: 'ok',
+      state: { attributions: [], coverage: [], evidence: [], gaps: [] } });
+  });
+
+  for (const [name, patch] of [
+    ['a numeric attempt sequence', { attempt_seq: 5 }],
+    ['an empty answer', { text: '' }],
+    ['an answer longer than 16384 characters', { text: 'a'.repeat(16385) }],
+    ['a negative answer timestamp', { answered_at_ms: -1 }],
+    ['a non-canonical question id', { question_id: 'ABC' }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    it(`rejects an answer with ${name}`, async () => {
+      const event = buildPublicEnvelope({ type: 'slipstream.question.answered.v1', occurred_at_ms: 1,
+        data: { question_id: QUESTION, attempt_seq: '5', text: 'Because.', answered_at_ms: 1 } }, 6n, SESSION);
+      const bad = { ...event, data: { ...event.data, ...patch } };
+      assert.ok(validate(await loadSchema('slipstream.question.answered.v1'), bad).length > 0);
+    });
+  }
+
+  it('accepts a follow-up that names the question it replies to', async () => {
+    const event = queuedQuestion();
+    (event.data as Record<string, unknown>).reply_to_question_id = QUESTION;
+    assert.deepEqual(validate(await loadSchema('slipstream.question.queued.v1'), event), []);
+  });
+
   it('accepts the durable D1 record and additive future fields', async () => {
     const event = queuedQuestion();
     event.future_envelope_field = true;
@@ -101,6 +136,7 @@ describe('slipstream.question.queued.v1 schema', () => {
     ['a missing target worktree', (event: Record<string, unknown>) => { delete ((event.data as Record<string, unknown>).target as Record<string, unknown>).worktree; }],
     ['a fractional line range', (event: Record<string, unknown>) => { ((event.data as Record<string, unknown>).context as Record<string, unknown>).line_start = 1.5; }],
     ['a negative queued timestamp', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).queued_at_ms = -1; }],
+    ['a non-canonical reply-to question id', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).reply_to_question_id = 'ABC'; }],
     ['a negative expiry timestamp', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).expires_at_ms = -1; }],
   ] as Array<[string, (event: Record<string, unknown>) => void]>) {
     it(`rejects ${name}`, async () => {

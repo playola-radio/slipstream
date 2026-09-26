@@ -9,15 +9,21 @@ the harness starts.
 
 `src/mcp-forwarder.ts` is a thin, per-session stdio MCP server. When a harness
 starts a session it spawns one forwarder subprocess and speaks JSON-RPC to it
-over stdin/stdout. The forwarder exposes exactly one tool,
-`slipstream_begin_task(title)` (see `SKILL.md`), and forwards each declaration
-to the shared Slipstream daemon over the daemon's local control socket. It never
-captures files, never attaches or detaches (the `slipstream` CLI owns that), and
-never reads the feed — it only forwards task declarations.
+over stdin/stdout. The forwarder exposes two tools and forwards each call to the
+shared Slipstream daemon over the daemon's local control socket:
 
-If no daemon is running for the store, the tool fails fast with
+- `slipstream_begin_task(title)` declares a task (see `SKILL.md`).
+- `slipstream_answer_question(question_id, text)` returns the agent's answer to
+  a question the user asked from Slipstream. The delivered question tells the
+  agent to call it; see `docs/ask-agent/contract.md` ("Answer return").
+
+It never captures files, never attaches or detaches (the `slipstream` CLI owns
+that), and never reads the feed.
+
+If no daemon is running for the store, a tool fails fast with
 `DAEMON_UNAVAILABLE`; it never hangs. Declaring a task is best-effort grouping,
-so a missing daemon is harmless to the agent's work.
+so a missing daemon is harmless to the agent's work. An answer that fails is
+not recorded, and the tool result says so.
 
 ## Prerequisites
 
@@ -76,6 +82,31 @@ args = [
 ```
 
 Again, omit the `--store` arguments to use the default `~/.slipstream` store.
+
+To let Codex return answers, also:
+
+- Approve the answer tool so Codex calls it without an approval prompt (with
+  approval policy `never`, every call otherwise fails with "MCP tool call
+  requires approval"):
+
+  ```toml
+  [mcp_servers.slipstream.tools.slipstream_answer_question]
+  approval_mode = "approve"
+  ```
+
+- Run Codex in a **git** worktree. Outside git, Codex does not send the
+  workspace metadata the forwarder uses to identify the chat, and every call
+  fails closed with `IDENTITY_UNRESOLVED`.
+- Install the Codex question hook (`docs/ask-agent/contract.md`, "Startup
+  installation") in **each** workspace's `.codex/hooks.json`. Codex loads
+  project hooks from the chat's own workspace, so a Conductor workspace does not
+  read the main checkout's copy.
+
+## After installing
+
+MCP servers and hooks load only when a chat starts. Start a new chat after
+installing or changing any of the above; an already-running chat does not see
+the new tool.
 
 ## Installing the skill
 

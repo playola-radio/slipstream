@@ -75,7 +75,8 @@ from the public events API (sequence numbers are decimal strings):
 }
 ```
 
-The example hash is a placeholder: use the actual change's `after.sha256`. The
+A follow-up adds `"reply_to_question_id"` naming the earlier question; its
+`context` must be identical. The example hash is a placeholder: use the actual change's `after.sha256`. The
 daemon validates the durable event and original blob, derives the selected text,
 and copies the explicit attach target. It never reads the current working file
 or accepts client-supplied authorship. Only after-content up to 1 MiB is eligible;

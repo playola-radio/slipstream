@@ -122,6 +122,43 @@ test('an unrecognized client fails closed as IDENTITY_UNRESOLVED without contact
   }
 });
 
+test('lists the task and answer tools', async () => {
+  const handlers = createForwarderHandlers({ socketPath: '/nonexistent/control.sock', env: {} });
+  const res = await dispatch({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, handlers);
+  const tools = (res!.result as { tools: Array<{ name: string }> }).tools;
+  assert.deepEqual(tools.map(t => t.name), ['slipstream_begin_task', 'slipstream_answer_question']);
+});
+
+const callAnswer = (args: Record<string, unknown>, meta: Record<string, unknown>): JsonRpcRequest => ({
+  jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'slipstream_answer_question', arguments: args, _meta: meta },
+});
+const CODEX_META = { threadId: 'thread-9', 'x-codex-turn-metadata': { workspaces: { '/repos/edinburgh-v1': { role: 'primary' } } } };
+const QUESTION = '11111111-1111-4111-8111-111111111111';
+
+test('the answer tool forwards the question id, verbatim text, and caller identity', async () => {
+  const ack = { session_id: 'cap-1', question_id: QUESTION, event_id: '8', seq: '8', answered_at_ms: 5, duplicate: false };
+  const daemon = await fakeDaemon({ v: 1, ok: true, ...ack });
+  try {
+    const handlers = createForwarderHandlers({ socketPath: daemon.socketPath, env: {} });
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    const res = resultOf(await dispatch(callAnswer({ question_id: QUESTION, text: '  exact\n' }, CODEX_META), handlers));
+    assert.deepEqual(res, { text: `Answer recorded for question ${QUESTION} (seq 8).`, isError: false, structured: ack });
+    assert.deepEqual(daemon.received, [{ v: 1, verb: 'answer_question', question_id: QUESTION, text: '  exact\n',
+      harness: 'codex', harness_session_id: 'thread-9', worktree: '/repos/edinburgh-v1' }]);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('an unreachable daemon records nothing and reports DAEMON_UNAVAILABLE', async () => {
+  const handlers = createForwarderHandlers({ socketPath: join(tmpdir(), 'slip-missing', 'control.sock'), env: {} });
+  await dispatch(initialize('codex-mcp-client'), handlers);
+  const res = resultOf(await dispatch(callAnswer({ question_id: QUESTION, text: 'x' }, CODEX_META), handlers));
+  assert.equal(res.isError, true);
+  assert.deepEqual(res.structured, { code: 'DAEMON_UNAVAILABLE' });
+  assert.match(res.text, /^DAEMON_UNAVAILABLE: /);
+});
+
 // ---- stdin framing (bounded) -----------------------------------------------
 
 const linesOf = (frames: StdinFrame[]): string[] =>

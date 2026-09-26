@@ -57,6 +57,7 @@ describe('cli ask', () => {
         change_seq: '9007199254740993', path: 'src/example.ts',
         snapshot_sha256: 'a'.repeat(64), line_start: 2, line_end: 4,
       },
+      reply_to_question_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
     }));
     let received: Record<string, unknown> | undefined;
     const server = createServer((socket) => {
@@ -93,6 +94,7 @@ describe('cli ask', () => {
           change_seq: '9007199254740993', path: 'src/example.ts',
           snapshot_sha256: 'a'.repeat(64), line_start: 2, line_end: 4,
         },
+        reply_to_question_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
       });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

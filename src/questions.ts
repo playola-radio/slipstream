@@ -5,11 +5,12 @@ import { createHash } from 'node:crypto';
 import { openLogCursor } from './log-reader.ts';
 import { blobPath } from './store-reader.ts';
 import { sourceFor } from './event.ts';
-import type { QuestionQueuedEvent } from './public-events.ts';
+import type { QuestionAnsweredEvent, QuestionQueuedEvent } from './public-events.ts';
 export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const MAX_ANSWER_BYTES = 16 * 1024;
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface QuestionContext {
   change_seq: string;
@@ -23,6 +24,7 @@ export interface QuestionRequest {
   request_id: string;
   text: string;
   context: QuestionContext;
+  reply_to_question_id?: string;
 }
 export class QuestionError extends Error {
   readonly code: ControlErrorCode;
@@ -59,16 +61,18 @@ export function normalizeAsk(value: unknown): QuestionRequest {
     || /[\uD800-\uDFFF]/u.test(ctx.path)) invalidContext('context path must be a relative source path of at most 4096 UTF-8 bytes');
   if (typeof ctx.snapshot_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(ctx.snapshot_sha256)) invalidContext('snapshot_sha256 must be a lowercase SHA-256');
   if (!validRange(ctx.line_start, ctx.line_end)) invalidContext('select 1–200 source lines using inclusive positive integer bounds');
+  const reply = req.reply_to_question_id;
+  if (reply !== undefined && (typeof reply !== 'string' || !UUID.test(reply))) invalidContext('reply_to_question_id must be a canonical lowercase UUID');
   return { session_id: req.session_id, request_id: req.request_id, text, context: {
     change_seq: ctx.change_seq, path: ctx.path, snapshot_sha256: ctx.snapshot_sha256,
     line_start: ctx.line_start as number, line_end: ctx.line_end as number,
-  } };
+  }, ...(reply !== undefined ? { reply_to_question_id: reply } : {}) };
 }
 
 /** Fixed-order normalized request body; identity excludes derived text and target. */
-export function questionBody(req: Pick<QuestionRequest, 'text' | 'context'>): string {
+export function questionBody(req: Pick<QuestionRequest, 'text' | 'context' | 'reply_to_question_id'>): string {
   const c = req.context;
-  return JSON.stringify([req.text, c.change_seq, c.path, c.snapshot_sha256, c.line_start, c.line_end]);
+  return JSON.stringify([req.text, c.change_seq, c.path, c.snapshot_sha256, c.line_start, c.line_end, req.reply_to_question_id ?? null]);
 }
 
 export function selectSource(bytes: Buffer, range: Pick<QuestionContext, 'line_start' | 'line_end'>): string {
@@ -155,4 +159,27 @@ export function questionResult(event: QuestionQueuedEvent): QuestionAccepted {
   const d = event.data;
   return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
     seq: event.seq, queued_at_ms: d.queued_at_ms, expires_at_ms: d.expires_at_ms, duplicate: false });
+}
+
+/** Answer text is stored verbatim, so it is checked but never trimmed. Unpaired
+ * surrogates are refused for the same reason as in question text. */
+export function assertAnswerText(text: unknown): asserts text is string {
+  if (typeof text !== 'string' || !/\S/u.test(text) || /[\uD800-\uDFFF]/u.test(text)
+    || Buffer.byteLength(text, 'utf8') > MAX_ANSWER_BYTES) {
+    throw new QuestionError('INVALID_ANSWER', `answer text must contain a non-whitespace character and be at most ${MAX_ANSWER_BYTES} UTF-8 bytes`);
+  }
+}
+
+export interface AnswerAccepted {
+  session_id: string;
+  question_id: string;
+  event_id: string;
+  seq: string;
+  answered_at_ms: number;
+  duplicate: boolean;
+}
+export function answerResult(event: QuestionAnsweredEvent): AnswerAccepted {
+  const d = event.data;
+  return Object.freeze({ session_id: d.session_id, question_id: d.question_id, event_id: event.seq, seq: event.seq,
+    answered_at_ms: d.answered_at_ms, duplicate: false });
 }

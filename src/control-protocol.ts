@@ -31,6 +31,9 @@ export type ControlErrorCode =
   | 'REQUEST_CONFLICT'
   | 'QUESTION_LIMIT'
   | 'INVALID_TITLE'
+  | 'INVALID_ANSWER'
+  | 'QUESTION_NOT_FOUND'
+  | 'ANSWER_CONFLICT'
   | 'PROTOCOL';
 
 export interface RequestEnvelope {

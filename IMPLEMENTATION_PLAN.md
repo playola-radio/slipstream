@@ -871,3 +871,40 @@ observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
 `2.1.280`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
 capture source, Swift UI, launcher, hook installer or automatic hook trust is
 added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+## D4: Answer return (2026-09-26)
+
+**Status**: In Progress. Daemon slice implemented on
+`briankeane/d4-daemon-answer-contract`: answered event and recovery, session
+`answerQuestion`, the `answer_question` control verb, the forwarder tool
+`slipstream_answer_question`, the delivery-text instruction, and the
+`reply_to_question_id` follow-up field. Unit suites and the synthetic
+`F4-answer` acceptance check pass. Codex review, challenge and excess audit ran;
+their findings are fixed (the ask CLI and the delivered text now carry the
+follow-up link, and the tool only reports "recorded" for a complete ack).
+
+Live answer proof re-run against this branch on 2026-09-26:
+- Claude Code 2.1.283 (Terminal): PASS. The root answered two questions, a
+  subagent answered a third, a non-selected session got
+  `SESSION_NOT_SELECTED`, and an undispatched question stayed queued.
+- Codex CLI 0.155.1 (Conductor's bundled binary): PASS, child rejected. The root
+  answered two questions; a subagent and a non-selected session got
+  `SESSION_NOT_SELECTED`. The installed Codex 0.157.1 is outside the daemon's
+  attach allowlist (`0.154.0`, `0.155.1`) and fails closed at attach, so it
+  was not used; widening the pin needs its own probe.
+- The Conductor checks passed earlier (O5).
+
+An agent returns an answer only by calling the forwarder tool; a chat reply or
+transcript line is never an answer. The daemon records one immutable
+`slipstream.question.answered.v1` per dispatched question, only from the harness
+session the question was dispatched to. It proves the answer came through that
+session, not from its root agent: Codex subagents are rejected, but a Claude
+Code subagent shares the root's MCP server and is accepted (owner decision O1;
+a root-only witness is a later follow-up). There is no timeout, expiry,
+"received" or "delivered" fact. The owner decisions are summarized as B1–B6 in
+[docs/ask-agent/spec.md](docs/ask-agent/spec.md); the contract is
+[docs/ask-agent/contract.md](docs/ask-agent/contract.md) ("Answer return").
+
+Release gate: the Swift client's tolerance patch (Swift brief S0) must be
+released no later than this, or the current viewer shows an "Unsupported event"
+marker for each answer.

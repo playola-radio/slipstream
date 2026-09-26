@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.question.answered.v1.json",
+  "title": "slipstream.question.answered.v1",
+  "$comment": "An answer returned through the slipstream_answer_question tool by the harness session a question was dispatched to. It proves the call came through that session, not which agent in the session wrote it.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "subject", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "source": { "type": "string", "pattern": "^urn:slipstream:session:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "type": { "const": "slipstream.question.answered.v1" },
+    "datacontenttype": { "const": "application/json" },
+    "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "time": { "type": "string", "format": "date-time" },
+    "subject": { "type": "string", "pattern": "^question/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "data": {
+      "type": "object",
+      "required": ["session_id", "question_id", "attempt_seq", "text", "answered_at_ms"],
+      "properties": {
+        "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "question_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "attempt_seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "answered_at_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

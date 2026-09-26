@@ -19,8 +19,8 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent } from './public-events.ts';
-import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted } from './questions.ts';
+import type { PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
+import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
 import type { TranscriptFileIO } from './transcript/file-reader.ts';
@@ -117,6 +117,7 @@ export interface CaptureSession {
   ingestEvidence(evidence: NormalizedEvidence): Promise<IngestOutcome>;
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
+  answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   stop(): Promise<void>;
 }
 
@@ -192,6 +193,12 @@ export async function startCapture(
   // consumed either way) so eligibility counting and claim lookup scan only
   // outstanding questions, not every question ever queued by a long-lived capture.
   const unattemptedQuestions = new Map<string, QuestionQueuedEvent>();
+  // Kept for the capture's lifetime: a question stays answerable after it
+  // leaves the unattempted queue or passes its claim TTL.
+  const questionsById = new Map<string, QuestionQueuedData>();
+  const attemptSeqs = new Map<string, string>();
+  const committedAnswers = new Map<string, { text: string; result: AnswerAccepted }>();
+  const inflightAnswers = new Map<string, { text: string; promise: Promise<AnswerAccepted> }>();
   let currentTaskId: string | undefined;
   const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
   const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
@@ -209,6 +216,10 @@ export async function startCapture(
       unattemptedQuestions.set(event.data.question_id, event);
     }
     for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
+    questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
+    for (const event of rec.questions) questionsById.set(event.data.question_id, event.data);
+    for (const event of rec.questionAttempts) attemptSeqs.set(event.data.question_id, event.seq);
+    for (const event of rec.questionAnswers) committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -239,9 +250,19 @@ export async function startCapture(
     onCommitted: (event) => {
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
-      if (event.type === 'slipstream.question.queued.v1') unattemptedQuestions.set(event.data.question_id, event);
-      if (event.type === 'slipstream.question.dispatch_attempted.v1') unattemptedQuestions.delete(event.data.question_id);
-      if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1') producer?.noteCommitted(event);
+      if (event.type === 'slipstream.question.queued.v1') {
+        unattemptedQuestions.set(event.data.question_id, event);
+        questionsById.set(event.data.question_id, event.data);
+      }
+      if (event.type === 'slipstream.question.dispatch_attempted.v1') {
+        unattemptedQuestions.delete(event.data.question_id);
+        attemptSeqs.set(event.data.question_id, event.seq);
+      }
+      if (event.type === 'slipstream.question.answered.v1') {
+        committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
+      }
+      if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
+        && event.type !== 'slipstream.question.answered.v1') producer?.noteCommitted(event);
     },
   };
 
@@ -346,6 +367,7 @@ export async function startCapture(
   function appendEvent(input: EventInput): Promise<AnyEvent>;
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
+  function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -805,6 +827,14 @@ export async function startCapture(
     if (existing && existing.body !== body) throw new QuestionError('REQUEST_CONFLICT', 'request_id was used for a different question or context');
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
+    if (req.reply_to_question_id !== undefined) {
+      const parent = questionsById.get(req.reply_to_question_id)?.context;
+      const c = req.context;
+      if (!parent || parent.change_seq !== c.change_seq || parent.path !== c.path || parent.snapshot_sha256 !== c.snapshot_sha256
+        || parent.line_start !== c.line_start || parent.line_end !== c.line_end) {
+        throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to a question in this capture about the same source');
+      }
+    }
     // A reservation covers source reads as well as append, bounding concurrent scans.
     // An expired-but-never-attempted entry can never become eligible again, so it
     // is dropped here rather than kept forever awaiting a claim that will not come.
@@ -824,7 +854,8 @@ export async function startCapture(
       const queued_at_ms = now();
       const event = await appendEvent({ type: 'slipstream.question.queued.v1', occurred_at_ms: queued_at_ms,
         data: { question_id: randomUUID(), request_id: req.request_id, target, text: req.text,
-          context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS } });
+          context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS,
+          ...(req.reply_to_question_id !== undefined ? { reply_to_question_id: req.reply_to_question_id } : {}) } });
       if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
       assertOwnership();
       const result = questionResult(event);
@@ -857,6 +888,38 @@ export async function startCapture(
     } finally { reservedQuestions.delete(id); }
   };
 
+  // Order: INVALID_ANSWER, then QUESTION_NOT_FOUND (which also hides questions
+  // dispatched to another harness session), then duplicate or ANSWER_CONFLICT.
+  const answerQuestion = async (input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<AnswerAccepted> => {
+    const { question_id: id, text } = input;
+    assertAnswerText(text);
+    assertOwnership();
+    questionReady();
+    const owner = typeof id === 'string' ? questionsById.get(id)?.target : undefined;
+    const attemptSeq = typeof id === 'string' ? attemptSeqs.get(id) : undefined;
+    if (typeof id !== 'string' || !owner || attemptSeq === undefined || owner.harness !== target.harness
+      || owner.harness_session_id !== target.harness_session_id || owner.worktree !== target.worktree) {
+      throw new QuestionError('QUESTION_NOT_FOUND', 'no question with that id was dispatched to this harness session');
+    }
+    const settled = committedAnswers.get(id);
+    const pending = inflightAnswers.get(id);
+    const existing = settled ?? pending;
+    if (existing && existing.text !== text) throw new QuestionError('ANSWER_CONFLICT', 'this question already has a different answer');
+    if (settled) return { ...settled.result, duplicate: true };
+    if (pending) return { ...await pending.promise, duplicate: true };
+    const promise = Promise.resolve().then(async (): Promise<AnswerAccepted> => {
+      const answered_at_ms = now();
+      const event = await appendEvent({ type: 'slipstream.question.answered.v1', occurred_at_ms: answered_at_ms,
+        data: { question_id: id, attempt_seq: attemptSeq, text, answered_at_ms } });
+      if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+      assertOwnership();
+      return answerResult(event);
+    });
+    inflightAnswers.set(id, { text, promise });
+    try { return await promise; }
+    finally { inflightAnswers.delete(id); }
+  };
+
   const doStop = async (): Promise<void> => {
     stopped = true;
     // Stop feeding the engine immediately: if the watcher unsubscribe below
@@ -880,7 +943,7 @@ export async function startCapture(
     // Fence the attribution generation and flush its in-flight appends before the
     // log closes: a stale evaluation must never append after the log is gone.
     await producer?.stop().catch(record);
-    await Promise.allSettled([...inflightQuestions.values()].map(q => q.promise));
+    await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
     await underlying.close().catch(record);
     await lock.release().catch(record);
     if (firstError !== undefined) throw firstError;
@@ -898,6 +961,7 @@ export async function startCapture(
     beginTask,
     askQuestion,
     claimQuestion,
+    answerQuestion,
     ingestEvidence,
     stop: () => (stopPromise ??= doStop()),
   };

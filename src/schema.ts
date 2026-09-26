@@ -5,11 +5,12 @@ import { dirname, join } from 'node:path';
 /**
  * A deliberately small JSON Schema validator covering exactly the draft 2020-12
  * keywords the Slipstream v1 schemas use: type, required, properties, const,
- * enum, pattern, minimum, oneOf, items, and local `#/$defs/...` `$ref`. It is
- * not a general validator — it exists so the tests can prove that emitted events
- * conform to the frozen public schemas, catching producer/schema drift. Unknown
- * keywords are ignored, and `additionalProperties` is intentionally never
- * enforced: the v1 contract permits unknown fields for forward compatibility.
+ * enum, pattern, minimum, minLength, maxLength, oneOf, items, and local
+ * `#/$defs/...` `$ref`. It is not a general validator — it exists so the tests
+ * can prove that emitted events conform to the frozen public schemas, catching
+ * producer/schema drift. Unknown keywords are ignored, and `additionalProperties`
+ * is intentionally never enforced: the v1 contract permits unknown fields for
+ * forward compatibility.
  */
 export type JsonSchema = Record<string, unknown>;
 
@@ -92,6 +93,12 @@ export function validate(
     if (!new RegExp(schema.pattern).test(value)) {
       errors.push(`${path}: ${JSON.stringify(value)} does not match /${schema.pattern}/`);
     }
+  }
+
+  if (typeof value === 'string' && (typeof schema.minLength === 'number' || typeof schema.maxLength === 'number')) {
+    const length = [...value].length;
+    if (typeof schema.minLength === 'number' && length < schema.minLength) errors.push(`${path}: length ${length} < minLength ${schema.minLength}`);
+    if (typeof schema.maxLength === 'number' && length > schema.maxLength) errors.push(`${path}: length ${length} > maxLength ${schema.maxLength}`);
   }
 
   if (schema.format === 'date-time' && typeof value === 'string' && !DATE_TIME.test(value)) {

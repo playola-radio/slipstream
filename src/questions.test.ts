@@ -27,6 +27,16 @@ describe('question normalization', () => {
     input.context.path = 'mutated';
     assert.equal(result.context.path, 'src/a.ts');
   });
+  it('passes a canonical reply_to_question_id through and counts it in the request body', () => {
+    const reply = '33333333-3333-4333-8333-333333333333';
+    const result = normalizeAsk({ ...request(), reply_to_question_id: reply });
+    assert.equal(result.reply_to_question_id, reply);
+    assert.equal('reply_to_question_id' in normalizeAsk(request()), false);
+    assert.notEqual(questionBody(result), questionBody(normalizeAsk(request())));
+    for (const bad of ['', 'ABCDEFAB-1111-4111-8111-111111111111', '../x', 7, null]) {
+      assert.throws(() => normalizeAsk({ ...request(), reply_to_question_id: bad }), code('INVALID_CONTEXT'));
+    }
+  });
   it('requires canonical IDs and decimal string seq', () => {
     for (const field of ['session_id', 'request_id']) {
       for (const bad of ['', 'ABCDEFAB-1111-4111-8111-111111111111', '../x', 7]) {

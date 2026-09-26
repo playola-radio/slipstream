@@ -44,7 +44,8 @@
           }
         },
         "queued_at_ms": { "type": "integer", "minimum": 0 },
-        "expires_at_ms": { "type": "integer", "minimum": 0 }
+        "expires_at_ms": { "type": "integer", "minimum": 0 },
+        "reply_to_question_id": { "$ref": "#/$defs/uuid" }
       }
     }
   },
