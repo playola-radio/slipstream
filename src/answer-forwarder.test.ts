@@ -54,7 +54,10 @@ test('every first-send rejection passes through once without a resend', async ()
 
 test('a lost reply or a mismatched ack is resolved by one identical resend', async () => {
   for (const first of [unknown(), ok({ ...ACK, question_id: '22222222-2222-4222-8222-222222222222' }),
-    ok({ ...ACK, seq: '' }), ok({ ...ACK, event_id: '9' }), ok({})]) {
+    ok({ ...ACK, seq: '' }), ok({ ...ACK, event_id: '9' }), ok({}),
+    ok({ ...ACK, seq: 'x', event_id: 'x' }), ok({ ...ACK, seq: '08', event_id: '08' }),
+    ok({ question_id: QUESTION, event_id: '8', seq: '8' }), ok({ ...ACK, session_id: '' }),
+    ok({ ...ACK, answered_at_ms: '1000' }), ok({ ...ACK, duplicate: 'false' })]) {
     const { send, sent } = scriptedSend([first, ok({ ...ACK, duplicate: true })]);
     const res = await answer(send);
     assert.equal(res.isError, false);

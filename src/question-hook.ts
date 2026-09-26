@@ -1,5 +1,6 @@
 import { controlSocketPath } from './daemon-location.ts';
 import { sendControlRequest } from './control-client.ts';
+import { UUID } from './questions.ts';
 
 const MAX_INPUT_BYTES = 1024 * 1024;
 const MAX_CONTEXT_BYTES = 32 * 1024;
@@ -28,9 +29,12 @@ async function postToolUse(harness: 'codex' | 'claude-code', input: unknown, sto
     if (!q || !context || !nonempty(q.question_id) || !nonempty(q.text, 8192)
       || !nonempty(context.path) || typeof context.selected_text !== 'string'
       || !Number.isSafeInteger(context.line_start) || !Number.isSafeInteger(context.line_end)) return null;
+    const replyTo = q.reply_to_question_id;
+    if (replyTo !== undefined && (typeof replyTo !== 'string' || !UUID.test(replyTo))) return null;
     const head = [
       `Slipstream question ${q.question_id} about the current captured change. Answer the user in your normal conversation, then continue your original work.`,
       `Question: ${q.text}`,
+      ...(replyTo !== undefined ? [`This follows up Slipstream question ${replyTo} about the same source.`] : []),
     ];
     const selected = [`BEGIN SELECTED SOURCE ${q.question_id}`, context.selected_text, `END SELECTED SOURCE ${q.question_id}`,
       `Return your answer by calling the slipstream_answer_question tool with question_id ${q.question_id} and your complete answer as text. A chat reply alone does not reach the user.`];

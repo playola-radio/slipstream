@@ -24,9 +24,12 @@ export interface ForwardAnswerDeps {
 
 const DEFINITIVE_ON_RESEND = new Set(['INVALID_ANSWER', 'IDENTITY_UNRESOLVED', 'ANSWER_CONFLICT']);
 
+/** Only a complete ack naming a durable event proves the answer was recorded; any
+ * other `ok:true` shape is post-send ambiguity, resolved like a lost reply. */
 function recordedAck(res: ResponseEnvelope, questionId: string): Record<string, unknown> | null {
-  if (!res.ok || res.question_id !== questionId || typeof res.seq !== 'string' || res.seq.length === 0
-    || res.event_id !== res.seq) return null;
+  if (!res.ok || res.question_id !== questionId || typeof res.seq !== 'string' || !/^[1-9][0-9]*$/.test(res.seq)
+    || res.event_id !== res.seq || typeof res.session_id !== 'string' || res.session_id.length === 0
+    || !Number.isSafeInteger(res.answered_at_ms) || typeof res.duplicate !== 'boolean') return null;
   const { v: _v, ok: _ok, ...ack } = res;
   return ack;
 }
@@ -60,7 +63,6 @@ export async function forwardAnswer(deps: ForwardAnswerDeps): Promise<ToolResult
       return { text: `Answer recorded for question ${deps.questionId} (seq ${String(ack.seq)}).`, isError: false, structured: ack };
     }
     if (!res.ok && (!resend || DEFINITIVE_ON_RESEND.has(res.code))) return failure(res.code, res.message);
-    if (resend) break;
   }
   return outcomeUnknown();
 }

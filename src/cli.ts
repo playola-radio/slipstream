@@ -44,6 +44,7 @@ import type { HarnessName } from './event.ts';
 interface AskInput {
   text: unknown;
   context: unknown;
+  reply_to_question_id?: unknown;
 }
 
 type Args =
@@ -317,7 +318,8 @@ async function readAskInput(path: string): Promise<AskInput> {
   if (!isPlainObject(value)) {
     throw new Error('input must be an object with text and context');
   }
-  return { text: value.text, context: value.context };
+  return { text: value.text, context: value.context,
+    ...(Object.hasOwn(value, 'reply_to_question_id') ? { reply_to_question_id: value.reply_to_question_id } : {}) };
 }
 
 /** The input-file cap alone is insufficient because routing fields are added
@@ -511,8 +513,7 @@ async function main(): Promise<void> {
     try {
       input = await readAskInput(args.inputPath);
       assertAskRequestFitsControlLine({
-        verb: 'ask', session_id: args.sessionId, request_id: args.requestId,
-        text: input.text, context: input.context,
+        verb: 'ask', session_id: args.sessionId, request_id: args.requestId, ...input,
       });
     } catch (err) {
       console.error(`slipstream: ${(err as Error).message}`);
@@ -520,8 +521,7 @@ async function main(): Promise<void> {
       return;
     }
     await runAskControl(args.store, {
-      verb: 'ask', session_id: args.sessionId, request_id: args.requestId,
-      text: input.text, context: input.context,
+      verb: 'ask', session_id: args.sessionId, request_id: args.requestId, ...input,
     });
     return;
   }

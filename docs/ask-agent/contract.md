@@ -379,4 +379,7 @@ so reusing a `request_id` with a different reply target is `REQUEST_CONFLICT`.
 `queued.v1` carries it as optional `data.reply_to_question_id`. A thread is the
 root question plus every question whose chain reaches it. The daemon does not
 check whether the previous turn has been answered; disabling follow-up while a
-turn is Waiting is a client rule.
+turn is Waiting is a client rule. The delivered follow-up names its parent on
+the line after the question text:
+
+> This follows up Slipstream question <reply_to_question_id> about the same source.

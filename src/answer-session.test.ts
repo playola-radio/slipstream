@@ -12,7 +12,7 @@ import { StorageError } from './storage.ts';
 
 type Session = Awaited<ReturnType<typeof startCapture>>;
 type Target = { harness: 'codex' | 'claude-code'; harness_session_id: string; worktree: string };
-interface Ctx { session: Session; target: Target; ask: () => Promise<string>; setTime: (n: number) => void; storeDir: string; root: string }
+interface Ctx { session: Session; target: Target; ask: () => Promise<string>; setTime: (n: number) => void }
 
 async function fixture(run: (ctx: Ctx) => Promise<void>, deps: Parameters<typeof startCapture>[1] = {}) {
   await withTempDir(async base => {
@@ -26,7 +26,7 @@ async function fixture(run: (ctx: Ctx) => Promise<void>, deps: Parameters<typeof
     const ask = async () => (await session.askQuestion({ session_id: session.sessionId, request_id: randomUUID(), text: 'Why?', context: {
       change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
     } }, target)).question_id;
-    try { await run({ session, target, ask, setTime: n => { now = n; }, storeDir, root }); }
+    try { await run({ session, target, ask, setTime: n => { now = n; } }); }
     finally { await session.stop(); }
   });
 }

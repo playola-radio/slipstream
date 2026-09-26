@@ -10,7 +10,7 @@ export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
 export const MAX_ANSWER_BYTES = 16 * 1024;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface QuestionContext {
   change_seq: string;
