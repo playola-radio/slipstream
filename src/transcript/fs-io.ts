@@ -56,9 +56,9 @@ const MAX_FIRST_LINE = 16 * 1024 * 1024;
  * Enough lines to clear a cwd-less preamble; a per-line cap skips a large
  * attachment (its cwd, if any, recurs on the smaller records around it); a total
  * cap bounds the read even when large lines are skipped. */
-const HEAD_SCAN_LINES = 64;
-const HEAD_LINE_CAP = 256 * 1024;
-const HEAD_SCAN_BYTES = 4 * 1024 * 1024;
+export const HEAD_SCAN_LINES = 64;
+export const HEAD_LINE_CAP = 256 * 1024;
+export const HEAD_SCAN_BYTES = 4 * 1024 * 1024;
 
 function classifyDirError(err: unknown): 'missing' | 'inaccessible' {
   return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'inaccessible';
