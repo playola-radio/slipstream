@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createCas } from './cas.ts';
 import { createLog } from './log.ts';
 import { recoverSession, CorruptLogError } from './recovery.ts';
-import type { EventInput } from './event.ts';
+import type { PublicEventInput as EventInput } from './public-events.ts';
 import { withTempDir } from './test/helpers.ts';
 
 const SESSION = '00000000-0000-4000-8000-000000000000';
@@ -38,6 +38,32 @@ async function seedLog(dir: string, inputs: EventInput[]): Promise<string> {
   }
   return path;
 }
+
+const QUESTION = '11111111-1111-4111-8111-111111111111';
+const OTHER_QUESTION = '22222222-2222-4222-8222-222222222222';
+const queued = (questionId: string): EventInput => ({
+  type: 'slipstream.question.queued.v1',
+  occurred_at_ms: 4,
+  data: {
+    question_id: questionId,
+    request_id: questionId,
+    target: { harness: 'codex', harness_session_id: 'root', worktree: '/work' },
+    text: 'Why?',
+    context: { change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1, selected_text: 'a' },
+    queued_at_ms: 4,
+    expires_at_ms: 5,
+  },
+});
+const attempted = (questionId: string, queuedSeq: string): EventInput => ({
+  type: 'slipstream.question.dispatch_attempted.v1',
+  occurred_at_ms: 5,
+  data: { question_id: questionId, queued_seq: queuedSeq, attempted_at_ms: 5 },
+});
+const answered = (questionId: string, attemptSeq: string, text = 'Because.'): EventInput => ({
+  type: 'slipstream.question.answered.v1',
+  occurred_at_ms: 6,
+  data: { question_id: questionId, attempt_seq: attemptSeq, text, answered_at_ms: 6 },
+});
 
 describe('recovery', () => {
   it('recovers through the last complete record and discards a torn trailing suffix', async () => {
@@ -93,6 +119,55 @@ describe('recovery', () => {
       assert.equal(rec.recoveredThroughSeq, 2n);
     });
   });
+
+  it('rebuilds committed answers in log order', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, queued(QUESTION), queued(OTHER_QUESTION), attempted(QUESTION, '2'),
+        attempted(OTHER_QUESTION, '3'), answered(OTHER_QUESTION, '5', 'second first'), answered(QUESTION, '4')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual(rec.questionAnswers.map(a => [a.seq, a.data.question_id, a.data.attempt_seq, a.data.text]),
+        [['6', OTHER_QUESTION, '5', 'second first'], ['7', QUESTION, '4', 'Because.']]);
+    });
+  });
+
+  it('does not count a torn trailing answer', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, queued(QUESTION), attempted(QUESTION, '2')]);
+      await appendFile(path, '{"seq":"4","type":"slipstream.question.answered.v1","data":{"question_id":"' + QUESTION + '"');
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual(rec.questionAnswers, []);
+      assert.equal(rec.recoveredThroughSeq, 3n);
+    });
+  });
+
+  for (const [name, inputs, mutate] of [
+    ['a subject that disagrees with the question id', [queued(QUESTION), attempted(QUESTION, '2'), answered(QUESTION, '3')],
+      (e: Record<string, unknown>) => { e.subject = `question/${OTHER_QUESTION}`; }],
+    ['a missing attempt_seq', [queued(QUESTION), attempted(QUESTION, '2'), answered(QUESTION, '3')],
+      (e: Record<string, unknown>) => { delete (e.data as Record<string, unknown>).attempt_seq; }],
+    ['an attempt_seq naming another question\'s attempt', [queued(QUESTION), queued(OTHER_QUESTION), attempted(QUESTION, '2'),
+      attempted(OTHER_QUESTION, '3'), answered(QUESTION, '5')], undefined],
+    ['an answer to a question that was never dispatched', [queued(QUESTION), answered(QUESTION, '2')], undefined],
+    ['a second answer for the same question', [queued(QUESTION), attempted(QUESTION, '2'), answered(QUESTION, '3'),
+      answered(QUESTION, '3')], undefined],
+  ] as Array<[string, EventInput[], ((e: Record<string, unknown>) => void) | undefined]>) {
+    it(`rejects ${name} as corrupt`, async () => {
+      await withTempDir(async (dir) => {
+        const cas = await createCas(join(dir, 'blobs'));
+        const path = await seedLog(dir, [started, ...inputs]);
+        if (mutate) {
+          const lines = (await readFile(path, 'utf8')).trimEnd().split('\n');
+          const last = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
+          mutate(last);
+          lines[lines.length - 1] = JSON.stringify(last);
+          await writeFile(path, lines.join('\n') + '\n');
+        }
+        await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError);
+      });
+    });
+  }
 
   it('treats a corrupt record in the middle of the log as a hard error, not a skip', async () => {
     await withTempDir(async (dir) => {
