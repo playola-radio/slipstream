@@ -124,6 +124,11 @@ export async function recoverSession(
   const questions: QuestionQueuedEvent[] = [];
   const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const questionAnswers: QuestionAnsweredEvent[] = [];
+  // Keep the ordered event arrays for callers, while replay validation uses
+  // indexes so a long-lived session is replayed in one pass.
+  const queuedSeqsByQuestion = new Map<string, Set<string>>();
+  const attemptSeqByQuestion = new Map<string, string>();
+  const answeredQuestionIds = new Set<string>();
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
   let root: string | undefined;
@@ -259,24 +264,32 @@ export async function recoverSession(
       case 'slipstream.question.queued.v1': {
         if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
         questions.push(event);
+        let queuedSeqs = queuedSeqsByQuestion.get(event.data.question_id);
+        if (queuedSeqs === undefined) {
+          queuedSeqs = new Set<string>();
+          queuedSeqsByQuestion.set(event.data.question_id, queuedSeqs);
+        }
+        queuedSeqs.add(event.seq);
         break;
       }
       case 'slipstream.question.dispatch_attempted.v1': {
         if (event.subject !== `question/${event.data.question_id}`
-          || !questions.some(q => q.data.question_id === event.data.question_id && q.seq === event.data.queued_seq)
-          || questionAttempts.some(a => a.data.question_id === event.data.question_id)) {
+          || !queuedSeqsByQuestion.get(event.data.question_id)?.has(event.data.queued_seq)
+          || attemptSeqByQuestion.has(event.data.question_id)) {
           throw new CorruptLogError(`${at}: dispatch attempt has no unique queued question`);
         }
         questionAttempts.push(event);
+        attemptSeqByQuestion.set(event.data.question_id, event.seq);
         break;
       }
       case 'slipstream.question.answered.v1': {
         if (event.subject !== `question/${event.data.question_id}`
-          || !questionAttempts.some(a => a.data.question_id === event.data.question_id && a.seq === event.data.attempt_seq)
-          || questionAnswers.some(a => a.data.question_id === event.data.question_id)) {
+          || attemptSeqByQuestion.get(event.data.question_id) !== event.data.attempt_seq
+          || answeredQuestionIds.has(event.data.question_id)) {
           throw new CorruptLogError(`${at}: answer has no unique attempted question`);
         }
         questionAnswers.push(event);
+        answeredQuestionIds.add(event.data.question_id);
         break;
       }
       case 'slipstream.task.started.v1': {
