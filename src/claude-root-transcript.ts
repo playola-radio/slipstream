@@ -20,7 +20,7 @@ function record(value: unknown): Record<string, unknown> | null {
  * Claude can write cwd-less preamble lines before the first user/attachment
  * record, and may still be writing the last line while attach reads. Every
  * complete bounded line is parsed; the first identity record fixes the root
- * cwd, while later cwd values can drift after a shell cd.
+ * cwd and identity, while later records must not conflict with the binding.
  */
 export async function verifyClaudeRootTranscript(path: string, sessionId: string, worktree: string): Promise<ClaudeRootResult> {
   let handle;
@@ -39,6 +39,8 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
     let lines = 0;
     let version: string | undefined;
     let entrypoint: string | undefined;
+    let rootCwd: string | undefined;
+    let lastLineComplete = true;
     for (let i = 0; i < total && lines < HEAD_SCAN_LINES; i += 1) {
       if (bytes[i] !== 0x0a) continue;
       if (i - start > HEAD_LINE_CAP || i >= HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
@@ -47,6 +49,7 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
       catch { return { ok: false, reason: 'gap' }; }
       if (!parsed) return { ok: false, reason: 'gap' };
       lines += 1;
+      lastLineComplete = true;
       start = i + 1;
       if (Object.hasOwn(parsed, 'sessionId') && parsed.sessionId !== sessionId) return { ok: false, reason: 'mismatch' };
       const hasIdentityField = Object.hasOwn(parsed, 'cwd') || Object.hasOwn(parsed, 'version')
@@ -66,8 +69,10 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
         catch { return { ok: false, reason: 'mismatch' }; }
         version = parsed.version;
         entrypoint = parsed.entrypoint;
+        rootCwd = parsed.cwd as string;
       } else if ((Object.hasOwn(parsed, 'version') && parsed.version !== version)
         || (Object.hasOwn(parsed, 'entrypoint') && parsed.entrypoint !== entrypoint)
+        || (Object.hasOwn(parsed, 'cwd') && parsed.cwd !== rootCwd)
         || (Object.hasOwn(parsed, 'userType') && parsed.userType !== 'external')
         || (Object.hasOwn(parsed, 'isSidechain') && parsed.isSidechain !== false)) {
         return { ok: false, reason: 'mismatch' };
@@ -75,6 +80,9 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
     }
     if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
     if (lines < HEAD_SCAN_LINES && total - start > HEAD_LINE_CAP) return { ok: false, reason: 'gap' };
+    // If we've scanned the limit but the last line is incomplete (no newline after it),
+    // the transcript is still being written and we should retry verification later.
+    if (lines >= HEAD_SCAN_LINES && !lastLineComplete) return { ok: false, reason: 'not-yet' };
     if (version === undefined) return { ok: false, reason: lines === HEAD_SCAN_LINES ? 'gap' : 'not-yet' };
     return { ok: true };
   } catch { return { ok: false, reason: 'unavailable' }; }
