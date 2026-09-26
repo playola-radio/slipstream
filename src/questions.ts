@@ -24,6 +24,7 @@ export interface QuestionRequest {
   request_id: string;
   text: string;
   context: QuestionContext;
+  reply_to_question_id?: string;
 }
 export class QuestionError extends Error {
   readonly code: ControlErrorCode;
@@ -60,16 +61,18 @@ export function normalizeAsk(value: unknown): QuestionRequest {
     || /[\uD800-\uDFFF]/u.test(ctx.path)) invalidContext('context path must be a relative source path of at most 4096 UTF-8 bytes');
   if (typeof ctx.snapshot_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(ctx.snapshot_sha256)) invalidContext('snapshot_sha256 must be a lowercase SHA-256');
   if (!validRange(ctx.line_start, ctx.line_end)) invalidContext('select 1–200 source lines using inclusive positive integer bounds');
+  const reply = req.reply_to_question_id;
+  if (reply !== undefined && (typeof reply !== 'string' || !UUID.test(reply))) invalidContext('reply_to_question_id must be a canonical lowercase UUID');
   return { session_id: req.session_id, request_id: req.request_id, text, context: {
     change_seq: ctx.change_seq, path: ctx.path, snapshot_sha256: ctx.snapshot_sha256,
     line_start: ctx.line_start as number, line_end: ctx.line_end as number,
-  } };
+  }, ...(reply !== undefined ? { reply_to_question_id: reply } : {}) };
 }
 
 /** Fixed-order normalized request body; identity excludes derived text and target. */
-export function questionBody(req: Pick<QuestionRequest, 'text' | 'context'>): string {
+export function questionBody(req: Pick<QuestionRequest, 'text' | 'context' | 'reply_to_question_id'>): string {
   const c = req.context;
-  return JSON.stringify([req.text, c.change_seq, c.path, c.snapshot_sha256, c.line_start, c.line_end]);
+  return JSON.stringify([req.text, c.change_seq, c.path, c.snapshot_sha256, c.line_start, c.line_end, req.reply_to_question_id ?? null]);
 }
 
 export function selectSource(bytes: Buffer, range: Pick<QuestionContext, 'line_start' | 'line_end'>): string {

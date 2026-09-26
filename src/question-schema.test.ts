@@ -78,6 +78,12 @@ describe('slipstream.question.queued.v1 schema', () => {
     });
   }
 
+  it('accepts a follow-up that names the question it replies to', async () => {
+    const event = queuedQuestion();
+    (event.data as Record<string, unknown>).reply_to_question_id = QUESTION;
+    assert.deepEqual(validate(await loadSchema('slipstream.question.queued.v1'), event), []);
+  });
+
   it('accepts the durable D1 record and additive future fields', async () => {
     const event = queuedQuestion();
     event.future_envelope_field = true;
@@ -130,6 +136,7 @@ describe('slipstream.question.queued.v1 schema', () => {
     ['a missing target worktree', (event: Record<string, unknown>) => { delete ((event.data as Record<string, unknown>).target as Record<string, unknown>).worktree; }],
     ['a fractional line range', (event: Record<string, unknown>) => { ((event.data as Record<string, unknown>).context as Record<string, unknown>).line_start = 1.5; }],
     ['a negative queued timestamp', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).queued_at_ms = -1; }],
+    ['a non-canonical reply-to question id', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).reply_to_question_id = 'ABC'; }],
     ['a negative expiry timestamp', (event: Record<string, unknown>) => { (event.data as Record<string, unknown>).expires_at_ms = -1; }],
   ] as Array<[string, (event: Record<string, unknown>) => void]>) {
     it(`rejects ${name}`, async () => {

@@ -13,6 +13,7 @@ export interface QuestionQueuedData {
   context: QuestionContext & { selected_text: string };
   queued_at_ms: number;
   expires_at_ms: number;
+  reply_to_question_id?: string;
 }
 export interface QuestionQueuedEvent {
   specversion: typeof SPEC_VERSION;

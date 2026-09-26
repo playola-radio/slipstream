@@ -121,7 +121,7 @@ it('accepts an answer after the question TTL without changing what can be claime
   });
 });
 
-it('keeps answers across a resume so a resend replays and a new text conflicts', async () => {
+it('keeps questions and answers across a resume for replays, conflicts, and follow-ups', async () => {
   await withTempDir(async base => {
     const root = join(base, 'work'); await mkdir(root);
     const storeDir = join(base, 'store');
@@ -142,6 +142,9 @@ it('keeps answers across a resume so a resend replays and a new text conflicts',
     try {
       assert.deepEqual(await resumed.answerQuestion({ question_id: id, text: 'kept' }, target), { ...original, duplicate: true });
       await assert.rejects(resumed.answerQuestion({ question_id: id, text: 'changed' }, target), code('ANSWER_CONFLICT'));
+      const followUp = await resumed.askQuestion({ session_id: first.sessionId, request_id: randomUUID(), text: 'And?',
+        reply_to_question_id: id, context: { change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1 } }, target);
+      assert.equal(followUp.duplicate, false);
     } finally { await resumed.stop(); }
   });
 });

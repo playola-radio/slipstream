@@ -151,3 +151,20 @@ it('does not acknowledge a question when ownership is lost during append', async
     } };
   } });
 });
+it('queues a follow-up only for a question in this capture with the same source context', async () => {
+  await fixture(async (s, input) => {
+    const first = await s.askQuestion(input, target);
+    const followUp = { ...input, request_id: randomUUID(), text: 'And then?', reply_to_question_id: first.question_id };
+    const accepted = await s.askQuestion(followUp, target);
+    await assert.rejects(s.askQuestion({ ...followUp, request_id: randomUUID(), reply_to_question_id: randomUUID() }, target), { code: 'INVALID_CONTEXT' });
+    await assert.rejects(s.askQuestion({ ...followUp, request_id: randomUUID(), reply_to_question_id: 'not-a-uuid' }, target), { code: 'INVALID_CONTEXT' });
+    await assert.rejects(s.askQuestion({ ...followUp, request_id: randomUUID(), context: { ...input.context, line_end: 1 } }, target),
+      { code: 'INVALID_CONTEXT' });
+    await assert.rejects(s.askQuestion({ ...followUp, reply_to_question_id: undefined }, target), { code: 'REQUEST_CONFLICT' });
+    assert.deepEqual(await s.askQuestion(followUp, target), { ...accepted, duplicate: true });
+    const queued = (await readRecords(s.logPath)).filter(e => e.type === 'slipstream.question.queued.v1');
+    assert.equal(queued.length, 2);
+    assert.equal('reply_to_question_id' in queued[0]!.data, false);
+    assert.equal((queued[1]!.data as { reply_to_question_id?: string }).reply_to_question_id, first.question_id);
+  });
+});

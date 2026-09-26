@@ -195,7 +195,7 @@ export async function startCapture(
   const unattemptedQuestions = new Map<string, QuestionQueuedEvent>();
   // Kept for the capture's lifetime: a question stays answerable after it
   // leaves the unattempted queue or passes its claim TTL.
-  const questionTargets = new Map<string, QuestionQueuedData['target']>();
+  const questionsById = new Map<string, QuestionQueuedData>();
   const attemptSeqs = new Map<string, string>();
   const committedAnswers = new Map<string, { text: string; result: AnswerAccepted }>();
   const inflightAnswers = new Map<string, { text: string; promise: Promise<AnswerAccepted> }>();
@@ -216,8 +216,8 @@ export async function startCapture(
       unattemptedQuestions.set(event.data.question_id, event);
     }
     for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
-    questionTargets.clear(); attemptSeqs.clear(); committedAnswers.clear();
-    for (const event of rec.questions) questionTargets.set(event.data.question_id, event.data.target);
+    questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
+    for (const event of rec.questions) questionsById.set(event.data.question_id, event.data);
     for (const event of rec.questionAttempts) attemptSeqs.set(event.data.question_id, event.seq);
     for (const event of rec.questionAnswers) committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
     currentTaskId = rec.currentTaskId;
@@ -252,7 +252,7 @@ export async function startCapture(
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') {
         unattemptedQuestions.set(event.data.question_id, event);
-        questionTargets.set(event.data.question_id, event.data.target);
+        questionsById.set(event.data.question_id, event.data);
       }
       if (event.type === 'slipstream.question.dispatch_attempted.v1') {
         unattemptedQuestions.delete(event.data.question_id);
@@ -827,6 +827,14 @@ export async function startCapture(
     if (existing && existing.body !== body) throw new QuestionError('REQUEST_CONFLICT', 'request_id was used for a different question or context');
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
+    if (req.reply_to_question_id !== undefined) {
+      const parent = questionsById.get(req.reply_to_question_id)?.context;
+      const c = req.context;
+      if (!parent || parent.change_seq !== c.change_seq || parent.path !== c.path || parent.snapshot_sha256 !== c.snapshot_sha256
+        || parent.line_start !== c.line_start || parent.line_end !== c.line_end) {
+        throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to a question in this capture about the same source');
+      }
+    }
     // A reservation covers source reads as well as append, bounding concurrent scans.
     // An expired-but-never-attempted entry can never become eligible again, so it
     // is dropped here rather than kept forever awaiting a claim that will not come.
@@ -846,7 +854,8 @@ export async function startCapture(
       const queued_at_ms = now();
       const event = await appendEvent({ type: 'slipstream.question.queued.v1', occurred_at_ms: queued_at_ms,
         data: { question_id: randomUUID(), request_id: req.request_id, target, text: req.text,
-          context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS } });
+          context: { ...req.context, selected_text }, queued_at_ms, expires_at_ms: queued_at_ms + QUESTION_TTL_MS,
+          ...(req.reply_to_question_id !== undefined ? { reply_to_question_id: req.reply_to_question_id } : {}) } });
       if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
       assertOwnership();
       const result = questionResult(event);
@@ -886,7 +895,7 @@ export async function startCapture(
     assertAnswerText(text);
     assertOwnership();
     questionReady();
-    const owner = typeof id === 'string' ? questionTargets.get(id) : undefined;
+    const owner = typeof id === 'string' ? questionsById.get(id)?.target : undefined;
     const attemptSeq = typeof id === 'string' ? attemptSeqs.get(id) : undefined;
     if (typeof id !== 'string' || !owner || attemptSeq === undefined || owner.harness !== target.harness
       || owner.harness_session_id !== target.harness_session_id || owner.worktree !== target.worktree) {
