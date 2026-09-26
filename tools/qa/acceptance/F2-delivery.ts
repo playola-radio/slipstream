@@ -81,7 +81,7 @@ export const f2Delivery: AcceptanceModule = {
             v: 1, verb: 'claim_question', harness: 'claude-code', harness_session_id: harnessSessionId,
             worktree, transcript_path: transcript,
           } });
-          if (claude.ok) throw new Error('Claude claimed before routing proof');
+          if (claude.ok) throw new Error('Claude claimed a Codex binding');
           const positive = await cli(['hook', 'codex', 'post-tool-use', '--store', store], callback);
           if (positive.code !== 0 || positive.stderr !== '') throw new Error('Codex hook failed or logged callback data');
           const output = JSON.parse(positive.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
