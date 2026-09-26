@@ -84,6 +84,11 @@ describe('daemon control verbs', () => {
       await writeFile(transcript, JSON.stringify({ type: 'queue-operation', sessionId: 'root' }) + '\n');
       const preamble = await call(attachReq);
       assert.equal(preamble.ok === false && preamble.code, 'IDENTITY_UNRESOLVED');
+      await writeFile(transcript, JSON.stringify({ type: 'queue-operation', sessionId: 'root' }) + '\n' + meta() + '{"sessionId":"other"');
+      const torn = await call(attachReq);
+      assert.equal(torn.ok === false && torn.code, 'IDENTITY_UNRESOLVED');
+      assert.match(torn.ok === false ? torn.message : '', /retry attach/);
+      assert.equal(rec(await call({ verb: 'status' })).root_transcript, undefined);
       await writeFile(transcript, JSON.stringify({ type: 'queue-operation', sessionId: 'root' }) + '\n' + meta());
       await writeFile(otherTranscript, meta('other'));
       const attached = await call(attachReq);

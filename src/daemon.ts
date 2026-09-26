@@ -437,7 +437,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           const verified = await verifyClaudeRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
           if (!verified.ok) {
             throw new RootIdentityError(verified.reason === 'not-yet'
-              ? 'root Claude transcript has no complete identity yet; retry attach after the first root tool call'
+              ? 'root Claude transcript head is not complete yet; retry attach after the first root tool call'
               : verified.reason === 'gap'
                 ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
                 : `root Claude transcript identity is ${verified.reason}`);

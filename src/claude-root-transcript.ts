@@ -40,7 +40,6 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
     let version: string | undefined;
     let entrypoint: string | undefined;
     let rootCwd: string | undefined;
-    let lastLineComplete = true;
     for (let i = 0; i < total && lines < HEAD_SCAN_LINES; i += 1) {
       if (bytes[i] !== 0x0a) continue;
       if (i - start > HEAD_LINE_CAP || i >= HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
@@ -49,7 +48,6 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
       catch { return { ok: false, reason: 'gap' }; }
       if (!parsed) return { ok: false, reason: 'gap' };
       lines += 1;
-      lastLineComplete = true;
       start = i + 1;
       if (Object.hasOwn(parsed, 'sessionId') && parsed.sessionId !== sessionId) return { ok: false, reason: 'mismatch' };
       const hasIdentityField = Object.hasOwn(parsed, 'cwd') || Object.hasOwn(parsed, 'version')
@@ -80,9 +78,8 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
     }
     if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
     if (lines < HEAD_SCAN_LINES && total - start > HEAD_LINE_CAP) return { ok: false, reason: 'gap' };
-    // If we've scanned the limit but the last line is incomplete (no newline after it),
-    // the transcript is still being written and we should retry verification later.
-    if (lines >= HEAD_SCAN_LINES && !lastLineComplete) return { ok: false, reason: 'not-yet' };
+    // A torn record inside the bounded head may still be written; attach is retryable.
+    if (lines < HEAD_SCAN_LINES && start < total) return { ok: false, reason: 'not-yet' };
     if (version === undefined) return { ok: false, reason: lines === HEAD_SCAN_LINES ? 'gap' : 'not-yet' };
     return { ok: true };
   } catch { return { ok: false, reason: 'unavailable' }; }
