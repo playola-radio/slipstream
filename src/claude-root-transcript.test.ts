@@ -38,6 +38,15 @@ it('verifies the measured Conductor attachment as the first complete identity re
   });
 });
 
+it('accepts a completed matching tail and leaves bytes after the bounded 64 records unread', async () => {
+  await withFixture(async ({ root, path }) => {
+    await writeFile(path, line(preamble()) + line(identity(root)) + line(preamble()));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
+    await writeFile(path, Array.from({ length: 63 }, () => line(preamble())).join('') + line(identity(root)) + '{"sessionId":"other"');
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
+  });
+});
+
 it('fails closed on unavailable, incomplete, malformed, and contradictory bounded evidence', async () => {
   await withFixture(async ({ dir, root, path }) => {
     const check = async (body: string | Buffer, reason: string) => {
@@ -54,6 +63,10 @@ it('fails closed on unavailable, incomplete, malformed, and contradictory bounde
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), version: '2.1.999' }), 'mismatch');
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), userType: 'internal' }), 'mismatch');
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), sessionId: 'other' }), 'mismatch');
+    await check(line(preamble()) + line(identity(root)) + '{"sessionId":"other"', 'not-yet');
+    await check(line(preamble()) + line(identity(root)) + '{"sessionId":"other"}\n', 'mismatch');
+    await check(line(preamble()) + line(identity(root)) + 'x'.repeat(256 * 1024 + 1), 'gap');
+    await check(Array.from({ length: 62 }, () => line(preamble())).join('') + line(identity(root)) + '{"sessionId":"other"', 'not-yet');
     await check(line(preamble()) + line({ ...identity(root), version: '2.1.999' }), 'unsupported-version');
     await check(line(preamble()) + line({ ...identity(root), cwd: dir }), 'mismatch');
     await check(line(preamble()) + line({ ...identity(root), isSidechain: true }), 'mismatch');
