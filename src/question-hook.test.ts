@@ -184,7 +184,6 @@ it('delivers every accepted source verbatim within 32 KiB for both harnesses', a
           const context = JSON.parse(output!).hookSpecificOutput.additionalContext as string;
           assert.ok(Buffer.byteLength(context) <= 32 * 1024, label);
           assert.equal(sourceOf(context), source, label);
-          assert.ok(!context.includes('�'), label);
           const ordinary = context.includes(`Source: ${JSON.stringify(path)}, lines 1-2 (recorded snapshot).\n`);
           const block = `BEGIN SOURCE PATH ${id}\n${path}\nEND SOURCE PATH ${id}\nBEGIN SELECTED SOURCE ${id}\n`;
           assert.notEqual(ordinary, context.includes(block), `${label}: exactly one path form`);

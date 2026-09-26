@@ -170,8 +170,9 @@ appears JSON-escaped on the `Source:` line. Escaping can expand an accepted
 instead carries the raw path between `BEGIN SOURCE PATH <id>` and
 `END SOURCE PATH <id>` lines, labelled untrusted data. With accepted daemon
 limits (question 8192 bytes, path 4096 bytes, source 16384 bytes) the raw form
-always fits; the markers are framing, not a security boundary. A reply outside
-those limits gets no output. Parse, socket, daemon,
+always fits; the markers are framing, not a security boundary. A malformed
+reply whose context would still exceed 32 KiB, which accepted limits cannot
+produce, gets no output. Parse, socket, daemon,
 timeout, identity and malformed-response failures exit 0 with no stdout. It
 neither logs question/source bytes nor writes reply artifacts.
 
