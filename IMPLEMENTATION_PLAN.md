@@ -72,7 +72,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | # | Decision | Choice |
 |---|---|---|
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
-| Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); delivery and answer UI deferred |
+| Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery merged, Claude delivery D3 in progress, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
 | Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
@@ -824,18 +824,33 @@ in-process storage recovery. Capacity is 16 unexpired questions; TTL is 30 minut
 Contract and scope: [docs/ask-agent/contract.md](docs/ask-agent/contract.md) and
 [docs/ask-agent/spec.md](docs/ask-agent/spec.md). Queue acceptance acknowledges
 only durability. Hook delivery (D2), the Swift ask composer (S1), and answer UI
-are deferred. The frozen display-fold.v1 dependencies and fixtures stay unchanged:
+were separate slices. The frozen display-fold.v1 dependencies and fixtures stay unchanged:
 `src/public-events.ts` adds the new event alongside the released event catalogue.
 No capture, attribution, or existing success criterion changes.
 
 ## D2: Codex hook delivery (2026-09-25)
 
-**Status**: Implementation in progress on the Codex delivery branch. D2
-acceptance requires terminal and Conductor live runs; Claude routing and delivery
-remain blocked by their own runtime proof. No four-path milestone is claimed.
+**Status**: Merged into `develop`. D2 Codex delivery and S1 Swift sending are
+available to the D3 branch. No four-path milestone is claimed.
 
 Codex root identity is bound explicitly at attach. A PostToolUse claim must match
 the harness session, canonical worktree and bound root transcript, with both
 agent properties omitted. One oldest eligible question is reserved and a public
 dispatch-attempt event is durably appended before the hook response. The event
 does not prove receipt or an answer. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+## D3: Claude Code hook delivery (2026-09-25)
+
+**Status**: Implementation and acceptance in progress. Terminal Claude Code
+`2.1.283` delivery passed on an explicitly attached root: a child callback
+stayed silent, the selected root received the question once and continued,
+another root could not claim a second queued question, and `/clear` created a
+new session whose root could not claim the old queue. Conductor app acceptance
+and full gates remain pending.
+
+D3 adds bounded Claude root transcript verification at attach and a Claude
+Code `PostToolUse` command using the D2 claim/attempt contract. Supported
+observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
+`2.1.280`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
+capture source, Swift UI, launcher, hook installer or automatic hook trust is
+added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).

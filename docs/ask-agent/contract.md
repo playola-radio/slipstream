@@ -1,6 +1,8 @@
 # Queue contract for the ask/send slice
 
-Status: D1 queue merged through PRs #33/#34 at `1434899ad21e8f471da65fbe034c9a25ffc18b4b`. This branch implements the Codex D2 claim contract below. Claude delivery remains disabled until its own routing proof. Based on the prior Claude architecture consultation, source-verified corrections in decisions.md, and the reported Codex routing proof.
+Status: D1 queueing, D2 Codex delivery, and S1 Swift sending are merged. D3
+adds Claude Code delivery through the same public question and attempt events.
+Answer return remains a separate slice.
 
 ## Boundary
 
@@ -100,7 +102,7 @@ Use the existing single append/durability boundary; never append straight to eve
 - A full daemon restart/detach/new attach makes the old queue ineligible. Never resume or migrate it to the new capture. A retry addressed to the old session returns `SESSION_NOT_SELECTED`; retain uncertainty about whether the old log contains a commit. The public reader can inspect the old log by request_id, but this slice adds no dedicated lookup endpoint or UI.
 - Pre-transmission transport failure means unavailable. Any timeout/drop/malformed reply after transmission is outcome unknown. The client preserves the same request ID and draft for retry; it never silently creates a fresh request to resolve uncertainty.
 
-## D2 boundary — Codex only
+## Delivery through PostToolUse
 
 Name reserved for the later public event: `slipstream.question.dispatch_attempted.v1`. It is written before a claim reply; it proves an attempt, not receipt or model emission. D2 supplies its schema when its claim contract is finalized. No speculative dispatcher or unused dispatch schema in D1.
 
@@ -110,7 +112,9 @@ The reported Conductor routing proof established this Codex discriminator: root
 PostToolUse omits both `agent_id` and `agent_type`; a child includes both and
 has a different transcript. `session_id` and `cwd` alone do not distinguish
 them. The raw P0 routing report was absent from the D2 handoff, so independent
-D2 live acceptance must carry its own evidence. Claude remains disabled.
+D2 live acceptance carried its own evidence. Claude delivery uses the same
+root/child callback field discriminator, plus a separately verified Claude root
+transcript at attach.
 
 ### Concrete attach and claim protocol
 
@@ -189,6 +193,47 @@ repository's **main checkout** `.codex/hooks.json`; linked-worktree definitions
 were not loaded in the earlier probe. Review and trust this exact command through
 Codex's normal hook trust flow before the chat starts. The hook's ability to
 connect to the daemon's external Unix socket depends on the selected sandbox
-configuration. Installation does not bypass trust, launch an agent, or enable
-Claude delivery. This slice has no global automatic installer or Conductor API
+configuration. Installation does not bypass trust or launch an agent. This slice has no global automatic installer or Conductor API
 dependency.
+
+### D3 Claude Code binding and hook
+
+Select a running Claude Code root with its **root** `SessionStart` or
+`PostToolUse` callback's `session_id`, `cwd`, and `transcript_path`:
+
+```sh
+slipstream attach <worktree> --store <private-store> --harness claude-code \
+  --harness-session-id <root-session-id> --root-transcript <root-transcript-path>
+```
+
+Claude can write startup preamble records before its first identity-bearing
+record, and the transcript can be unavailable at `SessionStart`. In that case,
+wait for the first root tool callback and attach using its transcript path.
+Attachment reads a bounded, complete transcript head (at most 64 records,
+4 MiB total, 256 KiB per record). It requires a matching session ID,
+canonical worktree, external user, root `isSidechain:false`, and an observed
+runtime/entrypoint pair: Terminal Claude Code `2.1.283`/`sdk-cli` or Conductor
+Claude Code `2.1.280`/`sdk-ts`. Missing, truncated, contradictory, or newer
+unverified metadata fails closed; test a newer runtime before adding it. The
+callback must later match the selected harness, session ID, canonical worktree,
+and root transcript. Both `agent_id` and `agent_type` must be absent. A child,
+other root, wrong worktree, cross-harness claim, stale capture, or partial
+identity gets no question. Changing the chat with `/clear` creates a new
+session; select and attach that new root explicitly if desired. A question
+queued for the old capture is never migrated.
+
+Configure a Claude Code `PostToolUse` command hook before starting the chat,
+using absolute paths to Node 24, this checkout, and a private store:
+
+```json
+{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/absolute/node /absolute/slipstream/src/cli.ts hook claude-code post-tool-use --store /absolute/private/store","timeout":3}]}]}}
+```
+
+Merge the hook into existing Claude settings without replacing unrelated
+hooks. Use a project `settings.local.json` or explicit Terminal `--settings`
+file, following the host's normal hook trust flow. The hook sends a bounded
+`claim_question` to the owner-only control socket; it emits one
+`hookSpecificOutput.additionalContext` of at most 32 KiB on success and is
+silent on missing identity or failure. The daemon commits the public attempt
+before the hook reply. Neither that event nor stdout proves the model saw the
+question. No hook is automatically installed or trusted.

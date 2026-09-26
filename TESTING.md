@@ -425,3 +425,10 @@ dispatch-attempt event. This verifies the daemon, socket and hook output contrac
 it simulates callback input. A separate running-agent test must inspect the real
 agent's answer and ordinary hook trust before claiming Terminal or Conductor
 delivery acceptance.
+
+`npm run qa:check -- --pr F3-claude-delivery` uses a separate disposable daemon,
+OS watcher, public reader and production Claude hook command. It verifies one
+selected root delivery after the public attempt and negative child, unrelated
+root, wrong worktree, cross-harness, repeat and stale callbacks. It simulates
+callback input; live Terminal and Conductor runs are recorded separately in
+the D3 PR evidence.
