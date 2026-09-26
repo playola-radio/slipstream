@@ -1,6 +1,6 @@
 # Ask agent: select code and send a question
 
-Status: approved owner UX transcribed; architecture and first implementation handoff under review. This document does not authorize an answer-display design.
+Status: approved owner UX transcribed; the ask slice is implemented. Answer return (D4) is decided and specified below; its display follows the owner design named there.
 
 ## Authority and scope
 
@@ -10,7 +10,7 @@ Client baseline: `playola-radio/slipstream-client-swift`, `origin/develop` at `f
 Daemon baseline: `briankeane/slipstream`, `origin/develop` at `0105465fa72eefd8f2697e857c5bcabce9b3bd38`.
 Revalidate baselines before handing each PR to a fresh workspace. Never rename the orchestrator branch.
 
-The outcome is selecting visible source lines, writing a question, and submitting it to the explicitly connected implementing agent. Receiving and displaying an answer is a later owner-designed slice. Delivery is cooperative at a subsequent agent tool call; it is not immediate interruption or idle wakeup.
+The outcome is selecting visible source lines, writing a question, and submitting it to the explicitly connected implementing agent. Receiving and displaying an answer is the D4 slice below. Delivery is cooperative at a subsequent agent tool call; it is not immediate interruption or idle wakeup.
 
 ## Product requirements
 
@@ -23,7 +23,18 @@ The outcome is selecting visible source lines, writing a question, and submittin
 - **A7 — Same intended session.** Sending requires explicit connection to the intended main agent session. Neither matching workspace paths nor the presence of a change card establishes authorship. Another chat, another worktree, or a child agent must not consume the message. Unsupported or ambiguous identity must fail closed.
 - **A8 — Harness/host independence.** Support Claude and Codex in both terminals and Conductor through their verified hook mechanism. No Conductor-only messaging API, replacement agent, agent launcher, implicit permission changes, or silent hook-trust bypass.
 - **A9 — Replaceable client.** Sending and inspecting submission outcomes must have a documented daemon/command interface usable by an independent client. Preserve the daemon's public event/schema and GET-only reader invariants. Do not have the Swift UI manipulate the prototype's private files.
-- **A10 — Honest completion.** Accepted/queued, hook emission, and a model answer are different facts. Success must state precisely which is acknowledged. No exactly-once-delivery claim. No unbounded waiting hidden behind a success state. Answer presentation is excluded even if QA observes a test reply artifact.
+- **A10 — Honest completion.** Accepted/queued, hook emission, and a model answer are different facts. Success must state precisely which is acknowledged. No exactly-once-delivery claim. No unbounded waiting hidden behind a success state. Only a recorded answer event is an answer; a chat reply or transcript line never is.
+
+## Answer return (D4)
+
+Owner decisions of 2026-09-26; the daemon contract is [Answer return](contract.md#answer-return-d4).
+
+- **B1 — Explicit return.** The agent answers by calling `slipstream_answer_question` with the question id and its complete answer. The delivered question tells it to. A chat reply alone never reaches the user.
+- **B2 — One immutable answer.** Each question keeps its first recorded answer, at most 16384 UTF-8 bytes. A correction is a follow-up question.
+- **B3 — Who may answer.** Only the harness session the question was dispatched to. On Codex that is the root chat; a Claude Code subagent shares the root's session and can answer. Restricting Claude to its root is a later follow-up.
+- **B4 — Waiting.** A question without a recorded answer shows plain Waiting, indefinitely, including after expiry, detach or restart. Any "not answered in this session" label is derived by the client from the capture having ended, never from a daemon event.
+- **B5 — Display.** Waiting, New reply and Answered bars under the captured source, with an anchored reply popover, as drawn in the owner design (client PR5, frame `v51ziQ`). New reply outranks Waiting, which outranks Answered. Each ask is its own thread. The "open full conversation" icon stays hidden. Read markers and drafts are client memory, shared across windows and reset on app restart.
+- **B6 — Follow-up.** The popover's follow-up input asks again about the same source in the same capture, naming the question it replies to. It is disabled while the previous turn is Waiting.
 
 ## Visual verification
 
@@ -46,4 +57,4 @@ The daemon already has an owner-only Unix control socket, explicit attached harn
 
 ## Deferred work
 
-Receiving-answer UX, general chat history, change instructions, a full file/diff viewer, interface/caller graphs, database diagrams, TUI, idle-agent wakeup, and retrofit into arbitrary running sessions. The previously reported intermittent feed rendering bug and expected-disconnect logging fix remain separately tracked.
+General chat history, change instructions, a full file/diff viewer, interface/caller graphs, database diagrams, TUI, idle-agent wakeup, and retrofit into arbitrary running sessions. The previously reported intermittent feed rendering bug and expected-disconnect logging fix remain separately tracked.

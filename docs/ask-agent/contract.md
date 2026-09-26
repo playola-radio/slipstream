@@ -1,8 +1,9 @@
 # Queue contract for the ask/send slice
 
 Status: D1 queueing, D2 Codex delivery, S1 Swift sending, and D3 Claude Code
-delivery through the same public question and attempt events are merged.
-Answer return remains a separate slice.
+delivery through the same public question and attempt events are merged. D4
+answer return and follow-up questions are specified in
+[Answer return](#answer-return-d4).
 
 ## Boundary
 
@@ -26,6 +27,7 @@ interface AskRequest {
     line_start: number; // inclusive, 1-based integer
     line_end: number;   // inclusive, 1-based integer
   };
+  reply_to_question_id?: string; // D4 follow-up; see "Follow-up questions"
 }
 interface AskAccepted {
   v: 1;
@@ -88,6 +90,7 @@ interface QuestionQueuedData {
   context: AskRequest['context'] & { selected_text: string };
   queued_at_ms: number;
   expires_at_ms: number;
+  reply_to_question_id?: string; // present only on a D4 follow-up
 }
 ```
 
@@ -195,10 +198,11 @@ chat, using the absolute Node 24 executable and this checkout's absolute
 ```
 
 Merge this entry into the existing `.codex/hooks.json` rather than replacing
-other hooks. In Terminal, use the project hook file Codex loads for that
-checkout. For Conductor linked worktrees, put the hook definition in the
-repository's **main checkout** `.codex/hooks.json`; linked-worktree definitions
-were not loaded in the earlier probe. Review and trust this exact command through
+other hooks. Codex loads project hooks from the chat's own workspace, so every
+Conductor workspace needs the entry in its own `.codex/hooks.json`; a copy only
+in the repository's main checkout is not loaded (D4 Conductor proof). The
+workspace copy was observed to inherit the main checkout's hook trust without a
+new prompt; that is an observation, not a traced guarantee. Review and trust this exact command through
 Codex's normal hook trust flow before the chat starts. The hook's ability to
 connect to the daemon's external Unix socket depends on the selected sandbox
 configuration. Installation does not bypass trust or launch an agent. This slice has no global automatic installer or Conductor API
@@ -256,3 +260,123 @@ file, following the host's normal hook trust flow. The hook sends a bounded
 silent on missing identity or failure. The daemon commits the public attempt
 before the hook reply. Neither that event nor stdout proves the model saw the
 question. No hook is automatically installed or trusted.
+
+## Answer return (D4)
+
+The agent returns an answer only by calling the forwarder's MCP tool
+`slipstream_answer_question({question_id, text})`. A chat reply, transcript
+line, Stop/idle hook or next assistant message is never an answer. The delivered
+question ends with one line telling the agent to use the tool:
+
+> Return your answer by calling the slipstream_answer_question tool with question_id <id> and your complete answer as text. A chat reply alone does not reach the user.
+
+`queued.v1` is a durable request, `dispatch_attempted.v1` means the hook reply
+was about to be written, and `answered.v1` means the targeted harness session
+called the tool with this text. No "received", "delivered", "expired" or
+timeout fact exists.
+
+### Control verb
+
+```typescript
+interface AnswerQuestionRequest {
+  v: 1;
+  verb: 'answer_question';
+  question_id: string;
+  text: string;
+  harness: 'claude-code' | 'codex';
+  harness_session_id: string;
+  worktree: string; // absolute; the daemon canonicalizes it
+}
+interface AnswerAccepted {
+  v: 1;
+  ok: true;
+  session_id: string; // capture
+  question_id: string;
+  event_id: string; // == seq
+  seq: string; // answered event seq
+  answered_at_ms: number;
+  duplicate: boolean;
+}
+interface AnswerRejected {
+  v: 1;
+  ok: false;
+  code: 'PROTOCOL' | 'IDENTITY_UNRESOLVED' | 'SESSION_NOT_SELECTED' | 'CAPTURE_NOT_READY'
+    | 'STORAGE_UNAVAILABLE' | 'INVALID_ANSWER' | 'QUESTION_NOT_FOUND' | 'ANSWER_CONFLICT';
+  message: string;
+}
+```
+
+Checks, in order:
+
+1. The identity triple is present, else `IDENTITY_UNRESOLVED`.
+2. The worktree is canonicalized; afterwards the binding must still be current,
+   untorn and uncompromised, and harness, harness session and worktree must equal
+   the attached binding, else `SESSION_NOT_SELECTED`. A replaced capture is never
+   retargeted.
+3. Text is a string with a non-whitespace character, no unpaired surrogate, and
+   at most 16384 UTF-8 bytes, else `INVALID_ANSWER`. It is stored verbatim.
+4. The question exists in this capture, has a committed `dispatch_attempted.v1`,
+   and its target equals the caller, else `QUESTION_NOT_FOUND`. Unknown, other
+   capture, other harness session and queued-but-undispatched are
+   indistinguishable.
+5. One immutable answer per question: the same text replays the original result
+   with `duplicate:true`; different text is `ANSWER_CONFLICT`.
+
+`ok:true` means durably appended (or already appended). `STORAGE_UNAVAILABLE` is
+outcome unknown, as for `ask`. The question TTL gates only claiming; a
+dispatched question can be answered after it, and answering changes neither
+claim eligibility nor claim order.
+
+Authorization proves the answer came through the selected harness session, not
+from the root agent. A Codex subagent has its own thread id and is rejected. A
+Claude Code subagent shares the root's MCP server and environment, so its call is
+accepted.
+
+### MCP tool result
+
+- Success requires an ack whose `question_id` matches and whose `event_id`
+  equals a nonempty `seq`. Text: `Answer recorded for question <id> (seq <n>).`,
+  with the ack (without `v`/`ok`) as structured content.
+- A first-send rejection passes through as `isError:true`, text
+  `<CODE>: <message>`, structured `{code}`.
+- A lost or malformed reply after sending is retried once with identical text.
+  On that resend only `INVALID_ANSWER`, `IDENTITY_UNRESOLVED` and
+  `ANSWER_CONFLICT` are definitive; anything else becomes `OUTCOME_UNKNOWN`
+  ("resending the identical text is safe, different text is not"), because the
+  first send may have committed.
+- An unreachable daemon is `DAEMON_UNAVAILABLE` and records nothing.
+
+### Durable event
+
+`slipstream.question.answered.v1` uses the `dispatch_attempted.v1` envelope
+(`id == seq`, `subject = question/<question_id>`):
+
+```typescript
+interface QuestionAnsweredData {
+  session_id: string;
+  question_id: string;
+  attempt_seq: string; // seq of the dispatch_attempted.v1 this answer follows
+  text: string;
+  answered_at_ms: number;
+}
+```
+
+Recovery treats a subject that does not match `question_id`, an `attempt_seq`
+that does not name that question's attempt, or a second answer for a question as
+a corrupt log. Answers are not filesystem changes or attribution evidence. The
+reader and SSE carry them in seq order, and in-process recovery rebuilds the
+answer index from the durable prefix, so a resend after recovery replays. A
+detach, daemon restart or new attach ends the capture; a late answer to an old
+question gets `SESSION_NOT_SELECTED` and the old log stays readable.
+
+### Follow-up questions
+
+A follow-up is a normal `ask` with `reply_to_question_id`. The referenced
+question must exist in the same capture and the request `context` must equal its
+context (change seq, path, snapshot hash and line range), else `INVALID_CONTEXT`;
+a malformed id is also `INVALID_CONTEXT`. The field is part of the request body,
+so reusing a `request_id` with a different reply target is `REQUEST_CONFLICT`.
+`queued.v1` carries it as optional `data.reply_to_question_id`. A thread is the
+root question plus every question whose chain reaches it. The daemon does not
+check whether the previous turn has been answered; disabling follow-up while a
+turn is Waiting is a client rule.
