@@ -11,7 +11,7 @@ function nonempty(value: unknown, maxBytes = 4096): value is string {
 }
 
 /** An unsupported or partial callback never asks the daemon to consume a question. */
-export async function codexPostToolUse(input: unknown, storeDir: string, deadlineAtMs = Date.now() + 1000): Promise<string | null> {
+async function postToolUse(harness: 'codex' | 'claude-code', input: unknown, storeDir: string, deadlineAtMs: number): Promise<string | null> {
   const event = object(input);
   if (!event || event.hook_event_name !== 'PostToolUse' || !nonempty(event.session_id)
     || !nonempty(event.cwd) || !nonempty(event.transcript_path)
@@ -19,7 +19,7 @@ export async function codexPostToolUse(input: unknown, storeDir: string, deadlin
     || Date.now() >= deadlineAtMs) return null;
   try {
     const reply = await sendControlRequest({ socketPath: controlSocketPath(storeDir),
-      request: { v: 1, verb: 'claim_question', harness: 'codex', harness_session_id: event.session_id,
+      request: { v: 1, verb: 'claim_question', harness, harness_session_id: event.session_id,
         worktree: event.cwd, transcript_path: event.transcript_path },
       connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs });
     if (!reply.ok || reply.question === null) return null;
@@ -43,6 +43,14 @@ export async function codexPostToolUse(input: unknown, storeDir: string, deadlin
     // formatting an already-claimed reply must not discard it.
     return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext } });
   } catch { return null; }
+}
+
+export function codexPostToolUse(input: unknown, storeDir: string, deadlineAtMs = Date.now() + 1000): Promise<string | null> {
+  return postToolUse('codex', input, storeDir, deadlineAtMs);
+}
+
+export function claudePostToolUse(input: unknown, storeDir: string, deadlineAtMs = Date.now() + 1000): Promise<string | null> {
+  return postToolUse('claude-code', input, storeDir, deadlineAtMs);
 }
 
 /** Bounded stdin prevents a malformed hook payload from retaining unbounded bytes. */

@@ -14,6 +14,17 @@ describe('cli ask', () => {
       { command: 'attach', dir: '/work', store: '/s', harness: 'codex',
         harnessSessionId: 'root', rootTranscript: '/transcript.jsonl' });
   });
+  it('parses the Claude hook and exits silently on invalid callback input', async () => {
+    assert.deepEqual(parseArgs(['hook', 'claude-code', 'post-tool-use', '--store', '/s']),
+      { command: 'claude-hook', store: '/s' });
+    const { execFile } = await import('node:child_process');
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(resolve => {
+      const child = execFile(process.execPath, ['src/cli.ts', 'hook', 'claude-code', 'post-tool-use', '--store', '/missing'],
+        { timeout: 5000 }, (error, stdout, stderr) => resolve({ code: error && typeof error.code === 'number' ? error.code : 0, stdout, stderr }));
+      child.stdin?.end('{invalid');
+    });
+    assert.deepEqual(result, { code: 0, stdout: '', stderr: '' });
+  });
   it('parses the required store, capture session, request id, and input flags', () => {
     assert.deepEqual(parseArgs([
       'ask', '--store', '/s', '--session', ASK_SESSION,
