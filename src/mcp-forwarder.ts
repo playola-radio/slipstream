@@ -2,15 +2,16 @@
 /**
  * The Slipstream MCP forwarder — the whole subprocess a harness spawns.
  *
- * It wires four locked pieces together and owns nothing else:
+ * It wires these pieces together and owns nothing else:
  *   - {@link ./mcp-protocol.ts}   — hand-rolled MCP-over-stdio JSON-RPC transport.
  *   - {@link ./harness-context.ts} — fail-closed harness-identity resolver (SC3).
  *   - {@link ./task-forwarder.ts} — begin_task orchestration with honest retry.
+ *   - {@link ./answer-forwarder.ts} — answer_question orchestration with honest retry.
  *   - {@link ./control-client.ts} — the unix-socket control channel to the daemon.
  *
- * It exposes exactly ONE tool, `slipstream_begin_task(title)`. The forwarder is a
- * control client: it never attaches, never captures, and never touches the store
- * — it resolves the daemon's control socket from `--store` (shared with the CLI)
+ * It exposes two tools, `slipstream_begin_task(title)` and
+ * `slipstream_answer_question(question_id, text)`. The forwarder is a control
+ * client: it never attaches, never captures, and never touches the store — it resolves the daemon's control socket from `--store` (shared with the CLI)
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
@@ -18,8 +19,10 @@ import { isMainModule } from './entrypoint.ts';
 import { dispatch, parseMessage, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
+import { forwardAnswer } from './answer-forwarder.ts';
 import { sendControlRequest } from './control-client.ts';
 import { controlSocketPath, resolveStoreDir } from './daemon-location.ts';
+import type { RequestEnvelope } from './control-protocol.ts';
 
 export const BEGIN_TASK_TOOL: ToolDef = {
   name: 'slipstream_begin_task',
@@ -32,6 +35,22 @@ export const BEGIN_TASK_TOOL: ToolDef = {
       title: { type: 'string', description: 'A short human-readable title for the task.' },
     },
     required: ['title'],
+    additionalProperties: false,
+  },
+};
+
+export const ANSWER_QUESTION_TOOL: ToolDef = {
+  name: 'slipstream_answer_question',
+  description:
+    'Return your answer to a Slipstream question. Call it once per question with the exact ' +
+    'question_id from the Slipstream question context and your complete answer as text.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      question_id: { type: 'string', description: 'The exact Slipstream question id you are answering.' },
+      text: { type: 'string', description: 'Your complete answer for the user.' },
+    },
+    required: ['question_id', 'text'],
     additionalProperties: false,
   },
 };
@@ -49,13 +68,12 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
 
-function titleOf(params: unknown): string {
-  // Pass the raw title through; the daemon is the authority on title validity
-  // (an empty/absent title becomes its INVALID_TITLE, not a second local rule).
-  if (isObject(params) && isObject(params.arguments) && typeof params.arguments.title === 'string') {
-    return params.arguments.title;
-  }
-  return '';
+function stringArg(params: unknown, key: string): string {
+  // Pass the raw value through; the daemon is the authority on validity (an
+  // empty/absent title or answer becomes its INVALID_TITLE / INVALID_ANSWER,
+  // not a second local rule).
+  const value = isObject(params) && isObject(params.arguments) ? params.arguments[key] : undefined;
+  return typeof value === 'string' ? value : '';
 }
 
 export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers {
@@ -64,17 +82,18 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
   return {
     serverInfo: { name: 'slipstream-forwarder', version: '0.0.0' },
     protocolVersion: '2025-06-18',
-    tools: [BEGIN_TASK_TOOL],
+    tools: [BEGIN_TASK_TOOL, ANSWER_QUESTION_TOOL],
     onInitialize: (params) => {
       const clientInfo = isObject(params) ? params.clientInfo : undefined;
       ctx.initialize(clientInfo, opts.env);
     },
-    callTool: (_name, params) =>
-      forwardBeginTask({
-        identity: ctx.identityForCall(params),
-        title: titleOf(params),
-        send: (request) => sendControlRequest({ socketPath: opts.socketPath, request }),
-      }),
+    callTool: (name, params) => {
+      const identity = ctx.identityForCall(params);
+      const send = (request: RequestEnvelope) => sendControlRequest({ socketPath: opts.socketPath, request });
+      return name === ANSWER_QUESTION_TOOL.name
+        ? forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send })
+        : forwardBeginTask({ identity, title: stringArg(params, 'title'), send });
+    },
   };
 }
 
