@@ -45,7 +45,7 @@ follows shared types. Namespace/module members and values wrapped in casts,
 `satisfies`, or parentheses are currently `unsupported-construct` when they
 contain eligible functions. A direct class-expression binding,
 computed method name, class-field function, opaque function-type alias on a
-function binding, or eligible syntax this module cannot represent is
+function binding, `this` parameter, decorated parameter, or eligible syntax this module cannot represent is
 `unsupported-construct` for the entire file. This is a syntax-only subset, not
 an assertion that excluded code has no callable behavior.
 

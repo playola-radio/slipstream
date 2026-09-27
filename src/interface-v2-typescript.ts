@@ -188,7 +188,7 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   for (let i = 0; i < node.childCount; i++) {
     const c = node.child(i);
     if (!c || c.startIndex >= (field(node, 'parameters')?.startIndex ?? node.endIndex)) break;
-    if (['async', 'static', 'abstract', 'override', 'readonly', 'accessibility_modifier',
+    if (['async', 'static', 'abstract', 'override_modifier', 'readonly', 'accessibility_modifier',
       'declare', 'default', 'generator', '*', '?'].includes(c.type)) modifierNodes.push(normalizedTokens(c));
   }
   const genericNode = child(node, 'type_parameters');
@@ -242,11 +242,13 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
           const token = node.child(i);
           if (token?.type === 'export' || token?.type === 'default') exportModifiers.push(token.text);
         }
-        if (!inner && children(node).some(n => n.type === 'class' || n.type === 'class_expression')) return false;
+        if (!inner && children(node).some(n => ['class', 'class_expression', 'module',
+          'internal_module', 'statement_block', 'expression_statement'].includes(n.type))) return false;
         return !inner || scan(inner, node, [...exportModifiers, ...mods]);
       }
       if (node.type === 'ambient_declaration') {
         const inner = children(node)[0];
+        if (inner && ['module', 'internal_module', 'statement_block'].includes(inner.type)) return false;
         return !inner || scan(inner, span, [...mods, 'declare']);
       }
       if (['function_declaration', 'function_signature', 'generator_function_declaration'].includes(node.type)) {
@@ -296,7 +298,7 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
         }
         return true;
       }
-      if (node.type === 'internal_module'
+      if (node.type === 'module' || node.type === 'internal_module'
         || node.type === 'expression_statement' && children(node).some(n => n.type === 'internal_module')) return false;
       return true;
     };

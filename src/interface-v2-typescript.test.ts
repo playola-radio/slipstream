@@ -240,6 +240,17 @@ test('modified accessors remain excluded', async () => {
   if (result.status === 'complete') assert.deepEqual(result.declarations.map(d => d.identity.name), ['m']);
 });
 
+test('adding override changes the written method header', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('class A extends B { m(): void {} }'));
+  const after = extract(Buffer.from('class A extends B { override m(): void {} }'));
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.changes.length, 1);
+  assert.deepEqual(result.changes[0]!.header.before?.modifiers, []);
+  assert.deepEqual(result.changes[0]!.header.after?.modifiers, ['override']);
+});
+
 test('template literal types keep literal fragments', async () => {
   const extract = await createTypeScriptInterfaceExtractor('typescript');
   const before = extract(Buffer.from('function f(x: `a-${string}`): void {}'));
@@ -266,8 +277,14 @@ test('typed binding keeps optional, rest, and generic clauses', async () => {
 
 test('namespace members and wrapped function bindings fail visibly', async () => {
   const extract = await createTypeScriptInterfaceExtractor('typescript');
-  assert.deepEqual(extract(Buffer.from('namespace N { export function f(): void {} }')),
-    { status: 'incomplete', reason: 'unsupported-construct' });
+  for (const source of [
+    'namespace N { export function f(): void {} }',
+    'export namespace N { export function f(): void {} }',
+    'module N { export function f(): void {} }',
+    'declare module "x" { export function f(): void; }',
+    'declare global { function f(): void; }',
+  ]) assert.deepEqual(extract(Buffer.from(source)),
+    { status: 'incomplete', reason: 'unsupported-construct' }, source);
   assert.deepEqual(extract(Buffer.from('const f = ((x: number) => x) as Fn;')),
     { status: 'incomplete', reason: 'unsupported-construct' });
 });
