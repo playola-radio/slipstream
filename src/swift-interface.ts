@@ -20,11 +20,13 @@ export async function extractSwiftSides(
   for (const { id, bytes } of sides) {
     if (ids.has(id)) throw new Error(`duplicate Swift side id: ${id}`);
     ids.add(id);
+    if (options.limits?.inputBytes !== undefined && bytes.byteLength > options.limits.inputBytes) {
+      failures.set(id, { status: 'tooLarge', limit: 'inputBytes' });
+      continue;
+    }
     try {
       const source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-      if (options.limits?.inputBytes !== undefined && bytes.byteLength > options.limits.inputBytes) {
-        failures.set(id, { status: 'tooLarge', limit: 'inputBytes' });
-      } else decoded.push({ id, source });
+      decoded.push({ id, source });
     }
     catch { failures.set(id, { status: 'incomplete', reason: 'parse-error' }); }
   }

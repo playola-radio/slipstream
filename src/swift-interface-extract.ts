@@ -14,7 +14,7 @@ export const SWIFT_V1 = {
 
 export interface SwiftLimits { inputBytes?: number; declarations?: number; syntaxVisits?: number }
 export type SwiftSide =
-  | { status: 'complete'; declarations: V2Declaration[]; stats: { declarations: number; syntaxVisits: number } }
+  | { status: 'complete'; declarations: V2Declaration[] }
   | { status: 'incomplete'; reason: 'parse-error' | 'unsupported-construct' }
   | { status: 'tooLarge'; limit: 'inputBytes' | 'declarations' | 'syntaxVisits' };
 
@@ -32,42 +32,101 @@ function field(node: Node, child: Node): string | null {
 }
 function direct(node: Node, type: string): Node | undefined { return children(node).find((child) => child.type === type); }
 function tokens(node: Node, source: string): string[] {
-  if (node.type === 'comment' || node.type === 'multiline_comment') return [];
-  if (node.type.includes('string_literal') || node.type === 'regex_literal') return [source.slice(node.startIndex, node.endIndex)];
-  if (node.childCount === 0) return [source.slice(node.startIndex, node.endIndex)];
-  return children(node).flatMap((child) => tokens(child, source));
+  const result: string[] = [];
+  const pending = [node];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (current.type === 'comment' || current.type === 'multiline_comment') continue;
+    if (current.type.includes('string_literal') || current.type === 'regex_literal' || current.childCount === 0) {
+      result.push(source.slice(current.startIndex, current.endIndex));
+      continue;
+    }
+    const parts = children(current);
+    for (let i = parts.length - 1; i >= 0; i--) pending.push(parts[i]!);
+  }
+  return result;
 }
 /** Canonical token rendering: trivia is discarded, literal contents are atomic. */
-function normalized(node: Node, source: string): string {
-  const ts = tokens(node, source);
+function renderTokens(ts: string[]): string {
   let result = '';
   for (let i = 0; i < ts.length; i++) {
     const t = ts[i]!;
     const previous = ts[i - 1];
     const word = (s: string): boolean => /[\p{L}\p{N}_$]$/u.test(s);
     const startsWord = (s: string): boolean => /^[\p{L}\p{N}_$]/u.test(s);
+    const operator = (s: string): boolean => /^[&|+*/%=~^-]+$/.test(s);
+    const punctuation = (s: string): boolean => /^[!$%&*+./:<=>?@^|~-]+$/.test(s);
     const gap = previous !== undefined && ((word(previous) && startsWord(t)) || previous === ':' || previous === ',' ||
-      previous === '->' || t === '->' || previous === '==' || t === '==');
+      previous === '->' || t === '->' || operator(previous) || operator(t) ||
+      (punctuation(previous) && punctuation(t)));
     if (gap) result += ' ';
     result += t;
   }
   return result;
 }
+function normalized(node: Node, source: string): string { return renderTokens(tokens(node, source)); }
+function identifier(node: Node, source: string): string {
+  const written = normalized(node, source);
+  return written.startsWith('`') && written.endsWith('`') ? written.slice(1, -1) : written;
+}
 
-function parameter(node: Node, source: string, position: number, defaultNode?: Node): V2Parameter {
-  const names = children(node).filter((c) => c.type === 'simple_identifier');
-  const external = children(node).find((c) => field(node, c) === 'external_name');
+/** The pinned grammar exposes a #if directive as one opaque leaf, so scan its
+ * condition into tokens without treating comments or spacing as identity. */
+function guardCondition(raw: string): string {
+  const result: string[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    if (/\s/u.test(raw[i]!)) { i++; continue; }
+    if (raw.startsWith('//', i)) break;
+    if (raw.startsWith('/*', i)) {
+      let depth = 1;
+      i += 2;
+      while (i < raw.length && depth) {
+        if (raw.startsWith('/*', i)) { depth++; i += 2; }
+        else if (raw.startsWith('*/', i)) { depth--; i += 2; }
+        else i++;
+      }
+      if (depth) throw new Unsupported('unclosed directive comment');
+      continue;
+    }
+    const start = i;
+    const c = raw[i]!;
+    if (c === '"') {
+      i++;
+      while (i < raw.length) {
+        if (raw[i] === '\\') { i += 2; continue; }
+        if (raw[i++] === '"') break;
+      }
+    } else if (/[\p{L}\p{N}_]/u.test(c)) {
+      i++;
+      while (i < raw.length && /[\p{L}\p{N}_]/u.test(raw[i]!)) i++;
+    } else if (/[!$%&*+./:<=>?@^|~-]/.test(c)) {
+      i++;
+      while (i < raw.length && /[!$%&*+./:<=>?@^|~-]/.test(raw[i]!)) i++;
+    } else i++;
+    result.push(raw.slice(start, i));
+  }
+  return renderTokens(result);
+}
+
+function parameter(node: Node, source: string, position: number, attributes: Node[], defaultNode?: Node): V2Parameter {
+  const parts = children(node);
+  const names = parts.filter((c) => c.type === 'simple_identifier');
+  const external = parts.find((c) => field(node, c) === 'external_name');
   const local = names.find((c) => c !== external);
   if (!local) throw new Unsupported('parameter without local name');
-  const colon = children(node).findIndex((c) => c.type === ':');
-  const typeNode = colon < 0 ? undefined : children(node).slice(colon + 1).find((c) =>
+  const colon = parts.findIndex((c) => c.type === ':');
+  const typeNode = colon < 0 ? undefined : parts.slice(colon + 1).find((c) =>
     c.isNamed && c.type !== 'parameter_modifiers');
   if (!typeNode) throw new Unsupported('parameter without type');
   const modifierNode = direct(node, 'parameter_modifiers');
-  const modifiers = modifierNode ? named(modifierNode).map((c) => normalized(c, source)) : [];
-  const name = normalized(local, source);
+  const modifiers = [
+    ...attributes.map((attribute) => normalized(attribute, source)),
+    ...(modifierNode ? named(modifierNode).map((c) => normalized(c, source)) : []),
+  ];
+  const name = identifier(local, source);
   return {
-    position, label: external ? normalized(external, source) : null, name,
+    position, label: external ? identifier(external, source) : null, name,
     binding: name === '_' ? 'wildcard' : 'identifier',
     type: { state: 'written', text: normalized(typeNode, source) },
     optional: false, variadic: Boolean(direct(node, '...')),
@@ -84,29 +143,47 @@ function scopeKind(node: Node): string {
 }
 function declaration(node: Node, source: string, table: ReturnType<typeof buildUtf16ToByteTable>,
   scope: V2Declaration['identity']['scope'], guards: string[]): V2Declaration {
+  const parts = children(node);
   const isInit = node.type === 'init_declaration';
-  const nameNode = children(node).find((c) => field(node, c) === 'name' &&
+  const nameNode = parts.find((c) => field(node, c) === 'name' &&
     (c.type === 'simple_identifier' || c.type === 'init'));
   if (!nameNode && !isInit) throw new Unsupported('function without representable name');
-  const name = isInit ? 'init' : normalized(nameNode!, source);
+  const name = isInit ? 'init' : identifier(nameNode!, source);
   const params: V2Parameter[] = [];
-  for (let i = 0; i < children(node).length; i++) {
-    const child = children(node)[i]!;
+  const pendingAttributes: Node[] = [];
+  let withinParameters = false;
+  for (let i = 0; i < parts.length; i++) {
+    const child = parts[i]!;
+    if (child.type === '(' && !withinParameters) { withinParameters = true; continue; }
+    if (child.type === ')' && withinParameters) {
+      if (pendingAttributes.length) throw new Unsupported('parameter attribute without parameter');
+      withinParameters = false;
+      continue;
+    }
+    if (child.type === 'attribute' && withinParameters) {
+      pendingAttributes.push(child);
+      continue;
+    }
     if (child.type === 'parameter') {
-      const next = children(node)[i + 1];
-      const defaultNode = next?.type === '=' ? children(node)[i + 2] : undefined;
-      params.push(parameter(child, source, params.length, defaultNode));
+      const next = parts[i + 1];
+      const defaultNode = next?.type === '=' ? parts[i + 2] : undefined;
+      params.push(parameter(child, source, params.length, pendingAttributes, defaultNode));
+      pendingAttributes.length = 0;
     }
   }
-  const arrow = children(node).findIndex((c) => c.type === '->');
-  const returnNode = arrow < 0 ? undefined : children(node).slice(arrow + 1).find((c) => c.isNamed);
-  if (arrow >= 0 && (!returnNode || returnNode.type === 'type_constraints' || returnNode.type === 'function_body')) {
+  const arrow = parts.findIndex((c) => c.type === '->');
+  const endOfReturn = arrow < 0 ? -1 : parts.findIndex((c, i) => i > arrow &&
+    (c.type === 'type_constraints' || c.type === 'function_body'));
+  const returnParts = arrow < 0 ? [] : parts.slice(arrow + 1, endOfReturn < 0 ? undefined : endOfReturn)
+    .filter((c) => c.isNamed);
+  if (arrow >= 0 && (returnParts.length < 1 || returnParts.length > 2 ||
+    (returnParts.length === 2 && returnParts[0]!.type !== 'type_modifiers'))) {
     throw new Unsupported('return type missing');
   }
-  const failableNode = isInit ? children(node).find((c) => c.type === '?' || c.type === '!' || c.type === 'bang') : undefined;
+  const failableNode = isInit ? parts.find((c) => c.type === '?' || c.type === '!' || c.type === 'bang') : undefined;
   const failable = failableNode?.type === 'bang' ? '!' : failableNode?.type as '?' | '!' | undefined;
   const result: V2Result = isInit ? { kind: 'initializer', failable: failable ?? null } :
-    { kind: 'return', type: returnNode ? { state: 'written', text: normalized(returnNode, source) } :
+    { kind: 'return', type: returnParts.length ? { state: 'written', text: returnParts.map((c) => normalized(c, source)).join(' ') } :
       { state: 'implicit', text: 'Void' } };
   const throwsNode = direct(node, 'throws');
   const throws: V2Throws = { mode: throwsNode?.text === 'rethrows' ? 'rethrows' : throwsNode ? 'throws' : 'none' };
@@ -115,8 +192,9 @@ function declaration(node: Node, source: string, table: ReturnType<typeof buildU
   const constraintNode = direct(node, 'type_constraints');
   const header: V2Header = {
     modifiers: [
-      ...(modifierNode ? named(modifierNode).map((c) => normalized(c, source)) : []),
-      ...children(node).filter((c) => c.type === 'async').map((c) => normalized(c, source)),
+      ...(modifierNode ? children(modifierNode).map((c) => normalized(c, source)) : []),
+      ...parts.filter((c) => c.type === 'class' || c.type === 'static').map((c) => normalized(c, source)),
+      ...parts.filter((c) => c.type === 'async').map((c) => normalized(c, source)),
     ],
     generic_parameters: genericNode ? named(genericNode).filter((c) => c.type === 'type_parameter').map((c) => normalized(c, source)) : [],
     constraints: constraintNode ? named(constraintNode).filter((c) => c.type === 'type_constraint').map((c) => normalized(c, source)) : [],
@@ -165,15 +243,16 @@ export function extractSwiftSource(language: Language, source: string, limits: S
           const text = child.text.trim();
           const match = /^#(if|elseif|else|endif)\b(?:\s+([\s\S]*))?$/.exec(text);
           if (!match) continue; // Nonconditional directives do not change identity.
-          const condition = match[2]?.trim();
+          const condition = match[2] === undefined ? undefined : guardCondition(match[2]);
           if (match[1] === 'if') { if (!condition) throw new Unsupported('empty if'); frames.push({ prior: [condition], active: condition }); }
           else if (match[1] === 'endif') { if (!frames.pop()) throw new Unsupported('unmatched endif'); }
           else {
             const frame = frames.at(-1);
             if (!frame) throw new Unsupported('unmatched conditional');
             const prior = frame.prior.map((c) => `!(${c})`).join(' && ');
-            frame.active = match[1] === 'else' ? prior : `${prior} && ${condition}`;
-            if (match[1] === 'elseif' && condition) frame.prior.push(condition);
+            if (match[1] === 'elseif' && !condition) throw new Unsupported('empty elseif');
+            frame.active = match[1] === 'else' ? prior : `${prior} && (${condition})`;
+            if (match[1] === 'elseif') frame.prior.push(condition!);
           }
           continue;
         }
@@ -183,17 +262,17 @@ export function extractSwiftSource(language: Language, source: string, limits: S
           if (limits.declarations !== undefined && declarations.length > limits.declarations) throw new TooLarge('declarations');
         } else if (child.type === 'class_declaration' || child.type === 'protocol_declaration') {
           const kind = scopeKind(child);
-          if (direct(child, 'type_constraints')) throw new Unsupported('constrained extension scope');
+          if (kind === 'extension' && direct(child, 'type_constraints')) throw new Unsupported('constrained extension scope');
           const nameNode = children(child).find((c) => field(child, c) === 'name');
           const body = children(child).find((c) => field(child, c) === 'body');
           if (!nameNode || !body) throw new Unsupported('type scope without name or body');
-          visit(body, [...scope, { kind, name: normalized(nameNode, source) }], activeGuards);
-        } else if (child.type === 'operator_declaration') throw new Unsupported('operator declaration');
+          visit(body, [...scope, { kind, name: identifier(nameNode, source) }], activeGuards);
+        }
       }
       if (frames.length) throw new Unsupported('unclosed if');
     };
     visit(tree.rootNode, [], []);
-    return { status: 'complete', declarations, stats: { declarations: declarations.length, syntaxVisits } };
+    return { status: 'complete', declarations };
   } catch (error) {
     if (error instanceof TooLarge) return { status: 'tooLarge', limit: error.limit };
     if (error instanceof Unsupported) return { status: 'incomplete', reason: 'unsupported-construct' };

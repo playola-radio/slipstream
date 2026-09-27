@@ -36,8 +36,8 @@ export async function runSwiftExtractCheck(io: CheckIO): Promise<number> {
       sides.push({ id, bytes });
     }
     const extracted = await extractSwiftSides(sides);
-    const left = extracted.get('before') ?? { status: 'complete', declarations: [], stats: { declarations: 0, syntaxVisits: 0 } };
-    const right = extracted.get('after') ?? { status: 'complete', declarations: [], stats: { declarations: 0, syntaxVisits: 0 } };
+    const left = extracted.get('before') ?? { status: 'complete', declarations: [] };
+    const right = extracted.get('after') ?? { status: 'complete', declarations: [] };
     const incomplete = (side: SwiftSide, prefix: string): string | null =>
       side.status === 'incomplete' ? `${prefix}-${side.reason}` : side.status === 'tooLarge' ? 'too-large' : null;
     const reason = incomplete(left, 'before') ?? incomplete(right, 'after');

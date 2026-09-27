@@ -8,7 +8,7 @@ settings, inspect function bodies, or infer behavior.
 
 - `src/swift-interface.ts` exports `SWIFT_V1` and
   `extractSwiftSides([{ id, bytes }], { signal, deadlineMs, limits })`.
-  Each result is `complete` with declarations and visit counts, `incomplete`
+  Each result is `complete` with declarations, `incomplete`
   with `parse-error` or `unsupported-construct`, or `tooLarge` with the limit.
   An abort or deadline rejects as `SwiftExtractCancelled` or
   `SwiftExtractTimeout`. Other host failures propagate. A pre-aborted signal
@@ -35,7 +35,8 @@ settings, inspect function bodies, or infer behavior.
 The module extracts top-level `func`, members of classes, structs, enums,
 actors, protocols and extensions, protocol requirements and `init` (including
 `init?` and `init!`). It records written external labels, local names,
-defaults, `inout` and other parsed parameter modifiers, variadics, `async`,
+defaults, parameter attributes, `inout` and other parsed parameter modifiers,
+`class`/`static` method modifiers, variadics, `async`,
 `throws`/`rethrows`, generic parameters and `where` constraints. Omitted
 `func` returns are `implicit Void`; initializers have the distinct initializer
 result, never `-> Self`. Every syntactic `#if` branch is traversed and guards

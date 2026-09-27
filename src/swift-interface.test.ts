@@ -7,7 +7,8 @@ import { extractSwiftSides, SWIFT_V1, SwiftExtractCancelled, SwiftExtractTimeout
 
 const corpus = new URL('../contracts/interface/v2/cases/', import.meta.url);
 type Snapshot = { kind: 'content'; sha256: string } | { kind: 'absent' };
-type FixtureFile = { path: string; status: string; fallback_reason?: string; changes: unknown[] };
+type FixtureFile = { path: string; status: string; fallback_reason?: string; changes: unknown[];
+  coverage?: { before: { state: string; reason?: string }; after: { state: string; reason?: string } } };
 type HistoryEvent = { type: string; data: { path?: string; snapshot?: Snapshot; before?: Snapshot; after?: Snapshot } };
 
 test('Swift v2 metadata publishes the narrow language scope', () => {
@@ -51,7 +52,14 @@ test('every applicable Swift v2 fixture is reproduced from its captured source b
       const before = beforeBytes === null ? { status: 'complete' as const, declarations: [] } : sides.get('before')!;
       const after = afterBytes === null ? { status: 'complete' as const, declarations: [] } : sides.get('after')!;
       if (file.status === 'incomplete' && file.fallback_reason?.endsWith('parse-error')) {
-        assert.equal((file.fallback_reason.startsWith('before-') ? before : after).status, 'incomplete', name);
+        const refused = file.fallback_reason.startsWith('before-') ? before : after;
+        assert.deepEqual(refused, { status: 'incomplete', reason: 'parse-error' }, name);
+        for (const [id, side] of [['before', before], ['after', after]] as const) {
+          const expectedSide = file.coverage?.[id];
+          assert.ok(expectedSide, `${name} ${id} coverage missing`);
+          assert.equal(side.status, expectedSide!.state, `${name} ${id} status`);
+          if (side.status === 'incomplete') assert.equal(side.reason, expectedSide!.reason, `${name} ${id} reason`);
+        }
         continue;
       }
       assert.equal(before.status, 'complete', `${name} before`);
@@ -97,13 +105,103 @@ test('token spacing and comments do not create a written-header change', async (
   if (b.status === 'complete' && a.status === 'complete') assert.deepEqual(compareV2(b.declarations, a.declarations), { status: 'ready', changes: [] });
 });
 
+test('parameter attributes and attributed return types produce visible component changes', async () => {
+  const pairs = [
+    ['func f(content: () -> Int) {}', 'func f(@ViewBuilder content: () -> Int) {}', 'parameters'],
+    ['func f() -> @Sendable () -> Void { {} }',
+      'func f() -> @Sendable (Int) -> String { { String($0) } }', 'result'],
+  ] as const;
+  for (const [before, after, component] of pairs) {
+    const sides = await extractSwiftSides([
+      { id: 'before', bytes: Buffer.from(before) }, { id: 'after', bytes: Buffer.from(after) },
+    ]);
+    const b = sides.get('before')!, a = sides.get('after')!;
+    assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+    if (b.status !== 'complete' || a.status !== 'complete') continue;
+    const compared = compareV2(b.declarations, a.declarations);
+    assert.equal(compared.status, 'ready');
+    if (compared.status !== 'ready') continue;
+    assert.equal(compared.changes.length, 1);
+    const row = compared.changes[0]!;
+    assert.equal(row.kind, 'signatureChanged');
+    assert.equal(component === 'parameters' ? row.parameters[0]!.op : row.result?.op, 'changed');
+  }
+});
+
+test('class func is a written header modifier and does not collide with an instance method', async () => {
+  const sources = ['class C { func f() {} }', 'class C { class func f() {} }'];
+  const sides = await extractSwiftSides(sources.map((source, i) => ({ id: String(i), bytes: Buffer.from(source) })));
+  const b = sides.get('0')!, a = sides.get('1')!;
+  assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+  if (b.status !== 'complete' || a.status !== 'complete') return;
+  const result = compareV2(b.declarations, a.declarations);
+  assert.equal(result.status, 'ready');
+  if (result.status === 'ready') assert.deepEqual(result.changes[0]!.header.after?.modifiers, ['class']);
+  const both = (await extractSwiftSides([{ id: 'both', bytes: Buffer.from('class C { func f() {}; class func f() {} }') }])).get('both')!;
+  assert.equal(both.status, 'complete');
+  if (both.status === 'complete') assert.equal(compareV2(both.declarations, []).status, 'ready');
+  const staticSide = (await extractSwiftSides([{ id: 'static', bytes: Buffer.from('struct S { static func f() {} }') }])).get('static')!;
+  assert.equal(staticSide.status, 'complete');
+  if (staticSide.status === 'complete') assert.deepEqual(staticSide.declarations[0]!.header.modifiers, ['static']);
+});
+
+test('guard trivia has no effect and elseif disjunction remains grouped', async () => {
+  const before = '#if A&&B\nfunc f() {}\n#endif\n';
+  const after = '#if A && B // note\nfunc f() {}\n#endif\n';
+  const sides = await extractSwiftSides([{ id: 'b', bytes: Buffer.from(before) }, { id: 'a', bytes: Buffer.from(after) }]);
+  const b = sides.get('b')!, a = sides.get('a')!;
+  assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+  if (b.status === 'complete' && a.status === 'complete') assert.deepEqual(compareV2(b.declarations, a.declarations), { status: 'ready', changes: [] });
+  const branch = (await extractSwiftSides([{ id: 'branch', bytes: Buffer.from('#if A\n#elseif B || C\nfunc g() {}\n#endif\n') }])).get('branch')!;
+  assert.equal(branch.status, 'complete');
+  if (branch.status === 'complete') assert.deepEqual(branch.declarations[0]!.identity.guards, ['!(A) && (B || C)']);
+});
+
+test('different operator tokens and backtick spelling cannot hide a written change', async () => {
+  const sides = await extractSwiftSides([
+    { id: 'b', bytes: Buffer.from('func f(x: Bool = a && b) {}') },
+    { id: 'a', bytes: Buffer.from('func f(x: Bool = a & & b) {}') },
+  ]);
+  const b = sides.get('b')!, a = sides.get('a')!;
+  assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+  if (b.status === 'complete' && a.status === 'complete') {
+    const result = compareV2(b.declarations, a.declarations);
+    assert.equal(result.status, 'ready');
+    if (result.status === 'ready') assert.equal(result.changes[0]?.parameters[0]?.op, 'changed');
+  }
+  const escaped = await extractSwiftSides([
+    { id: 'b', bytes: Buffer.from('func `f`() {}') }, { id: 'a', bytes: Buffer.from('func f() {}') },
+  ]);
+  const e1 = escaped.get('b')!, e2 = escaped.get('a')!;
+  assert.equal(e1.status, 'complete'); assert.equal(e2.status, 'complete');
+  if (e1.status === 'complete' && e2.status === 'complete') assert.deepEqual(compareV2(e1.declarations, e2.declarations), { status: 'ready', changes: [] });
+});
+
+test('deep type syntax in one side does not prevent a sibling from extracting', async () => {
+  const deep = 'func f(_ x: ' + '['.repeat(5_000) + 'Int' + ']'.repeat(5_000) + ') {}';
+  const sides = await extractSwiftSides([
+    { id: 'deep', bytes: Buffer.from(deep) }, { id: 'clean', bytes: Buffer.from('func g() {}') },
+  ], { limits: { syntaxVisits: 50_000 }, deadlineMs: 30_000 });
+  assert.equal(sides.get('deep')?.status, 'complete');
+  assert.equal(sides.get('clean')?.status, 'complete');
+});
+
+test('non-function operator declarations and constrained named types do not refuse contained functions', async () => {
+  const sources = ['infix operator +++\nfunc f() {}', 'struct S<T> where T: Equatable { func f() {} }'];
+  for (const source of sources) {
+    const side = (await extractSwiftSides([{ id: 'one', bytes: Buffer.from(source) }])).get('one')!;
+    assert.equal(side.status, 'complete');
+    if (side.status === 'complete') assert.equal(side.declarations.length, 1);
+  }
+});
+
 test('nested #if guards are syntactic and all branches are extracted', async () => {
   const source = '#if A\n#if B\nfunc f() {}\n#elseif C\nfunc g() {}\n#else\nfunc h() {}\n#endif\n#endif\n';
   const side = (await extractSwiftSides([{ id: 'one', bytes: Buffer.from(source) }])).get('one')!;
   assert.equal(side.status, 'complete');
   if (side.status !== 'complete') return;
   assert.deepEqual(side.declarations.map((d) => d.identity.guards), [
-    ['A', 'B'], ['A', '!(B) && C'], ['A', '!(B) && !(C)'],
+    ['A', 'B'], ['A', '!(B) && (C)'], ['A', '!(B) && !(C)'],
   ]);
 });
 

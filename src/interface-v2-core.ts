@@ -17,7 +17,7 @@ export interface V2Parameter {
   modifiers: string[];
 }
 export type V2Result = { kind: 'return'; type: V2Parameter['type'] } | { kind: 'initializer'; failable: '?' | '!' | null };
-export interface V2Throws { mode: 'notExpressible' | 'none' | 'throws' | 'rethrows'; type?: string }
+export interface V2Throws { mode: 'notExpressible' | 'none' | 'throws' | 'rethrows' }
 export interface V2Header { modifiers: string[]; generic_parameters: string[]; constraints: string[] }
 export interface V2Declaration {
   identity: V2Identity;
@@ -92,7 +92,7 @@ function order(a: V2Declaration, b: V2Declaration): number {
     b.identity.scope.flatMap((s) => [s.kind, s.name]));
   const guardOrder = cmpArray(a.identity.guards, b.identity.guards);
   for (const [x, y] of [
-    [a.displayName, b.displayName], [a.signature, b.signature], [a.identity.kind, b.identity.kind],
+    [a.displayName, b.displayName], [a.identity.kind, b.identity.kind],
   ] as const) { const c = cmp(x, y); if (c) return c; }
   if (scopeOrder) return scopeOrder;
   const nameOrder = cmp(a.identity.name, b.identity.name);
