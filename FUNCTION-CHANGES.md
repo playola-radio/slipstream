@@ -689,7 +689,7 @@ numbers**:
 | Blob bytes | 1 MiB per side, 8 MiB per page |
 | Eligible declarations | 4,096 per side |
 | Syntax visits | 100,000 per side |
-| File results | 512 KiB per page, counting the serialized file results only (the envelope is bounded separately by the metadata cap). When the next file result would cross the ceiling, the page ends before it (`page.complete: false`, cursor at the last returned file). If that result is the page's **first**, it is replaced by its row-less `skipped / too-large` result. That fallback is exempt from the ceiling and always emitted, so every page makes progress. Content is never truncated |
+| File results | 512 KiB per page, counting the serialized file results only (the envelope is bounded separately by the metadata cap). When the next file result would cross the ceiling, the page ends before it (`page.complete: false`, cursor at the last returned file). The page's **first** result is always emitted, so every page makes progress: a row-less result (any status except a `ready` one) is emitted as is, and a `ready` result that exceeds the ceiling is replaced by its row-less `skipped / too-large` result. Row-less results are bounded by path length, so this exemption is bounded too. Content is never truncated |
 | Prefix scan for endpoint resolution | 100,000 records / 16 MiB, then `skipped / scan-limit` |
 | Disposable cache | 128 entries / 16 MiB |
 
@@ -950,8 +950,9 @@ accepts: write them as the session's log, put `blobs` in the CAS, and leave
   - `interrupt: { at_path, reason: "timeout" | "cancelled" }`: the deadline or
     cancellation hits while that file is being compared.
   - `limits: { file_result_bytes: 0, metadata_bytes: 0 }`: zeroes a ceiling.
-    `file_result_bytes: 0` makes the first file that would be `ready`
-    `skipped / too-large` and ends the page there; `metadata_bytes: 0` empties
+    `file_result_bytes: 0` ends the page after its first result, which is
+    `skipped / too-large` if it would have been `ready` and otherwise its own
+    row-less result (§4.7); `metadata_bytes: 0` empties
     `gaps` and `unknown_scopes`. Zero is the only value, because it is the only
     one whose outcome does not depend on serialized sizes.
 

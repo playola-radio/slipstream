@@ -146,7 +146,30 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('a ready file under an interrupt', /precedence gives skipped \/ cancelled/, (c) => { c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'cancelled' } }; });
   rejects('a ready first file under a zero file-result budget', /precedence gives skipped \/ too-large/, (c) => { c.history.harness = { limits: { file_result_bytes: 0 } }; });
   rejects('a full gap list under a zero metadata budget', /empty under a zero metadata budget/, (c) => { c.history.harness = { limits: { metadata_bytes: 0 } }; }, 'range-gap-unchanged-hashes');
+  rejects('a correspondence failure without both sides extracted', /precedence gives unavailable \/ before-blob-missing/, (c) => {
+    file(c).status = 'incomplete';
+    file(c).fallback_reason = 'ambiguous-correspondence';
+  }, 'ts-missing-blob');
   rejects('a case with both expected files', /exactly one of/, (c) => { c.expectedError = { http_status: 500 }; });
+});
+
+describe('interface.v2 contract validator accepts', () => {
+  it('an interrupt that leaves one side unevaluated while a parse error wins', () => {
+    assert.deepEqual(errorsAfter((c) => {
+      c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'timeout' } };
+      file(c).coverage.after = { state: 'notEvaluated' };
+      c.expected.status = 'partial';
+      c.expected.page = { complete: false, next_after_path: 'src/f.ts' };
+    }, 'ts-parse-failure'), []);
+  });
+
+  it('a zero file-result budget that ends the page after a row-less first result', () => {
+    assert.deepEqual(errorsAfter((c) => {
+      c.history.harness = { limits: { file_result_bytes: 0 } };
+      c.expected.files = c.expected.files.slice(0, 1);
+      c.expected.page = { complete: false, next_after_path: c.expected.files[0].path };
+    }, 'ts-shared-type-only'), []);
+  });
 });
 
 describe('interface.v2 request grammar', () => {

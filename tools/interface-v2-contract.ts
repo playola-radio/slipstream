@@ -447,7 +447,8 @@ function derivedStatus(file: Obj, endpoints: Endpoints, history: History, forced
   for (const side of ['before', 'after'] as const) {
     if (coverage[side].state === 'incomplete') return ['incomplete', `${side}-${String(coverage[side].reason)}`];
   }
-  if (file.status === 'incomplete' && ['duplicate-declaration', 'ambiguous-correspondence'].includes(file.fallback_reason as string)) {
+  const extracted = file.language !== null && ['complete', 'absent'].includes(coverage.before.state as string) && ['complete', 'absent'].includes(coverage.after.state as string);
+  if (extracted && file.status === 'incomplete' && ['duplicate-declaration', 'ambiguous-correspondence'].includes(file.fallback_reason as string)) {
     return ['incomplete', file.fallback_reason as string];
   }
   for (const side of ['before', 'after'] as const) {
@@ -486,9 +487,10 @@ function checkFile(file: Obj, req: Request, history: History, forcedSkip: string
       if (!isDeepStrictEqual(cov, forced)) errors.push(`${where}.coverage.${side}: must be ${JSON.stringify(forced)} for this endpoint`);
       continue;
     }
+    // A side the deadline, cancellation or a per-file limit cut off stays notEvaluated (D10).
     const allowed = status === 'identical' ? ['notEvaluated']
       : file.language === null ? ['unsupported']
-      : status === 'skipped' ? ['complete', 'notEvaluated']
+      : forcedSkip !== null ? ['complete', 'incomplete', 'notEvaluated']
       : ['complete', 'incomplete'];
     if (!allowed.includes(cov.state as string)) errors.push(`${where}.coverage.${side}: a retained content side of a ${status} file cannot be ${cov.state as string}`);
     if ((cov.reason !== undefined) !== (cov.state === 'incomplete')) errors.push(`${where}.coverage.${side}: reason must be present exactly for incomplete`);
