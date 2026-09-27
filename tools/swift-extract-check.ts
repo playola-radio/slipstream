@@ -10,6 +10,12 @@ import { checkRootAgainstRealStore } from './qa/safety.ts';
 
 export interface CheckIO { argv: string[]; stdout: (line: string) => void; stderr: (line: string) => void }
 
+// Bounds parent-side work before the checker is committed to a full extraction:
+// large captured files are refused rather than decoded and shipped to the child.
+// Matches the repo's other source-parse byte caps (e.g. clip-projection.ts's
+// MAX_UTF8_BYTES, questions.ts's MAX_SOURCE_BYTES).
+const MAX_INPUT_BYTES = 1024 * 1024;
+
 /** Prints only structured results, never source or credentials. 0 ready, 1 refusal, 2 input/host error. */
 export async function runSwiftExtractCheck(io: CheckIO): Promise<number> {
   try {
@@ -35,7 +41,7 @@ export async function runSwiftExtractCheck(io: CheckIO): Promise<number> {
       if (createHash('sha256').update(bytes).digest('hex') !== sha) throw new Error(`${id} blob hash mismatch`);
       sides.push({ id, bytes });
     }
-    const extracted = await extractSwiftSides(sides);
+    const extracted = await extractSwiftSides(sides, { limits: { inputBytes: MAX_INPUT_BYTES }, deadlineMs: 30_000 });
     const left = extracted.get('before') ?? { status: 'complete', declarations: [] };
     const right = extracted.get('after') ?? { status: 'complete', declarations: [] };
     const incomplete = (side: SwiftSide, prefix: string): string | null =>

@@ -87,12 +87,14 @@ function cmpArray(a: string[], b: string[]): number {
   }
   return cmp(a.length, b.length);
 }
+/** D8 tuple: display_name, signature, identity.kind, identity.scope pairs,
+ * identity.name, identity.guards, span.byte_start, span.byte_end. */
 function order(a: V2Declaration, b: V2Declaration): number {
   const scopeOrder = cmpArray(a.identity.scope.flatMap((s) => [s.kind, s.name]),
     b.identity.scope.flatMap((s) => [s.kind, s.name]));
   const guardOrder = cmpArray(a.identity.guards, b.identity.guards);
   for (const [x, y] of [
-    [a.displayName, b.displayName], [a.identity.kind, b.identity.kind],
+    [a.displayName, b.displayName], [a.signature, b.signature], [a.identity.kind, b.identity.kind],
   ] as const) { const c = cmp(x, y); if (c) return c; }
   if (scopeOrder) return scopeOrder;
   const nameOrder = cmp(a.identity.name, b.identity.name);

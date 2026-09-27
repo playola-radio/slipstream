@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { blobPath } from '../src/store-reader.ts';
 import { runSwiftExtractCheck } from './swift-extract-check.ts';
 
@@ -26,5 +27,23 @@ test('isolated checker reads disposable captured blobs and compares source, with
     assert.equal(result.status, 'ready');
     assert.equal(result.changes[0]!.parameters[0]!.op, 'changed');
     assert.ok(!lines[0]!.includes('func f('), 'checker reports rows, not source bytes');
+  } finally { await rm(store, { recursive: true, force: true }); }
+});
+
+test('checker refuses a blob over the input-byte limit instead of extracting it', async () => {
+  const store = await mkdtemp(join(tmpdir(), 'fd2-check-large-'));
+  try {
+    const oversized = `func f() {}\n${'/'.repeat(1024 * 1024 + 1)}`;
+    const sha = createHash('sha256').update(oversized).digest('hex');
+    const path = blobPath(store, sha);
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, oversized);
+    const lines: string[] = [];
+    const code = await runSwiftExtractCheck({ argv: ['--store', store, '--before', sha, '--after', 'absent'],
+      stdout: (s) => lines.push(s), stderr: () => {} });
+    assert.equal(code, 1);
+    const result = JSON.parse(lines[0]!) as { status: string; fallback_reason: string };
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.fallback_reason, 'too-large');
   } finally { await rm(store, { recursive: true, force: true }); }
 });

@@ -70,10 +70,12 @@ test('v2 order uses scope tuple with shorter prefix first', () => {
   if (result.status === 'ready') assert.equal(result.changes[0]!.identity.scope.length, 1);
 });
 
-test('v2 orders same-name removed overloads by source span before internal signature', () => {
+test('v2 orders same-name removed overloads by signature before source span (D8)', () => {
   const first = declaration('f', 'String', 0);
   const second = declaration('f', 'Int', 23);
   const result = compareV2([first, second], []);
   assert.equal(result.status, 'ready');
-  if (result.status === 'ready') assert.deepEqual(result.changes.map((c) => c.before?.span.byte_start), [0, 23]);
+  // D8 compares signature before span: 'Int' < 'String', so the span-23
+  // declaration sorts first despite its later position in the source.
+  if (result.status === 'ready') assert.deepEqual(result.changes.map((c) => c.before?.span.byte_start), [23, 0]);
 });
