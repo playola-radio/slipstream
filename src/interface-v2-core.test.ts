@@ -70,12 +70,14 @@ test('v2 order uses scope tuple with shorter prefix first', () => {
   if (result.status === 'ready') assert.equal(result.changes[0]!.identity.scope.length, 1);
 });
 
-test('v2 orders same-name removed overloads by signature before source span (D8)', () => {
+test('v2 orders same-name removed overloads by source span, not signature (D8, no signature in declarationSide)', () => {
   const first = declaration('f', 'String', 0);
   const second = declaration('f', 'Int', 23);
   const result = compareV2([first, second], []);
   assert.equal(result.status, 'ready');
-  // D8 compares signature before span: 'Int' < 'String', so the span-23
-  // declaration sorts first despite its later position in the source.
-  if (result.status === 'ready') assert.deepEqual(result.changes.map((c) => c.before?.span.byte_start), [23, 0]);
+  // Both rows share display_name, identity.kind/scope/name/guards (only their
+  // internal `signature` differs, which the emitted declarationSide never
+  // carries — see contracts/interface/v2/schema.json). D8 falls through to
+  // span, so the earlier declaration sorts first regardless of signature.
+  if (result.status === 'ready') assert.deepEqual(result.changes.map((c) => c.before?.span.byte_start), [0, 23]);
 });
