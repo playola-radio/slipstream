@@ -1,7 +1,7 @@
 // src/log-reader.ts
 import { open, type FileHandle } from 'node:fs/promises';
 
-export interface ReaderEvent { seq: bigint; type: string; raw: string; data: Record<string, unknown> }
+export interface ReaderEvent { seq: bigint; id?: string; source?: string; type: string; raw: string; data: Record<string, unknown> }
 export class LogCorruptError extends Error {}
 /** Optional bounded scans can stop before materializing an oversized record. */
 export class LogReadLimitError extends Error {}
@@ -22,11 +22,13 @@ export function parseLine(line: string): ReaderEvent {
   catch { throw new LogCorruptError(`invalid JSON: ${line.slice(0, 80)}`); }
   if (typeof obj !== 'object' || obj === null) throw new LogCorruptError('line is not an object');
   const rec = obj as Record<string, unknown>;
-  const seq = rec.seq; const type = rec.type; const data = rec.data;
+  const seq = rec.seq; const id = rec.id; const source = rec.source; const type = rec.type; const data = rec.data;
   if (typeof seq !== 'string' || !SEQ_RE.test(seq)) throw new LogCorruptError('bad seq');
+  if (id !== undefined && typeof id !== 'string') throw new LogCorruptError('bad id');
+  if (source !== undefined && typeof source !== 'string') throw new LogCorruptError('bad source');
   if (typeof type !== 'string') throw new LogCorruptError('bad type');
   if (typeof data !== 'object' || data === null) throw new LogCorruptError('bad data');
-  return { seq: BigInt(seq), type, raw: line, data: data as Record<string, unknown> };
+  return { seq: BigInt(seq), id, source, type, raw: line, data: data as Record<string, unknown> };
 }
 
 export interface LogCursor {
@@ -47,8 +49,12 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   let positioned = after === 0n;
   let window = Buffer.alloc(0);
   let windowStart = 0;
-  // Preserve a BOM on every line so JSON parsing rejects it, as recovery does.
-  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  // Recovery decodes the whole file with one non-streaming call, so the
+  // WHATWG decoder strips a BOM only if it is the file's first three bytes.
+  // Match that exactly: strip a BOM only for the record at byte offset 0, and
+  // preserve (so parseLine rejects) a BOM anywhere else, mid-log.
+  const firstLineDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+  const laterLineDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
   async function nextLine(maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
     let pos = offset;
@@ -84,6 +90,7 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
       let bytes = 0;
       while (lastSeq < boundary && out.length < Math.min(LOG_BATCH_RECORDS, limits.maxRecords ?? LOG_BATCH_RECORDS)
         && bytes < BATCH_BYTES && bytes < (limits.maxBytes ?? Infinity)) {
+        const lineStart = offset;
         let slice: Buffer | null;
         try { slice = await nextLine((limits.maxBytes ?? Infinity) - bytes, limits.signal); }
         catch (error) {
@@ -94,7 +101,7 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
         }
         if (slice === null) break;
         let line: string;
-        try { line = decoder.decode(slice); }
+        try { line = (lineStart === 0 ? firstLineDecoder : laterLineDecoder).decode(slice); }
         catch { throw new LogCorruptError('invalid UTF-8 in log record'); }
         const ev = parseLine(line);
         const lineBytes = slice.length + 1;

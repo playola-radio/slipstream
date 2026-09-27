@@ -17,7 +17,18 @@ async function withLog(events: Event[], run: (logPath: string) => Promise<void>)
   const root = await mkdtemp(join(tmpdir(), 'slipstream-fd3-'));
   try {
     const logPath = join(root, 'events.jsonl');
-    await writeFile(logPath, events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+    await writeFile(logPath, events.map((e) => JSON.stringify(envelope(e))).join('\n') + '\n');
+    await run(logPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function withRawLog(records: Array<Record<string, unknown>>, run: (logPath: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'slipstream-fd3-raw-'));
+  try {
+    const logPath = join(root, 'events.jsonl');
+    await writeFile(logPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
     await run(logPath);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -26,6 +37,11 @@ async function withLog(events: Event[], run: (logPath: string) => Promise<void>)
 
 function event(seq: number, type: string, data: Record<string, unknown> = {}): Event {
   return { seq: String(seq), type: `slipstream.${type}.v1`, data: { session_id: sessionId, ...data } };
+}
+
+function envelope(e: Event): Record<string, unknown> {
+  return { specversion: '1.0', id: e.seq, source: `urn:slipstream:session:${sessionId}`,
+    type: e.type, datacontenttype: 'application/json', seq: e.seq, time: '2026-01-01T00:00:00.000Z', data: e.data };
 }
 
 const content = (sha256: string, size = 1) => ({ kind: 'content', sha256: sha256.repeat(64), size });
@@ -114,7 +130,7 @@ test('all 62 successful fixture histories replay through the production resolver
     const request = parseRequest(await readFile(join(dir, 'request.txt'), 'utf8'));
     assert.notEqual(typeof request, 'string', name);
     if (typeof request === 'string') continue;
-    await withLog(history.events, async (logPath) => {
+    await withRawLog(history.events as unknown as Array<Record<string, unknown>>, async (logPath) => {
       const root = join(logPath, '..');
       for (const [hash, bytes] of Object.entries(history.blobs)) {
         assert.equal(createHash('sha256').update(bytes).digest('hex'), hash, `${name}: blob hash`);
@@ -136,7 +152,18 @@ test('all 62 successful fixture histories replay through the production resolver
         && (request.afterPath === null || e.data.path > request.afterPath),
       ).map((e) => e.data.path as string))].sort();
       assert.deepEqual(result.files.map((f) => f.path), eligible, `${name}: eligible paths`);
-      if (history.harness?.limits?.metadata_bytes !== 0) {
+      // The resolver has no knowledge of metadata_bytes — that budget only trims
+      // the public envelope (FD4). Its raw unknownScopes/gaps must still match
+      // the fixture's recorded history even when the harness zeroes that budget
+      // and expected.json's envelope-level fields go empty for a separate reason.
+      if (history.harness?.limits?.metadata_bytes === 0) {
+        const rawUnknownScopes = [...new Set(history.events
+          .filter((e) => e.type === 'slipstream.capture.baseline.completed.v1')
+          .flatMap((e) => (e.data.unknown_scopes as string[]) ?? []))].sort();
+        const rawGapCount = history.events.filter((e) => e.type === 'slipstream.capture.gap.v1').length;
+        assert.deepEqual(result.inventory.unknownScopes, rawUnknownScopes, `${name}: raw unknown scopes`);
+        assert.equal(result.gaps.length, rawGapCount, `${name}: raw gap count`);
+      } else {
         assert.deepEqual(result.inventory.unknownScopes, expected.inventory.unknown_scopes, name);
         assert.deepEqual(result.gaps, expected.gaps, `${name}: gaps`);
       }
@@ -228,7 +255,7 @@ test('record and byte scan ceilings produce explicit outcomes', async () => {
     assert.equal(count.kind, 'scanLimit');
     const bytes = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 10, bytes: 0 } }));
     assert.equal(bytes.kind, 'scanLimit');
-    const exact = events.reduce((total, e) => total + Buffer.byteLength(JSON.stringify(e)) + 1, 0);
+    const exact = events.reduce((total, e) => total + Buffer.byteLength(JSON.stringify(envelope(e))) + 1, 0);
     const pass = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 2, bytes: exact } }));
     assert.equal(pass.kind, 'resolved');
   });
@@ -260,6 +287,21 @@ test('malformed snapshots and unknown scopes are corrupt, not coverage guesses',
     unknown_scopes: ['../outside'],
   })], async (logPath) => {
     await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad unknown scopes/);
+  });
+});
+
+test('a matching session_id with a forged envelope id or source is corrupt', async () => {
+  await withRawLog([
+    envelope(event(1, 'session.started')),
+    { ...envelope(event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })), id: '99' },
+  ], async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /envelope id/);
+  });
+  await withRawLog([
+    envelope(event(1, 'session.started')),
+    { ...envelope(event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })), source: 'urn:slipstream:session:forged' },
+  ], async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /envelope source/);
   });
 });
 

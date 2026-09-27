@@ -88,6 +88,22 @@ describe('log-reader', () => {
       finally { await cur.close(); }
     });
 
+    it('accepts a UTF-8 BOM on the first record, as recovery does', async () => {
+      const p = await logWith('\uFEFF' + line(1), line(2));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        const events = await cur.readThrough(2n);
+        assert.deepEqual(events.map((e) => e.seq), [1n, 2n]);
+      } finally { await cur.close(); }
+    });
+
+    it('still rejects a first-record BOM when resuming after a nonzero cursor', async () => {
+      const p = await logWith(line(1), '\uFEFF' + line(2));
+      const cur = await openLogCursor(p, 1n);
+      try { await assert.rejects(cur.readThrough(2n), LogCorruptError); }
+      finally { await cur.close(); }
+    });
+
     it('stops a bounded read when its signal is aborted', async () => {
       const p = await logWith(line(1));
       const cur = await openLogCursor(p, 0n);

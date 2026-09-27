@@ -2,6 +2,7 @@
  * FD4 owns blob retention, extraction, response pagination and HTTP mapping. */
 import { openLogCursor, LogCorruptError, LogReadAbortedError, LogReadLimitError, type ReaderEvent } from './log-reader.ts';
 import { assertSafePath } from './recovery.ts';
+import { sourceFor } from './event.ts';
 import type { Snapshot, UnavailableReason } from './snapshot.ts';
 
 const BASELINED = 'slipstream.file.baselined.v1';
@@ -168,6 +169,8 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     const seq = record.seq.toString();
     const data = record.data;
     if (data.session_id !== sessionId) corrupt(`session mismatch at ${seq}`);
+    if (record.id !== seq) corrupt(`envelope id ${record.id} != seq ${seq} at ${seq}`);
+    if (record.source !== sourceFor(sessionId)) corrupt(`envelope source ${record.source} != ${sourceFor(sessionId)} at ${seq}`);
     if (record.type === BASELINED || record.type === CHANGED) {
       const path = checkPath(data.path, seq);
       const state = states.get(path) ?? {};
