@@ -6,6 +6,10 @@ It is a **feasibility finding**, not a production wiring. It makes **no
 declaration-extraction and no comparison claim** — those are T5a.4. Nothing here
 changes what the daemon launches by default.
 
+The later FD2 extraction built on this feasibility work is documented in
+`SWIFT-INTERFACE.md`; the measurements and isolation findings below remain
+the basis for its grammar boundary.
+
 Every number below is a **measurement on one machine**, not a budget. Budgets
 require explicit sign-off (D7); none are set here.
 

@@ -12,11 +12,13 @@ import { readFile } from 'node:fs/promises';
 import { isMainModule } from '../src/entrypoint.ts';
 import { loadSwiftLanguage, parseSwiftSource, type ArtifactProvenance, type SwiftParseResult } from '../src/swift-grammar.ts';
 import type { WorkerMessage } from './swift-parse-worker.ts';
+import { extractSwiftSource, type SwiftLimits, type SwiftSide } from '../src/swift-interface-extract.ts';
 
 const WORKER_URL = new URL('./swift-parse-worker.ts', import.meta.url);
 
 export type HostRequest =
   | { op: 'parse'; source: string }
+  | { op: 'extract'; sides: { id: string; source: string }[]; limits?: SwiftLimits }
   | { op: 'survive'; source: string; holdMs: number }
   | { op: 'measure'; sources: { label: string; source: string }[] }
   | { op: 'cancel-demo'; pathologicalSource: string; cleanSource: string };
@@ -28,6 +30,7 @@ interface ParseTimings {
 
 export type HostResult =
   | { op: 'parse'; provenance: ArtifactProvenance; result: SwiftParseResult; timings: ParseTimings }
+  | { op: 'extract'; results: { id: string; side: SwiftSide }[] }
   | { op: 'survive'; result: SwiftParseResult; heldMs: number }
   | { op: 'measure'; provenance: ArtifactProvenance; initAndLoadMs: number; parses: { label: string; byteLength: number; clean: boolean; firstParseMs: number; warmParseMs: number }[] }
   | { op: 'cancel-demo'; startedBeforeCancel: boolean; inProgressAtCancel: boolean; terminateMs: number; replacement: { clean: boolean; rootType: string } };
@@ -153,6 +156,12 @@ async function main(): Promise<number> {
     const result = parseSwiftSource(loaded.language, request.source);
     const firstParseMs = performance.now() - p0;
     print({ op: 'parse', provenance: loaded.provenance, result, timings: { initAndLoadMs, firstParseMs } });
+    return 0;
+  }
+
+  if (request.op === 'extract') {
+    const results = request.sides.map(({ id, source }) => ({ id, side: extractSwiftSource(loaded.language, source, request.limits) }));
+    print({ op: 'extract', results });
     return 0;
   }
 
