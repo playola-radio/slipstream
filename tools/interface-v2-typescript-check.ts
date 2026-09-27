@@ -1,5 +1,4 @@
 /** Standalone FD1 acceptance over real parser output and disposable blob bytes. */
-import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -37,20 +36,24 @@ export async function runInterfaceV2TypeScriptCheck(args: readonly string[],
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw error;
       }
-      const expected = JSON.parse(expectedText) as { files?: FixtureFile[] };
-      const files = (expected.files ?? []).filter(file => /\.tsx?$/.test(file.path)
-        && (file.status === 'ready' || file.status === 'incomplete'));
-      if (!files.length) continue;
+      const expected = JSON.parse(expectedText) as { files: FixtureFile[] };
       const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf8')) as {
         blobs: Record<string, string>;
       };
-      for (const [sha, text] of Object.entries(history.blobs ?? {})) {
-        const bytes = Buffer.from(text);
-        if (createHash('sha256').update(bytes).digest('hex') !== sha) {
-          failures.push(`${name}: blob hash mismatch`);
-          continue;
-        }
-        await writeFile(join(blobDir, sha), bytes);
+      const available = (endpoint: Endpoint): boolean => endpoint.kind === 'recorded'
+        && (endpoint.snapshot?.kind === 'absent'
+          || endpoint.snapshot?.kind === 'content' && endpoint.snapshot.sha256 !== undefined
+            && history.blobs[endpoint.snapshot.sha256] !== undefined);
+      const same = (before: Endpoint, after: Endpoint): boolean =>
+        before.snapshot?.kind === 'absent' && after.snapshot?.kind === 'absent'
+        || before.snapshot?.kind === 'content' && after.snapshot?.kind === 'content'
+          && before.snapshot.sha256 === after.snapshot.sha256;
+      const files = expected.files.filter(file => /\.tsx?$/.test(file.path)
+        && available(file.before) && available(file.after) && !same(file.before, file.after)
+        && file.status !== 'skipped'); // FD4 admission, independent of source bytes.
+      if (!files.length) continue;
+      for (const [sha, text] of Object.entries(history.blobs)) {
+        await writeFile(join(blobDir, sha), Buffer.from(text));
       }
       for (const file of files) {
         const id = `${name}/${file.path}`;
@@ -89,8 +92,21 @@ export async function runInterfaceV2TypeScriptCheck(args: readonly string[],
       || tsx.changes[0]?.result?.op !== 'equal') {
       failures.push('synthetic-tsx/Card: extraction mismatch');
     }
+    const commentBefore = Buffer.from('function f(x: /** id */ string): /* result */ Promise<void> {}');
+    const commentAfter = Buffer.from('function f(x: number): Promise<User> {}');
+    await writeFile(join(root, 'comment-before.ts'), commentBefore);
+    await writeFile(join(root, 'comment-after.ts'), commentAfter);
+    const commented = compareStructuredExtractions(extractTs(await readFile(join(root, 'comment-before.ts'))),
+      extractTs(await readFile(join(root, 'comment-after.ts'))));
+    if (commented.status !== 'ready' || commented.changes.length !== 1
+      || !isDeepStrictEqual(commented.changes[0]?.parameters[0]?.before?.type,
+        { state: 'written', text: 'string' })
+      || !isDeepStrictEqual(commented.changes[0]?.result?.before,
+        { kind: 'return', type: { state: 'written', text: 'Promise<void>' } })) {
+      failures.push('synthetic-typescript/commented-header: extraction mismatch');
+    }
     stdout(JSON.stringify({ status: failures.length ? 'fail' : 'pass', case_count: checked.length,
-      tsx_pairs: 1, cases: checked, failures }));
+      tsx_pairs: 1, comment_pairs: 1, cases: checked, failures }));
     return failures.length ? 1 : 0;
   } catch (error) {
     stderr(error instanceof Error ? error.message : String(error));

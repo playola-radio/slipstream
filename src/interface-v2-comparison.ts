@@ -1,5 +1,5 @@
 /** D3 correspondence and component deltas for interface.v2 written declarations. */
-import { compare, type Declaration, type Identity, type OutDeclaration } from './interface-projection.ts';
+import { compare, hasDuplicate, type Declaration, type Identity, type OutDeclaration } from './interface-projection.ts';
 
 export type TypeRef =
   | { state: 'written' | 'implicit'; text: string }
@@ -55,20 +55,6 @@ function signature(d: StructuredDeclaration): string {
     p.type, p.optional, p.variadic, p.default, p.modifiers]), d.result, d.throws, d.header]);
 }
 
-function key(d: StructuredDeclaration): string {
-  return JSON.stringify([d.identity.kind, d.identity.scope, d.identity.name, d.identity.guards, signature(d)]);
-}
-
-function hasDuplicate(ds: StructuredDeclaration[]): boolean {
-  const seen = new Set<string>();
-  for (const d of ds) {
-    const k = key(d);
-    if (seen.has(k)) return true;
-    seen.add(k);
-  }
-  return false;
-}
-
 function delta<T>(before: T | null, after: T | null): Delta<T> {
   const op: Op = before === null ? 'added' : after === null ? 'removed'
     : JSON.stringify(before) === JSON.stringify(after) ? 'equal' : 'changed';
@@ -76,13 +62,20 @@ function delta<T>(before: T | null, after: T | null): Delta<T> {
 }
 
 function parameterDeltas(before: Parameter[], after: Parameter[]): Delta<Parameter>[] {
-  const count = (ps: Parameter[], name: string): number => ps.filter(p => p.binding === 'identifier' && p.name === name).length;
+  const counts = (ps: Parameter[]): Map<string, number> => {
+    const result = new Map<string, number>();
+    for (const p of ps) if (p.binding === 'identifier') result.set(p.name, (result.get(p.name) ?? 0) + 1);
+    return result;
+  };
+  const beforeCounts = counts(before);
+  const afterCounts = counts(after);
+  const afterByName = new Map(after.map((p, index) => [p.name, index]));
   const paired = new Set<number>();
   const rows: Delta<Parameter>[] = before.map(p => {
-    if (p.binding !== 'identifier' || count(before, p.name) !== 1 || count(after, p.name) !== 1) {
+    if (p.binding !== 'identifier' || beforeCounts.get(p.name) !== 1 || afterCounts.get(p.name) !== 1) {
       return delta(p, null);
     }
-    const index = after.findIndex(a => a.binding === 'identifier' && a.name === p.name);
+    const index = afterByName.get(p.name)!;
     paired.add(index);
     return delta(p, after[index]!);
   });
@@ -122,25 +115,43 @@ export function compareStructuredExtractions(before: StructuredExtraction,
   };
   const b = before.status === 'absent' ? [] : before.declarations;
   const a = after.status === 'absent' ? [] : after.declarations;
-  if (hasDuplicate(b) || hasDuplicate(a)) return {
-    status: 'incomplete', fallback_reason: 'duplicate-declaration', changes: [],
-  };
   const asV1 = (d: StructuredDeclaration): Declaration => ({
     identity: d.identity, displayName: d.displayName, signature: signature(d), span: d.span,
   });
-  const matched = compare(b.map(asV1), a.map(asV1));
+  const beforeV1 = b.map(asV1);
+  const afterV1 = a.map(asV1);
+  if (hasDuplicate(beforeV1) || hasDuplicate(afterV1)) return {
+    status: 'incomplete', fallback_reason: 'duplicate-declaration', changes: [],
+  };
+  const matched = compare(beforeV1, afterV1);
   if (matched.ambiguous) return {
     status: 'incomplete', fallback_reason: 'ambiguous-correspondence', changes: [],
   };
-  const find = (list: StructuredDeclaration[], row: OutDeclaration) =>
-    list.find(d => d.displayName === row.display_name && signature(d) === row.signature &&
-      d.span.byteStart === row.span.byte_start && d.span.byteEnd === row.span.byte_end) ?? null;
-  return { status: 'ready', changes: matched.changes.map(row => {
-    const left = row.before ? find(b, row.before) : null;
-    const right = row.after ? find(a, row.after) : null;
+  const lookupKey = (identity: Identity, name: string, signatureText: string,
+    byteStart: number, byteEnd: number): string => JSON.stringify([
+      identity.kind, identity.scope, identity.name, identity.guards,
+      name, signatureText, byteStart, byteEnd,
+    ]);
+  const index = (original: StructuredDeclaration[], converted: Declaration[]): Map<string, StructuredDeclaration> =>
+    new Map(converted.map((d, i) => [lookupKey(d.identity, d.displayName, d.signature,
+      d.span.byteStart, d.span.byteEnd), original[i]!]));
+  const beforeIndex = index(b, beforeV1);
+  const afterIndex = index(a, afterV1);
+  const find = (map: Map<string, StructuredDeclaration>, row: OutDeclaration, identity: Identity) =>
+    map.get(lookupKey(identity, row.display_name, row.signature,
+      row.span.byte_start, row.span.byte_end)) ?? null;
+  const changes: StructuredChange[] = [];
+  for (const row of matched.changes) {
+    const left = row.before ? find(beforeIndex, row.before, row.identity) : null;
+    const right = row.after ? find(afterIndex, row.after, row.identity) : null;
     if ((row.before && !left) || (row.after && !right)) throw new Error('missing structured declaration');
-    return toChange(row.kind, left, right);
-  }) };
+    const change = toChange(row.kind, left, right);
+    // Overload role is an internal disambiguator, not a written input/output
+    // component. A role-only transition has no public delta.
+    if (row.kind === 'signatureChanged' && change.parameters.every(p => p.op === 'equal')
+      && (change.result === null || change.result.op === 'equal')
+      && change.throws.op === 'equal' && change.header.op === 'equal') continue;
+    changes.push(change);
+  }
+  return { status: 'ready', changes };
 }
-
-export const compareTypeScriptExtractions = compareStructuredExtractions;

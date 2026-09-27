@@ -2,14 +2,10 @@
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { Language, Parser, type Node } from 'web-tree-sitter';
 import { buildUtf16ToByteTable, utf16RangeToByteRange } from './swift-spans.ts';
-import type { Parameter, StructuredDeclaration, TypeRef } from './interface-v2-comparison.ts';
-
-export type TypeScriptDeclaration = StructuredDeclaration;
-export type TypeScriptExtraction =
-  | { status: 'complete'; declarations: TypeScriptDeclaration[] }
-  | { status: 'incomplete'; reason: 'parse-error' | 'unsupported-construct' };
+import type { Parameter, StructuredDeclaration, StructuredExtraction, TypeRef } from './interface-v2-comparison.ts';
 
 const require = createRequire(import.meta.url);
 let initialization: Promise<void> | undefined;
@@ -18,25 +14,40 @@ const GRAMMAR_SHA256 = {
   typescript: '8515404dceed38e1ed86aa34b09fcf3379fff1b4ff9dd3967bcd6d1eb5ac3d8f',
   tsx: '6aa3b2c70e76f5d48eafef1093e9c4de383e13f2fdde2f4e9b98a378f6a8f1b6',
 } as const;
+const RUNTIME_VERSION = '0.25.10';
+const RUNTIME_WASM_SHA256 = 'f38dcc4b43b818f9a0785bc1c6d5611a75ac4cdd428ff3f02757c34ca4e46d7f';
+
+function verifyParserRuntime(): void {
+  const root = dirname(require.resolve('web-tree-sitter'));
+  const version = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }).version;
+  const actual = createHash('sha256').update(readFileSync(join(root, 'tree-sitter.wasm'))).digest('hex');
+  if (version !== RUNTIME_VERSION || actual !== RUNTIME_WASM_SHA256) {
+    throw new Error('typescript.v2 parser runtime version or WASM hash mismatch');
+  }
+}
 
 /** A language_version must never silently select different grammar bytes. */
 export function verifyTypeScriptGrammarArtifact(language: 'typescript' | 'tsx',
-  expectedSha: string = GRAMMAR_SHA256[language]): string {
+  expectedSha: string = GRAMMAR_SHA256[language]): Uint8Array {
   const path = require.resolve(`tree-sitter-wasms/out/tree-sitter-${language}.wasm`);
-  const actual = createHash('sha256').update(readFileSync(path)).digest('hex');
+  const bytes = readFileSync(path);
+  const actual = createHash('sha256').update(bytes).digest('hex');
   if (actual !== expectedSha) throw new Error(`${language}.v2 grammar hash mismatch`);
-  return path;
+  return bytes;
 }
 
 export async function createTypeScriptInterfaceExtractor(language: 'typescript' | 'tsx'):
-  Promise<(bytes: Uint8Array) => TypeScriptExtraction> {
+  Promise<(bytes: Uint8Array) => StructuredExtraction> {
   let pending = grammars.get(language);
   if (!pending) {
     pending = (async () => {
-      initialization ??= Parser.init().catch(error => { initialization = undefined; throw error; });
+      initialization ??= Promise.resolve().then(() => {
+        verifyParserRuntime();
+        return Parser.init();
+      });
       await initialization;
       return Language.load(verifyTypeScriptGrammarArtifact(language));
-    })().catch(error => { grammars.delete(language); throw error; });
+    })();
     grammars.set(language, pending);
   }
   const grammar = await pending;
@@ -48,7 +59,7 @@ function child(node: Node, type: string): Node | undefined {
 }
 
 function children(node: Node): Node[] {
-  return node.namedChildren.filter((n): n is Node => n !== null);
+  return node.namedChildren.filter((n): n is Node => n !== null && n.type !== 'comment');
 }
 
 function field(node: Node, name: string): Node | undefined {
@@ -56,21 +67,26 @@ function field(node: Node, name: string): Node | undefined {
 }
 
 /** Join syntax leaves, never characters: literals remain intact and identifiers cannot merge. */
-export function normalizedTokens(node: Node): string {
+function normalizedTokens(node: Node): string {
   const tokens: string[] = [];
-  const visit = (current: Node): void => {
-    if (current.type === 'comment') return;
-    if (current.childCount === 0) { tokens.push(current.text); return; }
-    for (let i = 0; i < current.childCount; i++) {
-      const next = current.child(i);
-      if (next) visit(next);
+  const stack: Node[] = [node];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (current.type === 'comment') continue;
+    // This grammar omits literal fragments between template type substitutions.
+    if (current.type === 'template_literal_type' || current.childCount === 0) {
+      tokens.push(current.text);
+      continue;
     }
-  };
-  visit(node);
+    for (let i = current.childCount - 1; i >= 0; i--) {
+      const next = current.child(i);
+      if (next) stack.push(next);
+    }
+  }
   let out = '';
   let previous = '';
   const mergeable = new Set(['++', '--', '&&', '||', '??', '==', '!=', '>=', '<=',
-    '>>', '<<', '**', '?.', '/*', '//', '..', '=>', '+=', '-=', '*=', '/=',
+    '>>', '<<', '**', '?.', '/*', '//', '=>', '+=', '-=', '*=', '/=',
     '%=', '&=', '|=', '^=']);
   for (const token of tokens) {
     if (!token) continue;
@@ -91,7 +107,7 @@ export function normalizedTokens(node: Node): string {
 }
 
 function writtenType(annotation: Node | undefined): TypeRef {
-  const type = annotation?.namedChildren[0];
+  const type = annotation ? children(annotation)[0] : undefined;
   return type ? { state: 'written', text: normalizedTokens(type) }
     : { state: 'unknown', reason: 'inferred-not-computed' };
 }
@@ -147,6 +163,7 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   }] : null;
   if (!params) return null;
   let returnType = writtenType(field(node, 'return_type'));
+  let boundGenerics: string[] = [];
   if (bindingType) {
     const functionType = children(bindingType)[0];
     if (!functionType || functionType.type !== 'function_type') return null;
@@ -157,10 +174,15 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
       const written = typeParams[i]!.type;
       if (params[i]!.type.state === 'written' && JSON.stringify(params[i]!.type) !== JSON.stringify(written)) return null;
       params[i]!.type = written;
+      params[i]!.optional = typeParams[i]!.optional;
+      params[i]!.variadic = typeParams[i]!.variadic;
     }
     const boundResult: TypeRef = { state: 'written', text: normalizedTokens(typeResult) };
     if (returnType.state === 'written' && JSON.stringify(returnType) !== JSON.stringify(boundResult)) return null;
     returnType = boundResult;
+    const boundGenericNode = child(functionType, 'type_parameters');
+    boundGenerics = boundGenericNode ? children(boundGenericNode)
+      .filter(n => n.type === 'type_parameter').map(normalizedTokens) : [];
   }
   const modifierNodes: string[] = [];
   for (let i = 0; i < node.childCount; i++) {
@@ -170,13 +192,15 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
       'declare', 'default', 'generator', '*', '?'].includes(c.type)) modifierNodes.push(normalizedTokens(c));
   }
   const genericNode = child(node, 'type_parameters');
-  const generics = genericNode ? children(genericNode).filter(n => n.type === 'type_parameter').map(normalizedTokens) : [];
+  const inlineGenerics = genericNode ? children(genericNode).filter(n => n.type === 'type_parameter').map(normalizedTokens) : [];
+  if (inlineGenerics.length && boundGenerics.length && JSON.stringify(inlineGenerics) !== JSON.stringify(boundGenerics)) return null;
+  const generics = inlineGenerics.length ? inlineGenerics : boundGenerics;
   const kind = constructor ? 'constructor' : scope.length ? 'method' : 'function';
   return {
     identity: { kind, scope, name, guards: [] },
     displayName: scope.length ? `${scope.map(s => s.name).join('.')}.${name}` : name,
     span: utf16RangeToByteRange(table, spanNode.startIndex,
-      node.type === 'method_signature' && spanNode.nextSibling?.type === ';'
+      (node.type === 'method_signature' || node.type === 'abstract_method_signature') && spanNode.nextSibling?.type === ';'
         ? spanNode.nextSibling.endIndex : spanNode.endIndex),
     parameters: params,
     result: constructor ? null : { kind: 'return', type: returnType },
@@ -186,7 +210,7 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   };
 }
 
-function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
+function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
   let source: string;
   try {
     source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
@@ -200,7 +224,7 @@ function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
     tree = parser.parse(source);
     if (!tree || tree.rootNode.hasError) return { status: 'incomplete', reason: 'parse-error' };
     const table = buildUtf16ToByteTable(source);
-    const declarations: TypeScriptDeclaration[] = [];
+    const declarations: StructuredDeclaration[] = [];
     const add = (n: Node, span: Node, scope: StructuredDeclaration['identity']['scope'],
       mods: string[], binding?: string, bindingType?: Node): boolean => {
       const parsed = parseDeclaration(n, span, scope, mods, table, binding, bindingType);
@@ -210,12 +234,15 @@ function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
     };
     const scan = (node: Node, span = node, mods: string[] = []): boolean => {
       if (node.type === 'export_statement') {
-        const inner = children(node).find(n => n.type !== 'comment');
+        const inner = children(node).find(n => ['function_declaration', 'function_signature',
+          'generator_function_declaration', 'class_declaration', 'abstract_class_declaration',
+          'lexical_declaration', 'variable_declaration', 'ambient_declaration'].includes(n.type));
         const exportModifiers: string[] = [];
         for (let i = 0; i < node.childCount; i++) {
           const token = node.child(i);
           if (token?.type === 'export' || token?.type === 'default') exportModifiers.push(token.text);
         }
+        if (!inner && children(node).some(n => n.type === 'class' || n.type === 'class_expression')) return false;
         return !inner || scan(inner, node, [...exportModifiers, ...mods]);
       }
       if (node.type === 'ambient_declaration') {
@@ -225,14 +252,20 @@ function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
       if (['function_declaration', 'function_signature', 'generator_function_declaration'].includes(node.type)) {
         return add(node, span, [], mods);
       }
-      if (node.type === 'class_declaration') {
+      if (node.type === 'class_declaration' || node.type === 'abstract_class_declaration') {
         const name = field(node, 'name');
         const body = field(node, 'body');
         if (!name || !body) return false;
         const scope = [{ kind: 'class', name: name.text }];
         for (const member of children(body)) {
-          if (member.type === 'method_definition' || member.type === 'method_signature') {
-            if (member.child(0)?.type === 'get' || member.child(0)?.type === 'set') continue;
+          if (member.type === 'method_definition' || member.type === 'method_signature'
+            || member.type === 'abstract_method_signature') {
+            let accessor = false;
+            for (let i = 0; i < member.childCount; i++) {
+              const token = member.child(i);
+              if (token?.type === 'get' || token?.type === 'set') accessor = true;
+            }
+            if (accessor) continue;
             if (!add(member, member, scope, [])) return false;
           } else if (member.type === 'public_field_definition'
             && children(member).some(n => n.type === 'arrow_function' || n.type === 'function_expression')) {
@@ -246,6 +279,14 @@ function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
         for (const declarator of declarators) {
           const value = field(declarator, 'value');
           if (value?.type === 'class' || value?.type === 'class_expression') return false;
+          if (value && ['as_expression', 'satisfies_expression', 'parenthesized_expression'].includes(value.type)) {
+            const stack = [value];
+            while (stack.length) {
+              const current = stack.pop()!;
+              if (['arrow_function', 'function_expression', 'generator_function'].includes(current.type)) return false;
+              stack.push(...children(current));
+            }
+          }
           if (!value || !['arrow_function', 'function_expression', 'generator_function'].includes(value.type)) continue;
           const name = field(declarator, 'name');
           if (!name || name.type !== 'identifier' || declarators.length !== 1) return false;
@@ -255,6 +296,8 @@ function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
         }
         return true;
       }
+      if (node.type === 'internal_module'
+        || node.type === 'expression_statement' && children(node).some(n => n.type === 'internal_module')) return false;
       return true;
     };
     for (const node of children(tree.rootNode)) {

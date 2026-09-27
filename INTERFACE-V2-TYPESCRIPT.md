@@ -29,8 +29,8 @@ structured-header key; `interface.v1` remains unchanged.
 - Named `const`/`let`/`var` bindings whose value is directly an arrow or function
   expression, including TSX components. One-parameter arrows and inline
   function-type annotations on bindings are supported.
-- Methods and constructors in named class declarations, including their
-  overload signatures. Written parameter properties, generics, modifiers,
+- Methods and constructors in named class and abstract class declarations,
+  including their overload signatures. Written parameter properties, generics, modifiers,
   optional/rest/default syntax, and written returns are retained.
 - A destructuring pattern is one parameter. Omitted return annotations are
   `unknown / inferred-not-computed`; TypeScript throws is `notExpressible`.
@@ -39,16 +39,20 @@ structured-header key; `interface.v1` remains unchanged.
 
 The extractor excludes anonymous callbacks, local/nested functions, accessors,
 interface method signatures, object-literal methods, generated declarations,
-and function values hidden behind calls such as `memo(...)`. It never infers
-types from bodies or follows shared types. A direct class-expression binding,
+decorators as a source of function input/output changes, and function values
+hidden behind calls such as `memo(...)`. It never infers types from bodies or
+follows shared types. Namespace/module members and values wrapped in casts,
+`satisfies`, or parentheses are currently `unsupported-construct` when they
+contain eligible functions. A direct class-expression binding,
 computed method name, class-field function, opaque function-type alias on a
 function binding, or eligible syntax this module cannot represent is
 `unsupported-construct` for the entire file. This is a syntax-only subset, not
 an assertion that excluded code has no callable behavior.
 
-The grammar artifacts are pinned by SHA-256 in the loader. A changed WASM under
-`typescript.v2` fails to load. The checker command
+The grammar artifacts and Tree-sitter runtime are pinned by version/SHA-256 in
+the loader. A changed WASM under `typescript.v2` fails to load. The checker command
 `node tools/projection-check.ts interface-v2 --lang typescript` creates a
 disposable blob store and compares parser output with the hand-written corpus:
-28 source-bearing file comparisons across 27 case directories, plus one
-synthetic TSX pair. It does not claim FD3 endpoint/provenance validation.
+28 source-bearing file comparisons across 27 case directories, plus synthetic
+TSX and comment-bearing TypeScript pairs. It does not claim FD3
+endpoint/provenance validation.

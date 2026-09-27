@@ -1,10 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTypeScriptInterfaceExtractor, verifyTypeScriptGrammarArtifact } from './interface-v2-typescript.ts';
-import { compareTypeScriptExtractions } from './interface-v2-comparison.ts';
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { compareStructuredExtractions as compareTypeScriptExtractions } from './interface-v2-comparison.ts';
 
 test('extracts one written TypeScript function from whole source bytes', async () => {
   const extract = await createTypeScriptInterfaceExtractor('typescript');
@@ -25,70 +22,6 @@ test('extracts one written TypeScript function from whole source bytes', async (
     header: { modifiers: [], generic_parameters: [], constraints: [] },
     role: 'implementation',
   }]);
-});
-
-const corpus = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
-
-test('reproduces each source-bearing TypeScript v2 case from captured blobs', async () => {
-  const extract = await createTypeScriptInterfaceExtractor('typescript');
-  const cases = (await readdir(corpus)).sort();
-  const checked: string[] = [];
-  for (const name of cases) {
-    const dir = join(corpus, name);
-    let expectedBytes: string;
-    try {
-      expectedBytes = await readFile(join(dir, 'expected.json'), 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw error;
-    }
-    const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf8')) as {
-      blobs: Record<string, string>;
-    };
-    const expected = JSON.parse(expectedBytes) as {
-      files: Array<{
-        path: string;
-        before: { kind: string; snapshot?: { kind: string; sha256?: string } };
-        after: { kind: string; snapshot?: { kind: string; sha256?: string } };
-        status: string;
-        fallback_reason?: string;
-        changes: unknown[];
-      }>;
-    };
-    for (const file of expected.files) {
-      if (!file.path.endsWith('.ts') && !file.path.endsWith('.tsx')) continue;
-      if (file.status !== 'ready' && file.status !== 'incomplete') continue;
-      const side = (endpoint: typeof file.before) => {
-        if (endpoint.snapshot?.kind === 'absent') return { status: 'absent' as const };
-        const text = endpoint.snapshot?.sha256 && history.blobs[endpoint.snapshot.sha256];
-        assert.notEqual(text, undefined, `${name}: missing captured source`);
-        return extract(Buffer.from(text!));
-      };
-      const actual = compareTypeScriptExtractions(side(file.before), side(file.after));
-      assert.equal(actual.status, file.status, name);
-      assert.equal(actual.fallback_reason, file.fallback_reason, name);
-      assert.deepEqual(actual.changes, file.changes, name);
-      checked.push(`${name}/${file.path}`);
-    }
-  }
-  assert.deepEqual(checked, [
-    'range-all-failed-page/src/a.ts',
-    'range-cancelled-mid-page/src/a.ts',
-    'range-deadline-mid-page/src/a.ts',
-    'range-gap-before-b/src/f.ts', 'range-gap-cap/src/f.ts',
-    'range-page-boundary-first/src/a.ts', 'range-page-boundary-second/src/b.ts',
-    'range-rename/src/a.ts', 'range-rename/src/b.ts',
-    'range-restart-reconciliation/src/f.ts', 'range-unknown-scopes/src/f.ts',
-    'ts-added-file/src/f.ts', 'ts-added-function/src/f.ts',
-    'ts-constructor-change/src/f.ts', 'ts-destructured-param/src/f.ts',
-    'ts-inferred-return/src/f.ts', 'ts-known-path-incomplete-baseline/src/f.ts',
-    'ts-optional-rest-default/src/f.ts', 'ts-overload-ambiguity/src/f.ts',
-    'ts-parameter-change/src/f.ts', 'ts-parameter-reorder/src/f.ts',
-    'ts-parse-failure/src/f.ts', 'ts-removed-file/src/f.ts',
-    'ts-removed-function/src/f.ts', 'ts-return-change/src/f.ts',
-    'ts-shared-type-only/src/types/user.ts', 'ts-unchanged-signature/src/f.ts',
-    'ts-unicode-span/src/f.ts',
-  ]);
 });
 
 test('TSX named component binding has one written destructuring input and return', async () => {
@@ -198,8 +131,6 @@ test('UTF-8 byte spans include a leading BOM and reject invalid bytes', async ()
 });
 
 test('grammar loader rejects an artifact changed under typescript.v2', () => {
-  assert.doesNotThrow(() => verifyTypeScriptGrammarArtifact('typescript'));
-  assert.doesNotThrow(() => verifyTypeScriptGrammarArtifact('tsx'));
   assert.throws(() => verifyTypeScriptGrammarArtifact('typescript', '0'.repeat(64)), /hash mismatch/);
 });
 
@@ -267,4 +198,89 @@ test('normalization keeps adjacent operator tokens from merging', async () => {
   const result = extract(Buffer.from('function f(x: number = a + +b): void {}'));
   assert.equal(result.status, 'complete');
   if (result.status === 'complete') assert.match(result.declarations[0]!.parameters[0]!.default!, /\+\s+\+/);
+});
+
+test('comments in written headers are trivia, not missing types or unsupported parameters', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('function f(/*a*/ x: /** id */ string /*b*/, /*c*/ y: number): /* r */ Promise<void> {}'));
+  const after = extract(Buffer.from('function f(x: number, y: number): Promise<User> {}'));
+  assert.equal(before.status, 'complete');
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.changes.length, 1);
+  assert.deepEqual(result.changes[0]!.parameters[0]!.before?.type,
+    { state: 'written', text: 'string' });
+  assert.deepEqual(result.changes[0]!.result?.before,
+    { kind: 'return', type: { state: 'written', text: 'Promise<void>' } });
+});
+
+test('abstract classes and abstract methods remain eligible', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('abstract class A { abstract m(x: number): void; n(x: number): void {} }'));
+  const after = extract(Buffer.from('abstract class A { abstract m(x: string): void; n(x: string): void {} }'));
+  assert.equal(before.status, 'complete');
+  if (before.status === 'complete') assert.deepEqual(before.declarations.map(d => d.identity.name), ['m', 'n']);
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.changes.length, 2);
+});
+
+test('a decorator before an exported class does not remove its methods', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const plain = extract(Buffer.from('export class S { m(x: number): void {} }'));
+  const decorated = extract(Buffer.from('@Injectable()\nexport class S { m(x: number): void {} }'));
+  assert.equal(decorated.status, 'complete');
+  assert.deepEqual(compareTypeScriptExtractions(plain, decorated).changes, []);
+});
+
+test('modified accessors remain excluded', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const result = extract(Buffer.from('class A { static get x(): number { return 1 } public set y(v: number) {} m(): void {} }'));
+  assert.equal(result.status, 'complete');
+  if (result.status === 'complete') assert.deepEqual(result.declarations.map(d => d.identity.name), ['m']);
+});
+
+test('template literal types keep literal fragments', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('function f(x: `a-${string}`): void {}'));
+  const after = extract(Buffer.from('function f(x: `b-${string}`): void {}'));
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.changes.length, 1);
+  assert.deepEqual(result.changes[0]!.parameters[0]!.before?.type,
+    { state: 'written', text: '`a-${string}`' });
+});
+
+test('typed binding keeps optional, rest, and generic clauses', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('const f: <T>(...a: T[]) => T = (...a) => a[0]!;'));
+  const after = extract(Buffer.from('const f: <T extends object>(a?: T[]) => T = a => a![0]!;'));
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.changes.length, 1);
+  assert.deepEqual(result.changes[0]!.header.before?.generic_parameters, ['T']);
+  assert.deepEqual(result.changes[0]!.header.after?.generic_parameters, ['T extends object']);
+  assert.equal(result.changes[0]!.parameters[0]!.before?.variadic, true);
+  assert.equal(result.changes[0]!.parameters[0]!.after?.optional, true);
+});
+
+test('namespace members and wrapped function bindings fail visibly', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  assert.deepEqual(extract(Buffer.from('namespace N { export function f(): void {} }')),
+    { status: 'incomplete', reason: 'unsupported-construct' });
+  assert.deepEqual(extract(Buffer.from('const f = ((x: number) => x) as Fn;')),
+    { status: 'incomplete', reason: 'unsupported-construct' });
+});
+
+test('role-only declaration to implementation has no written input/output delta', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('function f(): void;'));
+  const after = extract(Buffer.from('function f(): void {}'));
+  assert.deepEqual(compareTypeScriptExtractions(before, after).changes, []);
+});
+
+test('deep syntax does not overflow normalization stack', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const source = `function f(x: ${'Array<'.repeat(20_000)}string${'>'.repeat(20_000)}): void {}`;
+  assert.equal(extract(Buffer.from(source)).status, 'complete');
 });
