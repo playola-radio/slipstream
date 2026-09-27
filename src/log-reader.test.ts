@@ -5,7 +5,7 @@ import { mkdtemp, writeFile, appendFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseCursor, parseLine, openLogCursor, LogCorruptError } from './log-reader.ts';
+import { parseCursor, parseLine, openLogCursor, LogCorruptError, LogReadLimitError, LogReadAbortedError } from './log-reader.ts';
 
 const line = (seq: number, type = 'slipstream.file.changed.v1', extra = {}) =>
   JSON.stringify({ specversion: '1.0', id: String(seq), source: 'urn:slipstream:session:x',
@@ -58,6 +58,70 @@ describe('log-reader', () => {
       assert.deepEqual((await cur.readThrough(1n)).map((e) => e.seq), [1n]);
       assert.deepEqual((await cur.readThrough(3n)).map((e) => e.seq), [2n, 3n]);
       await cur.close();
+    });
+
+    it('enforces an exact per-call record and UTF-8 byte budget before completing an oversized line', async () => {
+      const first = line(1);
+      const p = await logWith(first, line(2, undefined, { pad: 'x'.repeat(200_000) }));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        assert.deepEqual((await cur.readThrough(2n, { maxRecords: 1 })).map((e) => e.seq), [1n]);
+        await assert.rejects(cur.readThrough(2n, { maxBytes: 1024 }), LogReadLimitError);
+      } finally { await cur.close(); }
+    });
+
+    it('returns completed records before a byte limit and can resume without dropping any', async () => {
+      const first = line(1);
+      const second = line(2, undefined, { pad: 'x'.repeat(2000) });
+      const p = await logWith(first, second);
+      const cur = await openLogCursor(p, 0n);
+      try {
+        assert.deepEqual((await cur.readThrough(2n, { maxBytes: Buffer.byteLength(first) + 100 })).map((e) => e.seq), [1n]);
+        assert.deepEqual((await cur.readThrough(2n, { maxBytes: Buffer.byteLength(second) })).map((e) => e.seq), [2n]);
+      } finally { await cur.close(); }
+    });
+
+    it('rejects a UTF-8 BOM on a later JSONL line as recovery does', async () => {
+      const p = await logWith(line(1), '\uFEFF' + line(2));
+      const cur = await openLogCursor(p, 0n);
+      try { await assert.rejects(cur.readThrough(2n), LogCorruptError); }
+      finally { await cur.close(); }
+    });
+
+    it('accepts a UTF-8 BOM on the first record, as recovery does', async () => {
+      const p = await logWith('\uFEFF' + line(1), line(2));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        const events = await cur.readThrough(2n);
+        assert.deepEqual(events.map((e) => e.seq), [1n, 2n]);
+      } finally { await cur.close(); }
+    });
+
+    it('counts a stripped BOM in bytesRead so byte budgets reflect true disk bytes', async () => {
+      const first = line(1); // already newline-terminated
+      const p = await logWith('\uFEFF' + first, line(2));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        const events = await cur.readThrough(2n);
+        const bomBytes = Buffer.byteLength('\uFEFF', 'utf8');
+        assert.equal(events[0]!.bytesRead, Buffer.byteLength(first, 'utf8') + bomBytes);
+      } finally { await cur.close(); }
+    });
+
+    it('still rejects a first-record BOM when resuming after a nonzero cursor', async () => {
+      const p = await logWith(line(1), '\uFEFF' + line(2));
+      const cur = await openLogCursor(p, 1n);
+      try { await assert.rejects(cur.readThrough(2n), LogCorruptError); }
+      finally { await cur.close(); }
+    });
+
+    it('stops a bounded read when its signal is aborted', async () => {
+      const p = await logWith(line(1));
+      const cur = await openLogCursor(p, 0n);
+      const controller = new AbortController();
+      controller.abort();
+      try { await assert.rejects(cur.readThrough(1n, { signal: controller.signal }), LogReadAbortedError); }
+      finally { await cur.close(); }
     });
 
     it('round-trips a multibyte char whose bytes straddle a 64KB chunk boundary', async () => {

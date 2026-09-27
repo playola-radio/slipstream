@@ -1,8 +1,17 @@
 // src/log-reader.ts
 import { open, type FileHandle } from 'node:fs/promises';
 
-export interface ReaderEvent { seq: bigint; type: string; raw: string; data: Record<string, unknown> }
+export interface ReaderEvent {
+  seq: bigint; id?: string; source?: string; type: string; raw: string; data: Record<string, unknown>;
+  /** Bytes actually consumed from disk for this record, including its trailing
+   * newline and any stripped BOM — `raw` alone under-counts a BOM'd first line.
+   * Always populated by openLogCursor; optional only for bare parseLine/test use. */
+  bytesRead?: number;
+}
 export class LogCorruptError extends Error {}
+/** Optional bounded scans can stop before materializing an oversized record. */
+export class LogReadLimitError extends Error {}
+export class LogReadAbortedError extends Error {}
 
 const CURSOR_RE = /^(0|[1-9][0-9]*)$/;
 const SEQ_RE = /^[1-9][0-9]*$/;
@@ -19,15 +28,19 @@ export function parseLine(line: string): ReaderEvent {
   catch { throw new LogCorruptError(`invalid JSON: ${line.slice(0, 80)}`); }
   if (typeof obj !== 'object' || obj === null) throw new LogCorruptError('line is not an object');
   const rec = obj as Record<string, unknown>;
-  const seq = rec.seq; const type = rec.type; const data = rec.data;
+  const seq = rec.seq; const id = rec.id; const source = rec.source; const type = rec.type; const data = rec.data;
   if (typeof seq !== 'string' || !SEQ_RE.test(seq)) throw new LogCorruptError('bad seq');
+  if (id !== undefined && typeof id !== 'string') throw new LogCorruptError('bad id');
+  if (source !== undefined && typeof source !== 'string') throw new LogCorruptError('bad source');
   if (typeof type !== 'string') throw new LogCorruptError('bad type');
   if (typeof data !== 'object' || data === null) throw new LogCorruptError('bad data');
-  return { seq: BigInt(seq), type, raw: line, data: data as Record<string, unknown> };
+  // Callers that read from disk (openLogCursor) know the true consumed byte
+  // count — including a stripped BOM — and overwrite this default afterward.
+  return { seq: BigInt(seq), id, source, type, raw: line, bytesRead: Buffer.byteLength(line, 'utf8') + 1, data: data as Record<string, unknown> };
 }
 
 export interface LogCursor {
-  readThrough(boundary: bigint): Promise<ReaderEvent[]>;
+  readThrough(boundary: bigint, limits?: { maxRecords?: number; maxBytes?: number; signal?: AbortSignal }): Promise<ReaderEvent[]>;
   close(): Promise<void>;
 }
 
@@ -44,14 +57,22 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   let positioned = after === 0n;
   let window = Buffer.alloc(0);
   let windowStart = 0;
-  const decoder = new TextDecoder('utf-8', { fatal: true });
+  // Recovery decodes the whole file with one non-streaming call, so the
+  // WHATWG decoder strips a BOM only if it is the file's first three bytes.
+  // Match that exactly: strip a BOM only for the record at byte offset 0, and
+  // preserve (so parseLine rejects) a BOM anywhere else, mid-log.
+  const firstLineDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+  const laterLineDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
-  async function nextLine(): Promise<Buffer | null> {
+  async function nextLine(maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
     let pos = offset;
     const pieces: Buffer[] = [];
+    let lineBytes = 0;
     for (;;) {
+      if (signal?.aborted) throw new LogReadAbortedError('log read aborted');
+      if (lineBytes >= maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
       if (pos < windowStart || pos >= windowStart + window.length) {
-        const buffer = Buffer.allocUnsafe(READ_BYTES);
+        const buffer = Buffer.allocUnsafe(Math.min(READ_BYTES, maxBytes - lineBytes + 1));
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, pos);
         window = buffer.subarray(0, bytesRead);
         windowStart = pos;
@@ -60,26 +81,39 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
       const start = pos - windowStart;
       const nl = window.indexOf(0x0a, start);
       if (nl >= 0) {
+        if (lineBytes + nl - start + 1 > maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
         pieces.push(window.subarray(start, nl));
         return Buffer.concat(pieces);
       }
+      lineBytes += window.length - start;
+      if (lineBytes >= maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
       pieces.push(window.subarray(start));
       pos = windowStart + window.length;
     }
   }
 
   return {
-    async readThrough(boundary: bigint): Promise<ReaderEvent[]> {
+    async readThrough(boundary: bigint, limits = {}): Promise<ReaderEvent[]> {
       const out: ReaderEvent[] = [];
       let bytes = 0;
-      while (lastSeq < boundary && out.length < LOG_BATCH_RECORDS && bytes < BATCH_BYTES) {
-        const slice = await nextLine();
+      while (lastSeq < boundary && out.length < Math.min(LOG_BATCH_RECORDS, limits.maxRecords ?? LOG_BATCH_RECORDS)
+        && bytes < BATCH_BYTES && bytes < (limits.maxBytes ?? Infinity)) {
+        const lineStart = offset;
+        let slice: Buffer | null;
+        try { slice = await nextLine((limits.maxBytes ?? Infinity) - bytes, limits.signal); }
+        catch (error) {
+          // Offset already advanced for records in this batch. Return them before
+          // reporting the limit on the next call, so a retry cannot skip them.
+          if (out.length > 0 && (error instanceof LogReadLimitError || error instanceof LogReadAbortedError)) return out;
+          throw error;
+        }
         if (slice === null) break;
         let line: string;
-        try { line = decoder.decode(slice); }
+        try { line = (lineStart === 0 ? firstLineDecoder : laterLineDecoder).decode(slice); }
         catch { throw new LogCorruptError('invalid UTF-8 in log record'); }
         const ev = parseLine(line);
         const lineBytes = slice.length + 1;
+        ev.bytesRead = lineBytes;
         if (!positioned) {
           if (ev.seq <= after) { offset += lineBytes; continue; }
           positioned = true;
