@@ -76,6 +76,7 @@ import type { HostResult } from './swift-parse-host.ts';
 import { runFoldRelease } from './fold-release-check.ts';
 import { runAdmission } from './projection-admission-check.ts';
 import { runInterfaceV2Contract } from './interface-v2-contract.ts';
+import { runInterfaceV2TypeScriptCheck } from './interface-v2-typescript-check.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -668,8 +669,9 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
     if (sub === 'fold-release') return runFoldRelease({ ...io, argv: rest });
     if (sub === 'admission') return runAdmission({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd });
     if (sub === 'interface-v2-contract') return runInterfaceV2Contract({ argv: rest, stdout: io.stdout, stderr: io.stderr });
+    if (sub === 'interface-v2') return runInterfaceV2TypeScriptCheck(rest, io.stdout, io.stderr);
     if (sub !== 'acceptance') {
-      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'interface-v2-contract', 'swift-parse', 'swift-measure', 'fold-release', or 'admission'`);
+      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'interface-v2-contract', 'interface-v2', 'swift-parse', 'swift-measure', 'fold-release', or 'admission'`);
       return EXIT.USAGE;
     }
     return await runAcceptance({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd, signal: controller.signal });
