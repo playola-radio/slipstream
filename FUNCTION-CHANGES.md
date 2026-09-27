@@ -178,20 +178,35 @@ For every path with a record through `A`:
   endpoint. Its provenance stays that later record's `seq` with
   `field:"before"`, so the response never claims the before state was recorded
   by `B`.
-- **When it does not apply.** Two cases fall outside the rule:
-  - If the baseline was not complete at `B`, the before endpoint is
-    `unknown-boundary`.
-  - If that first record is itself a baseline snapshot, the before endpoint is
-    also `unknown-boundary`.
+- **When it does not apply.** A path with **no record at or before `B`** that
+  the rule does not cover has an **unknown before boundary**. Two cases lead
+  here:
+  - the baseline was not complete at `B`;
+  - the path's first record after `B` is itself a baseline snapshot. This
+    includes every baselined path when `B = 0`.
+
+  An unknown boundary is a **projection-derived** endpoint,
+  `{ "kind": "unknownBoundary" }`. It has no `record_seq`, `field` or snapshot,
+  because no such record exists. It is distinct from a recorded
+  `unavailable{reason}` snapshot, and its coverage is
+  `{ "state": "unavailable", "reason": "unknown-boundary" }`.
+- **Incomplete inventory is not the same as an unknown boundary.** A path that
+  *does* have a record at or before `B` uses that record, even if the baseline
+  was still running at `B`. Incomplete inventory is disclosed separately
+  (`inventory.baseline_completed_seq`).
+
+**Equal endpoints.** Two endpoints are *equal* when both are `absent`, or both
+are content with the same SHA-256. Recorded `unavailable` snapshots and unknown
+boundaries are **never** equal to anything, including a matching reason.
 
 ### 2.3 How recorded conditions affect results
 
 | Situation | Result |
 |---|---|
 | File added (explicit `absent` → content) | All eligible declarations are `added` after a successful extraction. Before coverage is `absent`. |
-| File removed (content → explicit `absent`) | All eligible declarations are `removed`. After coverage is `absent`. |
+| File removed (content → explicit `absent`) | All eligible declarations are `removed`. After coverage is `absent`. `absent` means absent from the captured **regular-file** state: the reader records a path replaced by a symlink or another non-regular object as `absent` (`src/reader.ts:54`). The view says "no longer a captured file", never "deleted". |
 | Empty file → populated | This is **not** an addition of the file. Before coverage is `complete` (it parsed as empty) and is reported differently from `absent`. |
-| Added then removed inside the range | No net endpoint change. The intermediate edits remain in the event stream, and the view never says "nothing happened". |
+| Added then removed inside the range | `absent` → `absent`: equal endpoints, so `identical` (§4.4). No language module is consulted. The intermediate edits remain in the event stream, and the view never says "nothing happened". |
 | Edited and reverted | Endpoints are identical: `identical`, meaning no net written-interface change. |
 | Rename or path move | A removal at the old path and an addition at the new path. No continuity is inferred. |
 | **Capture gap** between B and A | Known endpoints are still compared. The gap's `seq`, reason and scope are returned in `gaps[]`. History between the endpoints is incomplete and labelled as such. |
@@ -204,7 +219,7 @@ For every path with a record through `A`:
 | Before endpoint not establishable (§2.2) | `unavailable`, `before-unknown-boundary`. This is distinct from a missing blob. |
 | Path never recorded through A | No file row is invented. The inventory makes no claim about such paths. |
 | **Incomplete inventory**: baseline not complete at B, or `unknown_scopes` non-empty | The response returns `inventory.baseline_completed_seq` (or `null`) and `unknown_scopes`. "No detected changes" is qualified by that coverage. |
-| Excluded by capture policy: the store directory, `.git`, symlinks (`src/session.ts:426`, `:991`) | These are never listed. The response states the policy exclusions as static metadata (`inventory.policy_exclusions`) so the client can disclose them. The log records no event for a skipped symlink, which is a pre-existing disclosure gap. This proposal reports it but does not add capture events (that is a capture change, and not ours to make here). |
+| Excluded by capture policy: the store directory, `.git`, symlinks (`src/session.ts:426`, `:991`) | Excluded targets are never read. The baseline walk records no event for a skipped symlink, which is a pre-existing disclosure gap, so the response states the policy exclusions as static metadata (`inventory.policy_exclusions`). A *previously captured* path that later becomes a symlink can still appear, as content → `absent` (see "File removed"). This proposal reports the gap but does not add capture events (that is a capture change, and not ours to make here). |
 
 ---
 
@@ -239,7 +254,7 @@ exclusions in its metadata.
 
 | Construct | TypeScript / TSX (`typescript.v2`) | Swift (`swift.v1`) |
 |---|---|---|
-| Declarations | Named functions, overload signatures, methods, constructors, named function-valued `const` bindings | `func`, methods, extension members, protocol requirements, `init` |
+| Declarations | Named functions, overload signatures, methods, constructors, named function-valued bindings (`const` / `let` / `var`, incl. TSX components), per D2 | `func`, methods, extension members, protocol requirements, `init` |
 | Parameters | Ordered written name or pattern, annotation, `?`, rest, default syntax | Ordered external label and local name, annotation, default syntax, variadic, `inout` |
 | Destructuring | The written pattern is kept as **one** parameter; individual arguments are not invented | — |
 | Return | Written annotation. A missing annotation is `unknown` (inferred, not computed) | Written `-> T`. An omitted clause on `func` is `implicit: Void` (language-defined) |
@@ -282,9 +297,6 @@ Each propagation level multiplies the work per request:
 - **Compiler-level (F3-D):** needs captured `tsconfig`, dependency, module and
   toolchain inputs. It is out of scope for a watcher.
 
-Caching for F3-C would key on the **whole captured dependency manifest** (paths,
-hashes and resolution-policy version), not on two file hashes.
-
 ---
 
 ## 4. Proposed public contract (`interface.v2`): PROPOSAL, not pinnable
@@ -313,9 +325,12 @@ The following work in other streams could interact with these identifiers:
   starts captures earlier, which gives a better default F1 anchor. It is not a
   semantic change. **Real dependency:** if a future change lets `session_id`
   mean anything other than capture scope, this contract must be revisited.
-- **Session removal and GC.** Removing a session deletes its blobs. Endpoints
-  then become `*-blob-missing`, and a removed session returns `410`. Mark-and-sweep
-  never collects an active session's blobs.
+- **Session removal and GC.** Removing a session tombstones it, and requests
+  for it return `410`. GC then marks every blob referenced by any non-removed
+  session and sweeps the rest of the shared CAS (`src/maintenance.ts`).
+  - A blob shared with a retained session survives.
+  - A retained session's endpoint becomes `*-blob-missing` only if a CAS object
+    is lost outside normal GC.
 - **Stream worker.** Stream rows are keyed by `change_seq`, and range rows by
   `(B, A)`. The selection value is shared (§6.4).
 
@@ -326,7 +341,7 @@ GET /v1/sessions/:session_id/interfaces
       ?before_seq=B&after_seq=A&limit=16
       [&path_prefix=src/]           exact byte-prefix filter on recorded paths
       [&after_path=<cursor>]        exclusive, from page.next_after_path
-      [&include_identical=true]     also list paths whose endpoints are byte-identical
+      [&include_identical=true]     also list paths whose endpoints are equal (§2.2)
 GET /v1/schemas/projections/interface.v2
 ```
 
@@ -374,8 +389,7 @@ invented.
     "scope": "observed",                  // F2-A
     "baseline_completed_seq": "10",       // null if the baseline was not complete by A
     "unknown_scopes": [],                 // from capture.baseline.completed.v1
-    "policy_exclusions": ["store-directory", ".git", "symlinks"],
-    "unobserved_paths": "unknown"
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
   },
   "analysis": {                           // F3/F4 — every value "notAnalyzed" under A
     "shared_types": "notAnalyzed",
@@ -383,6 +397,7 @@ invented.
     "behavior": "notAnalyzed"
   },
   "gaps": [ { "seq": "14", "reason": "restart", "scope": "…" } ],
+  "gaps_complete": true,                  // false when capped; the full list is on the event stream
   "files": [ /* §4.4 */ ],
   "page": { "complete": true, "next_after_path": null }
 }
@@ -390,19 +405,33 @@ invented.
 
 What the page-level `status` values mean:
 
-- **`ready`**: every file on **this page** has a ready or identical result. It
-  does **not** mean complete repository inventory, complete history, all pages
-  loaded, or any semantic analysis.
-- **`partial`** (F5-A): the page mixes ready and non-ready files. Every
-  non-ready file still has `changes: []`.
-- **`skipped`**: the whole page could not run because of admission, a deadline,
-  the scan limit or shutdown. It returns no file rows, and the inventory is
-  treated as incomplete.
+- **`ready`**: every returned file is `ready` or `identical`. This includes an
+  empty page. It does **not** mean complete repository inventory, complete
+  history, all pages loaded, or any semantic analysis.
+- **`partial`** (F5-A): at least one returned file has another status. This
+  includes a page on which every file failed. Every such file has
+  `changes: []`.
+- **`skipped`**: the page returned no file rows because no file could start.
+  The causes are admission rejection or a deadline before the first file,
+  `scan-limit`, or shutdown. `page.complete` is `false` and the cursor does not
+  move.
 
-By default, `files` lists only paths whose endpoints **differ, or could not be
-shown identical**. With `include_identical=true`, paths whose endpoints are
-byte-identical are listed too, as `status:"identical"` with no parse and no blob
-read. This supports "Show unchanged branches".
+**Deadline and cancellation mid-page.**
+
+- Files already finished keep their results.
+- The file in progress is returned as `skipped / timeout` or
+  `skipped / cancelled`.
+- The page ends there, with `page.complete: false`. `next_after_path` is that
+  file's path, so the next request moves past it.
+- A client can retry one file on its own with `path_prefix`.
+
+**Filtering.** By default, `files` lists only paths whose endpoints are **not
+equal** (§2.2). With `include_identical=true`, paths with equal endpoints are
+listed too, as `status:"identical"`. This supports "Show unchanged branches".
+
+**Gap cap.** `gaps` is capped at 256 entries, ordered by `seq`. Beyond the cap,
+`gaps_complete` is `false`. The cap is explicit and never silent, and the full
+gap list stays on the public event stream.
 
 ### 4.4 File result
 
@@ -414,8 +443,8 @@ read. This supports "Show unchanged branches".
   "after":  { "record_seq": "19", "field": "after",
               "snapshot": { "kind": "content", "sha256": "…", "size": 431 },
               "observation": "watcher" },        // or "reconciliation" + "gap_ref"
-  "language": "typescript",                      // plain string, never an enum; null iff unsupported
-  "language_version": "typescript.v2",           // null iff unsupported
+  "language": "typescript",                      // plain string, never an enum; null iff no module for the path
+  "language_version": "typescript.v2",           // null iff no module, whatever the status
   "status": "ready",
   "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
   "changes": [ /* §4.5 */ ]
@@ -427,7 +456,7 @@ wins, extending D10:
 
 | # | Condition | `status` | `fallback_reason` |
 |---|---|---|---|
-| 0 | Both endpoints are content with an equal SHA-256 | `identical` | — |
+| 0 | Endpoints are equal (§2.2), and for content the blob is still retained. Retention is checked on every request. No parse happens; content coverage is `notEvaluated` and absent coverage is `absent`. A missing blob falls through to row 5/6 | `identical` | — |
 | 1 | Before extraction incomplete | `incomplete` | `before-parse-error` / `before-unsupported-construct` |
 | 2 | After extraction incomplete | `incomplete` | `after-parse-error` / `after-unsupported-construct` |
 | 3 | Duplicate declaration | `incomplete` | `duplicate-declaration` |
@@ -435,18 +464,15 @@ wins, extending D10:
 | 5 | Before side not comparable | `unavailable` | `before-blob-missing` / `before-unknown-boundary` / `before-<capture reason>` |
 | 6 | After side not comparable | `unavailable` | `after-blob-missing` / `after-<capture reason>` |
 | 7 | No language module | `unsupported` | `unsupported-language` |
-| 8 | Per-file input limit (bytes, declarations, syntax visits) | `skipped` | `too-large` |
-| 9 | Deadline or cancellation reached before this file | `skipped` | `timeout` / `cancelled` |
+| 8 | Per-file limit: input bytes, declarations, syntax visits, or a single file result larger than the response ceiling. This is **terminal**: retrying gives the same result, and the cursor moves past the file | `skipped` | `too-large` |
+| 9 | Deadline or cancellation hit this file. This is **retryable** | `skipped` | `timeout` / `cancelled` |
 | 10 | Comparison succeeded | `ready` | — |
 
-The D10 consequences carry over unchanged:
-
-- Every non-`ready` result has `changes: []`.
-- Coverage reports each side's actual state, even when that side's reason lost
-  precedence.
-- A side that was never evaluated can never establish a conclusion about empty
-  sides.
-- Unfinished sides are `notEvaluated`.
+The D10 consequences in [INTERFACE-PROJECTION.md](INTERFACE-PROJECTION.md#status-precedence-d10)
+carry over unchanged. One boundary case needs its own shape: an unknown before
+boundary is `"before": { "kind": "unknownBoundary" }` with coverage
+`{ "state": "unavailable", "reason": "unknown-boundary" }`, and it has no
+recorded provenance.
 
 ### 4.5 Change rows and component deltas
 
@@ -488,8 +514,7 @@ The proposed row:
     "op": "equal",
     "before": { "modifiers": ["export", "async"], "generic_parameters": [], "constraints": [] },
     "after":  { "modifiers": ["export", "async"], "generic_parameters": [], "constraints": [] }
-  },
-  "coverage": { "written_header": "complete", "type_references": "notAnalyzed", "effects": "notAnalyzed" }
+  }
 }
 ```
 
@@ -497,16 +522,21 @@ The proposed row:
 `changed` is `~`. The client may render `changed` as a `−` line followed by a
 `+` line, as the design does for `Promise<void>` → `Promise<User>`.
 
-**Parameter pairing.** Within one matched declaration, parameters pair by
-**unique local name**:
+**Parameter pairing.** Within one matched declaration, a parameter's pairing
+key is its written **local name**. Two parameters pair only when that name
+occurs exactly once on each side.
 
 - A change of label, default, type, position, `inout`, variadic or optional is
   reported as `changed`.
 - A different name is `removed` plus `added`. For example, `active` → `state`
   is exactly the design's `− active` / `+ state`.
-- Destructured patterns and non-unique names pair only by exact written
-  pattern. Otherwise they are reported as removed plus added, with no guessed
-  correspondence.
+- Some parameters have no usable key. These are:
+  - a Swift `_` local name;
+  - a destructured pattern;
+  - a name that occurs more than once.
+
+  They are never paired. They are always `removed` plus `added`, with no
+  guessed correspondence, even when the text is identical.
 
 **Components outside the parameter list.**
 
@@ -524,7 +554,7 @@ The proposed row:
   (`"inferred-not-computed"`). Extraction is complete, but the type is unknown.
 
 A written `User` annotation is fully extracted **syntax** even while the meaning
-of `User` is not analyzed (`type_references: "notAnalyzed"`).
+of `User` is not analyzed (`analysis.shared_types: "notAnalyzed"`).
 
 **Identity and renames.** v1's `(kind, scope[], name, guards[])` stays the
 declaration key, scoped to the path:
@@ -545,9 +575,11 @@ It is **not** a permanent symbol ID.
 - Files are ordered by path, by exact UTF-16 code unit.
 - Declarations follow D8 order: removed, then signatureChanged, then added, then
   the D8 tuple.
-- Parameters are ordered by after-position for surviving and added rows. Removed
-  rows are ordered by before-position and placed at the point where they were
-  removed from the before list.
+- Parameters are ordered as follows. Rows with a `before` side (`equal`,
+  `changed`, `removed`) come first, in before-position order. `added` rows
+  follow, in after-position order. Positions are unique per side, so this order
+  is total. For `setActivity` this gives `userId`, `− active`, `+ state`, as in
+  the design.
 
 ### 4.6 Versioning
 
@@ -602,7 +634,7 @@ numbers**:
 | Blob bytes | 1 MiB per side, 8 MiB per page |
 | Eligible declarations | 4,096 per side |
 | Syntax visits | 100,000 per side |
-| Response | 512 KiB |
+| Response | 512 KiB. When the next file result would cross the ceiling, the page ends early with `page.complete: false`. A **single** file result over the ceiling becomes `skipped / too-large`. Content is never truncated |
 | Prefix scan for endpoint resolution | 100,000 records / 16 MiB, then `skipped / scan-limit` |
 | Disposable cache | 128 entries / 16 MiB |
 
@@ -668,9 +700,9 @@ Proposed response:
   "range": { "before_seq": "10", "after_seq": "20" },
   "status": "ready",
   "inventory": { "scope": "observed", "baseline_completed_seq": "10", "unknown_scopes": [],
-                 "policy_exclusions": ["store-directory", ".git", "symlinks"], "unobserved_paths": "unknown" },
+                 "policy_exclusions": ["store-directory", ".git", "symlinks"] },
   "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
-  "gaps": [],
+  "gaps": [], "gaps_complete": true,
   "files": [{
     "path": "src/f.ts",
     "before": { "record_seq": "4", "field": "snapshot",
@@ -694,8 +726,7 @@ Proposed response:
       "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
       "header": { "op": "equal",
         "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
-        "after":  { "modifiers": [], "generic_parameters": [], "constraints": [] } },
-      "coverage": { "written_header": "complete", "type_references": "notAnalyzed", "effects": "notAnalyzed" }
+        "after":  { "modifiers": [], "generic_parameters": [], "constraints": [] } }
     }]
   }],
   "page": { "complete": true, "next_after_path": null }
@@ -725,7 +756,9 @@ history. In each case the file result is what matters.
 | `missing-content` (blob gone) | The `parameter-change` pair with the before CAS object deleted | Same | `unavailable / before-blob-missing`, `changes: []`. **Never** `added`. |
 | `missing-content` (capture unavailable) | Before snapshot is `unavailable{oversize}`; the after source is valid | Same | `unavailable / before-oversize`. Never `added`. |
 | `missing-content` + unsupported | `.py` path with a missing blob | — | `unavailable / before-blob-missing` (unavailable outranks unsupported). |
-| `unknown-boundary` | The path's first record after B is a late baseline snapshot, or the baseline was incomplete at B | Same | `unavailable / before-unknown-boundary`. Never `added`. |
+| `unknown-boundary` | The path has **no record at or before B**, and either its first later record is a baseline snapshot (for example `B = 0`) or the baseline was incomplete at B | Same | `unavailable / before-unknown-boundary`, with before endpoint `{ "kind": "unknownBoundary" }` and no provenance. Never `added`. |
+| `known-path-incomplete-baseline` | The path was baselined before B; other files were still being scanned at B; then a parameter change | Same | `ready`, a normal `signatureChanged`. `inventory.baseline_completed_seq` discloses that the baseline was incomplete. |
+| `parameter-reorder` | `function f(a: number, b: number, c: number)` → `function f(c: number, a: number)` | `func f(_: Int, _: String) {}` → `func f(_: String, _: Int) {}` | TS: `a` changed (position), `b` removed, `c` changed (position), in before order. Swift: the `_` names have no key, so there are two `removed` rows and then two `added` rows. |
 
 **Swift-specific cases:**
 
@@ -756,7 +789,10 @@ history. In each case the file result is what matters.
 - first-change predecessor;
 - gap with unchanged hashes;
 - restart reconciliation;
-- add-then-remove inside the range;
+- add-then-remove inside the range (`absent` → `absent` → `identical`, also for a `.py` path);
+- all-failed page (`partial`) and deadline mid-page;
+- oversized single file result (`too-large`) and gap cap (`gaps_complete: false`);
+- a captured file replaced by a symlink (content → `absent`);
 - `A > H` → `409`;
 - a huge decimal `seq`;
 - corrupt predecessor chain → `500`;
@@ -788,8 +824,12 @@ never be confused:
 The validation check proves:
 
 - every `expected.json` validates against the schema, using `src/schema.ts`;
-- cross-field invariants hold: non-ready ⇒ `changes: []`; `fallback_reason` ⇔
-  non-ready; `language` null ⇔ unsupported;
+- cross-field invariants hold:
+  - `changes` is non-empty only when the status is `ready`;
+  - `fallback_reason` is present exactly for `incomplete`, `unavailable`,
+    `unsupported` and `skipped`;
+  - `language` and `language_version` are `null` exactly when no module exists
+    for the path, whatever the status;
 - source hashes and sizes match the stored bytes;
 - every span slices whole UTF-8 characters, checked with a fatal decode;
 - a deliberately malformed fixture is **rejected**.
