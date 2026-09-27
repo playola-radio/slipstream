@@ -1,0 +1,64 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "3", "after_seq": "5" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "3",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [], "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/a.ts",
+      "before": { "kind": "recorded", "record_seq": "2", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "bc98078357a5987f2db56aff88ddd897840c5be61e22aac2c7b90843580cc00c", "size": 22 } },
+      "after": { "kind": "recorded", "record_seq": "4", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "absent" } },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "absent" } },
+      "changes": [
+        {
+          "kind": "removed",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 21 } },
+          "after": null,
+          "parameters": [],
+          "result": { "op": "removed", "before": { "kind": "return", "type": { "state": "written", "text": "void" } }, "after": null },
+          "throws": { "op": "removed", "before": { "mode": "notExpressible" }, "after": null },
+          "header": { "op": "removed", "before": { "modifiers": [], "generic_parameters": [], "constraints": [] }, "after": null }
+        }
+      ]
+    },
+    {
+      "path": "src/b.ts",
+      "before": { "kind": "recorded", "record_seq": "5", "field": "before", "observation": "watcher",
+        "snapshot": { "kind": "absent" } },
+      "after": { "kind": "recorded", "record_seq": "5", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "bc98078357a5987f2db56aff88ddd897840c5be61e22aac2c7b90843580cc00c", "size": 22 } },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "absent" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "added",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": null,
+          "after": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 21 } },
+          "parameters": [],
+          "result": { "op": "added", "before": null, "after": { "kind": "return", "type": { "state": "written", "text": "void" } } },
+          "throws": { "op": "added", "before": null, "after": { "mode": "notExpressible" } },
+          "header": { "op": "added", "before": null, "after": { "modifiers": [], "generic_parameters": [], "constraints": [] } }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

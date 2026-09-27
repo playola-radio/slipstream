@@ -1,5 +1,5 @@
 /**
- * `npm run qa:check` — the Part 5 QA command surface. Seven subcommands:
+ * `npm run qa:check` — the Part 5 QA command surface. Eight subcommands:
  *
  *  - `acceptance`: a registry + runner that proves each PR did what it claims by
  *    driving a LIVE daemon and asserting on its public reader output.
@@ -13,6 +13,10 @@
  *    exactly one canonical envelope. Exit 0 = envelope produced (with --check it
  *    matched the fixture's expected.json); 1 = --check mismatch (envelope still
  *    printed); 2 = bad args, missing fixture, unreadable/malformed input.
+ *  - `interface-v2-contract`: validates the hand-written `interface.v2` fixtures
+ *    (FUNCTION-CHANGES.md §5.3; see tools/interface-v2-contract.ts). Prints one
+ *    JSON report; exit 0 = every case valid and the negative control rejected,
+ *    1 = otherwise, 2 = bad args or an unloadable contract. Takes no arguments.
  *  - `swift-parse`: the Swift-grammar feasibility checker (SWIFT-GRAMMAR.md).
  *    `swift-parse --fixture <name>` or `swift-parse --file <path|->` loads the
  *    pinned grammar in the isolated host and prints one JSON report (artifact
@@ -71,6 +75,7 @@ import { runSwiftParseChild, runSwiftParseFile, runSwiftParseStdin, swiftFixture
 import type { HostResult } from './swift-parse-host.ts';
 import { runFoldRelease } from './fold-release-check.ts';
 import { runAdmission } from './projection-admission-check.ts';
+import { runInterfaceV2Contract } from './interface-v2-contract.ts';
 import type { AcceptanceContext, AcceptanceModule } from './qa/acceptance/types.ts';
 
 /**
@@ -662,8 +667,9 @@ export async function main(io: Omit<RunIO, 'argv' | 'signal'> & { argv: readonly
     if (sub === 'swift-measure') return runSwiftMeasure({ argv: rest, stdout: io.stdout, stderr: io.stderr, signal: controller.signal });
     if (sub === 'fold-release') return runFoldRelease({ ...io, argv: rest });
     if (sub === 'admission') return runAdmission({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd });
+    if (sub === 'interface-v2-contract') return runInterfaceV2Contract({ argv: rest, stdout: io.stdout, stderr: io.stderr });
     if (sub !== 'acceptance') {
-      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'swift-parse', 'swift-measure', 'fold-release', or 'admission'`);
+      io.stderr(`qa-check: unknown subcommand '${sub ?? ''}'; expected 'acceptance', 'fold', 'interface', 'interface-v2-contract', 'swift-parse', 'swift-measure', 'fold-release', or 'admission'`);
       return EXIT.USAGE;
     }
     return await runAcceptance({ argv: rest, stdout: io.stdout, stderr: io.stderr, cwd: io.cwd, signal: controller.signal });

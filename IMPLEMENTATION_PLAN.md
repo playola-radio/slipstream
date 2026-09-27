@@ -688,6 +688,17 @@ several small passing TDD commits; ordering + splits per the Codex consult):
 **Honesty is not deferrable to a later pass** — every view above ships its honesty
 contract when it ships.
 
+**T5 re-scope (2026-09-27).** T5a.2 / T5a.4 / T5b.2 / T5b.3 were paused on
+2026-09-24 when Brian re-scoped to the native Swift client. `FUNCTION-CHANGES.md`
+defines their replacement: `interface.v2`, a range comparison of structured
+function inputs/outputs between two recorded cutoffs, superseding the unbuilt
+per-change `interface.v1` endpoint (the v1 core and corpus stay). Decisions F1–F6
+were settled as A on 2026-09-27 (delegated by Brian). The contract
+(`contracts/interface/v2/`: schema, hand-written fixtures, and the
+`projection-check interface-v2-contract` validator) is written. Its slices
+(FD1–FD5 daemon, FS1–FS3 Swift) are **Not Started**, and are unblocked. No
+success criterion or ratified decision changes.
+
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
 
 ---

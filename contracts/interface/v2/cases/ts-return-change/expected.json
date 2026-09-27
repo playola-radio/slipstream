@@ -1,0 +1,53 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "3", "after_seq": "4" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "3",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [], "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/f.ts",
+      "before": {
+        "kind": "recorded", "record_seq": "2", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "091455371625186f6b1d8c33589e90d8ef478563db392e55faf79e184d4efc72", "size": 35 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "4", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "49967d2e67b614b50c02fc3ef83a7a47c6c46c216541ed1e8963c43abe71493b", "size": 37 }
+      },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 34 } },
+          "after": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 36 } },
+          "parameters": [],
+          "result": {
+            "op": "changed",
+            "before": { "kind": "return", "type": { "state": "written", "text": "number" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "string" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

@@ -1,0 +1,100 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "5",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "1",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.session.started.v1",
+      "datacontenttype": "application/json",
+      "seq": "1",
+      "time": "2026-09-21T14:13:20.001Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "root": "/fixture/worktree",
+        "max_bytes": 1048576,
+        "started_at_ms": 1790000000001
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "2",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "2",
+      "time": "2026-09-21T14:13:20.002Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/types/user.ts",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "e8d4de57f52b96ca5ed29690bbc8b21ed52fdd31fd1f2ee36e1164b533d84638",
+          "size": 44
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "3",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "3",
+      "time": "2026-09-21T14:13:20.003Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/access.ts",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "2fd9a1b483f1e48c1d9d9acab227a0330c90df78ce09a58d4f8d811851378bd1",
+          "size": 106
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "5",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "5",
+      "time": "2026-09-21T14:13:20.005Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/types/user.ts",
+        "before": {
+          "kind": "content",
+          "sha256": "e8d4de57f52b96ca5ed29690bbc8b21ed52fdd31fd1f2ee36e1164b533d84638",
+          "size": 44
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "6c347469173754891ca78ff2d8474d3c1ff004ec1b54ab97e03d3723c2f07c64",
+          "size": 50
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000005
+      }
+    }
+  ],
+  "blobs": {
+    "e8d4de57f52b96ca5ed29690bbc8b21ed52fdd31fd1f2ee36e1164b533d84638": "export interface User { isActive: boolean }\n",
+    "2fd9a1b483f1e48c1d9d9acab227a0330c90df78ce09a58d4f8d811851378bd1": "import type { User } from \"./types/user\";\nexport function canAccess(user: User): boolean { return true; }\n",
+    "6c347469173754891ca78ff2d8474d3c1ff004ec1b54ab97e03d3723c2f07c64": "export interface User { isActive: ActivityState }\n"
+  }
+}

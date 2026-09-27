@@ -71,7 +71,7 @@ const ENVELOPE_SCHEMA: JsonSchema = {
 /** A captured path is relative to the worktree root and never escapes it. A log
  * whose path escapes (absolute, or with a `..` segment) is corrupt — reconciling
  * it would read outside the watched tree. */
-function assertSafePath(path: string, at: string): void {
+export function assertSafePath(path: string, at: string): void {
   if (path === '' || isAbsolute(path) || /(^|[\\/])\.\.([\\/]|$)/.test(path)) {
     throw new CorruptLogError(`${at}: unsafe path ${JSON.stringify(path)}`);
   }

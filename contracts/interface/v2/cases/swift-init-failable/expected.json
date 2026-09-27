@@ -1,0 +1,60 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "3", "after_seq": "4" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "3",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "Sources/App/F.swift",
+      "before": {
+        "kind": "recorded", "record_seq": "2", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "b6dec2e050f810fcc39e9ac11dee4373d8f4180461a163c2219733bb29821323", "size": 31 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "4", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "d1c2e1df1b499eb581694abd66dae1b250aa5799503a49e5ef81264bbb9967ec", "size": 32 }
+      },
+      "language": "swift",
+      "language_version": "swift.v1",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "initializer", "scope": [{ "kind": "struct", "name": "P" }], "name": "init", "guards": [] },
+          "before": { "display_name": "P.init(x:)", "span": { "byte_start": 13, "byte_end": 28 } },
+          "after": { "display_name": "P.init(x:)", "span": { "byte_start": 13, "byte_end": 29 } },
+          "parameters": [
+            {
+              "op": "equal",
+              "before": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "Int" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "Int" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "changed",
+            "before": { "kind": "initializer", "failable": null },
+            "after": { "kind": "initializer", "failable": "?" }
+          },
+          "throws": { "op": "equal", "before": { "mode": "none" }, "after": { "mode": "none" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

@@ -1,0 +1,83 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "4",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "1",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.session.started.v1",
+      "datacontenttype": "application/json",
+      "seq": "1",
+      "time": "2026-09-21T14:13:20.001Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "root": "/fixture/worktree",
+        "max_bytes": 1048576,
+        "started_at_ms": 1790000000001
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "2",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "2",
+      "time": "2026-09-21T14:13:20.002Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.py",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "960771da576dd73ed4ed2b0a1a556e66aa4464d3f2b0348f1a88e2a98ceab95c",
+          "size": 19
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "3",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "3",
+      "time": "2026-09-21T14:13:20.003Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.py",
+        "before": {
+          "kind": "content",
+          "sha256": "960771da576dd73ed4ed2b0a1a556e66aa4464d3f2b0348f1a88e2a98ceab95c",
+          "size": 19
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "a9a255cc86822586b917ff57839ae31e917c901e6d9a7b64f86fc643214399b4",
+          "size": 22
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000004
+      }
+    }
+  ],
+  "blobs": {
+    "a9a255cc86822586b917ff57839ae31e917c901e6d9a7b64f86fc643214399b4": "def f(x, y): return y\n"
+  },
+  "missing_blobs": [
+    "960771da576dd73ed4ed2b0a1a556e66aa4464d3f2b0348f1a88e2a98ceab95c"
+  ]
+}

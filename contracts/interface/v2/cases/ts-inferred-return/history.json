@@ -1,0 +1,81 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "4",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "1",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.session.started.v1",
+      "datacontenttype": "application/json",
+      "seq": "1",
+      "time": "2026-09-21T14:13:20.001Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "root": "/fixture/worktree",
+        "max_bytes": 1048576,
+        "started_at_ms": 1790000000001
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "2",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "2",
+      "time": "2026-09-21T14:13:20.002Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "6fd49c9632294277f81b7f8e5238a9deb3ca2403f402603cc69b3dce36c48e5d",
+          "size": 27
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "3",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "3",
+      "time": "2026-09-21T14:13:20.003Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "before": {
+          "kind": "content",
+          "sha256": "6fd49c9632294277f81b7f8e5238a9deb3ca2403f402603cc69b3dce36c48e5d",
+          "size": 27
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "73735729fd3939dbbd09ad864d1929d5b0312b380d45c1a538000e1c3e2cddb4",
+          "size": 29
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000004
+      }
+    }
+  ],
+  "blobs": {
+    "6fd49c9632294277f81b7f8e5238a9deb3ca2403f402603cc69b3dce36c48e5d": "function f() { return 1; }\n",
+    "73735729fd3939dbbd09ad864d1929d5b0312b380d45c1a538000e1c3e2cddb4": "function f() { return \"1\"; }\n"
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "4",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "1",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.session.started.v1",
+      "datacontenttype": "application/json",
+      "seq": "1",
+      "time": "2026-09-21T14:13:20.001Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "root": "/fixture/worktree",
+        "max_bytes": 1048576,
+        "started_at_ms": 1790000000001
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "2",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "2",
+      "time": "2026-09-21T14:13:20.002Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0",
+          "size": 22
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "3",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "3",
+      "time": "2026-09-21T14:13:20.003Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "before": {
+          "kind": "content",
+          "sha256": "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0",
+          "size": 22
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "ef15783f9978b7dd32477e1b022d85732b6a4fbcd9d94235a32f964bdb2fcb3f",
+          "size": 27
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000004
+      }
+    }
+  ],
+  "blobs": {
+    "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0": "func f() -> Int { 1 }\n",
+    "ef15783f9978b7dd32477e1b022d85732b6a4fbcd9d94235a32f964bdb2fcb3f": "func f() -> String { \"1\" }\n"
+  }
+}

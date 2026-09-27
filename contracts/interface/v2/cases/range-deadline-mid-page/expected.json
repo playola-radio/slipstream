@@ -1,0 +1,68 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "5", "after_seq": "8" },
+  "status": "partial",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "5",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [], "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/a.ts",
+      "before": { "kind": "recorded", "record_seq": "2", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "1af9c23ea946b46e44febfa4180d843a1cfcd4116e68964847f3f3177713492d", "size": 31 } },
+      "after": { "kind": "recorded", "record_seq": "6", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "8c4e68ed763fbcb0b4a2f5b6dcc26feb0c0f95ff46dfb5550d2c407a21b988a3", "size": 31 } },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "function", "scope": [], "name": "a", "guards": [] },
+          "before": { "display_name": "a", "span": { "byte_start": 0, "byte_end": 30 } },
+          "after": { "display_name": "a", "span": { "byte_start": 0, "byte_end": 30 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "string" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "equal",
+            "before": { "kind": "return", "type": { "state": "written", "text": "void" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "void" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    },
+    {
+      "path": "src/b.ts",
+      "before": { "kind": "recorded", "record_seq": "3", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "22dda9f65a61bedf97a9e2727c91c5e83df96f621e219c23b7d790e309f5c373", "size": 31 } },
+      "after": { "kind": "recorded", "record_seq": "7", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "5df4d0e2271ed37553e192b83652ad9055a54a1032df11bc2baf9c5c63182d63", "size": 31 } },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "skipped",
+      "fallback_reason": "timeout",
+      "coverage": { "before": { "state": "notEvaluated" }, "after": { "state": "notEvaluated" } },
+      "changes": []
+    }
+  ],
+  "page": { "complete": false, "next_after_path": "src/b.ts" }
+}
