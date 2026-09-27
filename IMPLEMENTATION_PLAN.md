@@ -114,8 +114,10 @@ boundary registry and `CaptureSession` are already multi-session; single-active
 lives only in the daemon control plane (`src/daemon.ts` `state` / `current`).
 
 Rules that keep the expansion additive:
-- Every control verb names its target (session id or harness identity triple).
-  No new verb means "whatever is active".
+- Every control verb that acts on a particular capture names its target
+  (session id or harness identity triple); no new verb means "whatever is
+  active". Store-wide or listing verbs (`gc`, a future list-form `status`) are
+  the valid exception and take no single target.
 - No process-wide "current session" outside the daemon control plane.
 - Clients choose a session from `GET /v1/sessions`, never from control `status`.
 - One shared reader for the daemon, never one per capture.
