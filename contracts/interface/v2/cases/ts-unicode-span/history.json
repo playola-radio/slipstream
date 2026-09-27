@@ -1,0 +1,66 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "54b6d92ac3ff67768af54b30ee247267b52671970b8bc8931634b4e2b2797d56",
+          "size": 51
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "before": {
+          "kind": "content",
+          "sha256": "54b6d92ac3ff67768af54b30ee247267b52671970b8bc8931634b4e2b2797d56",
+          "size": 51
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "dd314c9866493687418d486917aef0bf0dc9e5074d82d876fc5eb5c9fe92014b",
+          "size": 51
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "54b6d92ac3ff67768af54b30ee247267b52671970b8bc8931634b4e2b2797d56": "// café ☕ naïve\nfunction f(x: number): void {}\n",
+    "dd314c9866493687418d486917aef0bf0dc9e5074d82d876fc5eb5c9fe92014b": "// café ☕ naïve\nfunction f(x: string): void {}\n"
+  }
+}

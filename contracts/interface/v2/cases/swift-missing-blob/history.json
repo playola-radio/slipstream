@@ -1,0 +1,68 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "c8b5c7f8d1396e03d98a7704dcfe46b69f6aae0f9504c5eb838fbcba58cd3ab8",
+          "size": 20
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "before": {
+          "kind": "content",
+          "sha256": "c8b5c7f8d1396e03d98a7704dcfe46b69f6aae0f9504c5eb838fbcba58cd3ab8",
+          "size": 20
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "ca411a3a36f5dfb28a446d7b1491157c0011fdf1483595b90b05b2be5f306e6f",
+          "size": 23
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "ca411a3a36f5dfb28a446d7b1491157c0011fdf1483595b90b05b2be5f306e6f": "func f(_ x: String) {}\n"
+  },
+  "missing_blobs": [
+    "c8b5c7f8d1396e03d98a7704dcfe46b69f6aae0f9504c5eb838fbcba58cd3ab8"
+  ]
+}

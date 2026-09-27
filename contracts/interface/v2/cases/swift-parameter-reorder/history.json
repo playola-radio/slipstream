@@ -1,0 +1,66 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "68ad81f3ae92bfd2c45b5da5b9ba84b550a90648e39bad8277a0c628ffe31e4b",
+          "size": 29
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "before": {
+          "kind": "content",
+          "sha256": "68ad81f3ae92bfd2c45b5da5b9ba84b550a90648e39bad8277a0c628ffe31e4b",
+          "size": 29
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "9593916820b66a52e27ca9462f0a7b1693cd98b029d4b3ed4e0b581aae72cf0d",
+          "size": 29
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "68ad81f3ae92bfd2c45b5da5b9ba84b550a90648e39bad8277a0c628ffe31e4b": "func f(_: Int, _: String) {}\n",
+    "9593916820b66a52e27ca9462f0a7b1693cd98b029d4b3ed4e0b581aae72cf0d": "func f(_: String, _: Int) {}\n"
+  }
+}

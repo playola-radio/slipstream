@@ -1,0 +1,56 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/f.ts",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "e65e049766112f2b6e94ed639865e3df16ad75a13deffe6b50000385016cb7f2", "size": 40 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "1fbc87a8b18c604a79be799a4a6da0bb14fb534137cc80dc33d2e2b304ae730e", "size": 40 }
+      },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "constructor", "scope": [{ "kind": "class", "name": "C" }], "name": "constructor", "guards": [] },
+          "before": { "display_name": "C.constructor", "span": { "byte_start": 12, "byte_end": 37 } },
+          "after": { "display_name": "C.constructor", "span": { "byte_start": 12, "byte_end": 37 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "string" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": null,
+          "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

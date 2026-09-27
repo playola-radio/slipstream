@@ -1,0 +1,54 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "Sources/App/F.swift",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "cd347705df7a2a49cedfa9509f7370219d9c3e792d0d7153b50d8be511e3604b", "size": 12 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "size": 0 }
+      },
+      "language": "swift",
+      "language_version": "swift.v1",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "removed",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": { "display_name": "f()", "span": { "byte_start": 0, "byte_end": 11 } },
+          "after": null,
+          "parameters": [],
+          "result": {
+            "op": "removed",
+            "before": { "kind": "return", "type": { "state": "implicit", "text": "Void" } },
+            "after": null
+          },
+          "throws": { "op": "removed", "before": { "mode": "none" }, "after": null },
+          "header": {
+            "op": "removed",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": null
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

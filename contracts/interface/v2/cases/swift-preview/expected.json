@@ -1,0 +1,36 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "partial",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "Sources/App/F.swift",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "e67c99fb6f6cf54e49e7d18fc39be74b1bcbf4277b2f2bcac92576ada05af736", "size": 35 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "50ca8164bdc07fea7a9bec387428fe9f8485f2f42cbdd35e21e64d77d0798be3", "size": 55 }
+      },
+      "language": "swift",
+      "language_version": "swift.v1",
+      "status": "incomplete",
+      "fallback_reason": "before-parse-error",
+      "coverage": { "before": { "state": "incomplete", "reason": "parse-error" }, "after": { "state": "incomplete", "reason": "parse-error" } },
+      "changes": []
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

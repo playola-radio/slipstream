@@ -1,0 +1,63 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "snapshot": {
+          "kind": "unavailable",
+          "reason": "oversize"
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "before": {
+          "kind": "unavailable",
+          "reason": "oversize"
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "bc98078357a5987f2db56aff88ddd897840c5be61e22aac2c7b90843580cc00c",
+          "size": 22
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "bc98078357a5987f2db56aff88ddd897840c5be61e22aac2c7b90843580cc00c": "function f(): void {}\n"
+  }
+}

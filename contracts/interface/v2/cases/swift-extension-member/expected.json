@@ -1,0 +1,60 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "Sources/App/F.swift",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "08b73a2f491e1ddb38a463ccb82fdae55a25edfb88b681373a89576dad62b52e", "size": 62 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "31c6c985bcaf642625ba20db078e902a2be50279a342b673396dfcd47e06c354", "size": 65 }
+      },
+      "language": "swift",
+      "language_version": "swift.v1",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "method", "scope": [{ "kind": "extension", "name": "Point" }], "name": "moved", "guards": [] },
+          "before": { "display_name": "Point.moved(by:)", "span": { "byte_start": 20, "byte_end": 59 } },
+          "after": { "display_name": "Point.moved(by:)", "span": { "byte_start": 20, "byte_end": 62 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": "by", "name": "d", "binding": "identifier", "type": { "state": "written", "text": "Int" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": "by", "name": "d", "binding": "identifier", "type": { "state": "written", "text": "Double" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "equal",
+            "before": { "kind": "return", "type": { "state": "written", "text": "Point" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "Point" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "none" }, "after": { "mode": "none" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

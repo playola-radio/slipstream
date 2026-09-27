@@ -1,0 +1,70 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/f.ts",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "d1a71d9f917c60d57126aa9341fa1ae5321986247f7980b46fe4607688691580", "size": 53 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "8ab449f1c4a4fb8862c26408dbc63fc1a580842b40a76d46a3d14c9701702b2f", "size": 42 }
+      },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 52 } },
+          "after": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 41 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": null, "name": "a", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 1, "label": null, "name": "a", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            },
+            {
+              "op": "removed",
+              "before": { "position": 1, "label": null, "name": "b", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": null
+            },
+            {
+              "op": "changed",
+              "before": { "position": 2, "label": null, "name": "c", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": null, "name": "c", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "equal",
+            "before": { "kind": "return", "type": { "state": "written", "text": "void" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "void" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}

@@ -1,0 +1,66 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "e65e049766112f2b6e94ed639865e3df16ad75a13deffe6b50000385016cb7f2",
+          "size": 40
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.ts",
+        "before": {
+          "kind": "content",
+          "sha256": "e65e049766112f2b6e94ed639865e3df16ad75a13deffe6b50000385016cb7f2",
+          "size": 40
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "1fbc87a8b18c604a79be799a4a6da0bb14fb534137cc80dc33d2e2b304ae730e",
+          "size": 40
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "e65e049766112f2b6e94ed639865e3df16ad75a13deffe6b50000385016cb7f2": "class C {\n  constructor(x: number) {}\n}\n",
+    "1fbc87a8b18c604a79be799a4a6da0bb14fb534137cc80dc33d2e2b304ae730e": "class C {\n  constructor(x: string) {}\n}\n"
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "12",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "12",
+      "time": "2026-09-21T14:13:20.012Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.py",
+        "before": {
+          "kind": "absent"
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "72d3d5b08c2cf9d267d33ca44474dfaeabe3c74c51fad8b1094d3d07ce3856b7",
+          "size": 23
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000012
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "18",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "18",
+      "time": "2026-09-21T14:13:20.018Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "src/f.py",
+        "before": {
+          "kind": "content",
+          "sha256": "72d3d5b08c2cf9d267d33ca44474dfaeabe3c74c51fad8b1094d3d07ce3856b7",
+          "size": 23
+        },
+        "after": {
+          "kind": "absent"
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000018
+      }
+    }
+  ],
+  "blobs": {
+    "72d3d5b08c2cf9d267d33ca44474dfaeabe3c74c51fad8b1094d3d07ce3856b7": "def f(x):\n    return x\n"
+  }
+}

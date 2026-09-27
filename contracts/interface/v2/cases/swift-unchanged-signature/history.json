@@ -1,0 +1,66 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "durable_seq": "20",
+  "events": [
+    {
+      "specversion": "1.0",
+      "id": "4",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.baselined.v1",
+      "datacontenttype": "application/json",
+      "seq": "4",
+      "time": "2026-09-21T14:13:20.004Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "snapshot": {
+          "kind": "content",
+          "sha256": "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0",
+          "size": 22
+        }
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "10",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.capture.baseline.completed.v1",
+      "datacontenttype": "application/json",
+      "seq": "10",
+      "time": "2026-09-21T14:13:20.010Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "unknown_scopes": []
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "20",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.file.changed.v1",
+      "datacontenttype": "application/json",
+      "seq": "20",
+      "time": "2026-09-21T14:13:20.020Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "path": "Sources/App/F.swift",
+        "before": {
+          "kind": "content",
+          "sha256": "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0",
+          "size": 22
+        },
+        "after": {
+          "kind": "content",
+          "sha256": "aabacf1a5b042535f07f77ae768d9fa81f46b245f8766f7db5ea8c1b624e7724",
+          "size": 22
+        },
+        "observation": "watcher",
+        "observed_at_ms": 1790000000020
+      }
+    }
+  ],
+  "blobs": {
+    "edceb3acd8bb0b5cde3371108af9304b63234120201fa50b222aa5568c9e40e0": "func f() -> Int { 1 }\n",
+    "aabacf1a5b042535f07f77ae768d9fa81f46b245f8766f7db5ea8c1b624e7724": "func f() -> Int { 2 }\n"
+  }
+}

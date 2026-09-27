@@ -1,11 +1,14 @@
-# Function input/output changes: design proposal
+# Function input/output changes: design and contract
 
-> **Status: PROPOSAL — this is not a contract.** Nothing below is served, pinned,
-> or implemented. The JSON shapes are **proposals labelled as such**; clients must
-> not pin them. The schema and its validated fixtures are written into this same
-> PR only after Brian settles decisions F1–F6 (see [Decisions](#3-decisions-for-brian)).
+> **Status: CONTRACT — decisions settled, not yet implemented.** Brian delegated
+> decisions F1–F6 on 2026-09-27 and all six were settled as **A** (see
+> [Decisions](#3-decisions-for-brian)). The authoritative contract is
+> `contracts/interface/v2/schema.json` plus the validated fixtures under
+> `contracts/interface/v2/cases/` (§5.3). The JSON in this document illustrates
+> it; where they differ, the schema and fixtures win. Nothing is served yet:
+> FD1–FD5 implement it (§6).
 
-This document proposes how the daemon reports what changed in functions'
+This document defines how the daemon reports what changed in functions'
 inputs and outputs over a stretch of captured work. It is the design for the
 "Function changes" view in the owner's design,
 `design/features/function-change-tree/exports/2026-09-24/`, which lives in the
@@ -18,7 +21,7 @@ admission budget ([ADMISSION.md](ADMISSION.md)) and the Swift grammar findings
 ([SWIFT-GRAMMAR.md](SWIFT-GRAMMAR.md)). It was architected through a Codex
 `gpt-6-astra` consult on 2026-09-27, which Claude adjudicated.
 
-**Headline.** The proposal is **`interface.v2`**, a bounded, read-only comparison
+**Headline.** The contract is **`interface.v2`**, a bounded, read-only comparison
 between two **recorded** points of one capture session. Each changed function
 gets structured inputs, outputs and declared throws, together with per-file
 coverage and source references.
@@ -39,8 +42,9 @@ table gives the evidence that exists today, what is missing, and the slice that
 would supply it (slices are defined in §6). The legend is:
 
 - **Have**: derivable today from public events and blobs.
-- **New**: needs this proposal.
-- **Gated**: needs a decision in §3.
+- **New**: needs this contract.
+- **Gated**: depended on a decision in §3. All six were settled as A, so every
+  gated element is reported as not analyzed until a follow-up is approved.
 - **Elsewhere**: owned by another workstream or unassigned. It is listed so it
   is not silently dropped.
 
@@ -84,7 +88,7 @@ would supply it (slices are defined in §6). The legend is:
 
 | Design element | Evidence today | Missing / slice |
 |---|---|---|
-| `Compare: Before story → Working tree ▾` | **Have** durable sequence boundaries and recorded snapshots. | **Gated**, F1. "Story" is rejected vocabulary (IMPLEMENTATION_PLAN "Task, not story"). The after side is the recorded state at a sequence, **not** the live working tree. Proposed wording: "Recorded at #B → Recorded at #A". |
+| `Compare: Before story → Working tree ▾` | **Have** durable sequence boundaries and recorded snapshots. | **Gated**, F1. "Story" is rejected vocabulary (IMPLEMENTATION_PLAN "Task, not story"). The after side is the recorded state at a sequence, **not** the live working tree. Wording (F1-A): "Recorded at #B → Recorded at #A". |
 | Breadcrumb `acme / storefront` | The session-start event records the capture root. | **Elsewhere.** The client may show the root's basename. Organization and repository identity are not recorded, so `acme` must not be invented. |
 | Branch `feat/activity-status` | Not recorded. | **Elsewhere, unassigned.** It must not be filled by querying the current Git state, because that would label a historical comparison with live state. Recording branch metadata at capture time would need its own decision. |
 | `ST-128 Introduce account activity states` | `task.started.v1` records `task_id` and `title`. | **Elsewhere** (stream and task work). The title can come from the task declaration. The ticket ID is not recorded. |
@@ -95,8 +99,8 @@ would supply it (slices are defined in §6). The legend is:
 | Disabled leaf subtitles `OUTPUT · nested field`, `INPUT + OUTPUT`, `INPUT · OUTPUT · EFFECT` | Disabled. | Preserved. `INPUT + OUTPUT` is derivable from v2 component rows. `nested field` needs F3 and `EFFECT` needs F4. |
 | Agent-connected indicator, account and settings | — | **Elsewhere** (setup work). Connection health is never derived from interface availability. |
 
-**What the owner design shows that the recommended first version cannot.** Under
-recommendations F3-A and F4-A, several parts of the illustrated tree do not
+**What the owner design shows that the first version cannot.** Under F3-A and
+F4-A, several parts of the illustrated tree do not
 appear:
 
 - the `createUser` and `canAccess` cards;
@@ -112,8 +116,8 @@ In their place the view shows the three header-level changes in the design:
 - `assertActive +` (without `Throws` in TypeScript).
 
 It also shows an explicit **"Shared types, effects and behaviour: not analyzed"**
-banner. This is a scope reduction that Brian must accept or reject through F3
-and F4. It is **not** a silent reduction. Reporting `createUser` or `canAccess`
+banner. This scope reduction was accepted through F3-A and F4-A on 2026-09-27.
+It is **not** a silent reduction. Reporting `createUser` or `canAccess`
 as signature changes would be false, because their written headers did not
 change.
 
@@ -219,15 +223,19 @@ boundaries are **never** equal to anything, including a matching reason.
 | Before endpoint not establishable (§2.2) | `unavailable`, `before-unknown-boundary`. This is distinct from a missing blob. |
 | Path never recorded through A | No file row is invented. The inventory makes no claim about such paths. |
 | **Incomplete inventory**: baseline not complete at B, or `unknown_scopes` non-empty | The response returns `inventory.baseline_completed_seq` (or `null`) and `unknown_scopes`. "No detected changes" is qualified by that coverage. |
-| Excluded by capture policy: the store directory, `.git`, symlinks (`src/session.ts:426`, `:991`) | Excluded targets are never read. The baseline walk records no event for a skipped symlink, which is a pre-existing disclosure gap, so the response states the policy exclusions as static metadata (`inventory.policy_exclusions`). A *previously captured* path that later becomes a symlink can still appear, as content → `absent` (see "File removed"). This proposal reports the gap but does not add capture events (that is a capture change, and not ours to make here). |
+| Excluded by capture policy: the store directory, `.git`, symlinks (`src/session.ts:426`, `:991`) | Excluded targets are never read. The baseline walk records no event for a skipped symlink, which is a pre-existing disclosure gap, so the response states the policy exclusions as static metadata (`inventory.policy_exclusions`). A *previously captured* path that later becomes a symlink can still appear, as content → `absent` (see "File removed"). This contract reports the gap but does not add capture events (that is a capture change, and not ours to make here). |
 
 ---
 
 ## 3. Decisions for Brian
 
-Answer each with a letter, for example `F1 A · F2 A · F3 A · F4 A · F5 A · F6 A`.
+**Settled 2026-09-27: `F1 A · F2 A · F3 A · F4 A · F5 A · F6 A`.** Brian had no
+strong preference and delegated the choice, so the recommendation in each row
+was taken. F3-B and F4-B stay **named follow-ups**, not approved scope; each
+needs its own go-ahead. The table is kept as the record of what was weighed.
+
 Admission numbers are **not** a letter choice. Under D7 they are approved later,
-from measurements (§5.3).
+from measurements (FD5).
 
 | # | Question | Options | Recommendation |
 |---|---|---|---|
@@ -247,7 +255,7 @@ Already settled, and **not** reopened here:
 
 ### 3.1 Supported language subsets
 
-The table below proposes what each language extractor covers. Both languages
+The table below defines what each language extractor covers. Both languages
 **exclude** anonymous callbacks, local and nested declarations, accessors,
 subscripts and macro-generated declarations. Each extractor publishes its
 exclusions in its metadata.
@@ -299,7 +307,7 @@ Each propagation level multiplies the work per request:
 
 ---
 
-## 4. Proposed public contract (`interface.v2`): PROPOSAL, not pinnable
+## 4. Public contract (`interface.v2`)
 
 ### 4.1 Integration boundary
 
@@ -376,7 +384,7 @@ route.
 Error bodies stay **text**, as the reader's are today. No JSON error envelope is
 invented.
 
-### 4.3 Envelope (PROPOSAL)
+### 4.3 Envelope
 
 ```jsonc
 {
@@ -447,9 +455,9 @@ matching `gaps_complete` / `unknown_scopes_complete` flag becomes `false`.
 ```jsonc
 {
   "path": "src/services/activity.ts",
-  "before": { "record_seq": "4",  "field": "snapshot",
+  "before": { "kind": "recorded", "record_seq": "4",  "field": "snapshot",
               "snapshot": { "kind": "content", "sha256": "…", "size": 412 } },
-  "after":  { "record_seq": "19", "field": "after",
+  "after":  { "kind": "recorded", "record_seq": "19", "field": "after",
               "snapshot": { "kind": "content", "sha256": "…", "size": 431 },
               "observation": "watcher" },        // or "reconciliation" + "gap_ref"
   "language": "typescript",                      // plain string, never an enum; null iff no module for the path
@@ -498,7 +506,8 @@ export async function setActivity(userId: string, active: boolean): Promise<void
 export async function setActivity(userId: string, state: ActivityState): Promise<User> { return user; }
 ```
 
-The proposed row:
+The row, with parameter objects abbreviated to three fields (the full shape is
+below):
 
 ```jsonc
 {
@@ -534,6 +543,20 @@ The proposed row:
 **Component operations.** `equal` is `=`, `added` is `+`, `removed` is `−`, and
 `changed` is `~`. The client may render `changed` as a `−` line followed by a
 `+` line, as the design does for `Promise<void>` → `Promise<User>`.
+
+**Parameter fields.** Every parameter object carries all of these:
+
+| Field | Meaning |
+|---|---|
+| `position` | 0-based written index on that side. |
+| `label` | A separately written Swift argument label, including `_` (`_ x` → `"_"`, `from point` → `"from"`). `null` when a single name is written, and always `null` in TypeScript. |
+| `name` | The written local name. For a TypeScript destructuring pattern, the whole written pattern. |
+| `binding` | `identifier`, `pattern` (TypeScript destructuring) or `wildcard` (a Swift local name of `_`). |
+| `type` | A type state (below). Swift `inout` and variadic `...` are not part of the text: `inout Point` is `"Point"` with `modifiers: ["inout"]`, and `Int...` is `"Int"` with `variadic: true`. |
+| `optional` | TypeScript `?`. |
+| `variadic` | TypeScript rest or Swift variadic. |
+| `default` | The written default expression, or `null`. |
+| `modifiers` | As written: Swift `inout`, TypeScript `readonly` / `public` parameter properties. |
 
 **Parameter pairing.** Within one matched declaration, a parameter's pairing
 key is its written **local name**. Two parameters pair only when that name
@@ -578,6 +601,20 @@ declaration key, scoped to the path:
 - The TS extractor keeps the overload-signature role separate from the
   implementation role, so a legal TypeScript overload set never becomes an
   accidental `duplicate-declaration`.
+
+**Identity kinds and display names.**
+
+- `identity.kind` is `function` at top level, `method` for a member of a class,
+  struct, enum, protocol or extension, `constructor` for a TypeScript
+  constructor, and `initializer` for a Swift `init`. An extension's scope entry
+  is `{ "kind": "extension", "name": <extended type> }`.
+- `display_name` is presentation only, never a key. TypeScript uses the name,
+  prefixed `Scope.` for members (`C.m`). Swift uses the selector form
+  (`move(from:count:)`, `f(_:)`, `init(x:)`), prefixed `Type.` for members.
+- A TypeScript constructor has `result: null`. Swift `async` is a `header`
+  modifier; `throws` / `rethrows` is the `throws` slot.
+- `span` covers the whole declaration, from its first modifier to its closing
+  `}` or `;`, excluding any enclosing `#if` lines.
 
 **Selection identity.** A selection is comparison-local:
 `(session_id, B, A, path, projection_version, language_version, identity, side span)`.
@@ -681,11 +718,10 @@ The daemon owns analysis. The client owns:
 
 ---
 
-## 5. Proposed examples and fixtures
+## 5. Examples and fixtures
 
-These are **design proposals**, not runtime output and not approved fixtures.
-Sources are shown without their trailing newline. Final fixtures store exact
-bytes, and their hashes and spans are computed from those bytes.
+Sources in this section are shown without their trailing newline. The fixtures
+store exact bytes, and their hashes and spans are computed from those bytes.
 
 ### 5.1 Full worked example: parameter type change
 
@@ -704,7 +740,7 @@ function f(x: number): void {}
 function f(x: string): void {}
 ```
 
-Proposed response:
+Response, exactly as committed in `contracts/interface/v2/cases/ts-parameter-change/expected.json`:
 
 ```json
 {
@@ -712,37 +748,59 @@ Proposed response:
   "session_id": "11111111-1111-4111-8111-111111111111",
   "range": { "before_seq": "10", "after_seq": "20" },
   "status": "ready",
-  "inventory": { "scope": "observed", "baseline_completed_seq": "10", "unknown_scopes": [],
-                 "unknown_scopes_complete": true,
-                 "policy_exclusions": ["store-directory", ".git", "symlinks"] },
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
   "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
-  "gaps": [], "gaps_complete": true,
-  "files": [{
-    "path": "src/f.ts",
-    "before": { "record_seq": "4", "field": "snapshot",
-      "snapshot": { "kind": "content", "sha256": "86e1381da984ad21459e1e796d08963d95ee1ef6eca5987ecf6fa1fef5d64e46", "size": 31 } },
-    "after": { "record_seq": "20", "field": "after", "observation": "watcher",
-      "snapshot": { "kind": "content", "sha256": "a0f5933b9b22cb5a09402ec1d063c10504d634ea717c939360f5fde690a4be6d", "size": 31 } },
-    "language": "typescript", "language_version": "typescript.v2",
-    "status": "ready",
-    "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
-    "changes": [{
-      "kind": "signatureChanged",
-      "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
-      "before": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 30 } },
-      "after":  { "display_name": "f", "span": { "byte_start": 0, "byte_end": 30 } },
-      "parameters": [{ "op": "changed",
-        "before": { "position": 0, "name": "x", "type": { "state": "written", "text": "number" } },
-        "after":  { "position": 0, "name": "x", "type": { "state": "written", "text": "string" } } }],
-      "result": { "op": "equal",
-        "before": { "kind": "return", "type": { "state": "written", "text": "void" } },
-        "after":  { "kind": "return", "type": { "state": "written", "text": "void" } } },
-      "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
-      "header": { "op": "equal",
-        "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
-        "after":  { "modifiers": [], "generic_parameters": [], "constraints": [] } }
-    }]
-  }],
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "src/f.ts",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "86e1381da984ad21459e1e796d08963d95ee1ef6eca5987ecf6fa1fef5d64e46", "size": 31 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "a0f5933b9b22cb5a09402ec1d063c10504d634ea717c939360f5fde690a4be6d", "size": 31 }
+      },
+      "language": "typescript",
+      "language_version": "typescript.v2",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "function", "scope": [], "name": "f", "guards": [] },
+          "before": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 30 } },
+          "after": { "display_name": "f", "span": { "byte_start": 0, "byte_end": 30 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "number" }, "optional": false, "variadic": false, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": null, "name": "x", "binding": "identifier", "type": { "state": "written", "text": "string" }, "optional": false, "variadic": false, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "equal",
+            "before": { "kind": "return", "type": { "state": "written", "text": "void" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "void" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "notExpressible" }, "after": { "mode": "notExpressible" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
   "page": { "complete": true, "next_after_path": null }
 }
 ```
@@ -750,7 +808,9 @@ Proposed response:
 ### 5.2 Required cases
 
 Every case uses the §5.1 request shape and varies only the path and the recorded
-history. In each case the file result is what matters.
+history. In each case the file result is what matters. Each row below is
+committed as `ts-<case>` and `swift-<case>` (a Python row as `py-<case>`), and the
+boundary cases as `range-<case>`. The full index is at the end of this section.
 
 | Case | TypeScript before → after | Swift before → after | Expected file result |
 |---|---|---|---|
@@ -813,6 +873,33 @@ history. In each case the file result is what matters.
 - page boundary with `next_after_path`;
 - cache hit followed by blob loss.
 
+**Committed case index** (`contracts/interface/v2/cases/`, 67 cases):
+
+- **TypeScript (21):** `ts-` + `parameter-change`, `return-change`,
+  `added-function`, `added-file`, `removed-function`, `removed-file`,
+  `unchanged-signature`, `inferred-return`, `shared-type-only`,
+  `overload-ambiguity`, `parse-failure`, `missing-blob`, `capture-unavailable`,
+  `unknown-boundary`, `known-path-incomplete-baseline`, `parameter-reorder`,
+  plus `destructured-param`, `constructor-change` (`result: null`),
+  `unicode-span` (multi-byte text before the span) and `optional-rest-default`.
+- **Swift (23):** `swift-` + the same sixteen table rows, plus `preview`,
+  `labels-defaults-effects`, `init-failable`, `generics-where`, `variadic`,
+  `guard-move` and `extension-member`.
+- **Python (2):** `py-unsupported-language`, `py-missing-blob-unsupported`.
+- **Range and page (22):** `range-` + `gap-unchanged-hashes`,
+  `restart-reconciliation`, `gap-before-b`, `add-then-remove-ts`,
+  `add-then-remove-py`, `reverted-hidden` (default filter, `files: []`),
+  `reverted-listed`, `all-failed-page`, `deadline-mid-page`,
+  `cancelled-mid-page`, `too-large-first-file`, `gap-cap`, `unknown-scopes`,
+  `admission-skipped`, `page-boundary-first`, `page-boundary-second`,
+  `huge-seq`, `rename`, `symlink-replaced`, `durable-ahead-409`,
+  `corrupt-chain-500` and `invalid-request-400`.
+
+Two listed conditions are **not** static fixtures, because they need a race
+between requests: "cache hit followed by blob loss" and the `410` deletion race.
+They are FD4 tests (§6.1). `401` and `404` are the reader's existing behaviour
+and are not repeated here.
+
 **"Unavailable" versus "no detected changes".** These fragments are what must
 never be confused:
 
@@ -827,13 +914,34 @@ never be confused:
 
 ### 5.3 Fixture ownership and Swift pinning
 
-**The daemon owns the fixtures.** Once F1–F6 are settled, this PR adds:
+**The daemon owns the fixtures.** This PR adds:
 
-- `contracts/interface/v2/schema.json`;
-- `contracts/interface/v2/cases/<name>/` containing `history.json` (the
-  synthetic recorded records and blobs), `request.txt` and
-  `expected.json`;
-- a fixture-validation check under `node tools/projection-check.ts`.
+- `contracts/interface/v2/schema.json`, the contract. The JSON elsewhere in
+  this document illustrates it.
+- `contracts/interface/v2/cases/<name>/`, one directory per case, holding
+  `history.json`, `request.txt`, and exactly one of `expected.json` (a `200`
+  body) or `expected-error.json` (`{ "http_status": N, "headers"?: {…} }`).
+- `node tools/projection-check.ts interface-v2-contract`, the validator, which
+  runs in CI through `tools/interface-v2-contract.test.ts`.
+
+**`history.json`** is a synthetic recorded session that FD3 and FD4 can replay
+directly:
+
+- `session_id`, and `durable_seq` (the high-water `H`).
+- `events`: full public event envelopes (`id` = `seq`, strictly increasing,
+  each valid against its `schemas/slipstream.*.v1.json` schema).
+- `blobs`: SHA-256 → UTF-8 text for every stored content snapshot.
+- `missing_blobs` (optional): SHA-256s referenced by events whose CAS object
+  is gone.
+- `harness` (optional): execution conditions a recorded history cannot express.
+  - `admission: "overloaded"`: the page is rejected before any file starts.
+  - `interrupt: { at_path, reason: "timeout" | "cancelled" }`: the deadline or
+    cancellation hits while that file is being compared.
+  - `limits: { response_bytes, metadata_bytes }`: overrides the ceilings.
+    `response_bytes: 1` makes the first file `skipped / too-large`, and
+    `metadata_bytes: 0` caps `gaps` and `unknown_scopes` to empty lists.
+
+**`request.txt`** is one `GET` line, parsed with the exact §4.2 grammar.
 
 The validation check proves:
 
@@ -844,9 +952,22 @@ The validation check proves:
     `unsupported` and `skipped`;
   - `language` and `language_version` are `null` exactly when no module exists
     for the path, whatever the status;
+  - the page status, cursor and `fallback_reason` agree with the file
+    statuses (§4.3), and `identical` appears exactly when the endpoints are
+    equal and retained;
+  - each side's coverage matches what its endpoint forces (`absent`,
+    `blob-missing`, `unknown-boundary`, the capture reason);
+  - component operations agree with their sides, and parameters are paired
+    and ordered as §4.5 requires;
+- every history event is a valid public event, and every endpoint's
+  provenance points at the record it copies (§2.2);
+- the envelope's range, inventory and gaps agree with the history;
 - source hashes and sizes match the stored bytes;
 - every span slices whole UTF-8 characters, checked with a fatal decode;
-- a deliberately malformed fixture is **rejected**.
+- `request.txt` follows the §4.2 grammar, and every `400` / `409` fixture is
+  consistent with it;
+- a deliberately malformed envelope (a valid page relabelled `skipped`) is
+  **rejected**, so the validator cannot pass vacuously.
 
 The expected outputs are **hand-written**. They are not generated by the
 extractor they will later test.
@@ -870,10 +991,10 @@ invariant that would need those is checked in code in the validator.
 
 ---
 
-## 6. Implementation graph (after F1–F6 are settled)
+## 6. Implementation graph
 
-The design PR (this one) finalizes the schema and fixtures once F1–F6 are
-settled. There is no separate "promote the contract" PR.
+This PR carries the settled decisions, the schema, the fixtures and their
+validator. There is no separate "promote the contract" PR.
 
 ```text
 [this PR] decisions + schema + fixtures + validator
@@ -907,8 +1028,6 @@ Optional, only if approved (F3/F4):
 
 ### 6.3 What runs concurrently
 
-After decisions are settled:
-
 - **FD1, FD2, FD3 and FS1** run in parallel.
 - **FS2** can run alongside all daemon work.
 - **FS3** waits for FD4.
@@ -933,12 +1052,12 @@ After decisions are settled:
 
 ---
 
-## 7. Not in this proposal
+## 7. Not in this PR
 
 The following are out of scope for this PR:
 
 - Parsers, extractors, endpoints, workers, caches or Swift UI.
-- A served or pinnable schema before F1–F6 are settled.
+- Serving the schema over HTTP (FD4).
 - New log events, projection events, persistence, a persisted symbol index, or
   new GC roots.
 - Reading the live worktree, Git, compiler projects or harness logs.

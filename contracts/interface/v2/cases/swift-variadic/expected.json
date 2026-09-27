@@ -1,0 +1,60 @@
+{
+  "projection_version": "interface.v2",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "range": { "before_seq": "10", "after_seq": "20" },
+  "status": "ready",
+  "inventory": {
+    "scope": "observed",
+    "baseline_completed_seq": "10",
+    "unknown_scopes": [],
+    "unknown_scopes_complete": true,
+    "policy_exclusions": ["store-directory", ".git", "symlinks"]
+  },
+  "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
+  "gaps": [],
+  "gaps_complete": true,
+  "files": [
+    {
+      "path": "Sources/App/F.swift",
+      "before": {
+        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "snapshot": { "kind": "content", "sha256": "d2c89ef3d15f9ad377f58a7a31bcc4574f3c33a708b6b5ea2b451edca7d59830", "size": 36 }
+      },
+      "after": {
+        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "snapshot": { "kind": "content", "sha256": "ec3a70e795d25e283f5d6a89f784661d5639f09bfd68f48520eaf878b6a469fc", "size": 42 }
+      },
+      "language": "swift",
+      "language_version": "swift.v1",
+      "status": "ready",
+      "coverage": { "before": { "state": "complete" }, "after": { "state": "complete" } },
+      "changes": [
+        {
+          "kind": "signatureChanged",
+          "identity": { "kind": "function", "scope": [], "name": "sum", "guards": [] },
+          "before": { "display_name": "sum(_:)", "span": { "byte_start": 0, "byte_end": 35 } },
+          "after": { "display_name": "sum(_:)", "span": { "byte_start": 0, "byte_end": 41 } },
+          "parameters": [
+            {
+              "op": "changed",
+              "before": { "position": 0, "label": "_", "name": "xs", "binding": "identifier", "type": { "state": "written", "text": "Int" }, "optional": false, "variadic": true, "default": null, "modifiers": [] },
+              "after": { "position": 0, "label": "_", "name": "xs", "binding": "identifier", "type": { "state": "written", "text": "Double" }, "optional": false, "variadic": true, "default": null, "modifiers": [] }
+            }
+          ],
+          "result": {
+            "op": "changed",
+            "before": { "kind": "return", "type": { "state": "written", "text": "Int" } },
+            "after": { "kind": "return", "type": { "state": "written", "text": "Double" } }
+          },
+          "throws": { "op": "equal", "before": { "mode": "none" }, "after": { "mode": "none" } },
+          "header": {
+            "op": "equal",
+            "before": { "modifiers": [], "generic_parameters": [], "constraints": [] },
+            "after": { "modifiers": [], "generic_parameters": [], "constraints": [] }
+          }
+        }
+      ]
+    }
+  ],
+  "page": { "complete": true, "next_after_path": null }
+}
