@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { resolveRecordedRange } from './interface-range-resolver.ts';
-import type { RangeFile } from './interface-range-resolver.ts';
+import type { RangeEndpoint, RangeFile } from './interface-range-resolver.ts';
 import { parseRequest } from '../tools/interface-v2-contract.ts';
 
 const casesDir = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
@@ -89,19 +90,25 @@ test('an unavailable observation remains the endpoint and never equals another u
 });
 
 test('all 62 successful fixture histories replay through the production resolver', async () => {
-  const names = (await import('node:fs/promises')).readdir(casesDir);
-  for (const name of (await names).sort()) {
+  let resolvedCases = 0;
+  let errorCases = 0;
+  for (const name of (await readdir(casesDir)).sort()) {
     const dir = join(casesDir, name);
-    let expectedText: string;
-    try { expectedText = await readFile(join(dir, 'expected.json'), 'utf8'); }
-    catch { continue; }
+    const entries = await readdir(dir);
+    if (!entries.includes('expected.json')) {
+      assert.ok(entries.includes('expected-error.json'), `${name}: no expected outcome`);
+      errorCases++;
+      continue;
+    }
+    resolvedCases++;
+    const expectedText = await readFile(join(dir, 'expected.json'), 'utf8');
     const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf8')) as {
       session_id: string; durable_seq: string; events: Event[]; blobs: Record<string, string>;
       harness?: { limits?: { metadata_bytes?: number } };
     };
     const expected = JSON.parse(expectedText) as {
-      files: Array<{ path: string; before: unknown; after: unknown }>;
-      inventory: { baseline_completed_seq: string | null; unknown_scopes: string[] };
+      files: Array<{ path: string; before: unknown; after: unknown; status: string }>;
+      inventory: { baseline_completed_seq: string | null; unknown_scopes: string[]; policy_exclusions: string[] };
       gaps: unknown[];
     };
     const request = parseRequest(await readFile(join(dir, 'request.txt'), 'utf8'));
@@ -110,6 +117,7 @@ test('all 62 successful fixture histories replay through the production resolver
     await withLog(history.events, async (logPath) => {
       const root = join(logPath, '..');
       for (const [hash, bytes] of Object.entries(history.blobs)) {
+        assert.equal(createHash('sha256').update(bytes).digest('hex'), hash, `${name}: blob hash`);
         const path = join(root, 'blobs', 'sha256', hash.slice(0, 2), hash);
         await mkdir(join(root, 'blobs', 'sha256', hash.slice(0, 2)), { recursive: true });
         await writeFile(path, bytes);
@@ -120,6 +128,14 @@ test('all 62 successful fixture histories replay through the production resolver
       assert.equal(result.kind, 'resolved', name);
       if (result.kind !== 'resolved') return;
       assert.equal(result.inventory.baselineCompletedSeq, expected.inventory.baseline_completed_seq, name);
+      assert.deepEqual(result.inventory.policyExclusions, expected.inventory.policy_exclusions, name);
+      const eligible = [...new Set(history.events.filter((e) =>
+        (e.type === 'slipstream.file.baselined.v1' || e.type === 'slipstream.file.changed.v1')
+        && BigInt(e.seq) <= request.after && typeof e.data.path === 'string'
+        && e.data.path.startsWith(request.pathPrefix)
+        && (request.afterPath === null || e.data.path > request.afterPath),
+      ).map((e) => e.data.path as string))].sort();
+      assert.deepEqual(result.files.map((f) => f.path), eligible, `${name}: eligible paths`);
       if (history.harness?.limits?.metadata_bytes !== 0) {
         assert.deepEqual(result.inventory.unknownScopes, expected.inventory.unknown_scopes, name);
         assert.deepEqual(result.gaps, expected.gaps, `${name}: gaps`);
@@ -129,9 +145,22 @@ test('all 62 successful fixture histories replay through the production resolver
         assert.ok(actual, `${name}: missing ${file.path}`);
         assert.deepEqual(actual.before, file.before, `${name}: before ${file.path}`);
         assert.deepEqual(actual.after, file.after, `${name}: after ${file.path}`);
+        if (file.status === 'identical') assert.equal(actual.endpointsEqual, true, `${name}: equal tags`);
+        for (const endpoint of [actual.before, actual.after] as RangeEndpoint[]) {
+          if (endpoint.kind !== 'recorded' || endpoint.snapshot.kind !== 'content') continue;
+          const hash: string = endpoint.snapshot.sha256;
+          if (!Object.hasOwn(history.blobs, hash)) continue; // declared missing blobs belong to FD4
+          const blob = await readFile(join(root, 'blobs', 'sha256', hash.slice(0, 2), hash));
+          assert.equal(createHash('sha256').update(blob).digest('hex'), hash, `${name}: endpoint blob`);
+          assert.equal(blob.length, endpoint.snapshot.size, `${name}: endpoint size`);
+        }
       }
+      assert.deepEqual(result.files.filter((f) => expected.files.some((e) => e.path === f.path)).map((f) => f.path),
+        expected.files.map((f) => f.path), `${name}: expected row order`);
     });
   }
+  assert.equal(resolvedCases, 62);
+  assert.equal(errorCases, 4);
 });
 
 test('a contradictory predecessor anywhere through A is corruption, even outside the filter', async () => {
@@ -213,9 +242,10 @@ test('cancellation stops a scan and short log is corruption', async () => {
     const aborted = await resolveRecordedRange(options(logPath, 0n, 2n, { signal: controller.signal }));
     assert.equal(aborted.kind, 'aborted');
     let reads = 0;
-    const changingSignal = { get aborted() { return ++reads > 2; } } as AbortSignal;
+    const changingSignal = { get aborted() { return ++reads > 3; } } as AbortSignal;
     const during = await resolveRecordedRange(options(logPath, 0n, 2n, { signal: changingSignal }));
     assert.equal(during.kind, 'aborted');
+    if (during.kind === 'aborted') assert.equal(during.scan.records, 1);
     await assert.rejects(resolveRecordedRange(options(logPath, 0n, 3n)), /disk short/);
   });
 });
@@ -230,6 +260,14 @@ test('malformed snapshots and unknown scopes are corrupt, not coverage guesses',
     unknown_scopes: ['../outside'],
   })], async (logPath) => {
     await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad unknown scopes/);
+  });
+});
+
+test('a path-scoped gap cannot claim the root as a file path', async () => {
+  await withLog([event(1, 'session.started'), event(2, 'capture.gap', {
+    reason: 'watcher-error', scope: { kind: 'path', path: '' },
+  })], async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad gap scope/);
   });
 });
 

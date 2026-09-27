@@ -47,7 +47,8 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   let positioned = after === 0n;
   let window = Buffer.alloc(0);
   let windowStart = 0;
-  const decoder = new TextDecoder('utf-8', { fatal: true });
+  // Preserve a BOM on every line so JSON parsing rejects it, as recovery does.
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
   async function nextLine(maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
     let pos = offset;
@@ -83,7 +84,14 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
       let bytes = 0;
       while (lastSeq < boundary && out.length < Math.min(LOG_BATCH_RECORDS, limits.maxRecords ?? LOG_BATCH_RECORDS)
         && bytes < BATCH_BYTES && bytes < (limits.maxBytes ?? Infinity)) {
-        const slice = await nextLine((limits.maxBytes ?? Infinity) - bytes, limits.signal);
+        let slice: Buffer | null;
+        try { slice = await nextLine((limits.maxBytes ?? Infinity) - bytes, limits.signal); }
+        catch (error) {
+          // Offset already advanced for records in this batch. Return them before
+          // reporting the limit on the next call, so a retry cannot skip them.
+          if (out.length > 0 && (error instanceof LogReadLimitError || error instanceof LogReadAbortedError)) return out;
+          throw error;
+        }
         if (slice === null) break;
         let line: string;
         try { line = decoder.decode(slice); }

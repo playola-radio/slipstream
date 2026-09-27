@@ -71,6 +71,9 @@ function snapshot(value: unknown, seq: string): Snapshot {
   return corrupt(`bad snapshot at ${seq}`);
 }
 function sameRecordedState(a: Snapshot, b: Snapshot): boolean {
+  // The v2 fixture validator compares both content hash and recorded size for
+  // predecessor integrity. Recovery's equality helper suppresses observations
+  // by hash alone; it has a different purpose.
   if (a.kind !== b.kind) return false;
   if (a.kind === 'content' && b.kind === 'content') return a.sha256 === b.sha256 && a.size === b.size;
   if (a.kind === 'unavailable' && b.kind === 'unavailable') return a.reason === b.reason;
@@ -107,7 +110,7 @@ function checkGap(data: Record<string, unknown>, seq: string): RangeGap {
   const scope = data.scope;
   if (scope.kind === 'session') return { seq, reason: data.reason as RangeGap['reason'], scope: { kind: 'session' } };
   if ((scope.kind !== 'directory' && scope.kind !== 'path') || typeof scope.path !== 'string'
-    || scope.path.includes('\0')) corrupt(`bad gap scope at ${seq}`);
+    || scope.path.includes('\0') || (scope.kind === 'path' && scope.path === '')) corrupt(`bad gap scope at ${seq}`);
   if (scope.path !== '') checkPath(scope.path, seq);
   return { seq, reason: data.reason as RangeGap['reason'], scope: { kind: scope.kind, path: scope.path } };
 }
@@ -152,15 +155,14 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
       }
       if (batch.length === 0) corrupt(`disk short of durable boundary ${afterSeq}`);
       for (const record of batch) {
-        if (signal?.aborted) return { kind: 'aborted', scan: scan() };
         records += 1;
         bytes += Buffer.byteLength(record.raw, 'utf8') + 1;
-        if (records > scanBudget.records || bytes > scanBudget.bytes) return { kind: 'scanLimit', scan: scan() };
         lastSeq = record.seq;
         consume(record);
       }
     }
   } finally { await cursor.close(); }
+  if (signal?.aborted) return { kind: 'aborted', scan: scan() };
 
   function consume(record: ReaderEvent): void {
     const seq = record.seq.toString();

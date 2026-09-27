@@ -70,6 +70,24 @@ describe('log-reader', () => {
       } finally { await cur.close(); }
     });
 
+    it('returns completed records before a byte limit and can resume without dropping any', async () => {
+      const first = line(1);
+      const second = line(2, undefined, { pad: 'x'.repeat(2000) });
+      const p = await logWith(first, second);
+      const cur = await openLogCursor(p, 0n);
+      try {
+        assert.deepEqual((await cur.readThrough(2n, { maxBytes: Buffer.byteLength(first) + 100 })).map((e) => e.seq), [1n]);
+        assert.deepEqual((await cur.readThrough(2n, { maxBytes: Buffer.byteLength(second) })).map((e) => e.seq), [2n]);
+      } finally { await cur.close(); }
+    });
+
+    it('rejects a UTF-8 BOM on a later JSONL line as recovery does', async () => {
+      const p = await logWith(line(1), '\uFEFF' + line(2));
+      const cur = await openLogCursor(p, 0n);
+      try { await assert.rejects(cur.readThrough(2n), LogCorruptError); }
+      finally { await cur.close(); }
+    });
+
     it('stops a bounded read when its signal is aborted', async () => {
       const p = await logWith(line(1));
       const cur = await openLogCursor(p, 0n);
