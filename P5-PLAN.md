@@ -80,7 +80,8 @@ Refuse `attaching` / `active` / `detaching` / `wedged`. Checking only
 `current?.id` is insufficient because `current` is not installed during attach
 startup — a half-started capture would slip through. Requiring full detachment is
 the simple, safe admission rule and matches the multi-session guardrail memo
-("GC: refuse while any capture is attaching/active/detaching").
+("GC: refuse while any capture is attaching/active/detaching"; see
+`IMPLEMENTATION_PLAN.md`, "Future: several simultaneous captures").
 
 ### Concurrency: one maintenance slot (Q4)
 A single tracked `maintenanceInFlight?: Promise<unknown>`:

@@ -105,6 +105,37 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
   identities. A transcript record may *update attribution*; it may never
   *create* a filesystem-change event. This avoids double-capture structurally.
 
+### Future: several simultaneous captures (not built; Q4 stands)
+
+Capturing several worktrees at once, and later auto-connecting new Conductor
+workspaces, is the intended direction after the MVP. It is not built, and Q4
+and the Stage 3 success criteria are unchanged. The log, blob store, reader,
+boundary registry and `CaptureSession` are already multi-session; single-active
+lives only in the daemon control plane (`src/daemon.ts` `state` / `current`).
+
+Rules that keep the expansion additive:
+- Every control verb that acts on a particular capture names its target
+  (session id or harness identity triple); no new verb means "whatever is
+  active". Store-wide or listing verbs (`gc`, a future list-form `status`) are
+  the valid exception and take no single target.
+- No process-wide "current session" outside the daemon control plane.
+- Clients choose a session from `GET /v1/sessions`, never from control `status`.
+- One shared reader for the daemon, never one per capture.
+- Every event and question carries its `session_id`.
+
+Known later work: key the daemon's single slot by session; give `detach` and
+`status` a target and a list; make delete/GC safe while captures run (today they
+require full detachment); share transcript discovery across captures instead of
+one `~/.codex/sessions` scan per capture.
+
+Auto-connect findings (2026-09-27 research, not decisions): split "capture the
+worktree" (needs no harness identity; a workspace-folder watch can trigger it)
+from "bind an agent" (a hook announces its identity; reuse the attach transcript
+verifiers). Binding at the first root tool callback alone would fold the first
+edit into the baseline. Exact harness version pins break silently when Conductor
+updates its bundled binaries (Codex 0.156.1 already falls outside the attach
+allowlist), and Codex hooks load per workspace. Changing Q4 is Brian's decision.
+
 ---
 
 ## Stage 1: Prove byte capture
