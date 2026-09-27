@@ -97,6 +97,17 @@ describe('log-reader', () => {
       } finally { await cur.close(); }
     });
 
+    it('counts a stripped BOM in bytesRead so byte budgets reflect true disk bytes', async () => {
+      const first = line(1); // already newline-terminated
+      const p = await logWith('\uFEFF' + first, line(2));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        const events = await cur.readThrough(2n);
+        const bomBytes = Buffer.byteLength('\uFEFF', 'utf8');
+        assert.equal(events[0]!.bytesRead, Buffer.byteLength(first, 'utf8') + bomBytes);
+      } finally { await cur.close(); }
+    });
+
     it('still rejects a first-record BOM when resuming after a nonzero cursor', async () => {
       const p = await logWith(line(1), '\uFEFF' + line(2));
       const cur = await openLogCursor(p, 1n);

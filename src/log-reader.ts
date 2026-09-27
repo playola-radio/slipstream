@@ -1,7 +1,13 @@
 // src/log-reader.ts
 import { open, type FileHandle } from 'node:fs/promises';
 
-export interface ReaderEvent { seq: bigint; id?: string; source?: string; type: string; raw: string; data: Record<string, unknown> }
+export interface ReaderEvent {
+  seq: bigint; id?: string; source?: string; type: string; raw: string; data: Record<string, unknown>;
+  /** Bytes actually consumed from disk for this record, including its trailing
+   * newline and any stripped BOM — `raw` alone under-counts a BOM'd first line.
+   * Always populated by openLogCursor; optional only for bare parseLine/test use. */
+  bytesRead?: number;
+}
 export class LogCorruptError extends Error {}
 /** Optional bounded scans can stop before materializing an oversized record. */
 export class LogReadLimitError extends Error {}
@@ -28,7 +34,9 @@ export function parseLine(line: string): ReaderEvent {
   if (source !== undefined && typeof source !== 'string') throw new LogCorruptError('bad source');
   if (typeof type !== 'string') throw new LogCorruptError('bad type');
   if (typeof data !== 'object' || data === null) throw new LogCorruptError('bad data');
-  return { seq: BigInt(seq), id, source, type, raw: line, data: data as Record<string, unknown> };
+  // Callers that read from disk (openLogCursor) know the true consumed byte
+  // count — including a stripped BOM — and overwrite this default afterward.
+  return { seq: BigInt(seq), id, source, type, raw: line, bytesRead: Buffer.byteLength(line, 'utf8') + 1, data: data as Record<string, unknown> };
 }
 
 export interface LogCursor {
@@ -105,6 +113,7 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
         catch { throw new LogCorruptError('invalid UTF-8 in log record'); }
         const ev = parseLine(line);
         const lineBytes = slice.length + 1;
+        ev.bytesRead = lineBytes;
         if (!positioned) {
           if (ev.seq <= after) { offset += lineBytes; continue; }
           positioned = true;

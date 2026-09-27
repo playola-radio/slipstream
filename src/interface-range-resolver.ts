@@ -157,7 +157,8 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
       if (batch.length === 0) corrupt(`disk short of durable boundary ${afterSeq}`);
       for (const record of batch) {
         records += 1;
-        bytes += Buffer.byteLength(record.raw, 'utf8') + 1;
+        if (record.bytesRead === undefined) corrupt(`missing bytesRead at ${record.seq}`);
+        bytes += record.bytesRead;
         lastSeq = record.seq;
         consume(record);
       }

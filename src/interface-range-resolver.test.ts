@@ -261,6 +261,30 @@ test('record and byte scan ceilings produce explicit outcomes', async () => {
   });
 });
 
+test('scan.bytes counts a stripped BOM on the first record as bytes actually read', async () => {
+  const events = [event(1, 'session.started'), event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })];
+  await withRawLog(events.map((e) => envelope(e)), async (logPath) => {
+    const exact = events.reduce((total, e) => total + Buffer.byteLength(JSON.stringify(envelope(e))) + 1, 0);
+    const withoutBom = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 2, bytes: exact } }));
+    assert.equal(withoutBom.kind, 'resolved');
+  });
+
+  const root = await mkdtemp(join(tmpdir(), 'slipstream-fd3-bom-'));
+  try {
+    const logPath = join(root, 'events.jsonl');
+    const lines = events.map((e) => JSON.stringify(envelope(e)));
+    await writeFile(logPath, '﻿' + lines[0] + '\n' + lines[1] + '\n');
+    const bomBytes = Buffer.byteLength('﻿', 'utf8');
+    const exact = events.reduce((total, e) => total + Buffer.byteLength(JSON.stringify(envelope(e))) + 1, 0) + bomBytes;
+    // One byte short of the true on-disk total (including the BOM) must still hit the ceiling.
+    const short = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 2, bytes: exact - 1 } }));
+    assert.equal(short.kind, 'scanLimit');
+    const exactPass = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 2, bytes: exact } }));
+    assert.equal(exactPass.kind, 'resolved');
+    if (exactPass.kind === 'resolved') assert.equal(exactPass.scan.bytes, exact);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('cancellation stops a scan and short log is corruption', async () => {
   const events = [event(1, 'session.started'), event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })];
   await withLog(events, async (logPath) => {
