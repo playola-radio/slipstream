@@ -1,0 +1,268 @@
+/** TypeScript/TSX written function headers for interface.v2. No body inference. */
+import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { Language, Parser, type Node } from 'web-tree-sitter';
+import { buildUtf16ToByteTable, utf16RangeToByteRange } from './swift-spans.ts';
+import type { Parameter, StructuredDeclaration, TypeRef } from './interface-v2-comparison.ts';
+
+export type TypeScriptDeclaration = StructuredDeclaration;
+export type TypeScriptExtraction =
+  | { status: 'complete'; declarations: TypeScriptDeclaration[] }
+  | { status: 'incomplete'; reason: 'parse-error' | 'unsupported-construct' };
+
+const require = createRequire(import.meta.url);
+let initialization: Promise<void> | undefined;
+const grammars = new Map<'typescript' | 'tsx', Promise<Language>>();
+const GRAMMAR_SHA256 = {
+  typescript: '8515404dceed38e1ed86aa34b09fcf3379fff1b4ff9dd3967bcd6d1eb5ac3d8f',
+  tsx: '6aa3b2c70e76f5d48eafef1093e9c4de383e13f2fdde2f4e9b98a378f6a8f1b6',
+} as const;
+
+/** A language_version must never silently select different grammar bytes. */
+export function verifyTypeScriptGrammarArtifact(language: 'typescript' | 'tsx',
+  expectedSha: string = GRAMMAR_SHA256[language]): string {
+  const path = require.resolve(`tree-sitter-wasms/out/tree-sitter-${language}.wasm`);
+  const actual = createHash('sha256').update(readFileSync(path)).digest('hex');
+  if (actual !== expectedSha) throw new Error(`${language}.v2 grammar hash mismatch`);
+  return path;
+}
+
+export async function createTypeScriptInterfaceExtractor(language: 'typescript' | 'tsx'):
+  Promise<(bytes: Uint8Array) => TypeScriptExtraction> {
+  let pending = grammars.get(language);
+  if (!pending) {
+    pending = (async () => {
+      initialization ??= Parser.init().catch(error => { initialization = undefined; throw error; });
+      await initialization;
+      return Language.load(verifyTypeScriptGrammarArtifact(language));
+    })().catch(error => { grammars.delete(language); throw error; });
+    grammars.set(language, pending);
+  }
+  const grammar = await pending;
+  return bytes => extract(bytes, grammar);
+}
+
+function child(node: Node, type: string): Node | undefined {
+  return children(node).find(n => n.type === type);
+}
+
+function children(node: Node): Node[] {
+  return node.namedChildren.filter((n): n is Node => n !== null);
+}
+
+function field(node: Node, name: string): Node | undefined {
+  return node.childForFieldName(name) ?? undefined;
+}
+
+/** Join syntax leaves, never characters: literals remain intact and identifiers cannot merge. */
+export function normalizedTokens(node: Node): string {
+  const tokens: string[] = [];
+  const visit = (current: Node): void => {
+    if (current.type === 'comment') return;
+    if (current.childCount === 0) { tokens.push(current.text); return; }
+    for (let i = 0; i < current.childCount; i++) {
+      const next = current.child(i);
+      if (next) visit(next);
+    }
+  };
+  visit(node);
+  let out = '';
+  let previous = '';
+  const mergeable = new Set(['++', '--', '&&', '||', '??', '==', '!=', '>=', '<=',
+    '>>', '<<', '**', '?.', '/*', '//', '..', '=>', '+=', '-=', '*=', '/=',
+    '%=', '&=', '|=', '^=']);
+  for (const token of tokens) {
+    if (!token) continue;
+    const word = (value: string): boolean => /[\p{L}\p{N}_$]$/u.test(value);
+    const startsWord = (value: string): boolean => /^[\p{L}\p{N}_$]/u.test(value);
+    const space = previous === '{' && token !== '}'
+      || token === '}' && previous !== '{'
+      || previous === ',' || previous === ':'
+      || previous === '|' || previous === '&' || previous === '=' || previous === '=>'
+      || token === '|' || token === '&' || token === '=' || token === '=>'
+      || word(previous) && startsWord(token)
+      || mergeable.has(previous.slice(-1) + token[0]);
+    if (space && out && !out.endsWith(' ')) out += ' ';
+    out += token;
+    previous = token;
+  }
+  return out;
+}
+
+function writtenType(annotation: Node | undefined): TypeRef {
+  const type = annotation?.namedChildren[0];
+  return type ? { state: 'written', text: normalizedTokens(type) }
+    : { state: 'unknown', reason: 'inferred-not-computed' };
+}
+
+function parseParameters(params: Node | undefined): Parameter[] | null {
+  if (!params) return null;
+  const result: Parameter[] = [];
+  for (const param of children(params)) {
+    if (param.type !== 'required_parameter' && param.type !== 'optional_parameter') return null;
+    const first = children(param).find(n => n.type !== 'type_annotation' && n.type !== 'accessibility_modifier'
+      && n.type !== 'number' && n.type !== 'string');
+    if (!first) return null;
+    const rest = first.type === 'rest_pattern';
+    const binding = rest ? children(first)[0] : first;
+    if (!binding) return null;
+    const pattern = binding.type === 'object_pattern' || binding.type === 'array_pattern';
+    if (!pattern && binding.type !== 'identifier') return null;
+    const modifiers: string[] = [];
+    for (let i = 0; i < param.childCount; i++) {
+      const token = param.child(i);
+      if (token?.type === 'accessibility_modifier' || token?.type === 'readonly') {
+        modifiers.push(normalizedTokens(token));
+      }
+    }
+    const value = field(param, 'value');
+    result.push({
+      position: result.length, label: null,
+      name: pattern ? normalizedTokens(binding) : binding.text,
+      binding: pattern ? 'pattern' : 'identifier',
+      type: writtenType(field(param, 'type')),
+      optional: param.type === 'optional_parameter', variadic: rest,
+      default: value ? normalizedTokens(value) : null,
+      modifiers,
+    });
+  }
+  return result;
+}
+
+function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclaration['identity']['scope'],
+  wrapperModifiers: string[], table: ReturnType<typeof buildUtf16ToByteTable>,
+  bindingName?: string, bindingType?: Node): StructuredDeclaration | null {
+  const nameNode = field(node, 'name');
+  if (nameNode?.type === 'computed_property_name') return null;
+  const name = bindingName ?? nameNode?.text;
+  if (!name) return null;
+  const constructor = scope.length > 0 && name === 'constructor';
+  const formal = field(node, 'parameters');
+  const single = node.type === 'arrow_function' ? field(node, 'parameter') : undefined;
+  const params = formal ? parseParameters(formal) : single?.type === 'identifier' ? [{
+    position: 0, label: null, name: single.text, binding: 'identifier' as const,
+    type: { state: 'unknown' as const, reason: 'inferred-not-computed' as const },
+    optional: false, variadic: false, default: null, modifiers: [],
+  }] : null;
+  if (!params) return null;
+  let returnType = writtenType(field(node, 'return_type'));
+  if (bindingType) {
+    const functionType = children(bindingType)[0];
+    if (!functionType || functionType.type !== 'function_type') return null;
+    const typeParams = parseParameters(field(functionType, 'parameters'));
+    const typeResult = field(functionType, 'return_type');
+    if (!typeParams || typeParams.length !== params.length || !typeResult) return null;
+    for (let i = 0; i < params.length; i++) {
+      const written = typeParams[i]!.type;
+      if (params[i]!.type.state === 'written' && JSON.stringify(params[i]!.type) !== JSON.stringify(written)) return null;
+      params[i]!.type = written;
+    }
+    const boundResult: TypeRef = { state: 'written', text: normalizedTokens(typeResult) };
+    if (returnType.state === 'written' && JSON.stringify(returnType) !== JSON.stringify(boundResult)) return null;
+    returnType = boundResult;
+  }
+  const modifierNodes: string[] = [];
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (!c || c.startIndex >= (field(node, 'parameters')?.startIndex ?? node.endIndex)) break;
+    if (['async', 'static', 'abstract', 'override', 'readonly', 'accessibility_modifier',
+      'declare', 'default', 'generator', '*', '?'].includes(c.type)) modifierNodes.push(normalizedTokens(c));
+  }
+  const genericNode = child(node, 'type_parameters');
+  const generics = genericNode ? children(genericNode).filter(n => n.type === 'type_parameter').map(normalizedTokens) : [];
+  const kind = constructor ? 'constructor' : scope.length ? 'method' : 'function';
+  return {
+    identity: { kind, scope, name, guards: [] },
+    displayName: scope.length ? `${scope.map(s => s.name).join('.')}.${name}` : name,
+    span: utf16RangeToByteRange(table, spanNode.startIndex,
+      node.type === 'method_signature' && spanNode.nextSibling?.type === ';'
+        ? spanNode.nextSibling.endIndex : spanNode.endIndex),
+    parameters: params,
+    result: constructor ? null : { kind: 'return', type: returnType },
+    throws: { mode: 'notExpressible' },
+    header: { modifiers: [...wrapperModifiers, ...modifierNodes], generic_parameters: generics, constraints: [] },
+    role: node.type.includes('signature') ? 'signature' : 'implementation',
+  };
+}
+
+function extract(bytes: Uint8Array, grammar: Language): TypeScriptExtraction {
+  let source: string;
+  try {
+    source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return { status: 'incomplete', reason: 'parse-error' };
+  }
+  const parser = new Parser();
+  let tree: ReturnType<Parser['parse']> = null;
+  try {
+    parser.setLanguage(grammar);
+    tree = parser.parse(source);
+    if (!tree || tree.rootNode.hasError) return { status: 'incomplete', reason: 'parse-error' };
+    const table = buildUtf16ToByteTable(source);
+    const declarations: TypeScriptDeclaration[] = [];
+    const add = (n: Node, span: Node, scope: StructuredDeclaration['identity']['scope'],
+      mods: string[], binding?: string, bindingType?: Node): boolean => {
+      const parsed = parseDeclaration(n, span, scope, mods, table, binding, bindingType);
+      if (!parsed) return false;
+      declarations.push(parsed);
+      return true;
+    };
+    const scan = (node: Node, span = node, mods: string[] = []): boolean => {
+      if (node.type === 'export_statement') {
+        const inner = children(node).find(n => n.type !== 'comment');
+        const exportModifiers: string[] = [];
+        for (let i = 0; i < node.childCount; i++) {
+          const token = node.child(i);
+          if (token?.type === 'export' || token?.type === 'default') exportModifiers.push(token.text);
+        }
+        return !inner || scan(inner, node, [...exportModifiers, ...mods]);
+      }
+      if (node.type === 'ambient_declaration') {
+        const inner = children(node)[0];
+        return !inner || scan(inner, span, [...mods, 'declare']);
+      }
+      if (['function_declaration', 'function_signature', 'generator_function_declaration'].includes(node.type)) {
+        return add(node, span, [], mods);
+      }
+      if (node.type === 'class_declaration') {
+        const name = field(node, 'name');
+        const body = field(node, 'body');
+        if (!name || !body) return false;
+        const scope = [{ kind: 'class', name: name.text }];
+        for (const member of children(body)) {
+          if (member.type === 'method_definition' || member.type === 'method_signature') {
+            if (member.child(0)?.type === 'get' || member.child(0)?.type === 'set') continue;
+            if (!add(member, member, scope, [])) return false;
+          } else if (member.type === 'public_field_definition'
+            && children(member).some(n => n.type === 'arrow_function' || n.type === 'function_expression')) {
+            return false;
+          }
+        }
+        return true;
+      }
+      if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+        const declarators = children(node).filter(n => n.type === 'variable_declarator');
+        for (const declarator of declarators) {
+          const value = field(declarator, 'value');
+          if (value?.type === 'class' || value?.type === 'class_expression') return false;
+          if (!value || !['arrow_function', 'function_expression', 'generator_function'].includes(value.type)) continue;
+          const name = field(declarator, 'name');
+          if (!name || name.type !== 'identifier' || declarators.length !== 1) return false;
+          const keyword = node.child(0)?.text;
+          if (!add(value, span, [], [...mods, ...(keyword ? [keyword] : [])], name.text,
+            field(declarator, 'type'))) return false;
+        }
+        return true;
+      }
+      return true;
+    };
+    for (const node of children(tree.rootNode)) {
+      if (!scan(node)) return { status: 'incomplete', reason: 'unsupported-construct' };
+    }
+    return { status: 'complete', declarations };
+  } finally {
+    tree?.delete();
+    parser.delete();
+  }
+}
