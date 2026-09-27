@@ -191,6 +191,10 @@ test('constructor parameter properties keep their written modifiers', async () =
   assert.equal(result.status, 'complete');
   if (result.status === 'complete') assert.deepEqual(result.declarations[0]!.parameters[0]!.modifiers,
     ['public', 'readonly']);
+  const override = extract(Buffer.from('class C extends B { constructor(override readonly x: number) { super(); } }'));
+  assert.equal(override.status, 'complete');
+  if (override.status === 'complete') assert.deepEqual(override.declarations[0]!.parameters[0]!.modifiers,
+    ['override', 'readonly']);
 });
 
 test('normalization keeps adjacent operator tokens from merging', async () => {

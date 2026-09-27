@@ -118,6 +118,7 @@ function parseParameters(params: Node | undefined): Parameter[] | null {
   for (const param of children(params)) {
     if (param.type !== 'required_parameter' && param.type !== 'optional_parameter') return null;
     const first = children(param).find(n => n.type !== 'type_annotation' && n.type !== 'accessibility_modifier'
+      && n.type !== 'override_modifier'
       && n.type !== 'number' && n.type !== 'string');
     if (!first) return null;
     const rest = first.type === 'rest_pattern';
@@ -128,7 +129,8 @@ function parseParameters(params: Node | undefined): Parameter[] | null {
     const modifiers: string[] = [];
     for (let i = 0; i < param.childCount; i++) {
       const token = param.child(i);
-      if (token?.type === 'accessibility_modifier' || token?.type === 'readonly') {
+      if (token?.type === 'accessibility_modifier' || token?.type === 'readonly'
+        || token?.type === 'override_modifier') {
         modifiers.push(normalizedTokens(token));
       }
     }

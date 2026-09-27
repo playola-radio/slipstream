@@ -41,9 +41,10 @@ The extractor excludes anonymous callbacks, local/nested functions, accessors,
 interface method signatures, object-literal methods, generated declarations,
 decorators as a source of function input/output changes, and function values
 hidden behind calls such as `memo(...)`. It never infers types from bodies or
-follows shared types. Namespace/module members and values wrapped in casts,
-`satisfies`, or parentheses are currently `unsupported-construct` when they
-contain eligible functions. A direct class-expression binding,
+follows shared types. Any namespace, module, or `declare global` block is
+currently `unsupported-construct`. Values wrapped in casts, `satisfies`, or
+parentheses are `unsupported-construct` when they contain eligible functions.
+A direct class-expression binding,
 computed method name, class-field function, opaque function-type alias on a
 function binding, `this` parameter, decorated parameter, or eligible syntax this module cannot represent is
 `unsupported-construct` for the entire file. This is a syntax-only subset, not
