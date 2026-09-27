@@ -1,0 +1,261 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { resolveRecordedRange } from './interface-range-resolver.ts';
+import type { RangeFile } from './interface-range-resolver.ts';
+import { parseRequest } from '../tools/interface-v2-contract.ts';
+
+const casesDir = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
+const sessionId = '11111111-1111-4111-8111-111111111111';
+type Event = { seq: string; type: string; data: Record<string, unknown> };
+
+async function withLog(events: Event[], run: (logPath: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'slipstream-fd3-'));
+  try {
+    const logPath = join(root, 'events.jsonl');
+    await writeFile(logPath, events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+    await run(logPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function event(seq: number, type: string, data: Record<string, unknown> = {}): Event {
+  return { seq: String(seq), type: `slipstream.${type}.v1`, data: { session_id: sessionId, ...data } };
+}
+
+const content = (sha256: string, size = 1) => ({ kind: 'content', sha256: sha256.repeat(64), size });
+const absent = { kind: 'absent' };
+
+function options(logPath: string, beforeSeq: bigint, afterSeq: bigint, extra = {}) {
+  return { logPath, sessionId, durableSeq: afterSeq, beforeSeq, afterSeq,
+    scanBudget: { records: 100_000, bytes: 16 * 1024 * 1024 }, ...extra };
+}
+
+test('records both endpoint identities and retains equal candidates for later blob checks', async () => {
+  const events = [
+    event(1, 'session.started'),
+    event(2, 'file.baselined', { path: 'src/f.ts', snapshot: content('a') }),
+    event(3, 'capture.baseline.completed', { unknown_scopes: [] }),
+    event(4, 'file.changed', { path: 'src/f.ts', before: content('a'), after: content('b'), observation: 'watcher' }),
+    event(5, 'file.changed', { path: 'src/f.ts', before: content('b'), after: content('a'), observation: 'watcher' }),
+  ];
+  await withLog(events, async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 3n, 5n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.files, [{
+      path: 'src/f.ts', endpointsEqual: true,
+      before: { kind: 'recorded', record_seq: '2', field: 'snapshot', snapshot: content('a') },
+      after: { kind: 'recorded', record_seq: '5', field: 'after', snapshot: content('a'), observation: 'watcher' },
+    }]);
+    assert.deepEqual(result.inventory, { scope: 'observed', baselineCompletedSeq: '3', unknownScopes: [],
+      policyExclusions: ['store-directory', '.git', 'symlinks'] });
+    assert.deepEqual(result.gaps, []);
+  });
+});
+
+test('a first change supplies before only after completed baseline, with later provenance', async () => {
+  const events = [event(1, 'session.started'), event(2, 'capture.baseline.completed', { unknown_scopes: [] }),
+    event(3, 'file.changed', { path: 'src/new.ts', before: absent, after: content('a'), observation: 'watcher' })];
+  await withLog(events, async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 2n, 3n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.files[0]?.before, { kind: 'recorded', record_seq: '3', field: 'before', snapshot: absent, observation: 'watcher' });
+    const zero = await resolveRecordedRange(options(logPath, 0n, 3n));
+    assert.equal(zero.kind, 'resolved');
+    if (zero.kind === 'resolved') assert.deepEqual(zero.files[0]?.before, { kind: 'unknownBoundary' });
+  });
+});
+
+test('an unavailable observation remains the endpoint and never equals another unavailable', async () => {
+  const unavailable = { kind: 'unavailable', reason: 'oversize' };
+  const events = [event(1, 'session.started'), event(2, 'file.baselined', { path: 'f.ts', snapshot: content('a') }),
+    event(3, 'capture.baseline.completed', { unknown_scopes: [] }),
+    event(4, 'file.changed', { path: 'f.ts', before: content('a'), after: unavailable, observation: 'watcher' }),
+    event(5, 'file.changed', { path: 'f.ts', before: unavailable, after: unavailable, observation: 'watcher' })];
+  await withLog(events, async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 4n, 5n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') {
+      assert.deepEqual(result.files[0]?.before, { kind: 'recorded', record_seq: '4', field: 'after', snapshot: unavailable, observation: 'watcher' });
+      assert.equal(result.files[0]?.endpointsEqual, false);
+    }
+  });
+});
+
+test('all 62 successful fixture histories replay through the production resolver', async () => {
+  const names = (await import('node:fs/promises')).readdir(casesDir);
+  for (const name of (await names).sort()) {
+    const dir = join(casesDir, name);
+    let expectedText: string;
+    try { expectedText = await readFile(join(dir, 'expected.json'), 'utf8'); }
+    catch { continue; }
+    const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf8')) as {
+      session_id: string; durable_seq: string; events: Event[]; blobs: Record<string, string>;
+      harness?: { limits?: { metadata_bytes?: number } };
+    };
+    const expected = JSON.parse(expectedText) as {
+      files: Array<{ path: string; before: unknown; after: unknown }>;
+      inventory: { baseline_completed_seq: string | null; unknown_scopes: string[] };
+      gaps: unknown[];
+    };
+    const request = parseRequest(await readFile(join(dir, 'request.txt'), 'utf8'));
+    assert.notEqual(typeof request, 'string', name);
+    if (typeof request === 'string') continue;
+    await withLog(history.events, async (logPath) => {
+      const root = join(logPath, '..');
+      for (const [hash, bytes] of Object.entries(history.blobs)) {
+        const path = join(root, 'blobs', 'sha256', hash.slice(0, 2), hash);
+        await mkdir(join(root, 'blobs', 'sha256', hash.slice(0, 2)), { recursive: true });
+        await writeFile(path, bytes);
+      }
+      const result = await resolveRecordedRange(options(logPath, request.before, request.after, {
+        durableSeq: BigInt(history.durable_seq), pathPrefix: request.pathPrefix, afterPath: request.afterPath,
+      }));
+      assert.equal(result.kind, 'resolved', name);
+      if (result.kind !== 'resolved') return;
+      assert.equal(result.inventory.baselineCompletedSeq, expected.inventory.baseline_completed_seq, name);
+      if (history.harness?.limits?.metadata_bytes !== 0) {
+        assert.deepEqual(result.inventory.unknownScopes, expected.inventory.unknown_scopes, name);
+        assert.deepEqual(result.gaps, expected.gaps, `${name}: gaps`);
+      }
+      for (const file of expected.files) {
+        const actual: RangeFile | undefined = result.files.find((candidate: RangeFile) => candidate.path === file.path);
+        assert.ok(actual, `${name}: missing ${file.path}`);
+        assert.deepEqual(actual.before, file.before, `${name}: before ${file.path}`);
+        assert.deepEqual(actual.after, file.after, `${name}: after ${file.path}`);
+      }
+    });
+  }
+});
+
+test('a contradictory predecessor anywhere through A is corruption, even outside the filter', async () => {
+  const events = [event(1, 'session.started'),
+    event(2, 'file.baselined', { path: 'hidden.ts', snapshot: content('a') }),
+    event(3, 'capture.baseline.completed', { unknown_scopes: [] }),
+    event(4, 'file.changed', { path: 'hidden.ts', before: content('a', 2), after: content('b'), observation: 'watcher' })];
+  await withLog(events, async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 3n, 4n, { pathPrefix: 'visible/' })), /contradictory predecessor/);
+    const valid = await resolveRecordedRange(options(logPath, 2n, 3n));
+    assert.equal(valid.kind, 'resolved');
+  });
+});
+
+test('the first post-B baseline cannot establish a prior absence', async () => {
+  const events = [event(1, 'session.started'), event(2, 'capture.baseline.completed', { unknown_scopes: [] }),
+    event(3, 'file.baselined', { path: 'src/later.ts', snapshot: content('a') })];
+  await withLog(events, async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 2n, 3n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') assert.deepEqual(result.files[0]?.before, { kind: 'unknownBoundary' });
+  });
+});
+
+test('filters use exact prefix, exclusive cursor and UTF-16 order', async () => {
+  const events = [event(1, 'session.started'),
+    event(2, 'file.baselined', { path: 'src/\uE000.ts', snapshot: absent }),
+    event(3, 'file.baselined', { path: 'src/😀.ts', snapshot: absent }),
+    event(4, 'file.baselined', { path: 'other/a.ts', snapshot: absent })];
+  await withLog(events, async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 4n, { pathPrefix: 'src/' }));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') assert.deepEqual(result.files.map((f) => f.path), ['src/😀.ts', 'src/\uE000.ts']);
+    const page = await resolveRecordedRange(options(logPath, 0n, 4n, { pathPrefix: 'src/', afterPath: 'src/😀.ts' }));
+    assert.equal(page.kind, 'resolved');
+    if (page.kind === 'resolved') assert.deepEqual(page.files.map((f) => f.path), ['src/\uE000.ts']);
+  });
+});
+
+test('the durable high-water is caller supplied and arbitrary-size bigint', async () => {
+  await withLog([event(1, 'session.started')], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 18_446_744_073_709_551_616n, { durableSeq: 1n }));
+    assert.deepEqual(result, { kind: 'beyondDurable' });
+  });
+});
+
+test('A=0 resolves the empty recorded prefix even when no log file exists', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slipstream-fd3-empty-'));
+  try {
+    const result = await resolveRecordedRange(options(join(root, 'missing.jsonl'), 0n, 0n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') {
+      assert.deepEqual(result.files, []);
+      assert.deepEqual(result.gaps, []);
+      assert.deepEqual(result.inventory, { scope: 'observed', baselineCompletedSeq: null, unknownScopes: [],
+        policyExclusions: ['store-directory', '.git', 'symlinks'] });
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('record and byte scan ceilings produce explicit outcomes', async () => {
+  const events = [event(1, 'session.started'), event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })];
+  await withLog(events, async (logPath) => {
+    const count = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 1, bytes: 10000 } }));
+    assert.equal(count.kind, 'scanLimit');
+    const bytes = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 10, bytes: 0 } }));
+    assert.equal(bytes.kind, 'scanLimit');
+    const exact = events.reduce((total, e) => total + Buffer.byteLength(JSON.stringify(e)) + 1, 0);
+    const pass = await resolveRecordedRange(options(logPath, 0n, 2n, { scanBudget: { records: 2, bytes: exact } }));
+    assert.equal(pass.kind, 'resolved');
+  });
+});
+
+test('cancellation stops a scan and short log is corruption', async () => {
+  const events = [event(1, 'session.started'), event(2, 'file.baselined', { path: 'f.ts', snapshot: absent })];
+  await withLog(events, async (logPath) => {
+    const controller = new AbortController();
+    controller.abort();
+    const aborted = await resolveRecordedRange(options(logPath, 0n, 2n, { signal: controller.signal }));
+    assert.equal(aborted.kind, 'aborted');
+    let reads = 0;
+    const changingSignal = { get aborted() { return ++reads > 2; } } as AbortSignal;
+    const during = await resolveRecordedRange(options(logPath, 0n, 2n, { signal: changingSignal }));
+    assert.equal(during.kind, 'aborted');
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 3n)), /disk short/);
+  });
+});
+
+test('malformed snapshots and unknown scopes are corrupt, not coverage guesses', async () => {
+  await withLog([event(1, 'session.started'), event(2, 'file.baselined', {
+    path: 'f.ts', snapshot: { kind: 'content', sha256: 'a'.repeat(64) },
+  })], async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad snapshot/);
+  });
+  await withLog([event(1, 'session.started'), event(2, 'capture.baseline.completed', {
+    unknown_scopes: ['../outside'],
+  })], async (logPath) => {
+    await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad unknown scopes/);
+  });
+});
+
+test('forward-compatible extra event fields do not invalidate a recorded snapshot', async () => {
+  await withLog([event(1, 'session.started'), event(2, 'file.baselined', {
+    path: 'f.ts', snapshot: { kind: 'content', sha256: 'a'.repeat(64), size: 1, future: 'data' },
+  })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 2n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') {
+      assert.deepEqual(result.files[0]?.after.snapshot, content('a'));
+    }
+  });
+});
+
+test('the corrupt-chain fixture throws and the durable-ahead fixture returns 409 input', async () => {
+  for (const name of ['range-corrupt-chain-500', 'range-durable-ahead-409']) {
+    const dir = join(casesDir, name);
+    const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf8')) as { events: Event[]; durable_seq: string };
+    const request = parseRequest(await readFile(join(dir, 'request.txt'), 'utf8'));
+    assert.notEqual(typeof request, 'string');
+    if (typeof request === 'string') continue;
+    await withLog(history.events, async (logPath) => {
+      const call = resolveRecordedRange(options(logPath, request.before, request.after, { durableSeq: BigInt(history.durable_seq) }));
+      if (name === 'range-corrupt-chain-500') await assert.rejects(call, /contradictory predecessor/);
+      else assert.deepEqual(await call, { kind: 'beyondDurable' });
+    });
+  }
+});

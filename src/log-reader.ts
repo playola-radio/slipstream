@@ -3,6 +3,9 @@ import { open, type FileHandle } from 'node:fs/promises';
 
 export interface ReaderEvent { seq: bigint; type: string; raw: string; data: Record<string, unknown> }
 export class LogCorruptError extends Error {}
+/** Optional bounded scans can stop before materializing an oversized record. */
+export class LogReadLimitError extends Error {}
+export class LogReadAbortedError extends Error {}
 
 const CURSOR_RE = /^(0|[1-9][0-9]*)$/;
 const SEQ_RE = /^[1-9][0-9]*$/;
@@ -27,7 +30,7 @@ export function parseLine(line: string): ReaderEvent {
 }
 
 export interface LogCursor {
-  readThrough(boundary: bigint): Promise<ReaderEvent[]>;
+  readThrough(boundary: bigint, limits?: { maxRecords?: number; maxBytes?: number; signal?: AbortSignal }): Promise<ReaderEvent[]>;
   close(): Promise<void>;
 }
 
@@ -46,12 +49,15 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
   let windowStart = 0;
   const decoder = new TextDecoder('utf-8', { fatal: true });
 
-  async function nextLine(): Promise<Buffer | null> {
+  async function nextLine(maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
     let pos = offset;
     const pieces: Buffer[] = [];
+    let lineBytes = 0;
     for (;;) {
+      if (signal?.aborted) throw new LogReadAbortedError('log read aborted');
+      if (lineBytes >= maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
       if (pos < windowStart || pos >= windowStart + window.length) {
-        const buffer = Buffer.allocUnsafe(READ_BYTES);
+        const buffer = Buffer.allocUnsafe(Math.min(READ_BYTES, maxBytes - lineBytes + 1));
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, pos);
         window = buffer.subarray(0, bytesRead);
         windowStart = pos;
@@ -60,20 +66,24 @@ export async function openLogCursor(logPath: string, after: bigint): Promise<Log
       const start = pos - windowStart;
       const nl = window.indexOf(0x0a, start);
       if (nl >= 0) {
+        if (lineBytes + nl - start + 1 > maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
         pieces.push(window.subarray(start, nl));
         return Buffer.concat(pieces);
       }
+      lineBytes += window.length - start;
+      if (lineBytes >= maxBytes) throw new LogReadLimitError('log record exceeds scan byte budget');
       pieces.push(window.subarray(start));
       pos = windowStart + window.length;
     }
   }
 
   return {
-    async readThrough(boundary: bigint): Promise<ReaderEvent[]> {
+    async readThrough(boundary: bigint, limits = {}): Promise<ReaderEvent[]> {
       const out: ReaderEvent[] = [];
       let bytes = 0;
-      while (lastSeq < boundary && out.length < LOG_BATCH_RECORDS && bytes < BATCH_BYTES) {
-        const slice = await nextLine();
+      while (lastSeq < boundary && out.length < Math.min(LOG_BATCH_RECORDS, limits.maxRecords ?? LOG_BATCH_RECORDS)
+        && bytes < BATCH_BYTES && bytes < (limits.maxBytes ?? Infinity)) {
+        const slice = await nextLine((limits.maxBytes ?? Infinity) - bytes, limits.signal);
         if (slice === null) break;
         let line: string;
         try { line = decoder.decode(slice); }

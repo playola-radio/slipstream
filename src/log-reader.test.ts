@@ -5,7 +5,7 @@ import { mkdtemp, writeFile, appendFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseCursor, parseLine, openLogCursor, LogCorruptError } from './log-reader.ts';
+import { parseCursor, parseLine, openLogCursor, LogCorruptError, LogReadLimitError, LogReadAbortedError } from './log-reader.ts';
 
 const line = (seq: number, type = 'slipstream.file.changed.v1', extra = {}) =>
   JSON.stringify({ specversion: '1.0', id: String(seq), source: 'urn:slipstream:session:x',
@@ -58,6 +58,25 @@ describe('log-reader', () => {
       assert.deepEqual((await cur.readThrough(1n)).map((e) => e.seq), [1n]);
       assert.deepEqual((await cur.readThrough(3n)).map((e) => e.seq), [2n, 3n]);
       await cur.close();
+    });
+
+    it('enforces an exact per-call record and UTF-8 byte budget before completing an oversized line', async () => {
+      const first = line(1);
+      const p = await logWith(first, line(2, undefined, { pad: 'x'.repeat(200_000) }));
+      const cur = await openLogCursor(p, 0n);
+      try {
+        assert.deepEqual((await cur.readThrough(2n, { maxRecords: 1 })).map((e) => e.seq), [1n]);
+        await assert.rejects(cur.readThrough(2n, { maxBytes: 1024 }), LogReadLimitError);
+      } finally { await cur.close(); }
+    });
+
+    it('stops a bounded read when its signal is aborted', async () => {
+      const p = await logWith(line(1));
+      const cur = await openLogCursor(p, 0n);
+      const controller = new AbortController();
+      controller.abort();
+      try { await assert.rejects(cur.readThrough(1n, { signal: controller.signal }), LogReadAbortedError); }
+      finally { await cur.close(); }
     });
 
     it('round-trips a multibyte char whose bytes straddle a 64KB chunk boundary', async () => {
