@@ -1,15 +1,30 @@
 {
   "session_id": "11111111-1111-4111-8111-111111111111",
-  "durable_seq": "20",
+  "durable_seq": "3",
   "events": [
     {
       "specversion": "1.0",
-      "id": "10",
+      "id": "1",
+      "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
+      "type": "slipstream.session.started.v1",
+      "datacontenttype": "application/json",
+      "seq": "1",
+      "time": "2026-09-21T14:13:20.001Z",
+      "data": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "root": "/fixture/worktree",
+        "max_bytes": 1048576,
+        "started_at_ms": 1790000000001
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "2",
       "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
       "type": "slipstream.capture.baseline.completed.v1",
       "datacontenttype": "application/json",
-      "seq": "10",
-      "time": "2026-09-21T14:13:20.010Z",
+      "seq": "2",
+      "time": "2026-09-21T14:13:20.002Z",
       "data": {
         "session_id": "11111111-1111-4111-8111-111111111111",
         "unknown_scopes": []
@@ -17,12 +32,12 @@
     },
     {
       "specversion": "1.0",
-      "id": "20",
+      "id": "3",
       "source": "urn:slipstream:session:11111111-1111-4111-8111-111111111111",
       "type": "slipstream.file.changed.v1",
       "datacontenttype": "application/json",
-      "seq": "20",
-      "time": "2026-09-21T14:13:20.020Z",
+      "seq": "3",
+      "time": "2026-09-21T14:13:20.003Z",
       "data": {
         "session_id": "11111111-1111-4111-8111-111111111111",
         "path": "Sources/App/F.swift",
@@ -35,7 +50,7 @@
           "size": 12
         },
         "observation": "watcher",
-        "observed_at_ms": 1790000000020
+        "observed_at_ms": 1790000000003
       }
     }
   ],

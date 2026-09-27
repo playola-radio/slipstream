@@ -1,11 +1,11 @@
 {
   "projection_version": "interface.v2",
   "session_id": "11111111-1111-4111-8111-111111111111",
-  "range": { "before_seq": "10", "after_seq": "20" },
+  "range": { "before_seq": "4", "after_seq": "5" },
   "status": "ready",
   "inventory": {
     "scope": "observed",
-    "baseline_completed_seq": "10",
+    "baseline_completed_seq": "4",
     "unknown_scopes": [],
     "unknown_scopes_complete": false,
     "policy_exclusions": ["store-directory", ".git", "symlinks"]
@@ -15,9 +15,9 @@
   "files": [
     {
       "path": "src/f.ts",
-      "before": { "kind": "recorded", "record_seq": "4", "field": "snapshot",
+      "before": { "kind": "recorded", "record_seq": "2", "field": "snapshot",
         "snapshot": { "kind": "content", "sha256": "86e1381da984ad21459e1e796d08963d95ee1ef6eca5987ecf6fa1fef5d64e46", "size": 31 } },
-      "after": { "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+      "after": { "kind": "recorded", "record_seq": "5", "field": "after", "observation": "watcher",
         "snapshot": { "kind": "content", "sha256": "a0f5933b9b22cb5a09402ec1d063c10504d634ea717c939360f5fde690a4be6d", "size": 31 } },
       "language": "typescript",
       "language_version": "typescript.v2",

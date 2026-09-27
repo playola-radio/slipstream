@@ -1,11 +1,11 @@
 {
   "projection_version": "interface.v2",
   "session_id": "11111111-1111-4111-8111-111111111111",
-  "range": { "before_seq": "10", "after_seq": "20" },
+  "range": { "before_seq": "4", "after_seq": "5" },
   "status": "ready",
   "inventory": {
     "scope": "observed",
-    "baseline_completed_seq": "10",
+    "baseline_completed_seq": "4",
     "unknown_scopes": [],
     "unknown_scopes_complete": true,
     "policy_exclusions": ["store-directory", ".git", "symlinks"]
@@ -17,11 +17,11 @@
     {
       "path": "Sources/App/Access.swift",
       "before": {
-        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "kind": "recorded", "record_seq": "2", "field": "snapshot",
         "snapshot": { "kind": "content", "sha256": "6c94200b7b3fb9a83b6c804dac301b390917024e0f49572240f578e26f415146", "size": 46 }
       },
       "after": {
-        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "kind": "recorded", "record_seq": "2", "field": "snapshot",
         "snapshot": { "kind": "content", "sha256": "6c94200b7b3fb9a83b6c804dac301b390917024e0f49572240f578e26f415146", "size": 46 }
       },
       "language": "swift",
@@ -33,11 +33,11 @@
     {
       "path": "Sources/App/User.swift",
       "before": {
-        "kind": "recorded", "record_seq": "5", "field": "snapshot",
+        "kind": "recorded", "record_seq": "3", "field": "snapshot",
         "snapshot": { "kind": "content", "sha256": "957a9c837e856ceaee0b043335953965edc4b0130a4f0f05c48ccf18c4f24f66", "size": 37 }
       },
       "after": {
-        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "kind": "recorded", "record_seq": "5", "field": "after", "observation": "watcher",
         "snapshot": { "kind": "content", "sha256": "03e8b7cadf45b5c440e5b78f53ba2b22883f6230ea554a6a599f5a13acd849e4", "size": 46 }
       },
       "language": "swift",

@@ -1,4 +1,4 @@
 {
   "http_status": 409,
-  "headers": { "slipstream-durable-seq": "20" }
+  "headers": { "slipstream-durable-seq": "4" }
 }

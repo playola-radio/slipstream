@@ -3,9 +3,11 @@
  * `interface.v2` fixtures under contracts/interface/v2/cases/ (FUNCTION-CHANGES.md
  * §5.3). It proves shape and internal consistency, never extractor correctness:
  * every expected envelope validates against the schema, obeys the cross-field
- * invariants src/schema.ts cannot express, and agrees with its recorded history
- * (endpoint provenance, hashes, sizes, UTF-8 span boundaries). FD1–FD3 prove
- * correctness by reproducing the same cases.
+ * invariants src/schema.ts cannot express, and agrees with everything derivable
+ * from its recorded history: endpoints, status precedence, page membership,
+ * harness conditions, hashes, sizes and UTF-8 span boundaries. Only extraction
+ * outcomes (rows, parse results) are taken on trust; FD1–FD3 prove those by
+ * reproducing the same cases.
  *
  * A case directory holds `history.json`, `request.txt`, and exactly one of
  * `expected.json` (a 200 body) or `expected-error.json` (`{http_status, headers?}`).
@@ -27,14 +29,17 @@ const CUTOFF = /^(0|[1-9][0-9]*)$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_LIMIT = 16;
 const REQUEST_PARAMS = ['before_seq', 'after_seq', 'limit', 'path_prefix', 'after_path', 'include_identical'];
-const ERROR_STATUSES = [400, 401, 404, 409, 410, 500];
+const ERROR_STATUSES = [400, 409, 500];
+const POLICY_EXCLUSIONS = ['store-directory', '.git', 'symlinks'];
+const BASELINED = 'slipstream.file.baselined.v1';
+const CHANGED = 'slipstream.file.changed.v1';
+const COMPLETED = 'slipstream.capture.baseline.completed.v1';
 const ROW_KIND_ORDER = ['removed', 'signatureChanged', 'added'];
 const INCOMPLETE_REASONS = [
   'before-parse-error', 'before-unsupported-construct',
   'after-parse-error', 'after-unsupported-construct',
   'duplicate-declaration', 'ambiguous-correspondence',
 ];
-const SKIPPED_FILE_REASONS = ['too-large', 'timeout', 'cancelled'];
 
 type Obj = Record<string, unknown>;
 
@@ -60,9 +65,23 @@ interface History {
   sessionId: string;
   durableSeq: bigint;
   events: Obj[];
-  bySeq: Map<string, Obj>;
   blobs: Map<string, Uint8Array>;
   missing: Set<string>;
+  /** The first `file.changed` whose `before` contradicts its path's recorded predecessor. */
+  chainBreak: bigint | null;
+  harness: Harness;
+}
+
+interface Harness {
+  admissionOverloaded: boolean;
+  interrupt: { atPath: string; reason: string } | null;
+  noFileResultBudget: boolean;
+  noMetadataBudget: boolean;
+}
+
+interface Endpoints {
+  before: Obj;
+  after: Obj;
 }
 
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -78,17 +97,9 @@ export function parseRequest(text: string): Request | string {
   const match = /^GET \/v1\/sessions\/([^/?\s]+)\/interfaces\?(\S*)$/.exec(line);
   if (!match) return 'not a single GET /v1/sessions/:session_id/interfaces line';
   const [, rawSession = '', query = ''] = match;
+  // Decoded exactly as the reader's other routes decode (URLSearchParams: '+' is a space).
   const params = new Map<string, string>();
-  for (const pair of query.split('&')) {
-    const eq = pair.indexOf('=');
-    if (eq <= 0) return `malformed parameter '${pair}'`;
-    const key = pair.slice(0, eq);
-    let value: string;
-    try {
-      value = decodeURIComponent(pair.slice(eq + 1));
-    } catch {
-      return `undecodable value for '${key}'`;
-    }
+  for (const [key, value] of new URLSearchParams(query)) {
     if (!REQUEST_PARAMS.includes(key)) return `unknown parameter '${key}'`;
     if (params.has(key)) return `duplicate parameter '${key}'`;
     params.set(key, value);
@@ -106,8 +117,14 @@ export function parseRequest(text: string): Request | string {
   }
   const identical = params.get('include_identical');
   if (identical !== undefined && identical !== 'true') return "include_identical must be 'true' when present";
+  let sessionId: string;
+  try {
+    sessionId = decodeURIComponent(rawSession);
+  } catch {
+    return 'undecodable session id';
+  }
   return {
-    sessionId: decodeURIComponent(rawSession),
+    sessionId,
     before: BigInt(before),
     after: BigInt(after),
     limit: Number(limitText),
@@ -121,8 +138,8 @@ const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes)
 
 function snapshotsOf(event: Obj): Obj[] {
   const data = event.data as Obj;
-  if (event.type === 'slipstream.file.baselined.v1') return [data.snapshot as Obj];
-  if (event.type === 'slipstream.file.changed.v1') return [data.before as Obj, data.after as Obj];
+  if (event.type === BASELINED) return [data.snapshot as Obj];
+  if (event.type === CHANGED) return [data.before as Obj, data.after as Obj];
   return [];
 }
 
@@ -148,11 +165,13 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
     sessionId,
     durableSeq: BigInt(raw.durable_seq as string),
     events: [],
-    bySeq: new Map(),
     blobs: new Map(),
     missing: new Set(missingList as string[]),
+    chainBreak: null,
+    harness: checkHarness(raw.harness, errors),
   };
 
+  // A replayable session log: session.started first, seqs contiguous from 1.
   let previous = 0n;
   events.forEach((event, i) => {
     const where = `history.events[${i}]`;
@@ -163,15 +182,26 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
     for (const e of validate(schemas.get(event.type)!, event)) errors.push(`${where}: ${e}`);
     if (typeof event.seq !== 'string' || !SEQ.test(event.seq)) return;
     const seq = BigInt(event.seq);
-    if (seq <= previous) errors.push(`${where}: seq ${event.seq} is not strictly increasing`);
+    if (seq !== previous + 1n) errors.push(`${where}: seq ${event.seq} is not contiguous (expected ${previous + 1n})`);
+    if ((i === 0) !== (event.type === 'slipstream.session.started.v1')) errors.push(`${where}: session.started must be the first record, and only the first`);
     previous = seq;
     if (event.id !== event.seq) errors.push(`${where}: id must equal seq`);
     if (event.source !== `${SOURCE_PREFIX}${sessionId}`) errors.push(`${where}: source does not name the history session`);
     if (!isObj(event.data) || event.data.session_id !== sessionId) errors.push(`${where}: data.session_id does not match the history session`);
     history.events.push(event);
-    history.bySeq.set(event.seq, event);
   });
-  if (previous > history.durableSeq) errors.push('history.durable_seq: is below the last event seq');
+  if (previous !== history.durableSeq) errors.push('history.durable_seq: must be the last event seq');
+  if (errors.length > 0) return null;
+
+  const state = new Map<string, unknown>();
+  for (const event of history.events) {
+    const data = event.data as Obj;
+    if (event.type === CHANGED && state.has(data.path as string) && !isDeepStrictEqual(state.get(data.path as string), data.before)) {
+      history.chainBreak ??= BigInt(event.seq as string);
+    }
+    if (event.type === BASELINED) state.set(data.path as string, data.snapshot);
+    if (event.type === CHANGED) state.set(data.path as string, data.after);
+  }
 
   const referenced = new Set<string>();
   for (const [key, text] of Object.entries(raw.blobs as Obj)) {
@@ -201,53 +231,49 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
   for (const key of [...history.blobs.keys(), ...history.missing]) {
     if (!referenced.has(key)) errors.push(`history: blob ${key} is not referenced by any event`);
   }
-  checkHarness(raw.harness, errors);
   return history;
 }
 
-/** Test-only execution conditions a static history cannot express. */
-function checkHarness(raw: unknown, errors: string[]): void {
-  if (raw === undefined) return;
+/** Test-only execution conditions a static history cannot express. A zero
+ * budget is the only limit value, because it is the only one whose outcome is
+ * derivable without serializing the response. */
+function checkHarness(raw: unknown, errors: string[]): Harness {
+  const harness: Harness = { admissionOverloaded: false, interrupt: null, noFileResultBudget: false, noMetadataBudget: false };
+  if (raw === undefined) return harness;
   if (!isObj(raw)) {
     errors.push('history.harness: must be an object');
-    return;
+    return harness;
   }
   extraKeys(raw, ['admission', 'interrupt', 'limits'], 'history.harness', errors);
-  if (raw.admission !== undefined && raw.admission !== 'overloaded') errors.push("history.harness.admission: must be 'overloaded'");
+  if (raw.admission !== undefined) {
+    if (raw.admission !== 'overloaded') errors.push("history.harness.admission: must be 'overloaded'");
+    harness.admissionOverloaded = true;
+  }
   if (raw.interrupt !== undefined) {
     const i = raw.interrupt;
     if (!isObj(i) || typeof i.at_path !== 'string' || !['timeout', 'cancelled'].includes(i.reason as string)) {
       errors.push("history.harness.interrupt: must be {at_path, reason: 'timeout' | 'cancelled'}");
     } else {
       extraKeys(i, ['at_path', 'reason'], 'history.harness.interrupt', errors);
+      harness.interrupt = { atPath: i.at_path, reason: i.reason as string };
     }
   }
   if (raw.limits !== undefined) {
     const l = raw.limits;
     if (!isObj(l)) {
       errors.push('history.harness.limits: must be an object');
-      return;
+      return harness;
     }
-    extraKeys(l, ['response_bytes', 'metadata_bytes'], 'history.harness.limits', errors);
-    for (const [key, value] of Object.entries(l)) {
-      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-        errors.push(`history.harness.limits.${key}: must be a non-negative integer`);
-      }
-    }
+    extraKeys(l, ['file_result_bytes', 'metadata_bytes'], 'history.harness.limits', errors);
+    for (const [key, value] of Object.entries(l)) if (value !== 0) errors.push(`history.harness.limits.${key}: must be 0`);
+    harness.noFileResultBudget = l.file_result_bytes !== undefined;
+    harness.noMetadataBudget = l.metadata_bytes !== undefined;
   }
+  return harness;
 }
 
-/** Whitespace-insensitive equality: `op: equal` compares token sequences, and
- * the display text may differ only in whitespace. */
-function sameTokens(a: unknown, b: unknown): boolean {
-  const strip = (v: unknown): unknown =>
-    typeof v === 'string' ? v.replace(/\s+/g, '')
-      : Array.isArray(v) ? v.map(strip)
-      : isObj(v) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, strip(x)]))
-      : v;
-  return isDeepStrictEqual(strip(a), strip(b));
-}
-
+/** Component texts are the extractor's normalized token text, so `equal` means
+ * the sides are identical, never "identical after stripping whitespace". */
 function checkDelta(delta: Obj, where: string, errors: string[]): void {
   const { op, before, after } = delta;
   if (op === 'added' && (before !== null || after === null)) errors.push(`${where}: added needs before null and after present`);
@@ -257,7 +283,7 @@ function checkDelta(delta: Obj, where: string, errors: string[]): void {
       errors.push(`${where}: ${op as string} needs both sides`);
       return;
     }
-    const same = sameTokens(before, after);
+    const same = isDeepStrictEqual(before, after);
     if (op === 'equal' && !same) errors.push(`${where}: equal but the sides differ`);
     if (op === 'changed' && same) errors.push(`${where}: changed but the sides are equal`);
   }
@@ -317,7 +343,32 @@ function checkParameters(rows: Obj[], where: string, errors: string[]): void {
   }
 }
 
-function checkChange(change: Obj, blobs: { before?: Uint8Array; after?: Uint8Array }, where: string, errors: string[]): void {
+/** Language facts §4.5 fixes regardless of extraction: which declaration kinds
+ * exist, when the result slot is null, and which throws modes are expressible. */
+function checkLanguageRules(change: Obj, language: string, where: string, errors: string[]): void {
+  if (language !== 'typescript' && language !== 'swift') {
+    errors.push(`${where}: no change rows are defined for language '${language}'`);
+    return;
+  }
+  const ts = language === 'typescript';
+  const kind = (change.identity as Obj).kind as string;
+  if (!(ts ? ['function', 'method', 'constructor'] : ['function', 'method', 'initializer']).includes(kind)) {
+    errors.push(`${where}.identity.kind: '${kind}' is not a ${language} declaration kind`);
+  }
+  const sides = (delta: unknown): Obj[] => (isObj(delta) ? [delta.before, delta.after].filter(isObj) : []);
+  if (ts && (change.result === null) !== (kind === 'constructor')) errors.push(`${where}.result: null exactly for a TypeScript constructor`);
+  if (!ts && change.result === null) errors.push(`${where}.result: a Swift declaration always has a result slot`);
+  for (const r of sides(change.result)) {
+    if (ts ? r.kind !== 'return' : (r.kind === 'initializer') !== (kind === 'initializer')) errors.push(`${where}.result: '${r.kind as string}' does not fit a ${language} ${kind}`);
+  }
+  const modes = ts ? ['notExpressible'] : ['none', 'throws', 'rethrows'];
+  for (const t of sides(change.throws)) if (!modes.includes(t.mode as string)) errors.push(`${where}.throws: '${t.mode as string}' is not a ${language} throws mode`);
+  if (ts) {
+    for (const p of (change.parameters as Obj[]).flatMap(sides)) if (p.label !== null) errors.push(`${where}.parameters: TypeScript parameters have no label`);
+  }
+}
+
+function checkChange(change: Obj, language: string, blobs: { before?: Uint8Array; after?: Uint8Array }, where: string, errors: string[]): void {
   const kind = change.kind;
   const deltas: Array<[string, Obj]> = [
     ...((change.parameters as Obj[]).map((p, i) => [`${where}.parameters[${i}]`, p] as [string, Obj])),
@@ -335,10 +386,37 @@ function checkChange(change: Obj, blobs: { before?: Uint8Array; after?: Uint8Arr
     if (deltas.every(([, d]) => d.op === 'equal')) errors.push(`${where}: signatureChanged with every component equal`);
   }
   checkParameters(change.parameters as Obj[], `${where}.parameters`, errors);
+  checkLanguageRules(change, language, where, errors);
   for (const side of ['before', 'after'] as const) {
     const decl = change[side];
     if (isObj(decl)) checkSpan(decl.span as Obj, blobs[side], `${where}.${side}.span`, errors);
   }
+}
+
+function recordedEndpoint(event: Obj, field: string): Obj {
+  const data = event.data as Obj;
+  const endpoint: Obj = { kind: 'recorded', record_seq: event.seq, field, snapshot: data[field] };
+  if (event.type === CHANGED) {
+    endpoint.observation = data.observation;
+    if (data.gap_ref !== undefined) endpoint.gap_ref = data.gap_ref;
+  }
+  return endpoint;
+}
+
+/** §2.2 endpoint resolution, including the first-change predecessor rule.
+ * Null when the path has no record at or before `after_seq`. */
+function resolveEndpoints(path: string, req: Request, history: History): Endpoints | null {
+  const records = history.events.filter((e) => (e.data as Obj).path === path && snapshotsOf(e).length > 0);
+  const latest = (cutoff: bigint): Obj | undefined => records.filter((e) => BigInt(e.seq as string) <= cutoff).at(-1);
+  const stateField = (e: Obj): string => (e.type === BASELINED ? 'snapshot' : 'after');
+  const last = latest(req.after);
+  if (last === undefined) return null;
+  const after = recordedEndpoint(last, stateField(last));
+  const prior = latest(req.before);
+  if (prior !== undefined) return { before: recordedEndpoint(prior, stateField(prior)), after };
+  const first = records.find((e) => BigInt(e.seq as string) > req.before) as Obj;
+  const baselineDone = history.events.some((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.before);
+  return { before: baselineDone && first.type === CHANGED ? recordedEndpoint(first, 'before') : { kind: 'unknownBoundary' }, after };
 }
 
 /** The coverage a side's endpoint forces, independent of extraction outcome. */
@@ -351,55 +429,50 @@ function forcedCoverage(endpoint: Obj, history: History): Obj | null {
   return null;
 }
 
-function checkEndpoint(endpoint: Obj, side: 'before' | 'after', path: string, req: Request, history: History, where: string, errors: string[]): void {
-  if (endpoint.kind === 'unknownBoundary') {
-    if (side === 'after') errors.push(`${where}: only a before endpoint can be an unknown boundary`);
-    const earlier = history.events.some((e) => (e.data as Obj).path === path && snapshotsOf(e).length > 0 && BigInt(e.seq as string) <= req.before);
-    if (earlier) errors.push(`${where}: unknown boundary although the path has a record at or before before_seq`);
-    return;
-  }
-  const record = history.bySeq.get(endpoint.record_seq as string);
-  if (record === undefined || (record.data as Obj).path !== path) {
-    errors.push(`${where}: record_seq ${endpoint.record_seq as string} is not a record for ${path}`);
-    return;
-  }
-  const seq = BigInt(endpoint.record_seq as string);
-  const cutoff = side === 'before' ? req.before : req.after;
-  const firstChangeRule = side === 'before' && endpoint.field === 'before' && seq > req.before && seq <= req.after;
-  if (seq > cutoff && !firstChangeRule) errors.push(`${where}: record_seq is after the ${side} cutoff`);
-  const data = record.data as Obj;
-  const isChanged = record.type === 'slipstream.file.changed.v1';
-  const expectedField = isChanged ? ['before', 'after'] : ['snapshot'];
-  if (!expectedField.includes(endpoint.field as string)) {
-    errors.push(`${where}: field ${endpoint.field as string} does not exist on ${record.type as string}`);
-    return;
-  }
-  if (!isDeepStrictEqual(endpoint.snapshot, data[endpoint.field as string])) errors.push(`${where}: snapshot differs from the recorded ${endpoint.field as string}`);
-  if (endpoint.observation !== (isChanged ? data.observation : undefined)) errors.push(`${where}: observation must copy the file.changed record`);
-  if (endpoint.gap_ref !== (isChanged ? data.gap_ref : undefined)) errors.push(`${where}: gap_ref must copy the file.changed record`);
-}
-
-function endpointsEqual(before: Obj, after: Obj): boolean {
+/** §4.4 row 0: equal endpoints whose content is still retained. */
+function isIdentical(endpoints: Endpoints, history: History): boolean {
+  const { before, after } = endpoints;
   if (before.kind !== 'recorded' || after.kind !== 'recorded') return false;
   const b = before.snapshot as Obj;
   const a = after.snapshot as Obj;
   if (b.kind === 'absent' && a.kind === 'absent') return true;
-  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256;
+  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256 && !history.missing.has(b.sha256 as string);
 }
 
-function checkFile(file: Obj, req: Request, history: History, where: string, errors: string[]): void {
+/** The §4.4 status the first established condition forces. Extraction-only
+ * outcomes (rows 3–4) are accepted as written when nothing outranks them. */
+function derivedStatus(file: Obj, endpoints: Endpoints, history: History, forcedSkip: string | null): [string, string?] {
+  if (isIdentical(endpoints, history)) return ['identical'];
+  const coverage = file.coverage as Record<'before' | 'after', Obj>;
+  for (const side of ['before', 'after'] as const) {
+    if (coverage[side].state === 'incomplete') return ['incomplete', `${side}-${String(coverage[side].reason)}`];
+  }
+  if (file.status === 'incomplete' && ['duplicate-declaration', 'ambiguous-correspondence'].includes(file.fallback_reason as string)) {
+    return ['incomplete', file.fallback_reason as string];
+  }
+  for (const side of ['before', 'after'] as const) {
+    if (coverage[side].state === 'unavailable') return ['unavailable', `${side}-${String(coverage[side].reason)}`];
+  }
+  if (file.language === null) return ['unsupported', 'unsupported-language'];
+  if (forcedSkip !== null) return ['skipped', forcedSkip];
+  return ['ready'];
+}
+
+function checkFile(file: Obj, req: Request, history: History, forcedSkip: string | null, where: string, errors: string[]): void {
   const path = file.path as string;
   const status = file.status as string;
   const reason = file.fallback_reason as string | undefined;
-  const before = file.before as Obj;
-  const after = file.after as Obj;
   const coverage = file.coverage as Record<'before' | 'after', Obj>;
   const changes = file.changes as Obj[];
 
-  if (!path.startsWith(req.pathPrefix)) errors.push(`${where}: path is outside path_prefix`);
-  if (req.afterPath !== null && !(path > req.afterPath)) errors.push(`${where}: path is not after after_path`);
-  checkEndpoint(before, 'before', path, req, history, `${where}.before`, errors);
-  checkEndpoint(after, 'after', path, req, history, `${where}.after`, errors);
+  const endpoints = resolveEndpoints(path, req, history);
+  if (endpoints === null) {
+    errors.push(`${where}: ${path} has no record at or before after_seq`);
+    return;
+  }
+  for (const side of ['before', 'after'] as const) {
+    if (!isDeepStrictEqual(file[side], endpoints[side])) errors.push(`${where}.${side}: §2.2 resolves ${JSON.stringify(endpoints[side])}`);
+  }
 
   const needsReason = ['incomplete', 'unavailable', 'unsupported', 'skipped'].includes(status);
   if (needsReason !== (reason !== undefined)) errors.push(`${where}: fallback_reason must be present exactly for incomplete/unavailable/unsupported/skipped`);
@@ -408,42 +481,25 @@ function checkFile(file: Obj, req: Request, history: History, where: string, err
 
   for (const side of ['before', 'after'] as const) {
     const cov = coverage[side];
-    const hasReason = cov.reason !== undefined;
-    if (hasReason !== ['incomplete', 'unavailable'].includes(cov.state as string)) {
-      errors.push(`${where}.coverage.${side}: reason must be present exactly for incomplete/unavailable`);
+    const forced = forcedCoverage(endpoints[side], history);
+    if (forced !== null) {
+      if (!isDeepStrictEqual(cov, forced)) errors.push(`${where}.coverage.${side}: must be ${JSON.stringify(forced)} for this endpoint`);
+      continue;
     }
-    const forced = forcedCoverage(side === 'before' ? before : after, history);
-    if (forced !== null && !isDeepStrictEqual(cov, forced)) errors.push(`${where}.coverage.${side}: must be ${JSON.stringify(forced)} for this endpoint`);
-    if (forced === null && !['complete', 'incomplete', 'unsupported', 'notEvaluated'].includes(cov.state as string)) {
-      errors.push(`${where}.coverage.${side}: a retained content side cannot be ${cov.state as string}`);
-    }
+    const allowed = status === 'identical' ? ['notEvaluated']
+      : file.language === null ? ['unsupported']
+      : status === 'skipped' ? ['complete', 'notEvaluated']
+      : ['complete', 'incomplete'];
+    if (!allowed.includes(cov.state as string)) errors.push(`${where}.coverage.${side}: a retained content side of a ${status} file cannot be ${cov.state as string}`);
+    if ((cov.reason !== undefined) !== (cov.state === 'incomplete')) errors.push(`${where}.coverage.${side}: reason must be present exactly for incomplete`);
+    if (cov.state === 'incomplete' && !INCOMPLETE_REASONS.includes(`${side}-${String(cov.reason)}`)) errors.push(`${where}.coverage.${side}: '${String(cov.reason)}' is not an incomplete reason`);
   }
 
-  const equal = endpointsEqual(before, after) && forcedCoverage(before, history)?.state !== 'unavailable';
-  if (equal !== (status === 'identical')) errors.push(`${where}: status must be identical exactly when the endpoints are equal and retained`);
-  if (status === 'identical') {
-    const state = ((before.snapshot as Obj).kind === 'absent') ? 'absent' : 'notEvaluated';
-    if (coverage.before.state !== state || coverage.after.state !== state) errors.push(`${where}: identical coverage must be ${state} on both sides`);
-    if (!req.includeIdentical) errors.push(`${where}: identical results are listed only with include_identical=true`);
+  const [wantStatus, wantReason] = derivedStatus(file, endpoints, history, forcedSkip);
+  if (status !== wantStatus || reason !== wantReason) {
+    errors.push(`${where}: §4.4 precedence gives ${wantStatus}${wantReason === undefined ? '' : ` / ${wantReason}`}, not ${status}${reason === undefined ? '' : ` / ${reason}`}`);
   }
-  if (status === 'incomplete') {
-    if (!INCOMPLETE_REASONS.includes(reason ?? '')) errors.push(`${where}: '${reason ?? ''}' is not an incomplete reason`);
-    const side = reason?.startsWith('before-') ? 'before' : reason?.startsWith('after-') ? 'after' : null;
-    if (side !== null && coverage[side].state !== 'incomplete') errors.push(`${where}: ${reason as string} needs ${side} coverage incomplete`);
-  }
-  if (status === 'unavailable') {
-    const side = coverage.before.state === 'unavailable' ? 'before' : 'after';
-    const want = `${side}-${String(coverage[side].reason)}`;
-    if (reason !== want) errors.push(`${where}: unavailable must report '${want}'`);
-  }
-  if (status === 'unsupported' && (reason !== 'unsupported-language' || file.language !== null)) {
-    errors.push(`${where}: unsupported means unsupported-language with a null language`);
-  }
-  if (status === 'skipped' && !SKIPPED_FILE_REASONS.includes(reason ?? '')) errors.push(`${where}: '${reason ?? ''}' is not a file skip reason`);
-  if (status === 'ready' && (file.language === null || ['incomplete', 'unavailable', 'unsupported', 'notEvaluated'].includes(coverage.before.state as string)
-    || ['incomplete', 'unavailable', 'unsupported', 'notEvaluated'].includes(coverage.after.state as string))) {
-    errors.push(`${where}: ready needs a language module and both sides complete or absent`);
-  }
+  if (status === 'identical' && !req.includeIdentical) errors.push(`${where}: identical results are listed only with include_identical=true`);
 
   const blobOf = (endpoint: Obj): Uint8Array | undefined =>
     endpoint.kind === 'recorded' && (endpoint.snapshot as Obj).kind === 'content'
@@ -454,51 +510,92 @@ function checkFile(file: Obj, req: Request, history: History, where: string, err
     const kindIndex = ROW_KIND_ORDER.indexOf(change.kind as string);
     if (kindIndex < lastKind) errors.push(`${where}.changes[${i}]: rows must be ordered removed, signatureChanged, added`);
     lastKind = Math.max(lastKind, kindIndex);
-    checkChange(change, { before: blobOf(before), after: blobOf(after) }, `${where}.changes[${i}]`, errors);
+    checkChange(change, file.language as string, { before: blobOf(endpoints.before), after: blobOf(endpoints.after) }, `${where}.changes[${i}]`, errors);
   });
 }
 
+/** Every path the page may list, in UTF-16 order: a record at or before
+ * `after_seq`, inside the filter and cursor, and not hidden as identical. */
+function eligiblePaths(req: Request, history: History): string[] {
+  const paths = new Set<string>();
+  for (const e of history.events) {
+    if (snapshotsOf(e).length > 0 && BigInt(e.seq as string) <= req.after) paths.add((e.data as Obj).path as string);
+  }
+  return [...paths]
+    .filter((p) => p.startsWith(req.pathPrefix) && (req.afterPath === null || p > req.afterPath))
+    .filter((p) => req.includeIdentical || !isIdentical(resolveEndpoints(p, req, history) as Endpoints, history))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function checkMetadataList(listed: unknown[], complete: unknown, recorded: unknown[], capped: boolean, where: string, errors: string[]): void {
+  const want = capped ? [] : recorded;
+  if (!isDeepStrictEqual(listed, want)) errors.push(`${where}: must be ${capped ? 'empty under a zero metadata budget' : 'the full recorded list'}`);
+  if (complete !== (want.length === recorded.length)) errors.push(`${where}_complete: disagrees with the listed entries`);
+}
+
 function checkEnvelope(body: Obj, req: Request, history: History, errors: string[]): void {
+  const { harness } = history;
   if (body.session_id !== req.sessionId) errors.push('expected.session_id: does not match the request');
   const range = body.range as Obj;
   if (range.before_seq !== req.before.toString() || range.after_seq !== req.after.toString()) errors.push('expected.range: does not match the request');
 
-  const completed = history.events.find((e) => e.type === 'slipstream.capture.baseline.completed.v1' && BigInt(e.seq as string) <= req.after);
+  const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
   const inventory = body.inventory as Obj;
   if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
-  const scopes = (completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [];
-  const listed = inventory.unknown_scopes as string[];
-  const sortedScopes = [...scopes].sort();
-  if (!isDeepStrictEqual(listed, sortedScopes.slice(0, listed.length))) errors.push('expected.inventory.unknown_scopes: must be an ordered prefix of the recorded scopes');
-  if (inventory.unknown_scopes_complete !== (listed.length === scopes.length)) errors.push('expected.inventory.unknown_scopes_complete: disagrees with the listed scopes');
-
+  if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
+  const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
+  checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
   const recordedGaps = history.events
     .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
     .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
-  const gaps = body.gaps as Obj[];
-  if (!isDeepStrictEqual(gaps, recordedGaps.slice(0, gaps.length))) errors.push('expected.gaps: must be an ordered prefix of the recorded gaps at or before after_seq');
-  if (body.gaps_complete !== (gaps.length === recordedGaps.length)) errors.push('expected.gaps_complete: disagrees with the listed gaps');
+  checkMetadataList(body.gaps as unknown[], body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
 
   const files = body.files as Obj[];
-  const status = body.status;
   const page = body.page as Obj;
-  if ((status === 'skipped') !== (body.fallback_reason !== undefined)) errors.push('expected.fallback_reason: must be present exactly when status is skipped');
-  if (files.length > req.limit) errors.push(`expected.files: more than limit ${req.limit}`);
+  if ((body.status === 'skipped') !== (body.fallback_reason !== undefined)) errors.push('expected.fallback_reason: must be present exactly when status is skipped');
+  if (harness.admissionOverloaded) {
+    if (body.status !== 'skipped' || body.fallback_reason !== 'overloaded') errors.push('expected: an overloaded admission is a skipped page with fallback_reason overloaded');
+    if (files.length > 0 || page.complete !== false || page.next_after_path !== req.afterPath) errors.push('expected: a skipped page has no files, is not complete and does not move the cursor');
+    return;
+  }
+  if (body.status === 'skipped') errors.push('expected.status: only a harness admission rejection makes a fixture page skipped');
+
+  // Page membership: eligible paths in order, ended by the limit, an
+  // interrupt (§4.3), or a zero file-result budget (§4.7).
+  const eligible = eligiblePaths(req, history);
+  let count = Math.min(req.limit, eligible.length);
+  let endedEarly = false;
+  if (harness.interrupt !== null) {
+    const at = eligible.indexOf(harness.interrupt.atPath);
+    if (at < 0 || at >= req.limit) errors.push('history.harness.interrupt: at_path is not a path this page reaches');
+    else [count, endedEarly] = [at + 1, true];
+  }
+  if (harness.noFileResultBudget) count = Math.min(count, 1);
+  const paths = files.map((f) => f.path);
+  if (!isDeepStrictEqual(paths, eligible.slice(0, count))) errors.push(`expected.files: must list ${JSON.stringify(eligible.slice(0, count))}`);
+  const complete = !endedEarly && count === eligible.length;
+  if (page.complete !== complete) errors.push(`expected.page.complete: must be ${String(complete)}`);
+  const cursor = complete ? null : (eligible[count - 1] ?? req.afterPath);
+  if (page.next_after_path !== cursor) errors.push(`expected.page.next_after_path: must be ${JSON.stringify(cursor)}`);
+
+  const { interrupt } = harness;
   files.forEach((f, i) => {
-    if (i > 0 && !((files[i - 1]?.path as string) < (f.path as string))) errors.push(`expected.files[${i}]: not in strict UTF-16 path order`);
-    checkFile(f, req, history, `expected.files[${i}]`, errors);
+    const forcedSkip = interrupt !== null && interrupt.atPath === f.path ? interrupt.reason
+      : harness.noFileResultBudget && i === 0 ? 'too-large'
+      : null;
+    checkFile(f, req, history, forcedSkip, `expected.files[${i}]`, errors);
   });
   const settled = files.every((f) => f.status === 'ready' || f.status === 'identical');
-  if (status === 'ready' && !settled) errors.push('expected.status: ready needs every file ready or identical');
-  if (status === 'partial' && (files.length === 0 || settled)) errors.push('expected.status: partial needs a file that is not ready or identical');
-  if (status === 'skipped') {
-    if (files.length > 0 || page.complete !== false) errors.push('expected: a skipped page has no files and is not complete');
-    if (page.next_after_path !== req.afterPath) errors.push('expected.page.next_after_path: a skipped page must not move the cursor');
-  } else if (page.complete === true) {
-    if (page.next_after_path !== null) errors.push('expected.page.next_after_path: must be null on the last page');
-  } else if (files.length === 0 || page.next_after_path !== files[files.length - 1]?.path) {
-    errors.push('expected.page.next_after_path: an incomplete page moves the cursor to its last returned file');
-  }
+  if (body.status !== (settled ? 'ready' : 'partial')) errors.push(`expected.status: must be ${settled ? 'ready' : 'partial'} for these file statuses`);
+}
+
+/** The HTTP status the request and history force: 400, then 409, then 500 for
+ * a predecessor chain broken at or before `after_seq`, otherwise 200. */
+function expectedHttpStatus(req: Request | string, history: History): number {
+  if (typeof req === 'string') return 400;
+  if (req.after > history.durableSeq) return 409;
+  if (history.chainBreak !== null && history.chainBreak <= req.after) return 500;
+  return 200;
 }
 
 function checkError(raw: unknown, req: Request | string, history: History, errors: string[]): void {
@@ -507,13 +604,11 @@ function checkError(raw: unknown, req: Request | string, history: History, error
     return;
   }
   extraKeys(raw, ['http_status', 'headers'], 'expected-error', errors);
-  const status = raw.http_status as number;
-  if ((status === 400) !== (typeof req === 'string')) errors.push('expected-error: 400 exactly when the request is malformed');
-  if (status === 409) {
-    const header = isObj(raw.headers) ? raw.headers['slipstream-durable-seq'] : undefined;
-    if (header !== history.durableSeq.toString()) errors.push('expected-error: 409 must carry slipstream-durable-seq equal to the durable high-water');
-    if (typeof req !== 'string' && req.after <= history.durableSeq) errors.push('expected-error: 409 needs after_seq beyond the durable high-water');
-  }
+  const want = expectedHttpStatus(req, history);
+  if (raw.http_status !== want) errors.push(`expected-error: the request and history give ${want}, not ${String(raw.http_status)}`);
+  const header = isObj(raw.headers) ? raw.headers['slipstream-durable-seq'] : undefined;
+  if (raw.http_status === 409 && header !== history.durableSeq.toString()) errors.push('expected-error: 409 must carry slipstream-durable-seq equal to the durable high-water');
+  if (raw.http_status !== 409 && raw.headers !== undefined) errors.push('expected-error: only a 409 carries headers');
 }
 
 /** Every error found in one case; empty means the case is valid. */
@@ -531,11 +626,11 @@ export function checkCase(c: FixtureCase, projectionSchema: JsonSchema, eventSch
     checkError(c.expectedError, req, history, errors);
     return errors;
   }
-  if (typeof req === 'string') {
-    errors.push(`request.txt: ${req}`);
+  const want = expectedHttpStatus(req, history);
+  if (typeof req === 'string' || want !== 200) {
+    errors.push(`expected.json: the request and history give ${want}${typeof req === 'string' ? ` (${req})` : ''}`);
     return errors;
   }
-  if (req.after > history.durableSeq) errors.push('request.txt: after_seq is beyond the durable high-water, which is a 409');
   const shapeErrors = validate(projectionSchema, c.expected).map((e) => `expected: ${e}`);
   if (shapeErrors.length > 0) return [...errors, ...shapeErrors];
   checkEnvelope(c.expected as Obj, req, history, errors);
@@ -546,7 +641,8 @@ export async function loadProjectionSchema(): Promise<JsonSchema> {
   return JSON.parse(await readFile(join(CONTRACT_DIR, 'schema.json'), 'utf8')) as JsonSchema;
 }
 
-export async function loadCases(dir = CASES_DIR): Promise<FixtureCase[]> {
+export async function loadCases(): Promise<FixtureCase[]> {
+  const dir = CASES_DIR;
   const names = (await readdir(dir, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name).sort();
   return Promise.all(names.map(async (name) => {
     const files = await readdir(join(dir, name));

@@ -68,7 +68,7 @@
         "policy_exclusions": {
           "type": "array",
           "items": { "enum": ["store-directory", ".git", "symlinks"] },
-          "$comment": "Static capture policy: these targets are never read, and the baseline records no event for them."
+          "$comment": "Static capture policy, always exactly [\"store-directory\", \".git\", \"symlinks\"] (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them."
         }
       }
     },
@@ -327,7 +327,7 @@
     },
     "op": {
       "enum": ["equal", "added", "removed", "changed"],
-      "$comment": "equal: both sides present with equal token sequences (the display text may differ only in whitespace). added: before null. removed: after null. changed: both present, token sequences differ."
+      "$comment": "Sides carry normalized token text. equal: both sides present and identical. added: before null. removed: after null. changed: both present and different."
     },
     "typeRef": {
       "oneOf": [

@@ -544,6 +544,11 @@ below):
 `changed` is `~`. The client may render `changed` as a `−` line followed by a
 `+` line, as the design does for `Promise<void>` → `Promise<User>`.
 
+Every text in a component is the extractor's normalized token text (§3.1), so
+`equal` means the two sides are identical values, and `changed` means they
+differ. Whitespace that the normalization drops never reaches the response;
+whitespace inside a literal does, and makes the sides differ.
+
 **Parameter fields.** Every parameter object carries all of these:
 
 | Field | Meaning |
@@ -684,7 +689,7 @@ numbers**:
 | Blob bytes | 1 MiB per side, 8 MiB per page |
 | Eligible declarations | 4,096 per side |
 | Syntax visits | 100,000 per side |
-| Response | 512 KiB. When the next file result would cross the ceiling, the page ends before it (`page.complete: false`, cursor at the last returned file). If that result is the page's **first** and does not fit beside the bounded envelope, it becomes `skipped / too-large` instead, so every page makes progress. Content is never truncated |
+| File results | 512 KiB per page, counting the serialized file results only (the envelope is bounded separately by the metadata cap). When the next file result would cross the ceiling, the page ends before it (`page.complete: false`, cursor at the last returned file). If that result is the page's **first**, it is replaced by its row-less `skipped / too-large` result. That fallback is exempt from the ceiling and always emitted, so every page makes progress. Content is never truncated |
 | Prefix scan for endpoint resolution | 100,000 records / 16 MiB, then `skipped / scan-limit` |
 | Disposable cache | 128 entries / 16 MiB |
 
@@ -728,7 +733,7 @@ store exact bytes, and their hashes and spans are computed from those bytes.
 Request:
 
 ```text
-GET /v1/sessions/11111111-1111-4111-8111-111111111111/interfaces?before_seq=10&after_seq=20&path_prefix=src/f.ts&limit=1
+GET /v1/sessions/11111111-1111-4111-8111-111111111111/interfaces?before_seq=3&after_seq=4&path_prefix=src/f.ts&limit=1
 ```
 
 Sources (each 31 bytes including the `\n`; the declaration spans `[0,30)`):
@@ -746,11 +751,11 @@ Response, exactly as committed in `contracts/interface/v2/cases/ts-parameter-cha
 {
   "projection_version": "interface.v2",
   "session_id": "11111111-1111-4111-8111-111111111111",
-  "range": { "before_seq": "10", "after_seq": "20" },
+  "range": { "before_seq": "3", "after_seq": "4" },
   "status": "ready",
   "inventory": {
     "scope": "observed",
-    "baseline_completed_seq": "10",
+    "baseline_completed_seq": "3",
     "unknown_scopes": [],
     "unknown_scopes_complete": true,
     "policy_exclusions": ["store-directory", ".git", "symlinks"]
@@ -762,11 +767,11 @@ Response, exactly as committed in `contracts/interface/v2/cases/ts-parameter-cha
     {
       "path": "src/f.ts",
       "before": {
-        "kind": "recorded", "record_seq": "4", "field": "snapshot",
+        "kind": "recorded", "record_seq": "2", "field": "snapshot",
         "snapshot": { "kind": "content", "sha256": "86e1381da984ad21459e1e796d08963d95ee1ef6eca5987ecf6fa1fef5d64e46", "size": 31 }
       },
       "after": {
-        "kind": "recorded", "record_seq": "20", "field": "after", "observation": "watcher",
+        "kind": "recorded", "record_seq": "4", "field": "after", "observation": "watcher",
         "snapshot": { "kind": "content", "sha256": "a0f5933b9b22cb5a09402ec1d063c10504d634ea717c939360f5fde690a4be6d", "size": 31 }
       },
       "language": "typescript",
@@ -866,14 +871,17 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
 - add-then-remove inside the range (`absent` → `absent` → `identical`, also for a `.py` path);
 - all-failed page (`partial`) and deadline mid-page;
 - oversized single file result (`too-large`) and gap cap (`gaps_complete: false`);
-- a captured file replaced by a symlink (content → `absent`);
+- a captured file replaced by a symlink (content → `absent`). The log records
+  this exactly as a removal, so `ts-removed-file` / `swift-removed-file` cover
+  it; a separate fixture would repeat the same bytes;
 - `A > H` → `409`;
-- a huge decimal `seq`;
+- a huge decimal cutoff, compared exactly: `B = A + 1` above 2^64 is a `400`,
+  which a floating-point comparison would miss;
 - corrupt predecessor chain → `500`;
 - page boundary with `next_after_path`;
 - cache hit followed by blob loss.
 
-**Committed case index** (`contracts/interface/v2/cases/`, 67 cases):
+**Committed case index** (`contracts/interface/v2/cases/`, 66 cases):
 
 - **TypeScript (21):** `ts-` + `parameter-change`, `return-change`,
   `added-function`, `added-file`, `removed-function`, `removed-file`,
@@ -886,13 +894,13 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
   `labels-defaults-effects`, `init-failable`, `generics-where`, `variadic`,
   `guard-move` and `extension-member`.
 - **Python (2):** `py-unsupported-language`, `py-missing-blob-unsupported`.
-- **Range and page (22):** `range-` + `gap-unchanged-hashes`,
+- **Range and page (21):** `range-` + `gap-unchanged-hashes`,
   `restart-reconciliation`, `gap-before-b`, `add-then-remove-ts`,
   `add-then-remove-py`, `reverted-hidden` (default filter, `files: []`),
   `reverted-listed`, `all-failed-page`, `deadline-mid-page`,
   `cancelled-mid-page`, `too-large-first-file`, `gap-cap`, `unknown-scopes`,
   `admission-skipped`, `page-boundary-first`, `page-boundary-second`,
-  `huge-seq`, `rename`, `symlink-replaced`, `durable-ahead-409`,
+  `huge-seq`, `rename`, `durable-ahead-409`,
   `corrupt-chain-500` and `invalid-request-400`.
 
 Two listed conditions are **not** static fixtures, because they need a race
@@ -925,11 +933,15 @@ never be confused:
   runs in CI through `tools/interface-v2-contract.test.ts`.
 
 **`history.json`** is a synthetic recorded session that FD3 and FD4 can replay
-directly:
+directly. Its events form a real session log that the existing log reader
+accepts: write them as the session's log, put `blobs` in the CAS, and leave
+`missing_blobs` out.
 
-- `session_id`, and `durable_seq` (the high-water `H`).
-- `events`: full public event envelopes (`id` = `seq`, strictly increasing,
-  each valid against its `schemas/slipstream.*.v1.json` schema).
+- `session_id`, and `durable_seq` (the high-water `H`, which is the last
+  event's `seq`).
+- `events`: full public event envelopes. `session.started` comes first, `seq`
+  runs contiguously from `1`, `id` = `seq`, and each event is valid against its
+  `schemas/slipstream.*.v1.json` schema.
 - `blobs`: SHA-256 → UTF-8 text for every stored content snapshot.
 - `missing_blobs` (optional): SHA-256s referenced by events whose CAS object
   is gone.
@@ -937,35 +949,44 @@ directly:
   - `admission: "overloaded"`: the page is rejected before any file starts.
   - `interrupt: { at_path, reason: "timeout" | "cancelled" }`: the deadline or
     cancellation hits while that file is being compared.
-  - `limits: { response_bytes, metadata_bytes }`: overrides the ceilings.
-    `response_bytes: 1` makes the first file `skipped / too-large`, and
-    `metadata_bytes: 0` caps `gaps` and `unknown_scopes` to empty lists.
+  - `limits: { file_result_bytes: 0, metadata_bytes: 0 }`: zeroes a ceiling.
+    `file_result_bytes: 0` makes the first file that would be `ready`
+    `skipped / too-large` and ends the page there; `metadata_bytes: 0` empties
+    `gaps` and `unknown_scopes`. Zero is the only value, because it is the only
+    one whose outcome does not depend on serialized sizes.
 
 **`request.txt`** is one `GET` line, parsed with the exact §4.2 grammar.
 
-The validation check proves:
+The validation check re-derives everything the history and request determine,
+and takes only extraction outcomes (which declarations exist, how they parse)
+on trust:
 
 - every `expected.json` validates against the schema, using `src/schema.ts`;
-- cross-field invariants hold:
-  - `changes` is non-empty only when the status is `ready`;
-  - `fallback_reason` is present exactly for `incomplete`, `unavailable`,
-    `unsupported` and `skipped`;
-  - `language` and `language_version` are `null` exactly when no module exists
-    for the path, whatever the status;
-  - the page status, cursor and `fallback_reason` agree with the file
-    statuses (§4.3), and `identical` appears exactly when the endpoints are
-    equal and retained;
-  - each side's coverage matches what its endpoint forces (`absent`,
-    `blob-missing`, `unknown-boundary`, the capture reason);
-  - component operations agree with their sides, and parameters are paired
-    and ordered as §4.5 requires;
-- every history event is a valid public event, and every endpoint's
-  provenance points at the record it copies (§2.2);
-- the envelope's range, inventory and gaps agree with the history;
-- source hashes and sizes match the stored bytes;
+- the history is a replayable log (above), its hashes and sizes match the
+  stored bytes, and every event is a valid public event;
+- the HTTP status is forced: `400` exactly for a malformed request (§4.2
+  grammar, decoded as `URLSearchParams` decodes), then `409` with
+  `slipstream-durable-seq` for `A > H`, then `500` exactly when a
+  `file.changed.before` contradicts its path's recorded predecessor at or
+  before `A` (§2.2), otherwise `200`;
+- each file's `before` and `after` endpoints are exactly what §2.2 resolves,
+  including the first-change predecessor rule and unknown boundaries;
+- the page lists exactly the eligible paths in UTF-16 order (a record at or
+  before `A`, inside `path_prefix` and past `after_path`, `identical` ones only
+  with `include_identical`), ended only by `limit`, an interrupt or a zero
+  file-result budget; `page.complete`, the cursor and the page `status` follow;
+- each file's `status` and `fallback_reason` follow the §4.4 precedence from
+  its endpoints, coverage, language and harness condition; each side's
+  coverage matches what its endpoint forces (`absent`, `blob-missing`,
+  `unknown-boundary`, the capture reason) and is otherwise a state that status
+  allows;
+- the envelope's range, inventory (`policy_exclusions` included) and gaps agree
+  with the history and the metadata budget;
+- `changes` is non-empty only when the status is `ready`; component operations
+  agree with their sides (exact equality); parameters are paired and ordered as
+  §4.5 requires; each row obeys its language's fixed rules (declaration kinds,
+  when the result slot is null, throws modes, TypeScript's null labels);
 - every span slices whole UTF-8 characters, checked with a fatal decode;
-- `request.txt` follows the §4.2 grammar, and every `400` / `409` fixture is
-  consistent with it;
 - a deliberately malformed envelope (a valid page relabelled `skipped`) is
   **rejected**, so the validator cannot pass vacuously.
 
