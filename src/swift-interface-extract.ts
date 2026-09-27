@@ -116,9 +116,11 @@ function parameter(node: Node, source: string, position: number, attributes: Nod
   const local = names.find((c) => c !== external);
   if (!local) throw new Unsupported('parameter without local name');
   const colon = parts.findIndex((c) => c.type === ':');
-  const typeNode = colon < 0 ? undefined : parts.slice(colon + 1).find((c) =>
+  const typeParts = colon < 0 ? [] : parts.slice(colon + 1).filter((c) =>
     c.isNamed && c.type !== 'parameter_modifiers');
-  if (!typeNode) throw new Unsupported('parameter without type');
+  if (typeParts.length < 1 || typeParts.length > 2 ||
+    (typeParts.length === 2 && typeParts[0]!.type !== 'type_modifiers') ||
+    typeParts.at(-1)!.type === 'type_modifiers') throw new Unsupported('parameter without representable type');
   const modifierNode = direct(node, 'parameter_modifiers');
   const modifiers = [
     ...attributes.map((attribute) => normalized(attribute, source)),
@@ -128,7 +130,7 @@ function parameter(node: Node, source: string, position: number, attributes: Nod
   return {
     position, label: external ? identifier(external, source) : null, name,
     binding: name === '_' ? 'wildcard' : 'identifier',
-    type: { state: 'written', text: normalized(typeNode, source) },
+    type: { state: 'written', text: typeParts.map((c) => normalized(c, source)).join(' ') },
     optional: false, variadic: Boolean(direct(node, '...')),
     default: defaultNode ? normalized(defaultNode, source) : null,
     modifiers,

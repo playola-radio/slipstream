@@ -128,6 +128,23 @@ test('parameter attributes and attributed return types produce visible component
   }
 });
 
+test('attributed function parameter types retain their full written type', async () => {
+  const modifiers = ['@escaping @Sendable', '@Sendable @escaping', 'inout @Sendable'];
+  for (const modifier of modifiers) {
+    const before = `func f(x: ${modifier} (Int) -> Void) {}`;
+    const after = `func f(x: ${modifier} (String) -> Bool) {}`;
+    const sides = await extractSwiftSides([
+      { id: 'before', bytes: Buffer.from(before) }, { id: 'after', bytes: Buffer.from(after) },
+    ]);
+    const b = sides.get('before')!, a = sides.get('after')!;
+    assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+    if (b.status !== 'complete' || a.status !== 'complete') continue;
+    const compared = compareV2(b.declarations, a.declarations);
+    assert.equal(compared.status, 'ready');
+    if (compared.status === 'ready') assert.equal(compared.changes[0]?.parameters[0]?.op, 'changed', modifier);
+  }
+});
+
 test('class func is a written header modifier and does not collide with an instance method', async () => {
   const sources = ['class C { func f() {} }', 'class C { class func f() {} }'];
   const sides = await extractSwiftSides(sources.map((source, i) => ({ id: String(i), bytes: Buffer.from(source) })));
