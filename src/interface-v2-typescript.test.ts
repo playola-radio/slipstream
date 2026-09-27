@@ -79,6 +79,8 @@ test('an unrepresentable named class field function makes the whole file incompl
   const extract = await createTypeScriptInterfaceExtractor('typescript');
   assert.deepEqual(extract(Buffer.from('class C { m = (x: number): void => {}; }')),
     { status: 'incomplete', reason: 'unsupported-construct' });
+  assert.deepEqual(extract(Buffer.from('class C { m = ((x: number) => x); }')),
+    { status: 'incomplete', reason: 'unsupported-construct' });
 });
 
 test('local named functions and anonymous callbacks are outside extraction scope', async () => {
@@ -185,6 +187,17 @@ test('generator marker and optional method marker remain visible in headers', as
   assert.deepEqual(method.changes[0]!.before?.span, { byte_start: 10, byte_end: 30 });
 });
 
+test('a static method named constructor is a method, not the class constructor', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const result = extract(Buffer.from('class C { static constructor(): number { return 1; } }'));
+  assert.equal(result.status, 'complete');
+  if (result.status !== 'complete') return;
+  assert.deepEqual(result.declarations[0]!.identity,
+    { kind: 'method', scope: [{ kind: 'class', name: 'C' }], name: 'constructor', guards: [] });
+  assert.deepEqual(result.declarations[0]!.result,
+    { kind: 'return', type: { state: 'written', text: 'number' } });
+});
+
 test('constructor parameter properties keep their written modifiers', async () => {
   const extract = await createTypeScriptInterfaceExtractor('typescript');
   const result = extract(Buffer.from('class C { constructor(public readonly x: number) {} }'));
@@ -264,6 +277,13 @@ test('template literal types keep literal fragments', async () => {
   assert.equal(result.changes.length, 1);
   assert.deepEqual(result.changes[0]!.parameters[0]!.before?.type,
     { state: 'written', text: '`a-${string}`' });
+});
+
+test('template literal type substitution trivia is not a written change', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('function f(x: `a-${string}`): void {}'));
+  const after = extract(Buffer.from('function f(x: `a-${ string }`): void {}'));
+  assert.equal(compareTypeScriptExtractions(before, after).changes.length, 0);
 });
 
 test('typed binding keeps optional, rest, and generic clauses', async () => {

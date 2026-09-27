@@ -66,6 +66,34 @@ function field(node: Node, name: string): Node | undefined {
   return node.childForFieldName(name) ?? undefined;
 }
 
+/** A wrapped function expression (parenthesized, `as`, `satisfies`) is still an unrepresentable function value. */
+function containsWrappedFunction(node: Node): boolean {
+  const stack = [node];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (['arrow_function', 'function_expression', 'generator_function'].includes(current.type)) return true;
+    stack.push(...children(current));
+  }
+  return false;
+}
+
+/** The grammar omits literal fragments between template type substitutions as nodes; recover them from source gaps. */
+function templateLiteralTypeText(node: Node): string {
+  let out = '';
+  let cursor = node.startIndex;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (!c) continue;
+    out += node.text.slice(cursor - node.startIndex, c.startIndex - node.startIndex);
+    out += c.type === 'template_type'
+      ? `\${${normalizedTokens(children(c)[0]!)}}`
+      : c.text;
+    cursor = c.endIndex;
+  }
+  out += node.text.slice(cursor - node.startIndex);
+  return out;
+}
+
 /** Join syntax leaves, never characters: literals remain intact and identifiers cannot merge. */
 function normalizedTokens(node: Node): string {
   const tokens: string[] = [];
@@ -73,8 +101,11 @@ function normalizedTokens(node: Node): string {
   while (stack.length) {
     const current = stack.pop()!;
     if (current.type === 'comment') continue;
-    // This grammar omits literal fragments between template type substitutions.
-    if (current.type === 'template_literal_type' || current.childCount === 0) {
+    if (current.type === 'template_literal_type') {
+      tokens.push(templateLiteralTypeText(current));
+      continue;
+    }
+    if (current.childCount === 0) {
       tokens.push(current.text);
       continue;
     }
@@ -155,7 +186,11 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   if (nameNode?.type === 'computed_property_name') return null;
   const name = bindingName ?? nameNode?.text;
   if (!name) return null;
-  const constructor = scope.length > 0 && name === 'constructor';
+  let isStatic = false;
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.child(i)?.type === 'static') isStatic = true;
+  }
+  const constructor = scope.length > 0 && name === 'constructor' && !isStatic;
   const formal = field(node, 'parameters');
   const single = node.type === 'arrow_function' ? field(node, 'parameter') : undefined;
   const params = formal ? parseParameters(formal) : single?.type === 'identifier' ? [{
@@ -271,9 +306,9 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
             }
             if (accessor) continue;
             if (!add(member, member, scope, [])) return false;
-          } else if (member.type === 'public_field_definition'
-            && children(member).some(n => n.type === 'arrow_function' || n.type === 'function_expression')) {
-            return false;
+          } else if (member.type === 'public_field_definition') {
+            const value = field(member, 'value');
+            if (value && containsWrappedFunction(value)) return false;
           }
         }
         return true;
@@ -284,12 +319,7 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
           const value = field(declarator, 'value');
           if (value?.type === 'class' || value?.type === 'class_expression') return false;
           if (value && ['as_expression', 'satisfies_expression', 'parenthesized_expression'].includes(value.type)) {
-            const stack = [value];
-            while (stack.length) {
-              const current = stack.pop()!;
-              if (['arrow_function', 'function_expression', 'generator_function'].includes(current.type)) return false;
-              stack.push(...children(current));
-            }
+            if (containsWrappedFunction(value)) return false;
           }
           if (!value || !['arrow_function', 'function_expression', 'generator_function'].includes(value.type)) continue;
           const name = field(declarator, 'name');
