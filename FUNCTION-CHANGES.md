@@ -389,6 +389,7 @@ invented.
     "scope": "observed",                  // F2-A
     "baseline_completed_seq": "10",       // null if the baseline was not complete by A
     "unknown_scopes": [],                 // from capture.baseline.completed.v1
+    "unknown_scopes_complete": true,      // false when capped (see "Metadata cap")
     "policy_exclusions": ["store-directory", ".git", "symlinks"]
   },
   "analysis": {                           // F3/F4 — every value "notAnalyzed" under A
@@ -419,19 +420,27 @@ What the page-level `status` values mean:
 **Deadline and cancellation mid-page.**
 
 - Files already finished keep their results.
-- The file in progress is returned as `skipped / timeout` or
-  `skipped / cancelled`.
+- The file in progress is returned with its §4.4 status. That is
+  `skipped / timeout` or `skipped / cancelled` unless a higher-precedence
+  condition was already established; for example, a before-side parse error
+  still wins.
 - The page ends there, with `page.complete: false`. `next_after_path` is that
   file's path, so the next request moves past it.
 - A client can retry one file on its own with `path_prefix`.
 
-**Filtering.** By default, `files` lists only paths whose endpoints are **not
-equal** (§2.2). With `include_identical=true`, paths with equal endpoints are
-listed too, as `status:"identical"`. This supports "Show unchanged branches".
+**Filtering.** By default, `files` omits results whose status is `identical`.
+A missing blob is never `identical` (§4.4), so it is always listed. With
+`include_identical=true`, `identical` results are listed too. This supports
+"Show unchanged branches".
 
-**Gap cap.** `gaps` is capped at 256 entries, ordered by `seq`. Beyond the cap,
-`gaps_complete` is `false`. The cap is explicit and never silent, and the full
-gap list stays on the public event stream.
+**Metadata cap.** `gaps` (ordered by `seq`) and `unknown_scopes` (ordered by
+path) share a 64 KiB serialized budget. Entries beyond it are omitted, and the
+matching `gaps_complete` / `unknown_scopes_complete` flag becomes `false`.
+
+- The cap is explicit, never silent.
+- The full lists stay on the public event stream.
+- The envelope is therefore bounded, so the rest of the response budget is
+  always available to file results.
 
 ### 4.4 File result
 
@@ -469,7 +478,11 @@ wins, extending D10:
 | 10 | Comparison succeeded | `ready` | — |
 
 The D10 consequences in [INTERFACE-PROJECTION.md](INTERFACE-PROJECTION.md#status-precedence-d10)
-carry over unchanged. One boundary case needs its own shape: an unknown before
+carry over, with two v2 exceptions:
+
+- `identical`, like `ready`, has no `fallback_reason`.
+- `language` / `language_version` are `null` exactly when no module exists for
+  the path, whatever the status (§5.3). One boundary case needs its own shape: an unknown before
 boundary is `"before": { "kind": "unknownBoundary" }` with coverage
 `{ "state": "unavailable", "reason": "unknown-boundary" }`, and it has no
 recorded provenance.
@@ -634,7 +647,7 @@ numbers**:
 | Blob bytes | 1 MiB per side, 8 MiB per page |
 | Eligible declarations | 4,096 per side |
 | Syntax visits | 100,000 per side |
-| Response | 512 KiB. When the next file result would cross the ceiling, the page ends early with `page.complete: false`. A **single** file result over the ceiling becomes `skipped / too-large`. Content is never truncated |
+| Response | 512 KiB. When the next file result would cross the ceiling, the page ends before it (`page.complete: false`, cursor at the last returned file). If that result is the page's **first** and does not fit beside the bounded envelope, it becomes `skipped / too-large` instead, so every page makes progress. Content is never truncated |
 | Prefix scan for endpoint resolution | 100,000 records / 16 MiB, then `skipped / scan-limit` |
 | Disposable cache | 128 entries / 16 MiB |
 
@@ -700,6 +713,7 @@ Proposed response:
   "range": { "before_seq": "10", "after_seq": "20" },
   "status": "ready",
   "inventory": { "scope": "observed", "baseline_completed_seq": "10", "unknown_scopes": [],
+                 "unknown_scopes_complete": true,
                  "policy_exclusions": ["store-directory", ".git", "symlinks"] },
   "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
   "gaps": [], "gaps_complete": true,
