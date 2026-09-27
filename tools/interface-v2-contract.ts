@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { loadAllSchemas, validate, type JsonSchema } from '../src/schema.ts';
 import { SOURCE_PREFIX } from '../src/event.ts';
+import { assertSafePath, CorruptLogError } from '../src/recovery.ts';
 
 const CONTRACT_DIR = fileURLToPath(new URL('../contracts/interface/v2/', import.meta.url));
 const CASES_DIR = join(CONTRACT_DIR, 'cases');
@@ -35,6 +36,8 @@ const BASELINED = 'slipstream.file.baselined.v1';
 const CHANGED = 'slipstream.file.changed.v1';
 const COMPLETED = 'slipstream.capture.baseline.completed.v1';
 const ROW_KIND_ORDER = ['removed', 'signatureChanged', 'added'];
+/** D6: the only (language, language_version) pairs a client can decode (§4.6). */
+const LANGUAGE_VERSIONS: Record<string, string> = { typescript: 'typescript.v2', swift: 'swift.v1' };
 const INCOMPLETE_REASONS = [
   'before-parse-error', 'before-unsupported-construct',
   'after-parse-error', 'after-unsupported-construct',
@@ -188,6 +191,14 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
     if (event.id !== event.seq) errors.push(`${where}: id must equal seq`);
     if (event.source !== `${SOURCE_PREFIX}${sessionId}`) errors.push(`${where}: source does not name the history session`);
     if (!isObj(event.data) || event.data.session_id !== sessionId) errors.push(`${where}: data.session_id does not match the history session`);
+    if (isObj(event.data) && typeof event.data.path === 'string') {
+      try {
+        assertSafePath(event.data.path, where);
+      } catch (err) {
+        if (!(err instanceof CorruptLogError)) throw err;
+        errors.push(err.message);
+      }
+    }
     history.events.push(event);
   });
   if (previous !== history.durableSeq) errors.push('history.durable_seq: must be the last event seq');
@@ -393,6 +404,30 @@ function checkChange(change: Obj, language: string, blobs: { before?: Uint8Array
   }
 }
 
+/** D8 within one kind group, adapted to v2's declarationSide (no `signature`):
+ * (display_name, identity.kind, identity.scope pairs, identity.name,
+ * identity.guards, span.byte_start, span.byte_end). The anchor is `before` for
+ * removed/signatureChanged and `after` for added. */
+function compareRowKey(a: Obj, b: Obj): number {
+  const anchorSide = a.kind === 'added' ? 'after' : 'before';
+  const da = a[anchorSide] as Obj;
+  const db = b[anchorSide] as Obj;
+  const ia = a.identity as Obj;
+  const ib = b.identity as Obj;
+  const scopeKey = (scope: Obj[]): string => scope.map((s) => `${s.kind as string}\u0000${s.name as string}`).join('\u0001');
+  const keyOf = (d: Obj, i: Obj): unknown[] => [
+    d.display_name, i.kind, scopeKey(i.scope as Obj[]), i.name, (i.guards as string[]).join('\u0001'),
+    (d.span as Obj).byte_start, (d.span as Obj).byte_end,
+  ];
+  const ka = keyOf(da, ia);
+  const kb = keyOf(db, ib);
+  for (let idx = 0; idx < ka.length; idx++) {
+    if (ka[idx]! < kb[idx]!) return -1;
+    if (ka[idx]! > kb[idx]!) return 1;
+  }
+  return 0;
+}
+
 function recordedEndpoint(event: Obj, field: string): Obj {
   const data = event.data as Obj;
   const endpoint: Obj = { kind: 'recorded', record_seq: event.seq, field, snapshot: data[field] };
@@ -459,7 +494,10 @@ function derivedStatus(file: Obj, endpoints: Endpoints, history: History, forced
   return ['ready'];
 }
 
+const FILE_RESULT_KEYS = ['path', 'before', 'after', 'language', 'language_version', 'status', 'fallback_reason', 'coverage', 'changes'];
+
 function checkFile(file: Obj, req: Request, history: History, forcedSkip: string | null, where: string, errors: string[]): void {
+  extraKeys(file, FILE_RESULT_KEYS, where, errors);
   const path = file.path as string;
   const status = file.status as string;
   const reason = file.fallback_reason as string | undefined;
@@ -479,6 +517,9 @@ function checkFile(file: Obj, req: Request, history: History, forcedSkip: string
   if (needsReason !== (reason !== undefined)) errors.push(`${where}: fallback_reason must be present exactly for incomplete/unavailable/unsupported/skipped`);
   if (status !== 'ready' && changes.length > 0) errors.push(`${where}: only a ready file may carry changes`);
   if ((file.language === null) !== (file.language_version === null)) errors.push(`${where}: language and language_version must be null together`);
+  if (file.language !== null && LANGUAGE_VERSIONS[file.language as string] !== file.language_version) {
+    errors.push(`${where}: '${file.language as string}' / '${String(file.language_version)}' is not a known (language, language_version) pair`);
+  }
 
   for (const side of ['before', 'after'] as const) {
     const cov = coverage[side];
@@ -507,11 +548,16 @@ function checkFile(file: Obj, req: Request, history: History, forcedSkip: string
     endpoint.kind === 'recorded' && (endpoint.snapshot as Obj).kind === 'content'
       ? history.blobs.get((endpoint.snapshot as Obj).sha256 as string)
       : undefined;
-  let lastKind = 0;
+  let lastKind = -1;
+  let previous: Obj | null = null;
   changes.forEach((change, i) => {
     const kindIndex = ROW_KIND_ORDER.indexOf(change.kind as string);
     if (kindIndex < lastKind) errors.push(`${where}.changes[${i}]: rows must be ordered removed, signatureChanged, added`);
-    lastKind = Math.max(lastKind, kindIndex);
+    if (kindIndex === lastKind && previous !== null && compareRowKey(previous, change) >= 0) {
+      errors.push(`${where}.changes[${i}]: rows must be ordered by the D8 tuple within a kind`);
+    }
+    previous = change;
+    lastKind = kindIndex;
     checkChange(change, file.language as string, { before: blobOf(endpoints.before), after: blobOf(endpoints.after) }, `${where}.changes[${i}]`, errors);
   });
 }
@@ -535,14 +581,22 @@ function checkMetadataList(listed: unknown[], complete: unknown, recorded: unkno
   if (complete !== (want.length === recorded.length)) errors.push(`${where}_complete: disagrees with the listed entries`);
 }
 
+const ENVELOPE_KEYS = [
+  'projection_version', 'session_id', 'range', 'status', 'fallback_reason',
+  'inventory', 'analysis', 'gaps', 'gaps_complete', 'files', 'page',
+];
+
 function checkEnvelope(body: Obj, req: Request, history: History, errors: string[]): void {
   const { harness } = history;
+  extraKeys(body, ENVELOPE_KEYS, 'expected', errors);
   if (body.session_id !== req.sessionId) errors.push('expected.session_id: does not match the request');
   const range = body.range as Obj;
+  extraKeys(range, ['before_seq', 'after_seq'], 'expected.range', errors);
   if (range.before_seq !== req.before.toString() || range.after_seq !== req.after.toString()) errors.push('expected.range: does not match the request');
 
   const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
   const inventory = body.inventory as Obj;
+  extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
   if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
   if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
   const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
@@ -554,6 +608,7 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
 
   const files = body.files as Obj[];
   const page = body.page as Obj;
+  extraKeys(page, ['complete', 'next_after_path'], 'expected.page', errors);
   if ((body.status === 'skipped') !== (body.fallback_reason !== undefined)) errors.push('expected.fallback_reason: must be present exactly when status is skipped');
   if (harness.admissionOverloaded) {
     if (body.status !== 'skipped' || body.fallback_reason !== 'overloaded') errors.push('expected: an overloaded admission is a skipped page with fallback_reason overloaded');

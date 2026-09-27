@@ -151,6 +151,20 @@ describe('interface.v2 contract validator rejects', () => {
     file(c).fallback_reason = 'ambiguous-correspondence';
   }, 'ts-missing-blob');
   rejects('a case with both expected files', /exactly one of/, (c) => { c.expectedError = { http_status: 500 }; });
+  rejects('same-kind rows out of D8 order', /rows must be ordered by the D8 tuple/, (c) => {
+    const [r] = file(c).changes;
+    const later = { ...structuredClone(r), identity: { ...r.identity, name: 'z' }, before: { ...r.before, display_name: 'z' } };
+    const earlier = { ...structuredClone(r), identity: { ...r.identity, name: 'a' }, before: { ...r.before, display_name: 'a' } };
+    file(c).changes = [later, earlier];
+  });
+  rejects('an absolute path in a recorded event', /unsafe path/, (c) => { event(c, '2').data.path = '/etc/passwd'; });
+  rejects('a parent-directory segment in a recorded event path', /unsafe path/, (c) => { event(c, '4').data.path = '../secret.ts'; });
+  rejects('a language/version pair the client cannot decode', /not a known/, (c) => { file(c).language_version = 'typescript.v1'; });
+  rejects('a swift file labelled with the typescript version', /not a known/, (c) => {
+    file(c).language = 'swift';
+  }, 'ts-parameter-change');
+  rejects('an unknown field on the response envelope', /unexpected property 'extra'/, (c) => { (c.expected as Obj).extra = true; });
+  rejects('an unknown field on a file result', /unexpected property 'extra'/, (c) => { file(c).extra = true; });
 });
 
 describe('interface.v2 contract validator accepts', () => {
