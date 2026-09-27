@@ -145,6 +145,26 @@ test('attributed function parameter types retain their full written type', async
   }
 });
 
+test('implicitly unwrapped optional markers remain in parameter and return types', async () => {
+  const pairs = [
+    ['func f(x: Int!) {}', 'func f(x: Int) {}', 'parameters'],
+    ['func f() -> [Int]! { [] }', 'func f() -> [Int] { [] }', 'result'],
+  ] as const;
+  for (const [before, after, component] of pairs) {
+    const sides = await extractSwiftSides([
+      { id: 'before', bytes: Buffer.from(before) }, { id: 'after', bytes: Buffer.from(after) },
+    ]);
+    const b = sides.get('before')!, a = sides.get('after')!;
+    assert.equal(b.status, 'complete'); assert.equal(a.status, 'complete');
+    if (b.status !== 'complete' || a.status !== 'complete') continue;
+    const compared = compareV2(b.declarations, a.declarations);
+    assert.equal(compared.status, 'ready');
+    if (compared.status !== 'ready') continue;
+    const change = compared.changes[0];
+    assert.equal(component === 'parameters' ? change?.parameters[0]?.op : change?.result?.op, 'changed', component);
+  }
+});
+
 test('class func is a written header modifier and does not collide with an instance method', async () => {
   const sources = ['class C { func f() {} }', 'class C { class func f() {} }'];
   const sides = await extractSwiftSides(sources.map((source, i) => ({ id: String(i), bytes: Buffer.from(source) })));

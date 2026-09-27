@@ -70,6 +70,19 @@ function identifier(node: Node, source: string): string {
   return written.startsWith('`') && written.endsWith('`') ? written.slice(1, -1) : written;
 }
 
+function writtenType(parts: Node[], source: string, parameter: boolean): string {
+  const syntax = parts.filter((c) => c.type !== 'comment' && c.type !== 'multiline_comment' &&
+    !(parameter && (c.type === 'parameter_modifiers' || c.type === '...')));
+  const types = syntax.filter((c) => c.isNamed);
+  if (types.length < 1 || types.length > 2 ||
+    (types.length === 2 && types[0]!.type !== 'type_modifiers') ||
+    types.at(-1)!.type === 'type_modifiers') throw new Unsupported('type without representable syntax');
+  const suffix = syntax.filter((c) => !c.isNamed);
+  if (suffix.length > 1 || (suffix.length === 1 &&
+    (suffix[0]!.type !== '!' || syntax.at(-1) !== suffix[0]))) throw new Unsupported('unrepresented type suffix');
+  return types.map((c) => normalized(c, source)).join(' ') + (suffix.length ? '!' : '');
+}
+
 /** The pinned grammar exposes a #if directive as one opaque leaf, so scan its
  * condition into tokens without treating comments or spacing as identity. */
 function guardCondition(raw: string): string {
@@ -116,11 +129,8 @@ function parameter(node: Node, source: string, position: number, attributes: Nod
   const local = names.find((c) => c !== external);
   if (!local) throw new Unsupported('parameter without local name');
   const colon = parts.findIndex((c) => c.type === ':');
-  const typeParts = colon < 0 ? [] : parts.slice(colon + 1).filter((c) =>
-    c.isNamed && c.type !== 'parameter_modifiers');
-  if (typeParts.length < 1 || typeParts.length > 2 ||
-    (typeParts.length === 2 && typeParts[0]!.type !== 'type_modifiers') ||
-    typeParts.at(-1)!.type === 'type_modifiers') throw new Unsupported('parameter without representable type');
+  if (colon < 0) throw new Unsupported('parameter without type');
+  const type = writtenType(parts.slice(colon + 1), source, true);
   const modifierNode = direct(node, 'parameter_modifiers');
   const modifiers = [
     ...attributes.map((attribute) => normalized(attribute, source)),
@@ -130,7 +140,7 @@ function parameter(node: Node, source: string, position: number, attributes: Nod
   return {
     position, label: external ? identifier(external, source) : null, name,
     binding: name === '_' ? 'wildcard' : 'identifier',
-    type: { state: 'written', text: typeParts.map((c) => normalized(c, source)).join(' ') },
+    type: { state: 'written', text: type },
     optional: false, variadic: Boolean(direct(node, '...')),
     default: defaultNode ? normalized(defaultNode, source) : null,
     modifiers,
@@ -176,16 +186,12 @@ function declaration(node: Node, source: string, table: ReturnType<typeof buildU
   const arrow = parts.findIndex((c) => c.type === '->');
   const endOfReturn = arrow < 0 ? -1 : parts.findIndex((c, i) => i > arrow &&
     (c.type === 'type_constraints' || c.type === 'function_body'));
-  const returnParts = arrow < 0 ? [] : parts.slice(arrow + 1, endOfReturn < 0 ? undefined : endOfReturn)
-    .filter((c) => c.isNamed);
-  if (arrow >= 0 && (returnParts.length < 1 || returnParts.length > 2 ||
-    (returnParts.length === 2 && returnParts[0]!.type !== 'type_modifiers'))) {
-    throw new Unsupported('return type missing');
-  }
+  const returnType = arrow < 0 ? null : writtenType(
+    parts.slice(arrow + 1, endOfReturn < 0 ? undefined : endOfReturn), source, false);
   const failableNode = isInit ? parts.find((c) => c.type === '?' || c.type === '!' || c.type === 'bang') : undefined;
   const failable = failableNode?.type === 'bang' ? '!' : failableNode?.type as '?' | '!' | undefined;
   const result: V2Result = isInit ? { kind: 'initializer', failable: failable ?? null } :
-    { kind: 'return', type: returnParts.length ? { state: 'written', text: returnParts.map((c) => normalized(c, source)).join(' ') } :
+    { kind: 'return', type: returnType !== null ? { state: 'written', text: returnType } :
       { state: 'implicit', text: 'Void' } };
   const throwsNode = direct(node, 'throws');
   const throws: V2Throws = { mode: throwsNode?.text === 'rethrows' ? 'rethrows' : throwsNode ? 'throws' : 'none' };
