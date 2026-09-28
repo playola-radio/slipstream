@@ -311,6 +311,8 @@ test('namespace members and wrapped function bindings fail visibly', async () =>
     { status: 'incomplete', reason: 'unsupported-construct' }, source);
   assert.deepEqual(extract(Buffer.from('const f = ((x: number) => x) as Fn;')),
     { status: 'incomplete', reason: 'unsupported-construct' });
+  assert.deepEqual(extract(Buffer.from('const f = <Fn>((x: number) => x);')),
+    { status: 'incomplete', reason: 'unsupported-construct' });
 });
 
 test('role-only declaration to implementation has no written input/output delta', async () => {
@@ -343,4 +345,10 @@ test('a call wrapping a nested callback is not itself an unrepresentable class f
   const result = extract(Buffer.from('class C { handler = register(() => {}); m(x: number): void {} }'));
   assert.equal(result.status, 'complete');
   if (result.status === 'complete') assert.deepEqual(result.declarations.map(d => d.identity.name), ['m']);
+});
+
+test('legacy angle-bracket type-asserted function-valued class field is unsupported, not silently dropped', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const result = extract(Buffer.from('class C { m = <Fn>((x: number) => x); }'));
+  assert.deepEqual(result, { status: 'incomplete', reason: 'unsupported-construct' });
 });

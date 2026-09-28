@@ -67,18 +67,20 @@ function field(node: Node, name: string): Node | undefined {
 }
 
 /**
- * A wrapped function expression (parenthesized, `as`, `satisfies`) is still an unrepresentable
- * function value. This only unwraps those wrapper shells around a value's own top-level
- * expression — it must not descend into a call's arguments or other nested expressions, or
- * every value that merely contains a callback anywhere inside it would be misclassified as
- * itself an unrepresentable function value.
+ * A wrapped function expression (parenthesized, `as`, `satisfies`, legacy `<T>` angle-bracket
+ * assertion) is still an unrepresentable function value. This only unwraps those wrapper shells
+ * around a value's own top-level expression — it must not descend into a call's arguments or
+ * other nested expressions, or every value that merely contains a callback anywhere inside it
+ * would be misclassified as itself an unrepresentable function value.
  */
 function containsWrappedFunction(node: Node): boolean {
   let current: Node | undefined = node;
   while (current) {
     if (['arrow_function', 'function_expression', 'generator_function'].includes(current.type)) return true;
-    if (!['parenthesized_expression', 'as_expression', 'satisfies_expression'].includes(current.type)) return false;
-    current = children(current)[0];
+    if (!['parenthesized_expression', 'as_expression', 'satisfies_expression', 'type_assertion'].includes(current.type)) return false;
+    const kids = children(current);
+    // type_assertion is `<T>expr` — the type_arguments come first, so the wrapped expression is last.
+    current = current.type === 'type_assertion' ? kids[kids.length - 1] : kids[0];
   }
   return false;
 }
@@ -378,7 +380,7 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
         for (const declarator of declarators) {
           const value = field(declarator, 'value');
           if (value?.type === 'class' || value?.type === 'class_expression') return false;
-          if (value && ['as_expression', 'satisfies_expression', 'parenthesized_expression'].includes(value.type)) {
+          if (value && ['as_expression', 'satisfies_expression', 'parenthesized_expression', 'type_assertion'].includes(value.type)) {
             if (containsWrappedFunction(value)) return false;
           }
           if (!value || !['arrow_function', 'function_expression', 'generator_function'].includes(value.type)) continue;
