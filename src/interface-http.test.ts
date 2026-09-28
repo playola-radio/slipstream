@@ -120,8 +120,9 @@ test('trace attributes cache freshness separately to each returned file', async 
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
-test('trace marks unsupported and unavailable rows as having no fresh parse', async () => {
-  for (const name of ['py-unsupported-language', 'py-missing-blob-unsupported', 'swift-parse-failure']) {
+test('trace marks unsupported and incomplete comparisons as not fresh', async () => {
+  for (const name of ['py-unsupported-language', 'py-missing-blob-unsupported',
+    'swift-parse-failure', 'ts-parse-failure']) {
     const { storeDir, request } = await fixture(name);
     const events: ProjectionTraceEvent[] = [];
     const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,

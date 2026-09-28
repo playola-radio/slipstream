@@ -236,7 +236,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       signal.addEventListener('abort', task.cancel, { once: true });
       try {
         const result = await task.promise;
-        freshness = result.comparison === null ? 'none' : 'fresh';
+        freshness = result.comparison?.status === 'ready' ? 'fresh' : 'none';
         if (before.bytes !== null) base.coverage.before = result.before.status === 'incomplete'
           ? { state: 'incomplete', reason: result.before.reason }
           : result.before.status === 'tooLarge' ? { state: 'notEvaluated' } : { state: 'complete' };
@@ -282,7 +282,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       } else if ((left === undefined || left.status === 'complete') && (right === undefined || right.status === 'complete')) {
         const result = compareV2(left?.status === 'complete' ? left.declarations : [],
           right?.status === 'complete' ? right.declarations : []);
-        freshness = 'fresh';
+        freshness = result.status === 'ready' ? 'fresh' : 'none';
         if (result.status === 'incomplete') compareReason = result.reason;
         else changes = result.changes;
       }
