@@ -699,8 +699,10 @@ were settled as A on 2026-09-27 (delegated by Brian). The contract
 (FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2 and FD3 are merged;
 FD4 is in progress on the reader-API branch. Its production 100 ms provisional
 admission deadline times out cold Swift extraction in the standalone live check,
-so FD4 acceptance remains open and FD5 must measure D7 before any production
-value is approved. The Swift fixture-backed view remains FS2's work, and FS3
+so FD4 acceptance remains open. A preliminary FD5 four-arm run at a test-only
+400 ms interface deadline failed the paired capture and load-sufficiency gates
+(`FD5-MEASUREMENT-REPORT.md`); D7 production values remain unapproved. The
+Swift fixture-backed view remains FS2's work, and FS3
 live wiring waits for this API. No success criterion or ratified decision changes.
 
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.

@@ -144,8 +144,8 @@ thresholds. Crashes and missing data are **failures**, never discarded.
 |---|---|---|
 | **Baseline** | Capture only, no projection load. | Runnable now. |
 | **Clip-only** | Capture + a saturating clip request burst. | Runnable now. |
-| **Interface-only** | Capture + a saturating interface request burst. | **NOT YET RUNNABLE** — needs the TypeScript module (T5a.2) and Swift module (T5a.4). |
-| **Combined** | Capture + clip + interface bursts together, over the shared bound. | **NOT YET RUNNABLE** — needs T5a.2 + T5a.4. |
+| **Interface-only** | Capture + a saturating interface request burst. | Preliminary run failed the D7 decision gate; see `FD5-MEASUREMENT-REPORT.md`. |
+| **Combined** | Capture + clip + interface bursts together, over the shared bound. | Preliminary run failed the D7 decision gate; see `FD5-MEASUREMENT-REPORT.md`. |
 
 Inputs, once the interface arms are runnable: representative **TS / TSX / Swift** sizes,
 plus **malformed** and **Unicode** inputs; **cold** (first parse, grammar load) and
