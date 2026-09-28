@@ -29,6 +29,8 @@ export interface ReaderServerOptions {
   interfaceLimits?: Pick<InterfaceServiceOptions, 'fileResultBytes' | 'metadataBytes'>;
   /** Test seam for an isolated Swift host failure. */
   interfaceExtractSwift?: InterfaceServiceOptions['extractSwift'];
+  /** Test seam for interruption after a recorded content-retention probe. */
+  interfaceOnRetentionCheck?: InterfaceServiceOptions['onRetentionCheck'];
   /** Standalone single-session view (`serve`). Ignored when {@link registry} is
    * given; internally it becomes a one-entry registry. */
   active?: ActiveSession;
@@ -95,6 +97,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission });
   const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
     ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
+    onRetentionCheck: opts.interfaceOnRetentionCheck,
     admissionDeadlineMs: opts.interfaceDeadlineMs });
 
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {

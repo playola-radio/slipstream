@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { blobPath } from './store-reader.ts';
 import { startReaderServer } from './http-reader.ts';
 import { createInterfaceService } from './interface-service.ts';
+import { SwiftExtractTimeout } from './swift-interface.ts';
 import { createProjectionAdmission, type ProjectionAdmission, type AdmitRequest, type AdmitOutcome } from './projection-admission.ts';
 
 const CASES = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
@@ -368,6 +369,16 @@ async function serviceRequest(name: string) {
   } };
 }
 
+async function makeEndpointEqual(logPath: string, path: string): Promise<void> {
+  const records = (await readFile(logPath, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line) as {
+    type: string; data: { path?: string; before?: unknown; after?: unknown };
+  });
+  const change = records.find(record => record.type === 'slipstream.file.changed.v1' && record.data.path === path);
+  assert.ok(change?.data.before);
+  change.data.after = structuredClone(change.data.before);
+  await writeFile(logPath, records.map(record => JSON.stringify(record)).join('\n') + '\n');
+}
+
 for (const name of ['range-scan-limit-before-file', 'range-deadline-before-file',
   'range-cancelled-before-file'] as const) {
   test(`${name} matches its recorded golden through the service`, async () => {
@@ -465,6 +476,96 @@ test('cancellation retains a missing-blob disposition established before Swift e
     }]);
     assert.equal(page.page.next_after_path, 'Sources/App/F.swift');
   } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('cancellation after a verified hidden file preserves metadata and retries the unchanged cursor', async () => {
+  const { storeDir, req, expected } = await serviceRequest('range-page-boundary-first');
+  await makeEndpointEqual(req.logPath, 'src/a.ts');
+  const controller = new AbortController();
+  let interrupt = true;
+  const admission = createProjectionAdmission(FIXTURE_BUDGET);
+  const service = createInterfaceService({ storeDir, admission,
+    onRetentionCheck: (path, phase) => {
+      if (interrupt && path === 'src/a.ts' && phase === 'scan') {
+        interrupt = false;
+        controller.abort();
+      }
+    } });
+  try {
+    const stopped = await service.get({ ...req, signal: controller.signal });
+    assert.equal(stopped.status, 'skipped');
+    assert.equal(stopped.fallback_reason, 'cancelled');
+    assert.deepEqual(stopped.files, []);
+    assert.deepEqual(stopped.page, { complete: false, next_after_path: null });
+    assert.ok(stopped.inventory);
+    assert.ok(stopped.gaps);
+    const retried = await service.get(req);
+    assert.deepEqual(retried.files.map(file => file.path), ['src/b.ts']);
+    assert.deepEqual(retried.page, { complete: true, next_after_path: null });
+    assert.deepEqual(retried.inventory, stopped.inventory);
+    assert.deepEqual(retried.gaps, stopped.gaps);
+    const hiddenSha = (expected as { files: { before: { snapshot: { sha256: string } } }[] })
+      .files[0]!.before.snapshot.sha256;
+    await unlink(blobPath(storeDir, hiddenSha));
+    const afterLoss = await service.get(req);
+    assert.equal(afterLoss.files[0]?.path, 'src/a.ts');
+    assert.equal(afterLoss.files[0]?.status, 'unavailable');
+    assert.equal(afterLoss.files[0]?.fallback_reason, 'before-blob-missing');
+  } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('look-ahead interruption currently leaves a ready incomplete page with no reason', async () => {
+  const { storeDir, req } = await serviceRequest('range-page-boundary-first');
+  await makeEndpointEqual(req.logPath, 'src/b.ts');
+  const controller = new AbortController();
+  let interrupt = true;
+  const admission = createProjectionAdmission(FIXTURE_BUDGET);
+  const service = createInterfaceService({ storeDir, admission,
+    onRetentionCheck: (path, phase) => {
+      if (interrupt && path === 'src/b.ts' && phase === 'lookahead') {
+        interrupt = false;
+        controller.abort();
+      }
+    } });
+  try {
+    const stopped = await service.get({ ...req, signal: controller.signal });
+    assert.equal(stopped.status, 'ready');
+    assert.equal(stopped.fallback_reason, undefined);
+    assert.deepEqual(stopped.files.map(file => ({ path: file.path, status: file.status })),
+      [{ path: 'src/a.ts', status: 'ready' }]);
+    assert.deepEqual(stopped.page, { complete: false, next_after_path: 'src/a.ts' });
+    assert.ok(stopped.inventory);
+    const next = await service.get({ ...req, afterPath: stopped.page.next_after_path });
+    assert.deepEqual(next.files, []);
+    assert.deepEqual(next.page, { complete: true, next_after_path: null });
+  } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
+  const { storeDir, request } = await fixture('range-page-boundary-first');
+  const logPath = join(storeDir, 'sessions', '11111111-1111-4111-8111-111111111111', 'events.jsonl');
+  await makeEndpointEqual(logPath, 'src/b.ts');
+  let interrupt = true;
+  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    interfaceOnRetentionCheck: (path, phase) => {
+      if (interrupt && path === 'src/b.ts' && phase === 'lookahead') {
+        interrupt = false;
+        throw new SwiftExtractTimeout('test deadline during look-ahead');
+      }
+    } });
+  try {
+    const response = await fetch(reader.url + request.slice(4), {
+      headers: { authorization: `Bearer ${reader.token}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { status: string; fallback_reason?: string;
+      files: { path: string; status: string }[]; page: { complete: boolean; next_after_path: string | null } };
+    assert.equal(body.status, 'ready');
+    assert.equal(body.fallback_reason, undefined);
+    assert.deepEqual(body.files.map(file => ({ path: file.path, status: file.status })),
+      [{ path: 'src/a.ts', status: 'ready' }]);
+    assert.deepEqual(body.page, { complete: false, next_after_path: 'src/a.ts' });
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
 test('page blob budget ends before the next file with an exclusive cursor', async () => {

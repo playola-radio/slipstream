@@ -58,6 +58,8 @@ export interface InterfaceServiceOptions {
   pageBlobBytes?: number;
   /** Test harness interrupt seam; production does not set this. */
   onFileStart?: (path: string) => void;
+  /** Test harness seam after a recorded content-retention probe. */
+  onRetentionCheck?: (path: string, phase: 'scan' | 'lookahead') => void;
   /** Test seam for isolated child failures; production uses extractSwiftSides. */
   extractSwift?: typeof extractSwiftSides;
 }
@@ -352,6 +354,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (page.files.length >= Math.min(req.limit, FILES_PER_PAGE)) break;
         const equalAndRetained = file.endpointsEqual && await retainedContent(options.storeDir, file.before);
+        if (file.endpointsEqual) options.onRetentionCheck?.(file.path, 'scan');
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (equalAndRetained && !req.includeIdentical) { examined = file.path; continue; }
         const upcoming = equalAndRetained ? 0
@@ -390,11 +393,13 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       let remaining = false;
       for (const file of result.files) {
         if (file.path <= (examined ?? '')) continue;
-        if (!file.endpointsEqual || req.includeIdentical || !(await retainedContent(options.storeDir, file.before))) {
-          if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
+        if (!file.endpointsEqual || req.includeIdentical) {
           remaining = true; break;
         }
+        const retained = await retainedContent(options.storeDir, file.before);
+        options.onRetentionCheck?.(file.path, 'lookahead');
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
+        if (!retained) { remaining = true; break; }
       }
       page.page = { complete: !remaining, next_after_path: remaining ? examined : null };
       page.status = page.files.some(file => file.status !== 'ready' && file.status !== 'identical') ? 'partial' : 'ready';
