@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { blobPath } from './store-reader.ts';
 import { startReaderServer } from './http-reader.ts';
 import { createInterfaceService } from './interface-service.ts';
+import type { SwiftSide } from './swift-interface.ts';
 import { createProjectionAdmission, type ProjectionAdmission, type AdmitRequest, type AdmitOutcome } from './projection-admission.ts';
 
 const CASES = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
@@ -625,6 +626,44 @@ test('timeout during comparison preserves an established missing-blob status', a
     ]]);
     assert.deepEqual(page.page, { complete: false, next_after_path: 'Sources/App/F.swift' });
   } finally { await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('a late Swift result cannot change a timed-out page or populate its cache', async () => {
+  const { storeDir, req } = await serviceRequest('swift-parameter-change');
+  const { admission, timeout } = manualTimeoutAdmission();
+  let releaseLate: ((value: Map<string, SwiftSide>) => void) | undefined;
+  const late = new Promise<Map<string, SwiftSide>>(resolve => { releaseLate = resolve; });
+  const complete = (sides: { id: string }[]): Map<string, SwiftSide> => new Map(sides.map(side =>
+    [side.id, { status: 'complete', declarations: [] }]));
+  let calls = 0;
+  let firstSides: { id: string }[] = [];
+  const service = createInterfaceService({ storeDir, admission,
+    extractSwift: async sides => {
+      calls++;
+      if (calls === 1) {
+        firstSides = sides;
+        timeout();
+        return late;
+      }
+      return complete(sides);
+    } });
+  try {
+    const timedOut = await service.get(req);
+    assert.equal(timedOut.status, 'partial');
+    assert.deepEqual(timedOut.files.map(file => [file.status, file.fallback_reason]), [['skipped', 'timeout']]);
+    const frozen = structuredClone(timedOut);
+    releaseLate!(complete(firstSides));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(timedOut, frozen, 'late extraction changed the returned response');
+
+    const retried = await service.get(req);
+    assert.equal(retried.status, 'ready');
+    assert.equal(calls, 2, 'cancelled extraction was reused from the cache');
+  } finally {
+    releaseLate?.(new Map());
+    await service.close();
+    await rm(storeDir, { recursive: true, force: true });
+  }
 });
 
 test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
