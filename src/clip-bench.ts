@@ -16,7 +16,7 @@ import { createLog } from './log.ts';
 import { startCapture, type CaptureSession } from './session.ts';
 import { CLIP_PROJECTION_VERSION } from './clip-projection.ts';
 
-interface BenchmarkConfig { repetitions: number; scheduledWrites: number; scheduledIntervalMs: number; burstWrites: number; concurrentClipRequests: number; corpusChanges: number }
+export interface BenchmarkConfig { repetitions: number; scheduledWrites: number; scheduledIntervalMs: number; burstWrites: number; concurrentClipRequests: number; corpusChanges: number }
 const DEFAULTS: Readonly<BenchmarkConfig> = Object.freeze({ repetitions: 3, scheduledWrites: 100, scheduledIntervalMs: 120, burstWrites: 100, concurrentClipRequests: 16, corpusChanges: 8192 });
 const CHANGES_PER_HISTORICAL_SESSION = 64;
 const MAX_REQUEST_ATTEMPTS = 100_000;
@@ -191,13 +191,13 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
   };
 }
 
-async function readRecords(path: string): Promise<AnyEvent[]> {
+export async function readRecords(path: string): Promise<AnyEvent[]> {
   const text = await readFile(path, 'utf8').catch(() => '');
   const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
   return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line) as AnyEvent);
 }
 
-async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
+export async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     let quietTimer = setTimeout(() => done(true), QUIET_MS);
@@ -214,13 +214,13 @@ async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
   });
 }
 
-interface HistoricalChange { sessionId: string; seq: string; key: string }
+export interface HistoricalChange { sessionId: string; seq: string; key: string }
 function corpusBody(index: number, changed: boolean): string {
   const lines = Array.from({ length: 296 }, (_, line) => `  total += ${line === 147 && changed ? index + 2 : 1};`);
   return `export function corpus(value: number): number {\n  let total = value;\n${lines.join('\n')}\n  return total;\n}\n`;
 }
 
-async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
+export async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
   let sessionId = '';
   let log: Awaited<ReturnType<typeof createLog>> | undefined;
@@ -250,8 +250,8 @@ async function createHistoricalCorpus(storeDir: string, count: number): Promise<
   } finally { await log?.close(); }
 }
 
-interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
-function runWriter(root: string, repetition: number, config: BenchmarkConfig): Promise<WorkerWrite[]> {
+export interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
+export function runWriter(root: string, repetition: number, config: BenchmarkConfig): Promise<WorkerWrite[]> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), { workerData: { root, repetition, ...config } });
     let settled = false;
@@ -285,8 +285,8 @@ async function requestClip(url: string, token: string, change: HistoricalChange)
   }
 }
 
-interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
-function startContinuousLoad(url: string, token: string, corpus: HistoricalChange[], concurrent: number): { stop: () => Promise<LoadSummary> } {
+export interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
+export function startContinuousLoad(url: string, token: string, corpus: HistoricalChange[], concurrent: number): { stop: () => Promise<LoadSummary> } {
   const startedAtNs = process.hrtime.bigint();
   const responses: ClipResponse[] = [];
   const requested: string[] = [];
@@ -325,7 +325,7 @@ function startContinuousLoad(url: string, token: string, corpus: HistoricalChang
   };
 }
 
-function hostSample() { return { at: new Date().toISOString(), loadavg: loadavg(), freeMemoryGiB: freemem() / 2 ** 30 }; }
+export function hostSample() { return { at: new Date().toISOString(), loadavg: loadavg(), freeMemoryGiB: freemem() / 2 ** 30 }; }
 
 async function runReplication(arm: 'baseline' | 'saturation', repetition: number, storeDir: string, corpus: HistoricalChange[], config: BenchmarkConfig): Promise<CaptureArmReport> {
   const hostBefore = hostSample();
