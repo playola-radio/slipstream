@@ -88,6 +88,7 @@ const statusReason = (coverage: InterfaceFileResult['coverage'], language: strin
 };
 
 type ReadSide = { coverage: Coverage; bytes: Uint8Array | null; tooLarge: boolean; readBytes: number };
+type FileProgress = { coverage?: InterfaceFileResult['coverage']; tooLarge: boolean; identical: boolean };
 async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number): Promise<ReadSide> {
   const forced = sideFallback(endpoint);
   if (endpoint.kind === 'unknownBoundary' || endpoint.snapshot.kind !== 'content')
@@ -183,19 +184,30 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     return found.value;
   };
 
-  async function compareFile(file: RangeFile, signal: AbortSignal, equalAndRetained: boolean): Promise<{ result: InterfaceFileResult; blobBytes: number }> {
+  async function compareFile(file: RangeFile, signal: AbortSignal, equalAndRetained: boolean,
+    progress: FileProgress): Promise<{ result: InterfaceFileResult; blobBytes: number }> {
     const language = languageFor(file.path);
     const base: InterfaceFileResult = { path: file.path, before: file.before, after: file.after,
       language: language?.name ?? null, language_version: language?.version ?? null,
       status: 'ready', coverage: { before: sideFallback(file.before), after: sideFallback(file.after) }, changes: [] };
+    progress.coverage = base.coverage;
     if (equalAndRetained) {
+      progress.identical = true;
       base.status = 'identical';
       return { result: base, blobBytes: 0 };
     }
     const [before, after] = await Promise.all([
-      readSide(options.storeDir, file.before, SIDE_BYTES), readSide(options.storeDir, file.after, SIDE_BYTES),
+      readSide(options.storeDir, file.before, SIDE_BYTES).then(side => {
+        base.coverage.before = side.coverage;
+        progress.tooLarge ||= side.tooLarge;
+        return side;
+      }),
+      readSide(options.storeDir, file.after, SIDE_BYTES).then(side => {
+        base.coverage.after = side.coverage;
+        progress.tooLarge ||= side.tooLarge;
+        return side;
+      }),
     ]);
-    base.coverage = { before: before.coverage, after: after.coverage };
     if (!language) {
       if (base.coverage.before.state === 'notEvaluated') base.coverage.before = { state: 'unsupported' };
       if (base.coverage.after.state === 'notEvaluated') base.coverage.after = { state: 'unsupported' };
@@ -224,6 +236,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
           : result.after.status === 'tooLarge' ? { state: 'notEvaluated' } : { state: 'complete' };
         before.tooLarge ||= result.before.status === 'tooLarge';
         after.tooLarge ||= result.after.status === 'tooLarge';
+        progress.tooLarge ||= before.tooLarge || after.tooLarge;
         if (result.comparison?.status === 'incomplete') compareReason = result.comparison.fallback_reason;
         else if (result.comparison?.status === 'ready') changes = result.comparison.changes;
       } finally { signal.removeEventListener('abort', task.cancel); }
@@ -256,6 +269,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       if (left?.status === 'tooLarge' || right?.status === 'tooLarge') {
         before.tooLarge ||= left?.status === 'tooLarge';
         after.tooLarge ||= right?.status === 'tooLarge';
+        progress.tooLarge = true;
       } else if ((left === undefined || left.status === 'complete') && (right === undefined || right.status === 'complete')) {
         const result = compareV2(left?.status === 'complete' ? left.declarations : [],
           right?.status === 'complete' ? right.declarations : []);
@@ -287,6 +301,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     const page = envelope(req);
     let resolved = false;
     let current: RangeFile | undefined;
+    let currentProgress: FileProgress | undefined;
     let sealed = false;
     let failure: unknown;
     const interruptPage = (reason: 'timeout' | 'cancelled') => {
@@ -297,8 +312,12 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       }
       if (current) {
         const language = languageFor(current.path);
-        const coverage = { before: sideFallback(current.before), after: sideFallback(current.after) };
-        const disposition = statusReason(coverage, language?.name ?? null);
+        const progress = currentProgress;
+        const coverage = progress?.coverage ? {
+          before: { ...progress.coverage.before }, after: { ...progress.coverage.after },
+        } : { before: sideFallback(current.before), after: sideFallback(current.after) };
+        const disposition = progress?.identical ? { status: 'identical' as const }
+          : statusReason(coverage, language?.name ?? null, undefined, progress?.tooLarge);
         page.files.push({ path: current.path, before: current.before, after: current.after,
           language: language?.name ?? null, language_version: language?.version ?? null,
           status: disposition.status === 'ready' ? 'skipped' : disposition.status,
@@ -340,10 +359,12 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
             + (file.after.snapshot.kind === 'content' ? file.after.snapshot.size : 0);
         if (page.files.length > 0 && blobBytes + upcoming > (options.pageBlobBytes ?? PAGE_BLOB_BYTES)) break;
         current = file;
+        currentProgress = { tooLarge: false, identical: false };
         options.onFileStart?.(file.path);
-        const compared = await compareFile(file, abort.signal, equalAndRetained);
+        const compared = await compareFile(file, abort.signal, equalAndRetained, currentProgress);
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         current = undefined;
+        currentProgress = undefined;
         examined = file.path;
         blobBytes += compared.blobBytes;
         if (compared.result.status === 'identical' && !req.includeIdentical) continue;

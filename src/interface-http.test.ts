@@ -441,6 +441,32 @@ test('mid-page deadline preserves finished rows and advances after_path', async 
   finally { await service.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
+test('cancellation retains a missing-blob disposition established before Swift extraction', async () => {
+  const { storeDir, req, expected } = await serviceRequest('swift-parameter-change');
+  const beforeSha = (expected as { files: { before: { snapshot: { sha256: string } } }[] })
+    .files[0]!.before.snapshot.sha256;
+  await unlink(blobPath(storeDir, beforeSha));
+  const controller = new AbortController();
+  const admission = createProjectionAdmission(FIXTURE_BUDGET);
+  const service = createInterfaceService({ storeDir, admission,
+    extractSwift: async sides => {
+      assert.deepEqual(sides.map(side => side.id), ['after']);
+      controller.abort();
+      throw new Error('Swift extraction cancelled');
+    } });
+  try {
+    const page = await service.get({ ...req, signal: controller.signal });
+    assert.equal(page.status, 'partial');
+    assert.deepEqual(page.files.map(file => ({ path: file.path, status: file.status,
+      reason: file.fallback_reason, coverage: file.coverage })), [{
+      path: 'Sources/App/F.swift', status: 'unavailable', reason: 'before-blob-missing',
+      coverage: { before: { state: 'unavailable', reason: 'blob-missing' },
+        after: { state: 'notEvaluated' } },
+    }]);
+    assert.equal(page.page.next_after_path, 'Sources/App/F.swift');
+  } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
 test('page blob budget ends before the next file with an exclusive cursor', async () => {
   const { storeDir, req, expected } = await serviceRequest('range-page-boundary-first');
   const admission = createProjectionAdmission(FIXTURE_BUDGET);
