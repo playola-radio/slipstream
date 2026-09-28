@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { Language, Parser } from 'web-tree-sitter';
 import { createTypeScriptInterfaceExtractor, verifyTypeScriptGrammarArtifact } from './interface-v2-typescript.ts';
 import { compareStructuredExtractions as compareTypeScriptExtractions } from './interface-v2-comparison.ts';
 
@@ -150,6 +151,36 @@ test('UTF-8 byte spans include a leading BOM and reject invalid bytes', async ()
 
 test('grammar loader rejects an artifact changed under typescript.v2', () => {
   assert.throws(() => verifyTypeScriptGrammarArtifact('typescript', '0'.repeat(64)), /hash mismatch/);
+});
+
+test('a recoverable grammar-load failure does not poison later extraction', async (t) => {
+  const realLoad = Language.load.bind(Language);
+  let loads = 0;
+  t.mock.method(Language, 'load', async (...args: Parameters<typeof Language.load>) => {
+    if (++loads === 1) throw new Error('transient grammar load failure');
+    return realLoad(...args);
+  });
+  // A separate module instance gives this test an empty grammar cache without
+  // depending on which language another test loaded first.
+  const loader = await import(new URL('./interface-v2-typescript.ts?recoverable-load-test', import.meta.url).href);
+  await assert.rejects(loader.createTypeScriptInterfaceExtractor('typescript'), /transient grammar load failure/);
+  const extract = await loader.createTypeScriptInterfaceExtractor('typescript');
+  assert.equal(extract(Buffer.from('function recovered(): void {}')).status, 'complete');
+  assert.equal(loads, 2);
+});
+
+test('a recoverable parser initialization failure does not poison later extraction', async (t) => {
+  const realInit = Parser.init.bind(Parser);
+  let initializations = 0;
+  t.mock.method(Parser, 'init', async (...args: Parameters<typeof Parser.init>) => {
+    if (++initializations === 1) throw new Error('transient parser init failure');
+    return realInit(...args);
+  });
+  const loader = await import(new URL('./interface-v2-typescript.ts?recoverable-init-test', import.meta.url).href);
+  await assert.rejects(loader.createTypeScriptInterfaceExtractor('typescript'), /transient parser init failure/);
+  const extract = await loader.createTypeScriptInterfaceExtractor('typescript');
+  assert.equal(extract(Buffer.from('function recovered(): void {}')).status, 'complete');
+  assert.equal(initializations, 2);
 });
 
 test('typed function binding uses its written function type', async () => {

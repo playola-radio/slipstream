@@ -49,14 +49,22 @@ export async function createTypeScriptInterfaceExtractor(language: 'typescript' 
       initialization ??= Promise.resolve().then(() => {
         verifyParserRuntime();
         return Parser.init();
+      }).catch(error => {
+        initialization = undefined;
+        throw error;
       });
       await initialization;
       return Language.load(verifyTypeScriptGrammarArtifact(language));
     })();
     grammars.set(language, pending);
   }
-  const grammar = await pending;
-  return (bytes, limits) => extract(bytes, grammar, limits);
+  try {
+    const grammar = await pending;
+    return (bytes, limits) => extract(bytes, grammar, limits);
+  } catch (error) {
+    if (grammars.get(language) === pending) grammars.delete(language);
+    throw error;
+  }
 }
 
 function child(node: Node, type: string): Node | undefined {
