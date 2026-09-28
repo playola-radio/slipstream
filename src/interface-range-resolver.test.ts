@@ -124,8 +124,8 @@ test('all 62 successful fixture histories replay through the production resolver
     };
     const expected = JSON.parse(expectedText) as {
       files: Array<{ path: string; before: unknown; after: unknown; status: string }>;
-      inventory: { baseline_completed_seq: string | null; unknown_scopes: string[]; policy_exclusions: string[] };
-      gaps: unknown[];
+      inventory: { baseline_completed_seq: string | null; unknown_scopes: string[]; policy_exclusions: string[] } | null;
+      gaps: unknown[] | null;
     };
     const request = parseRequest(await readFile(join(dir, 'request.txt'), 'utf8'));
     assert.notEqual(typeof request, 'string', name);
@@ -143,8 +143,14 @@ test('all 62 successful fixture histories replay through the production resolver
       }));
       assert.equal(result.kind, 'resolved', name);
       if (result.kind !== 'resolved') return;
-      assert.equal(result.inventory.baselineCompletedSeq, expected.inventory.baseline_completed_seq, name);
-      assert.deepEqual(result.inventory.policyExclusions, expected.inventory.policy_exclusions, name);
+      // Admission-first skipped pages have no envelope metadata. FD3 still
+      // resolves that history independently, so compare its raw recorded facts.
+      const completed = history.events.find((e) => e.type === 'slipstream.capture.baseline.completed.v1'
+        && BigInt(e.seq) <= request.after);
+      assert.equal(result.inventory.baselineCompletedSeq,
+        expected.inventory?.baseline_completed_seq ?? completed?.seq ?? null, name);
+      assert.deepEqual(result.inventory.policyExclusions,
+        expected.inventory?.policy_exclusions ?? ['store-directory', '.git', 'symlinks'], name);
       const eligible = [...new Set(history.events.filter((e) =>
         (e.type === 'slipstream.file.baselined.v1' || e.type === 'slipstream.file.changed.v1')
         && BigInt(e.seq) <= request.after && typeof e.data.path === 'string'
@@ -156,7 +162,7 @@ test('all 62 successful fixture histories replay through the production resolver
       // the public envelope (FD4). Its raw unknownScopes/gaps must still match
       // the fixture's recorded history even when the harness zeroes that budget
       // and expected.json's envelope-level fields go empty for a separate reason.
-      if (history.harness?.limits?.metadata_bytes === 0) {
+      if (history.harness?.limits?.metadata_bytes === 0 || expected.inventory === null) {
         const rawUnknownScopes = [...new Set(history.events
           .filter((e) => e.type === 'slipstream.capture.baseline.completed.v1')
           .flatMap((e) => (e.data.unknown_scopes as string[]) ?? []))].sort();

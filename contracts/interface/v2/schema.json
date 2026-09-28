@@ -39,6 +39,37 @@
       "$comment": "Present exactly when status is skipped."
     },
     "inventory": {
+      "oneOf": [{ "$ref": "#/$defs/resolvedInventory" }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved. No inventory claim was evaluated."
+    },
+    "analysis": { "$ref": "#/$defs/analysis" },
+    "gaps": {
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" } }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved."
+    },
+    "gaps_complete": { "type": "boolean" },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fileResult" },
+      "$comment": "Ordered by path, by exact UTF-16 code unit. identical results appear only with include_identical=true."
+    },
+    "page": {
+      "type": "object",
+      "required": ["complete", "next_after_path"],
+      "properties": {
+        "complete": {
+          "type": "boolean",
+          "$comment": "true only on the last page. Loaded totals are partial until then."
+        },
+        "next_after_path": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "Exclusive cursor for the next request. null when complete. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "resolvedInventory": {
       "type": "object",
       "required": [
         "scope",
@@ -82,33 +113,6 @@
       },
       "$comment": "Decisions F3-A and F4-A. Analyzing any of these is a new projection version."
     },
-    "gaps": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/gap" },
-      "$comment": "Every capture.gap at or before after_seq, ordered by seq, subject to the shared 64 KiB metadata budget."
-    },
-    "gaps_complete": { "type": "boolean" },
-    "files": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/fileResult" },
-      "$comment": "Ordered by path, by exact UTF-16 code unit. identical results appear only with include_identical=true."
-    },
-    "page": {
-      "type": "object",
-      "required": ["complete", "next_after_path"],
-      "properties": {
-        "complete": {
-          "type": "boolean",
-          "$comment": "true only on the last page. Loaded totals are partial until then."
-        },
-        "next_after_path": {
-          "oneOf": [{ "type": "string" }, { "const": null }],
-          "$comment": "Exclusive cursor for the next request. null when complete. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
-        }
-      }
-    }
-  },
-  "$defs": {
     "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
     "cutoff": {
       "type": "string",

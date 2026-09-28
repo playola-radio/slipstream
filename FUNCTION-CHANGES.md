@@ -1,12 +1,12 @@
 # Function input/output changes: design and contract
 
-> **Status: CONTRACT — decisions settled, not yet implemented.** Brian delegated
+> **Status: CONTRACT — FD1–FD3 merged, FD4 in progress.** Brian delegated
 > decisions F1–F6 on 2026-09-27 and all six were settled as **A** (see
 > [Decisions](#3-decisions-for-brian)). The authoritative contract is
 > `contracts/interface/v2/schema.json` plus the validated fixtures under
 > `contracts/interface/v2/cases/` (§5.3). The JSON in this document illustrates
-> it; where they differ, the schema and fixtures win. Nothing is served yet:
-> FD1–FD5 implement it (§6).
+> it; where they differ, the schema and fixtures win. FD4 is adding the reader
+> route; FD5 remains the measured admission gate (§6).
 
 This document defines how the daemon reports what changed in functions'
 inputs and outputs over a stretch of captured work. It is the design for the
@@ -424,6 +424,14 @@ What the page-level `status` values mean:
   The causes are admission rejection or a deadline before the first file,
   `scan-limit`, or shutdown. `page.complete` is `false` and the cursor does not
   move.
+
+**Pre-resolution skipped metadata (FD4 amendment, Brian approved).** Admission
+comes before range resolution. If a request is rejected, cancelled, times out,
+or reaches the scan limit before the range resolves, `inventory` and `gaps` are
+`null` and `gaps_complete` is `false`. This says the recorded metadata was not
+evaluated; it never fabricates an empty inventory or gap list. Once resolution
+has completed, a skipped or partial page retains the resolved metadata. The
+`range-admission-skipped` golden fixture and schema encode this rule.
 
 **Deadline and cancellation mid-page.**
 

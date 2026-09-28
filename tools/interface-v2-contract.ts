@@ -594,17 +594,27 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
   extraKeys(range, ['before_seq', 'after_seq'], 'expected.range', errors);
   if (range.before_seq !== req.before.toString() || range.after_seq !== req.after.toString()) errors.push('expected.range: does not match the request');
 
-  const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
-  const inventory = body.inventory as Obj;
-  extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
-  if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
-  if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
-  const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
-  checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
-  const recordedGaps = history.events
-    .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
-    .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
-  checkMetadataList(body.gaps as unknown[], body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
+  if (harness.admissionOverloaded) {
+    if (body.inventory !== null || body.gaps !== null || body.gaps_complete !== false) {
+      errors.push('expected: pre-work overload must mark inventory and gaps not evaluated');
+    }
+  } else {
+    const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
+    const inventory = body.inventory as Obj;
+    if (!isObj(inventory)) errors.push('expected.inventory: resolved page needs inventory');
+    else {
+      extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
+      if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
+      if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
+      const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
+      checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
+    }
+    const recordedGaps = history.events
+      .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
+      .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
+    if (!Array.isArray(body.gaps)) errors.push('expected.gaps: resolved page needs gaps');
+    else checkMetadataList(body.gaps, body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
+  }
 
   const files = body.files as Obj[];
   const page = body.page as Obj;
