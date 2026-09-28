@@ -31,6 +31,8 @@ export interface ExpectedFile {
   languageVersion: string;
   beforeSha256: string;
   afterSha256: string;
+  beforeRecordSeq: string;
+  afterRecordSeq: string;
   /** Expected complete structured changes, from a hand-specified fixture. */
   changes: unknown[];
 }
@@ -158,6 +160,10 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
     const want = byPath.get(file.path);
     if (!want) { faults.push(`unexpected file ${file.path}`); continue; }
     if (sha(file.before) !== want.beforeSha256 || sha(file.after) !== want.afterSha256) faults.push(`source mismatch ${file.path}`);
+    const before = object(file.before), after = object(file.after);
+    if (before?.kind !== 'recorded' || before.record_seq !== want.beforeRecordSeq || before.field !== 'snapshot'
+      || after?.kind !== 'recorded' || after.record_seq !== want.afterRecordSeq || after.field !== 'after'
+      || after.observation !== 'watcher') faults.push(`source provenance mismatch ${file.path}`);
     if (file.language !== want.language || file.language_version !== want.languageVersion) faults.push(`language/version mismatch ${file.path}`);
     if (file.status === 'ready') {
       if (!Array.isArray(file.changes) || !same(file.changes, want.changes)) faults.push(`change mismatch ${file.path}`);

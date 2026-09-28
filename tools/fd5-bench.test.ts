@@ -11,6 +11,7 @@ import { createCas } from '../src/cas.ts';
 import { extractSwiftSides } from '../src/swift-interface.ts';
 import { compareV2 } from '../src/interface-v2-core.ts';
 import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
 
 test('registered config preserves fixed B2 limits and requires an explicit finite cold corpus', async () => {
   const config = JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8'));
@@ -78,12 +79,23 @@ test('TS, TSX and Swift corpus variants retain pinned changes at tiny and repres
 });
 
 test('isolated load client starts, stops and actually exits without a reader', async () => {
-  const worker = new Worker(new URL('./fd5-load-worker.ts', import.meta.url), {
-    workerData: { kind: 'interface', url: 'http://127.0.0.1:1', token: 'unused', corpus: [], slots: 16 },
-  });
+  const priorArgv = process.argv[1];
+  // Match the registered command's parent argv[1]. A file-backed worker sees
+  // its own script as argv[1]; the imported bench module must not run its CLI.
+  process.argv[1] = fileURLToPath(new URL('./fd5-bench.ts', import.meta.url));
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL('./fd5-load-worker.ts', import.meta.url), {
+      workerData: { kind: 'interface', url: 'http://127.0.0.1:1', token: 'unused', corpus: [], slots: 16 },
+    });
+  } finally {
+    if (priorArgv === undefined) process.argv.splice(1, 1);
+    else process.argv[1] = priorArgv;
+  }
   try {
     const [started] = await once(worker, 'message', { signal: AbortSignal.timeout(5_000) });
     assert.equal(started.type, 'started');
+    assert.equal(started.argv1, fileURLToPath(new URL('./fd5-load-worker.ts', import.meta.url)));
     const summary = once(worker, 'message', { signal: AbortSignal.timeout(5_000) });
     const exit = once(worker, 'exit', { signal: AbortSignal.timeout(5_000) });
     worker.postMessage('stop');

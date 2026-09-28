@@ -11,15 +11,18 @@ function expected(i: number, language = languages[i % 3]!): ExpectedInterfaceReq
     language, sizeClass: 'tiny', sessionId: '11111111-1111-4111-8111-111111111111',
     beforeSeq: '3', afterSeq: '4', files: [{ path: `file-${i}.${language === 'swift' ? 'swift' : language === 'tsx' ? 'tsx' : 'ts'}`,
       language: language === 'swift' ? 'swift' : 'typescript', languageVersion: language === 'swift' ? 'swift.v1' : 'typescript.v2',
-      beforeSha256: 'a'.repeat(64), afterSha256: 'b'.repeat(64), changes: [{ kind: 'signatureChanged', identity: { name: `f${i}` } }] }] };
+      beforeSha256: 'a'.repeat(64), afterSha256: 'b'.repeat(64), beforeRecordSeq: '2', afterRecordSeq: '4',
+      changes: [{ kind: 'signatureChanged', identity: { name: `f${i}` } }] }] };
 }
 function page(e: ExpectedInterfaceRequest): unknown {
   return { projection_version: 'interface.v2', session_id: e.sessionId,
     range: { before_seq: e.beforeSeq, after_seq: e.afterSeq }, status: 'ready',
     inventory: { scope: 'observed' }, analysis: { shared_types: 'notAnalyzed' }, gaps: [], gaps_complete: true,
     files: e.files.map(f => ({ path: f.path,
-      before: { kind: 'baseline', snapshot: { kind: 'content', sha256: f.beforeSha256 } },
-      after: { kind: 'recorded', snapshot: { kind: 'content', sha256: f.afterSha256 } },
+      before: { kind: 'recorded', record_seq: f.beforeRecordSeq, field: 'snapshot',
+        snapshot: { kind: 'content', sha256: f.beforeSha256 } },
+      after: { kind: 'recorded', record_seq: f.afterRecordSeq, field: 'after', observation: 'watcher',
+        snapshot: { kind: 'content', sha256: f.afterSha256 } },
       language: f.language, language_version: f.languageVersion, status: 'ready', changes: f.changes })),
     page: { complete: true, next_after_path: null } };
 }
@@ -63,6 +66,8 @@ test('validates every row and source/version/change, rather than first row or re
   rows[1]!.language_version = 'wrong';
   rows[1]!.changes = [];
   assert.match(validateInterfacePage(good, e).join(' '), /version mismatch.*change mismatch/);
+  rows[0]!.after = { ...(rows[0]!.after as object), record_seq: 'wrong' };
+  assert.match(validateInterfacePage(good, e).join(' '), /source provenance mismatch/);
   rows.pop();
   assert.match(validateInterfacePage(good, e).join(' '), /missing file/);
 });

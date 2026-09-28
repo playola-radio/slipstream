@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
 import { arch, cpus, release, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Worker } from 'node:worker_threads';
+import { isMainThread, Worker } from 'node:worker_threads';
 import { isMainModule } from '../src/entrypoint.ts';
 import { createCas } from '../src/cas.ts';
 import { createLog } from '../src/log.ts';
@@ -85,7 +85,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
     try {
       await log.append({ type: 'slipstream.session.started.v1', occurred_at_ms: Date.now(),
         data: { root: '/synthetic-fd5-corpus', max_bytes: 1024 * 1024 } });
-      const files: Array<ExpectedFile & { beforeSize: number; afterSize: number }> = [];
+      const baselines: Array<Omit<ExpectedFile, 'afterRecordSeq'> & { beforeSize: number; afterSize: number }> = [];
       for (let j = 0; j < limit; j++) {
         const language = pageLanguage;
         const source = language === 'swift' ? swift : ts;
@@ -95,22 +95,25 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
         const path = `file-${String(j).padStart(2, '0')}.${language === 'tsx' ? 'tsx' : source.extension}`;
         const before = await cas.put(Buffer.from(`${source.before}${filler}`));
         const after = await cas.put(Buffer.from(`${source.after}${filler}// fd5 ${seed} ${index}:${j}\n`));
-        files.push({ path, language: language === 'swift' ? 'swift' : 'typescript', languageVersion: source.languageVersion,
-          beforeSha256: before.sha256, afterSha256: after.sha256, changes: source.changes,
-          beforeSize: before.size, afterSize: after.size });
-        await log.append({ type: 'slipstream.file.baselined.v1', occurred_at_ms: Date.now(),
+        const baselineEvent = await log.append({ type: 'slipstream.file.baselined.v1', occurred_at_ms: Date.now(),
           data: { path, snapshot: { kind: 'content', sha256: before.sha256, size: before.size } } });
+        baselines.push({ path, language: language === 'swift' ? 'swift' : 'typescript', languageVersion: source.languageVersion,
+          beforeSha256: before.sha256, afterSha256: after.sha256, changes: source.changes,
+          beforeRecordSeq: baselineEvent.seq,
+          beforeSize: before.size, afterSize: after.size });
       }
       const baseline = await log.append({ type: 'slipstream.capture.baseline.completed.v1', occurred_at_ms: Date.now(),
         data: { unknown_scopes: [] } });
       let lastSeq = baseline.seq;
-      for (const file of files) {
+      const files: Array<ExpectedFile & { beforeSize: number; afterSize: number }> = [];
+      for (const file of baselines) {
         const time = Date.now();
         const event = await log.append({ type: 'slipstream.file.changed.v1', occurred_at_ms: time,
           data: { path: file.path, before: { kind: 'content', sha256: file.beforeSha256, size: file.beforeSize },
             after: { kind: 'content', sha256: file.afterSha256, size: file.afterSize },
             observation: 'watcher', observed_interval_ms: { start_ms: time, end_ms: time } } });
         lastSeq = event.seq;
+        files.push({ ...file, afterRecordSeq: event.seq });
       }
       const key = createHash('sha256').update(JSON.stringify(files.map(f => [f.beforeSha256, f.afterSha256, f.language, f.languageVersion]))).digest('hex');
       const routeKey = `/v1/sessions/${sessionId}/interfaces?${new URLSearchParams({ before_seq: baseline.seq,
@@ -206,9 +209,26 @@ function startLoadWorker(kind: 'clip' | 'interface', url: string, token: string,
   return { ready, stop: () => stopping ??= (async () => {
     await ready;
     worker.postMessage('stop');
-    const summary = await stopped;
+    let responseDeadline: ReturnType<typeof setTimeout> | undefined;
+    let summary: LoadSummary | InterfaceLoadSummary;
+    try {
+      summary = await Promise.race([stopped, new Promise<never>((_resolve, reject) => {
+        responseDeadline = setTimeout(() => reject(new Error('FD5 load worker did not stop within 20 seconds')), 20_000);
+      })]);
+    } catch (error) {
+      await worker.terminate();
+      throw error;
+    } finally { if (responseDeadline) clearTimeout(responseDeadline); }
     // A completed response is not enough; prove this client worker actually exited.
-    await exited;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([exited, new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('FD5 load worker did not exit after stop')), 5_000);
+      })]);
+    } catch (error) {
+      await worker.terminate();
+      throw error;
+    } finally { if (deadline) clearTimeout(deadline); }
     return summary;
   })() };
 }
@@ -343,7 +363,7 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
       'owner-approved timeout and useful-throughput rates', 'owner-approved D7 configuration'];
     await outputFile.appendFile(encode({ type: 'final', comparisons, measuredGatesPass,
       d7Decision: 'pending', outstandingEvidence,
-      measurementStatus: measuredGatesPass ? 'further evidence required' : 'measurement gates failed' }) + '\n');
+      measurementStatus: measuredGatesPass ? 'further evidence required' : 'invalid: missing or failed evidence' }) + '\n');
     await outputFile.sync();
   } catch (error) {
     await outputFile.appendFile(encode({ type: 'failed', error: String(error), completedArms: reports.length }) + '\n');
@@ -362,4 +382,4 @@ async function main(): Promise<void> {
   const config = validateConfig(JSON.parse(await readFile(resolve(configPath), 'utf8')));
   await runFD5(config, resolve(outPath));
 }
-if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) await main();
+if (isMainThread && process.argv[1] && isMainModule(import.meta.url, process.argv[1])) await main();

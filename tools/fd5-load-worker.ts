@@ -11,7 +11,7 @@ const input = workerData as Input;
 const load = input.kind === 'clip'
   ? startContinuousLoad(input.url, input.token, input.corpus, input.slots)
   : startInterfaceLoad(input.url, input.token, input.corpus, input.slots);
-parentPort.postMessage({ type: 'started' });
+parentPort.postMessage({ type: 'started', argv1: process.argv[1] });
 parentPort.once('message', async (message: unknown) => {
   if (message !== 'stop') throw new Error('FD5 load worker received an unknown command');
   try {
