@@ -231,7 +231,20 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         after.bytes !== null ? { id: 'after', bytes: after.bytes } : null].filter((v): v is { id: string; bytes: Uint8Array } => v !== null);
       const results = await (options.extractSwift ?? extractSwiftSides)(sides, { signal,
         limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
+      if (results.size !== sides.length) throw new Error('Swift extractor returned unexpected side count');
       for (const side of sides) if (!results.has(side.id)) throw new Error(`Swift extractor omitted ${side.id} side`);
+      for (const side of sides) {
+        const extracted = results.get(side.id)!;
+        if (extracted.status === 'complete') {
+          if (!Array.isArray(extracted.declarations)) throw new Error('Swift extractor omitted declarations');
+        } else if (extracted.status === 'incomplete') {
+          if (extracted.reason !== 'parse-error' && extracted.reason !== 'unsupported-construct')
+            throw new Error('Swift extractor returned unknown incomplete reason');
+        } else if (extracted.status === 'tooLarge') {
+          if (!['inputBytes', 'declarations', 'syntaxVisits'].includes(extracted.limit))
+            throw new Error('Swift extractor returned unknown limit');
+        } else throw new Error('Swift extractor returned unknown status');
+      }
       for (const side of ['before', 'after'] as const) {
         const extracted = results.get(side);
         if (extracted?.status === 'complete') base.coverage[side] = { state: 'complete' };

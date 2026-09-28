@@ -275,6 +275,27 @@ test('a Swift host reply missing a requested side fails closed as text HTTP 500'
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
+for (const [name, reply] of [
+  ['unknown status', new Map([['before', { status: 'mystery' }], ['after', { status: 'complete', declarations: [] }]])],
+  ['extra side', new Map([['before', { status: 'complete', declarations: [] }],
+    ['after', { status: 'complete', declarations: [] }], ['unexpected', { status: 'complete', declarations: [] }]])],
+  ['complete side without declarations', new Map([['before', { status: 'complete' }],
+    ['after', { status: 'complete', declarations: [] }]])],
+] as const) {
+  test(`a Swift host reply with ${name} fails closed as text HTTP 500`, async () => {
+    const { storeDir, request } = await fixture('swift-parameter-change');
+    const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+      interfaceExtractSwift: async () => reply as never });
+    try {
+      const response = await fetch(reader.url + request.slice(4), {
+        headers: { authorization: `Bearer ${reader.token}` },
+      });
+      assert.equal(response.status, 500);
+      assert.equal(await response.text(), 'internal error');
+    } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+  });
+}
+
 test('reader shutdown aborts in-flight isolated Swift work before closing', async () => {
   const { storeDir, request } = await fixture('swift-parameter-change');
   let started!: () => void;

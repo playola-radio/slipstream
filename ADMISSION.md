@@ -3,6 +3,8 @@
 **FD4 status (2026-09-27):** the reader now shares this provisional budget across
 clip and interface work. Values remain **UNAPPROVED**; see `docs/FD4-READER-API.md`
 for live evidence and the FD5 handoff.
+Consumer abort is used only by unkeyed interface requests; a keyed leader's abort
+would also cancel its coalesced waiters, so keyed callers must not pass a signal.
 
 Clip projection and the upcoming interface projection (T5b.2) both turn a change's
 before/after blobs into a derived view on demand, in terminable workers. Two
