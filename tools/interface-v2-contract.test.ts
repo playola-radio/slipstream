@@ -51,6 +51,7 @@ describe('interface.v2 contract fixtures', () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     const report = JSON.parse(out[0] ?? '{}');
+    assert.equal(report.cases, 69);
     assert.deepEqual(report.failures, []);
     assert.equal(report.negative_control_rejected, true);
     assert.equal(code, EXIT.PASS);
@@ -142,6 +143,19 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('a 400 for a well-formed request', /give 200, not 400/, (c) => { asError(c, 400); });
   rejects('an unknown harness condition', /unexpected property 'slow'/, (c) => { c.history.harness = { slow: true }; });
   rejects('a non-zero harness limit', /must be 0/, (c) => { c.history.harness = { limits: { file_result_bytes: 1 } }; });
+  rejects('a non-zero pre-first-file scan limit', /scan_records: must be 0/, (c) => {
+    c.history.harness.limits.scan_records = 1;
+  }, 'range-scan-limit-before-file');
+  rejects('an unknown pre-first-file interrupt phase', /phase.*resolve/, (c) => {
+    c.history.harness.interrupt.phase = 'after';
+  }, 'range-deadline-before-file');
+  rejects('an unknown pre-first-file interrupt reason', /reason.*timeout.*cancelled/, (c) => {
+    c.history.harness.interrupt.reason = 'overloaded';
+  }, 'range-cancelled-before-file');
+  rejects('evaluated inventory on pre-first-file timeout', /not evaluated/, (c) => {
+    c.expected.inventory = { scope: 'observed', baseline_completed_seq: '3', unknown_scopes: [],
+      unknown_scopes_complete: true, policy_exclusions: ['store-directory', '.git', 'symlinks'] };
+  }, 'range-deadline-before-file');
   rejects('a normal page under an admission rejection', /overloaded/, (c) => { c.history.harness = { admission: 'overloaded' }; });
   rejects('a ready file under an interrupt', /precedence gives skipped \/ cancelled/, (c) => { c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'cancelled' } }; });
   rejects('a ready first file under a zero file-result budget', /precedence gives skipped \/ too-large/, (c) => { c.history.harness = { limits: { file_result_bytes: 0 } }; });

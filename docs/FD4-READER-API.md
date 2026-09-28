@@ -56,10 +56,10 @@ change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
   filters, and version across `next_after_path`; handle partial/skipped pages,
   explicit unavailable sides, unknown scopes, gaps, 409, 410, and stale replies.
   FS2 owns the fixture-backed Swift screen. This PR changes no Swift client.
-- **Contract owner:** A deterministic fixture-harness extension for scan-limit,
-  deadline and cancellation before the first file was proposed separately.
-  No approved golden fixture was changed for that extension without owner
-  disposition. Unit tests cover those paths meanwhile.
+- **Contract owner:** Brian approved the narrow pre-first-file harness extension.
+  Three additional goldens cover scan-limit, deadline and cancellation during
+  resolution; the validator now checks 69 cases with its negative control.
+  Each new case is replayed through the actual interface service.
 - **Swift host crash:** The current v2 schema has no dedicated per-file status.
   An abnormal host exit is an internal text `500`; a reproducible crash on one
   file can block later paths on a page. A per-file recovery status would need a

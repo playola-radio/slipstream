@@ -60,7 +60,8 @@ test('reader serves the public interface.v2 projection schema with authenticatio
 });
 
 const HARNESS_ONLY = new Set(['range-admission-skipped', 'range-cancelled-mid-page',
-  'range-deadline-mid-page', 'range-gap-cap', 'range-too-large-first-file']);
+  'range-deadline-mid-page', 'range-gap-cap', 'range-too-large-first-file',
+  'range-scan-limit-before-file', 'range-deadline-before-file', 'range-cancelled-before-file']);
 for (const name of (await readdir(CASES)).filter(name => !HARNESS_ONLY.has(name))) {
   test(`reader comparison matches recorded ${name} history`, async () => {
     const { storeDir, request, expected, expectedError } = await fixture(name);
@@ -351,46 +352,34 @@ async function serviceRequest(name: string) {
   } };
 }
 
-test('pre-first-file cancellation and scan limit disclose unevaluated metadata', async () => {
-  const { storeDir, req } = await serviceRequest('ts-parameter-change');
-  const admission = createProjectionAdmission(FIXTURE_BUDGET);
-  const cancelled = new AbortController();
-  cancelled.abort();
-  const service = createInterfaceService({ storeDir, admission });
-  try {
-    const stopped = await service.get({ ...req, signal: cancelled.signal });
-    assert.equal(stopped.status, 'skipped');
-    assert.equal(stopped.fallback_reason, 'cancelled');
-    assert.equal(stopped.inventory, null);
-    assert.equal(stopped.gaps, null);
-    const scanService = createInterfaceService({ storeDir, admission, scanBudget: { records: 0, bytes: 0 } });
-    try {
-      const limited = await scanService.get(req);
-      assert.equal(limited.status, 'skipped');
-      assert.equal(limited.fallback_reason, 'scan-limit');
-      assert.equal(limited.inventory, null);
-      assert.equal(limited.gaps, null);
-    } finally { await scanService.close(); }
-  } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
-});
-
-test('deadline before any file starts returns a skipped page without moving the cursor', async () => {
-  const { storeDir, req } = await serviceRequest('ts-parameter-change');
-  const admission: ProjectionAdmission = {
-    admit: async () => ({ kind: 'timeout' }), close: async () => {},
-    snapshot: () => ({ running: 0, queued: 0, waiters: 0 }),
-  };
-  const service = createInterfaceService({ storeDir, admission });
-  try {
-    const page = await service.get(req);
-    assert.equal(page.status, 'skipped');
-    assert.equal(page.fallback_reason, 'timeout');
-    assert.equal(page.inventory, null);
-    assert.equal(page.gaps, null);
-    assert.deepEqual(page.files, []);
-    assert.deepEqual(page.page, { complete: false, next_after_path: null });
-  } finally { await service.close(); await rm(storeDir, { recursive: true, force: true }); }
-});
+for (const [name, reason] of [
+  ['range-scan-limit-before-file', 'scan-limit'],
+  ['range-deadline-before-file', 'timeout'],
+  ['range-cancelled-before-file', 'cancelled'],
+] as const) {
+  test(`pre-first-file ${reason} matches its recorded golden through the service`, async () => {
+    const { storeDir, req, expected } = await serviceRequest(name);
+    const controller = new AbortController();
+    const admission: ProjectionAdmission = reason === 'scan-limit'
+      ? createProjectionAdmission(FIXTURE_BUDGET)
+      : {
+        admit: async <T>(request: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
+          const handle = request.run();
+          if (reason === 'cancelled') {
+            controller.abort();
+            return { kind: 'ok', value: await handle.promise };
+          }
+          handle.cancel();
+          return { kind: 'timeout' };
+        },
+        close: async () => {}, snapshot: () => ({ running: 0, queued: 0, waiters: 0 }),
+      };
+    const service = createInterfaceService({ storeDir, admission,
+      scanBudget: reason === 'scan-limit' ? { records: 0, bytes: 0 } : undefined });
+    try { assert.deepEqual(await service.get({ ...req, signal: controller.signal }), expected); }
+    finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+  });
+}
 
 test('mid-page cancellation preserves finished rows and advances after_path', async () => {
   const { storeDir, req, expected } = await serviceRequest('range-cancelled-mid-page');

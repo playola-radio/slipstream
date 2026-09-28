@@ -86,10 +86,9 @@ ceiling. These numbers are a D7 owner decision input, not approved admission
 values or a reason to relax the clip deadline. The measurement command and full
 raw samples are retained in the workspace's `.context/` evidence.
 
-The approved fixture harness has no condition for a scan limit or a deadline
-before any file starts. The scoped contract amendment proposed for the owner is
+The approved FD4 fixture harness now covers a scan limit or interruption before
+any file starts. Its scoped owner-approved amendment uses
 `harness.limits.scan_records: 0` for deterministic pre-first-file scan-limit and
 `harness.interrupt: { phase: "resolve", reason: "timeout" | "cancelled" }` for
-the corresponding interruption. FD3 unit tests cover these outcomes now;
-no golden expectation or validator was altered here. FD4 can add the fixture
-only after an owner-approved harness extension.
+the corresponding interruption. FD3 unit tests and the three FD4 goldens cover
+these outcomes without changing the original 66 cases.

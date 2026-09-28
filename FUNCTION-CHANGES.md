@@ -889,9 +889,9 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
 - page boundary with `next_after_path`;
 - cache hit followed by blob loss.
 
-**Committed case index** (`contracts/interface/v2/cases/`, 66 cases):
+**Committed case index** (`contracts/interface/v2/cases/`, 69 cases):
 
-- **TypeScript (21):** `ts-` + `parameter-change`, `return-change`,
+- **TypeScript (20):** `ts-` + `parameter-change`, `return-change`,
   `added-function`, `added-file`, `removed-function`, `removed-file`,
   `unchanged-signature`, `inferred-return`, `shared-type-only`,
   `overload-ambiguity`, `parse-failure`, `missing-blob`, `capture-unavailable`,
@@ -902,14 +902,15 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
   `labels-defaults-effects`, `init-failable`, `generics-where`, `variadic`,
   `guard-move` and `extension-member`.
 - **Python (2):** `py-unsupported-language`, `py-missing-blob-unsupported`.
-- **Range and page (21):** `range-` + `gap-unchanged-hashes`,
+- **Range and page (24):** `range-` + `gap-unchanged-hashes`,
   `restart-reconciliation`, `gap-before-b`, `add-then-remove-ts`,
   `add-then-remove-py`, `reverted-hidden` (default filter, `files: []`),
   `reverted-listed`, `all-failed-page`, `deadline-mid-page`,
   `cancelled-mid-page`, `too-large-first-file`, `gap-cap`, `unknown-scopes`,
   `admission-skipped`, `page-boundary-first`, `page-boundary-second`,
   `huge-seq`, `rename`, `durable-ahead-409`,
-  `corrupt-chain-500` and `invalid-request-400`.
+  `corrupt-chain-500`, `invalid-request-400`, `scan-limit-before-file`,
+  `deadline-before-file` and `cancelled-before-file`.
 
 Two listed conditions are **not** static fixtures, because they need a race
 between requests: "cache hit followed by blob loss" and the `410` deletion race.

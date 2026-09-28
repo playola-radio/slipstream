@@ -105,7 +105,7 @@ test('an unavailable observation remains the endpoint and never equals another u
   });
 });
 
-test('all 62 successful fixture histories replay through the production resolver', async () => {
+test('all 65 successful fixture histories replay through the production resolver', async () => {
   let resolvedCases = 0;
   let errorCases = 0;
   for (const name of (await readdir(casesDir)).sort()) {
@@ -192,7 +192,7 @@ test('all 62 successful fixture histories replay through the production resolver
         expected.files.map((f) => f.path), `${name}: expected row order`);
     });
   }
-  assert.equal(resolvedCases, 62);
+  assert.equal(resolvedCases, 65);
   assert.equal(errorCases, 4);
 });
 
