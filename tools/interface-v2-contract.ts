@@ -281,7 +281,7 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
       extraKeys(i, ['at_path', 'reason'], 'history.harness.interrupt', errors);
       harness.interrupt = { atPath: i.at_path, reason: i.reason as string };
     } else {
-      errors.push("history.harness.interrupt: needs at_path or phase 'resolve'");
+      errors.push("history.harness.interrupt: needs at_path or phase 'resolve' | 'lookahead'");
     }
   }
   if (raw.limits !== undefined) {
@@ -488,14 +488,21 @@ function forcedCoverage(endpoint: Obj, history: History): Obj | null {
   return null;
 }
 
-/** §4.4 row 0: equal endpoints whose content is still retained. */
-function isIdentical(endpoints: Endpoints, history: History): boolean {
+/** Recorded endpoint equality before the separate CAS retention check. */
+function endpointsEqual(endpoints: Endpoints): boolean {
   const { before, after } = endpoints;
   if (before.kind !== 'recorded' || after.kind !== 'recorded') return false;
   const b = before.snapshot as Obj;
   const a = after.snapshot as Obj;
   if (b.kind === 'absent' && a.kind === 'absent') return true;
-  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256 && !history.missing.has(b.sha256 as string);
+  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256;
+}
+
+/** §4.4 row 0: equal endpoints whose content is still retained. */
+function isIdentical(endpoints: Endpoints, history: History): boolean {
+  if (!endpointsEqual(endpoints)) return false;
+  const snapshot = endpoints.before.snapshot as Obj;
+  return snapshot.kind === 'absent' || !history.missing.has(snapshot.sha256 as string);
 }
 
 /** The §4.4 status the first established condition forces. Extraction-only
@@ -667,13 +674,11 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
   }
   if (harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'lookahead') {
     const at = eligible.indexOf(harness.interrupt.afterPath);
-    if (at < 0 || at >= req.limit) errors.push('history.harness.interrupt: after_path is not a completed path this page reaches');
-    else {
-      if (at + 1 !== count) errors.push('history.harness.interrupt: after_path must end the completed page');
-      [count, endedEarly] = [at + 1, true];
-    }
+    if (at < 0) errors.push('history.harness.interrupt: after_path is not a completed path this page reaches');
+    else if (at + 1 !== count) errors.push('history.harness.interrupt: after_path must end the completed page');
+    else endedEarly = true;
     const unchecked = eligiblePaths({ ...req, includeIdentical: true, afterPath: harness.interrupt.afterPath }, history)[0];
-    if (unchecked === undefined || !isIdentical(resolveEndpoints(unchecked, req, history) as Endpoints, history)) {
+    if (req.includeIdentical || unchecked === undefined || !endpointsEqual(resolveEndpoints(unchecked, req, history) as Endpoints)) {
       errors.push('history.harness.interrupt: no unchecked path needs a lookahead retention check');
     }
   }

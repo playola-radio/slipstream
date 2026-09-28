@@ -44,7 +44,7 @@
     },
     "analysis": { "$ref": "#/$defs/analysis" },
     "gaps": {
-      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" } }, { "const": null }],
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" }, "$comment": "Every capture.gap at or before after_seq, ordered by seq, subject to the shared 64 KiB metadata budget." }, { "const": null }],
       "$comment": "null only when a skipped page stopped before the recorded range was resolved."
     },
     "gaps_complete": { "type": "boolean" },

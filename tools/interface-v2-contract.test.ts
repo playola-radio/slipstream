@@ -161,6 +161,9 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('a lookahead interruption without a pending candidate', /no unchecked path/, (c) => {
     c.request = c.request.replace('path_prefix=src/', 'path_prefix=src/a');
   }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption when identical rows are included', /no unchecked path needs a lookahead retention check/, (c) => {
+    c.request = c.request.replace('limit=1', 'limit=1&include_identical=true');
+  }, 'range-lookahead-timeout');
   rejects('a lookahead interruption combined with a zero file budget', /cannot combine lookahead/, (c) => {
     c.history.harness.limits = { file_result_bytes: 0 };
   }, 'range-lookahead-timeout');
@@ -209,6 +212,14 @@ describe('interface.v2 contract validator rejects', () => {
 });
 
 describe('interface.v2 contract validator accepts', () => {
+  it('a lookahead interruption while checking an equal file whose blob is now missing', () => {
+    assert.deepEqual(errorsAfter((c) => {
+      const hash = event(c, '3').data.snapshot.sha256 as string;
+      c.history.missing_blobs = [hash];
+      delete c.history.blobs[hash];
+    }, 'range-lookahead-timeout'), []);
+  });
+
   it('an interrupt that leaves one side unevaluated while a parse error wins', () => {
     assert.deepEqual(errorsAfter((c) => {
       c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'timeout' } };
