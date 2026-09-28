@@ -15,8 +15,9 @@ import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.
 import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
   waitForQuietCapture, type BenchmarkConfig, type HistoricalChange, type LoadSummary } from '../src/clip-bench.ts';
-import { compareCaptureToBaseline, scoreInterfaceLoad, type AdmissionTrace, type ExpectedFile,
+import { assembleProjectionTrace, compareCaptureToBaseline, scoreClipTrace, scoreInterfaceLoad, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
+import { createProjectionTraceCollector } from './fd5-trace.ts';
 
 const MAX_ATTEMPTS = 100_000;
 const DRAIN_TIMEOUT_MS = 15_000;
@@ -247,6 +248,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
   let off: (() => void) | undefined;
   const hostBefore = hostSample();
   const durableAtNsBySeq = new Map<string, bigint>();
+  const collector = createProjectionTraceCollector();
   try {
     session = await startCapture({ root, storeDir });
     let highWater = BigInt(session.health.snapshot().durable_seq);
@@ -258,7 +260,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     });
     server = await startReaderServer({ storeDir, active: { id: session.sessionId, health: session.health, logPath: session.logPath },
       projectionAdmissionConfig: { C: config.admission.C, Q: config.admission.Q, W: config.admission.W, D: config.admission.clipDeadlineMs },
-      interfaceDeadlineMs: config.admission.interfaceDeadlineMs });
+      interfaceDeadlineMs: config.admission.interfaceDeadlineMs, projectionTrace: collector.observe });
     if (arm === 'clip-only' || arm === 'combined') clipLoad = startLoadWorker('clip', server.url, server.token, clipCorpus, config.requestSlots);
     if (arm === 'interface-only' || arm === 'combined') interfaceLoad = startLoadWorker('interface', server.url, server.token, interfaceCorpus, config.requestSlots);
     await Promise.all([clipLoad?.ready, interfaceLoad?.ready]);
@@ -273,12 +275,54 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     const records = await readRecords(session.logPath);
     await server.close(); server = undefined;
     await rm(root, { recursive: true, force: true });
+    const observed = collector.snapshot();
+    const assembly = assembleProjectionTrace(observed.events, interfaces?.attempts ?? []);
+    const requiredPhases = new Set<string>();
+    if (clips || interfaces) for (const phase of ['worker-startup', 'worker-roundtrip', 'grammar-load',
+      'parse-compare', 'cas-read', 'serialization', 'http-completion']) requiredPhases.add(phase);
+    if (interfaces) for (const phase of ['range-scan', 'cas-hash']) requiredPhases.add(phase);
+    const phaseFaults = [...requiredPhases].filter(phase => (observed.phases[phase]?.count ?? 0) === 0)
+      .map(phase => `missing ${phase} timing`);
+    for (const trace of assembly.traces) {
+      if (trace.outcome !== 'ok') continue;
+      const names = observed.unitPhases.get(trace.unitId) ?? new Set<string>();
+      const interfaceAttempt = trace.workload === 'interface' ? assembly.attempts.find(attempt =>
+        attempt.expected.routeKey === trace.routeKey && attempt.startedAtNs <= trace.submittedAtNs
+          && trace.settledAtNs <= (attempt.completedAtNs ?? -1n)) : undefined;
+      const freshInterface = interfaceAttempt && (interfaceAttempt.body as { files?: Array<{ path?: string; status?: string }> } | undefined)
+        ?.files?.some(row => row.status === 'ready' && interfaceAttempt.freshnessByPath?.[String(row.path)] === 'fresh');
+      const readyClip = trace.workload === 'clip' && clips?.responses.some(response => response.routeKey === trace.routeKey
+        && response.status === 'ready' && response.startedAtNs !== undefined && response.completedAtNs !== undefined
+        && response.startedAtNs <= trace.submittedAtNs && trace.settledAtNs <= response.completedAtNs);
+      const needed = freshInterface ? ['range-scan', 'cas-read', 'cas-hash', 'worker-roundtrip', 'grammar-load', 'parse-compare']
+        : readyClip ? ['cas-read', 'worker-roundtrip', 'grammar-load', 'parse-compare'] : [];
+      for (const phase of needed) if (!names.has(phase))
+        phaseFaults.push(`unit ${trace.unitId} lacks ${phase} timing`);
+    }
+    const successfulRoutes = new Map<string, number>();
+    for (const attempt of interfaces?.attempts ?? []) if (attempt.httpStatus === 200)
+      successfulRoutes.set(attempt.expected.routeKey, (successfulRoutes.get(attempt.expected.routeKey) ?? 0) + 1);
+    for (const response of clips?.responses ?? []) if (response.httpStatus === 200 && response.routeKey)
+      successfulRoutes.set(response.routeKey, (successfulRoutes.get(response.routeKey) ?? 0) + 1);
+    for (const [routeKey, count] of successfulRoutes) {
+      const phases = observed.routePhases.get(routeKey);
+      if (phases?.serialization !== count || phases.completion !== count)
+        phaseFaults.push(`HTTP route ${routeKey} lacks serialization or completion timing`);
+    }
+    const traceFaults = [...observed.faults, ...assembly.faults, ...phaseFaults];
+    const processExitsVerified = assembly.processExitsVerified && !traceFaults.some(fault => /process|exit|spawn/.test(fault));
+    const cleanupComplete = processExitsVerified && traceFaults.length === 0;
     const writes = written.map(item => ({ path: item.path, sha256: hash(item.body), startedAtNs: BigInt(item.startedAtNs), phase: item.phase }));
     const capture = scoreCaptureArm({ name: (clips ? 'saturation' : arm) + ` repetition ${repetition + 1}`,
       writes, records, durableAtNsBySeq, clipResponses: clips?.responses ?? [], requestedClipKeys: clips?.requested ?? [],
       concurrentClipRequests: clips ? config.requestSlots : 0, maxConcurrentRequests: clips?.maxConcurrentRequests,
       coldCacheServerFresh: Boolean(clips), loadStartedAtNs: clips?.startedAtNs, loadStoppedAtNs: clips?.stoppedAtNs,
       corpusExhausted: clips?.corpusExhausted, attemptLimitReached: clips?.attemptLimitReached, drainTimedOut: !drained });
+    if (clips) {
+      const clipFaults = scoreClipTrace(clips.responses, assembly.traces, assembly.clipCacheBypasses);
+      capture.load.reasons.push(...traceFaults, ...clipFaults);
+      capture.load.sufficient &&= traceFaults.length === 0 && clipFaults.length === 0;
+    }
     const first = writes.reduce<bigint | undefined>((min, w) => min === undefined || w.startedAtNs < min ? w.startedAtNs : min, undefined);
     const expectedHashes = new Set(writes.map(w => `${w.path}\0${w.sha256}`));
     const last = records.reduce<bigint | undefined>((max, record) => {
@@ -289,21 +333,27 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
       return at !== undefined && (max === undefined || at > max) ? at : max;
     }, undefined);
     const interfaceInput: InterfaceLoadInput | undefined = interfaces && first !== undefined && last !== undefined ? {
-      ...interfaces, traces: [] as AdmissionTrace[], corpusKeys: interfaceCorpus.map(c => c.expected.key),
+      ...interfaces, attempts: assembly.attempts, traces: assembly.traces,
+      corpusKeys: interfaceCorpus.map(c => c.expected.key),
       freshServer: true, loadStartedAtNs: interfaces.startedAtNs, loadStoppedAtNs: interfaces.stoppedAtNs,
-      firstWriteAtNs: first, lastDurableAtNs: last, drained, cleanupComplete: false,
+      firstWriteAtNs: first, lastDurableAtNs: last, drained, cleanupComplete,
     } : undefined;
     const interfaceReport = interfaceInput ? scoreInterfaceLoad(interfaceInput) : null;
+    if (interfaceReport && traceFaults.length) {
+      interfaceReport.reasons.push(...traceFaults);
+      interfaceReport.sufficient = false;
+    }
     return { arm, repetition: repetition + 1, host: { before: hostBefore, after: hostSample() },
       capture, interface: interfaceReport,
       cleanup: { captureStopCompleted: true, quietDrainObserved: drained, readerClosed: true,
-        worktreeRemoved: true, processExitsVerified: false },
+        worktreeRemoved: true, processExitsVerified },
       raw: { writes, durableBoundaries: [...durableAtNsBySeq], clipResponses: clips?.responses ?? [],
-        interfaceAttempts: interfaces?.attempts.map(a => ({ requestId: a.requestId, key: a.expected.key,
+        interfaceAttempts: interfaces ? assembly.attempts.map(a => ({ requestId: a.requestId, key: a.expected.key,
           routeKey: a.expected.routeKey, language: a.expected.language, sizeClass: a.expected.sizeClass,
           startedAtNs: a.startedAtNs, completedAtNs: a.completedAtNs, httpStatus: a.httpStatus,
-          body: a.body, error: a.error, freshnessByPath: a.freshnessByPath })) ?? [],
-        admissionTraces: [] as AdmissionTrace[] } };
+          body: a.body, error: a.error, freshnessByPath: a.freshnessByPath })) : [],
+        admissionTraces: assembly.traces, traceFaults, phaseTimings: observed.phases,
+        clipCacheBypasses: assembly.clipCacheBypasses } };
   } finally {
     await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
     off?.();
@@ -364,7 +414,7 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
     const measuredGatesPass = comparisons.length === 9 && comparisons.every(c => c.passed)
       && reports.every(r => r.cleanup.captureStopCompleted && r.cleanup.quietDrainObserved
         && r.cleanup.readerClosed && r.cleanup.worktreeRemoved && r.cleanup.processExitsVerified);
-    const outstandingEvidence = ['bounded phase timing', 'trace overhead control', 'coalesced clip W diagnostic',
+    const outstandingEvidence = ['trace overhead control', 'coalesced clip W pressure measurement',
       'owner-approved timeout and useful-throughput rates', 'owner-approved D7 configuration'];
     await outputFile.appendFile(encode({ type: 'final', comparisons, measuredGatesPass,
       d7Decision: 'pending', outstandingEvidence,

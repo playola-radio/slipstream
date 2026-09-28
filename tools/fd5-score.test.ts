@@ -72,6 +72,14 @@ test('validates every row and source/version/change, rather than first row or re
   assert.match(validateInterfacePage(good, e).join(' '), /missing file/);
 });
 
+test('complete ready page may include an explicitly requested identical row', () => {
+  const e = expected(0);
+  const body = page(e) as { files: Array<Record<string, unknown>> };
+  body.files[0]!.status = 'identical';
+  body.files[0]!.changes = [];
+  assert.deepEqual(validateInterfacePage(body, e), []);
+});
+
 test('rejects malformed 200, HTTP failure, cache-only, empty, overload-only and missing language', () => {
   const variants: Array<[string, (x: InterfaceLoadInput) => void, RegExp]> = [
     ['malformed', x => { x.attempts[0]!.body = { status: 'ready', files: [] }; }, /projection version|session mismatch/],
@@ -87,6 +95,15 @@ test('rejects malformed 200, HTTP failure, cache-only, empty, overload-only and 
     assert.equal(report.sufficient, false, name);
     assert.match(report.reasons.join(' '), reason, name);
   }
+});
+
+test('cold comparison cannot hide one cached or unobserved ready row among useful work', () => {
+  const cached = passing();
+  cached.attempts[0]!.freshnessByPath![cached.attempts[0]!.expected.files[0]!.path] = 'cache-hit';
+  assert.match(scoreInterfaceLoad(cached).reasons.join(' '), /cold.*cached/);
+  const missing = passing();
+  delete missing.attempts[0]!.freshnessByPath![missing.attempts[0]!.expected.files[0]!.path];
+  assert.match(scoreInterfaceLoad(missing).reasons.join(' '), /lacks.*freshness/);
 });
 
 test('counts look-ahead timeout once even with ready file; separates queue and running timeouts', () => {
@@ -178,7 +195,9 @@ test('frozen observer events assemble into distinct retries and per-file freshne
     { kind: 'admission', unitId: 1, routeKey: e.routeKey, workload: 'interface', atNs: ns(1), disposition: 'overloaded' },
     { kind: 'settle', unitId: 1, atNs: ns(2), priorState: 'overloaded', outcome: 'overloaded' },
     { kind: 'admission', unitId: 2, routeKey: e.routeKey, workload: 'interface', atNs: ns(12), disposition: 'running' },
+    { kind: 'dispatch', unitId: 2, atNs: ns(13) },
     { kind: 'interface-file', routeKey: e.routeKey, path: e.files[0]!.path, atNs: ns(25), freshness: 'fresh', resultStatus: 'ready' },
+    { kind: 'task-finished', unitId: 2, atNs: ns(29) },
     { kind: 'settle', unitId: 2, atNs: ns(30), priorState: 'running', outcome: 'ok' },
   ] as const;
   const assembled = assembleProjectionTrace([...events], attempts);
@@ -186,7 +205,28 @@ test('frozen observer events assemble into distinct retries and per-file freshne
   assert.equal(assembled.traces.length, 2);
   assert.equal(assembled.attempts[1]!.freshnessByPath?.[e.files[0]!.path], 'fresh');
   assert.equal(assembled.attempts[0]!.freshnessByPath?.[e.files[0]!.path], undefined);
-  assert.match(assembleProjectionTrace([...events, events[3]], attempts).faults.join(' '), /duplicate interface-file/);
+  assert.match(assembleProjectionTrace([...events, events[4]], attempts).faults.join(' '), /duplicate interface-file/);
+});
+
+test('actual process exit and task completion are both required after a running timeout', () => {
+  const e = expected(0);
+  const events = [
+    { kind: 'admission', unitId: 1, routeKey: e.routeKey, workload: 'interface', atNs: ns(1), disposition: 'running' },
+    { kind: 'dispatch', unitId: 1, atNs: ns(2) },
+    { kind: 'process-start', processId: 9, process: 'ts-worker', atNs: ns(3) },
+    { kind: 'settle', unitId: 1, atNs: ns(4), priorState: 'running', outcome: 'timeout' },
+    { kind: 'process-retire', processId: 9, unitId: 1, atNs: ns(5) },
+    { kind: 'task-finished', unitId: 1, atNs: ns(6) },
+  ] as const;
+  const withoutExit = assembleProjectionTrace([...events], []);
+  assert.equal(withoutExit.traces[0]!.exitedAtNs, undefined);
+  assert.equal(withoutExit.processExitsVerified, false);
+  assert.match(withoutExit.faults.join(' '), /actual exit/);
+  const withExit = assembleProjectionTrace([...events,
+    { kind: 'process-exit', processId: 9, atNs: ns(7), code: 1 }], []);
+  assert.deepEqual(withExit.faults, []);
+  assert.equal(withExit.traces[0]!.exitedAtNs, ns(7));
+  assert.equal(withExit.processExitsVerified, true);
 });
 
 test('per-file freshness does not credit cached rows on a fresh multi-file page', () => {

@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterfaceCorpus, validateConfig } from './fd5-bench.ts';
+import { createHistoricalCorpus, type ClipResponse } from '../src/clip-bench.ts';
 import { createTypeScriptInterfaceExtractor } from '../src/interface-v2-typescript.ts';
 import { compareStructuredExtractions } from '../src/interface-v2-comparison.ts';
 import { createCas } from '../src/cas.ts';
+import { blobPath } from '../src/store-reader.ts';
 import { extractSwiftSides } from '../src/swift-interface.ts';
 import { compareV2 } from '../src/interface-v2-core.ts';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
+import { startReaderServer } from '../src/http-reader.ts';
+import { assembleProjectionTrace, scoreClipTrace, type InterfaceAttempt } from './fd5-score.ts';
+import { createProjectionTraceCollector } from './fd5-trace.ts';
 
 test('registered config preserves fixed B2 limits and requires an explicit finite cold corpus', async () => {
   const config = JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8'));
@@ -106,4 +111,80 @@ test('isolated load client starts, stops and actually exits without a reader', a
     const [code] = await exit;
     assert.equal(code, 0);
   } finally { await worker.terminate(); }
+});
+
+test('real authenticated reader events join TS, TSX and Swift HTTP responses through collector and actual exits', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-trace-test-'));
+  const collector = createProjectionTraceCollector();
+  let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+  try {
+    const corpus = await createInterfaceCorpus(root, 3);
+    reader = await startReaderServer({ storeDir: root, projectionTrace: collector.observe,
+      interfaceDeadlineMs: 30_000 });
+    const attempts: InterfaceAttempt[] = [];
+    for (const [index, page] of corpus.entries()) {
+      const startedAtNs = process.hrtime.bigint();
+      const response = await fetch(reader.url + page.expected.routeKey,
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      const body: unknown = await response.json();
+      attempts.push({ requestId: String(index), expected: page.expected, startedAtNs,
+        completedAtNs: process.hrtime.bigint(), httpStatus: response.status, body });
+    }
+    await reader.close(); reader = undefined;
+    const observed = collector.snapshot();
+    const assembled = assembleProjectionTrace(observed.events, attempts);
+    assert.deepEqual(observed.faults, []);
+    for (const phase of ['range-scan', 'cas-read', 'cas-hash', 'grammar-load', 'parse-compare',
+      'worker-startup', 'worker-roundtrip', 'serialization', 'http-completion'])
+      assert.ok((observed.phases[phase]?.count ?? 0) > 0, `missing ${phase} timing`);
+    assert.deepEqual(assembled.faults, []);
+    assert.equal(assembled.processExitsVerified, true);
+    assert.deepEqual(assembled.traces.map(trace => trace.outcome), ['ok', 'ok', 'ok']);
+    for (const trace of assembled.traces) for (const phase of ['range-scan', 'cas-read', 'cas-hash',
+      'grammar-load', 'parse-compare', 'worker-roundtrip'])
+      assert.ok(observed.unitPhases.get(trace.unitId)?.has(phase), `unit ${trace.unitId} lacks ${phase}`);
+    for (const page of corpus) assert.deepEqual(observed.routePhases.get(page.expected.routeKey),
+      { serialization: 1, completion: 1 });
+    assert.deepEqual(assembled.attempts.map(attempt => Object.values(attempt.freshnessByPath ?? {})),
+      [['fresh'], ['fresh'], ['fresh']]);
+    assert.equal(observed.events.filter(event => event.kind === 'process-start').length,
+      observed.events.filter(event => event.kind === 'process-exit').length);
+  } finally {
+    await reader?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('real clip cache bypass is separate from admission and blob loss forces a new compute', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-clip-trace-'));
+  const collector = createProjectionTraceCollector();
+  let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+  try {
+    const [change] = await createHistoricalCorpus(root, 1);
+    const routeKey = `/v1/sessions/${change!.sessionId}/changes/${change!.seq}/clips`;
+    reader = await startReaderServer({ storeDir: root, projectionTrace: collector.observe,
+      projectionAdmissionConfig: { C: 1, Q: 1, W: 1, D: 5_000 } });
+    const responses: ClipResponse[] = [];
+    for (let index = 0; index < 3; index++) {
+      if (index === 2) await unlink(blobPath(root, change!.key.split('/')[0]!));
+      const startedAtNs = process.hrtime.bigint();
+      const response = await fetch(reader.url + routeKey,
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      const body = await response.json() as { status: string; fallback_reason?: string };
+      responses.push({ httpStatus: response.status, status: body.status, reason: body.fallback_reason,
+        latencyMs: 0, routeKey, startedAtNs, completedAtNs: process.hrtime.bigint() });
+    }
+    await reader.close(); reader = undefined;
+    const assembled = assembleProjectionTrace(collector.snapshot().events, []);
+    assert.deepEqual(assembled.faults, []);
+    assert.equal(assembled.traces.filter(trace => trace.workload === 'clip').length, 2);
+    assert.equal(assembled.clipCacheBypasses.length, 1);
+    assert.match(scoreClipTrace([responses[0]!, responses[2]!], assembled.traces,
+      assembled.clipCacheBypasses).join(' '), /cold clip did not produce ready/);
+    assert.match(scoreClipTrace(responses, assembled.traces, assembled.clipCacheBypasses).join(' '),
+      /cache|admission/);
+  } finally {
+    await reader?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

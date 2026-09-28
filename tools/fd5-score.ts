@@ -1,18 +1,11 @@
 /** Pure FD5 evidence scorer. A ready HTTP page is not proof of admitted or fresh work. */
 import { isDeepStrictEqual } from 'node:util';
 import { scoreCaptureArm } from '../src/clip-bench.ts';
+import type { ClipResponse } from '../src/clip-bench.ts';
+import type { ProjectionTraceEvent } from '../src/projection-trace.ts';
 
 export type Language = 'typescript' | 'tsx' | 'swift';
 export type AdmissionOutcome = 'ok' | 'timeout' | 'overloaded' | 'cancelled' | 'closed' | 'error';
-/** Frozen test-only FD4 observer wire shape; see .context/fd5-trace-seam-handoff.md. */
-export type ProjectionTraceEvent =
-  | { kind: 'admission'; unitId: number; routeKey: string; workload: 'interface' | 'clip';
-      atNs: bigint; disposition: 'running' | 'queued' | 'waiting' | 'overloaded' }
-  | { kind: 'dispatch'; unitId: number; atNs: bigint }
-  | { kind: 'settle'; unitId: number; atNs: bigint;
-      priorState: 'running' | 'queued' | 'waiting' | 'overloaded'; outcome: AdmissionOutcome }
-  | { kind: 'interface-file'; routeKey: string; path: string; atNs: bigint;
-      freshness: 'fresh' | 'cache-hit' | 'none'; resultStatus: string };
 export interface AdmissionTrace {
   unitId: number;
   routeKey: string;
@@ -24,6 +17,46 @@ export interface AdmissionTrace {
   outcome: AdmissionOutcome;
   /** True only after the owned compute actually exited following cancellation. */
   exitedAtNs?: bigint;
+}
+
+/** A cold clip HTTP attempt must have one real admission, never a response-cache bypass. */
+export function scoreClipTrace(responses: ClipResponse[], traces: AdmissionTrace[],
+  bypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[]): string[] {
+  const faults: string[] = [];
+  const clipTraces = traces.filter(trace => trace.workload === 'clip');
+  const used = new Set<number>();
+  for (const response of responses) {
+    if (response.routeKey === undefined || response.startedAtNs === undefined || response.completedAtNs === undefined) {
+      faults.push('clip response lacks route or interval evidence'); continue;
+    }
+    const candidates = clipTraces.filter(trace => trace.routeKey === response.routeKey
+      && trace.submittedAtNs >= response.startedAtNs! && trace.settledAtNs <= response.completedAtNs!);
+    if (candidates.length !== 1 || used.has(candidates[0]!.unitId)) {
+      faults.push('clip request lacks unique admission outcome'); continue;
+    }
+    const trace = candidates[0]!;
+    used.add(trace.unitId);
+    if (bypasses.some(event => event.routeKey === response.routeKey
+      && event.atNs >= response.startedAtNs! && event.atNs <= response.completedAtNs!))
+      faults.push('cold clip request bypassed admission cache');
+    if (response.httpStatus !== 200 || response.error) faults.push('clip HTTP failure');
+    if (response.status !== 'ready' && !(response.status === 'skipped'
+      && (response.reason === 'overloaded' || response.reason === 'timeout')))
+      faults.push('cold clip did not produce ready, overload or timeout');
+    if (response.reason === 'overloaded' && trace.outcome !== 'overloaded'
+      || trace.outcome === 'overloaded' && response.reason !== 'overloaded')
+      faults.push('clip overload disagrees with admission');
+    if (response.reason === 'timeout' && trace.outcome !== 'timeout'
+      || trace.outcome === 'timeout' && response.reason !== 'timeout')
+      faults.push('clip timeout disagrees with admission');
+    if (response.status === 'ready' && (trace.outcome !== 'ok' || trace.startedAtNs === undefined))
+      faults.push('ready clip lacks completed compute');
+    if (trace.startedAtNs !== undefined && ['timeout', 'cancelled', 'closed'].includes(trace.outcome)
+      && trace.exitedAtNs === undefined) faults.push('clip interrupted compute has no actual exit');
+  }
+  if (used.size !== clipTraces.length || responses.length !== clipTraces.length)
+    faults.push('clip admission trace count differs from HTTP attempts');
+  return [...new Set(faults)];
 }
 export interface ExpectedFile {
   path: string;
@@ -59,50 +92,101 @@ export interface InterfaceAttempt {
   freshnessByPath?: Record<string, 'fresh' | 'cache-hit' | 'none'>;
 }
 export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts: InterfaceAttempt[]):
-  { traces: AdmissionTrace[]; attempts: InterfaceAttempt[]; faults: string[] } {
+  { traces: AdmissionTrace[]; attempts: InterfaceAttempt[]; faults: string[];
+    processExitsVerified: boolean; clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[];
+    phases: Extract<ProjectionTraceEvent, { kind: 'phase' }>[] } {
   const faults: string[] = [];
-  const units = new Map<number, { trace: Partial<AdmissionTrace>; disposition: 'running' | 'queued' | 'waiting' | 'overloaded'; settled: boolean }>();
+  const units = new Map<number, { trace: Partial<AdmissionTrace>; disposition: 'running' | 'queued' | 'waiting' | 'overloaded';
+    settled: boolean; dispatched: boolean }>();
   const joinedAttempts = attempts.map(a => ({ ...a, freshnessByPath: { ...a.freshnessByPath } }));
+  const finished = new Map<number, bigint>();
+  const processes = new Map<number, { startedAtNs: bigint; exitedAtNs?: bigint; unitIds: Set<number> }>();
+  const clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[] = [];
+  const phases: Extract<ProjectionTraceEvent, { kind: 'phase' }>[] = [];
   for (const event of events) {
     if (event.kind === 'admission') {
       if (units.has(event.unitId)) { faults.push('duplicate admission unit'); continue; }
-      units.set(event.unitId, { disposition: event.disposition, settled: false,
+      units.set(event.unitId, { disposition: event.disposition, settled: false, dispatched: false,
         trace: { unitId: event.unitId, routeKey: event.routeKey, workload: event.workload,
           submittedAtNs: event.atNs,
           ...(event.disposition === 'overloaded' ? {} : { admittedAtNs: event.atNs }),
-          ...(event.disposition === 'running' ? { startedAtNs: event.atNs } : {}) } });
+        } });
     } else if (event.kind === 'dispatch') {
       const unit = units.get(event.unitId);
-      if (!unit || unit.settled || unit.disposition !== 'queued' || unit.trace.startedAtNs !== undefined) {
+      if (!unit || unit.settled || unit.dispatched || !['running', 'queued'].includes(unit.disposition)) {
         faults.push('invalid admission dispatch'); continue;
       }
+      unit.dispatched = true;
       unit.trace.startedAtNs = event.atNs;
     } else if (event.kind === 'settle') {
       const unit = units.get(event.unitId);
       if (!unit || unit.settled || (unit.disposition === 'overloaded' && event.outcome !== 'overloaded')) {
         faults.push('invalid admission settlement'); continue;
       }
-      const state = unit.disposition === 'queued' && unit.trace.startedAtNs !== undefined ? 'running' : unit.disposition;
+      const state = unit.dispatched ? 'running' : unit.disposition;
       if (event.priorState !== state) faults.push('admission settlement state mismatch');
       unit.trace.settledAtNs = event.atNs;
       unit.trace.outcome = event.outcome;
       unit.settled = true;
-    } else {
+    } else if (event.kind === 'interface-file') {
       const candidates = joinedAttempts.filter(a => a.expected.routeKey === event.routeKey
         && a.startedAtNs <= event.atNs && event.atNs <= (a.completedAtNs ?? -1n));
       if (candidates.length !== 1) { faults.push('interface-file event has no unique HTTP attempt'); continue; }
       const target = candidates[0]!;
       if (!target.expected.files.some(f => f.path === event.path)) { faults.push('interface-file event names unexpected path'); continue; }
       if (target.freshnessByPath?.[event.path] !== undefined) { faults.push('duplicate interface-file event'); continue; }
+      const row = (object(target.body)?.files as unknown[] | undefined)?.find(raw => object(raw)?.path === event.path);
+      if (object(row)?.status !== event.resultStatus) { faults.push('interface-file status disagrees with HTTP row'); continue; }
       target.freshnessByPath![event.path] = event.freshness;
+    } else if (event.kind === 'task-finished') {
+      if (!units.has(event.unitId) || finished.has(event.unitId)) faults.push('invalid task completion');
+      else finished.set(event.unitId, event.atNs);
+    } else if (event.kind === 'process-start') {
+      if (processes.has(event.processId)) faults.push('duplicate process start');
+      else processes.set(event.processId, { startedAtNs: event.atNs,
+        unitIds: new Set(event.unitId === undefined ? [] : [event.unitId]) });
+    } else if (event.kind === 'process-retire') {
+      const process = processes.get(event.processId);
+      if (!process || !units.has(event.unitId) || process.exitedAtNs !== undefined)
+        faults.push('invalid process retirement');
+      else process.unitIds.add(event.unitId);
+    } else if (event.kind === 'process-exit') {
+      const process = processes.get(event.processId);
+      if (!process || process.exitedAtNs !== undefined || event.atNs < process.startedAtNs)
+        faults.push('orphan or duplicate process exit');
+      else process.exitedAtNs = event.atNs;
+    } else if (event.kind === 'process-spawn-failed') {
+      faults.push('reader process failed to spawn');
+    } else if (event.kind === 'clip-cache-bypass') {
+      clipCacheBypasses.push(event);
+    } else if (event.kind === 'phase') {
+      if (event.durationNs < 0n) faults.push('negative phase duration');
+      phases.push(event);
+    } else {
+      event satisfies never;
+      faults.push('unknown trace event');
     }
   }
   const traces: AdmissionTrace[] = [];
   for (const unit of units.values()) {
     if (!unit.settled) { faults.push('admission unit has no settlement'); continue; }
+    if (unit.disposition === 'running' && !unit.dispatched) faults.push('running admission has no dispatch');
+    if (unit.dispatched && !finished.has(unit.trace.unitId!)) faults.push('dispatched task has no completion');
+    if (unit.dispatched && ['timeout', 'cancelled', 'closed'].includes(String(unit.trace.outcome))) {
+      const linked = [...processes.values()].filter(process => process.unitIds.has(unit.trace.unitId!));
+      const taskAt = finished.get(unit.trace.unitId!);
+      if (taskAt !== undefined && linked.every(process => process.exitedAtNs !== undefined))
+        unit.trace.exitedAtNs = linked.reduce((at, process) => process.exitedAtNs! > at ? process.exitedAtNs! : at, taskAt);
+    }
     traces.push(unit.trace as AdmissionTrace);
   }
-  return { traces, attempts: joinedAttempts, faults };
+  for (const process of processes.values()) {
+    if (process.exitedAtNs === undefined) faults.push('reader process has no actual exit');
+    for (const unitId of process.unitIds) if (!units.has(unitId)) faults.push('process references unknown admission unit');
+  }
+  return { traces, attempts: joinedAttempts, faults,
+    processExitsVerified: [...processes.values()].every(process => process.exitedAtNs !== undefined),
+    clipCacheBypasses, phases };
 }
 export interface InterfaceLoadInput {
   attempts: InterfaceAttempt[];
@@ -175,7 +259,8 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
   if (page.status === 'ready' && object(page.page)?.complete === true) {
     for (const path of byPath.keys()) if (!seen.has(path)) faults.push(`missing file ${path}`);
     if (object(page.page)?.complete === true)
-      for (const raw of page.files) if (object(raw)?.status !== 'ready') faults.push(`complete page has non-ready file ${String(object(raw)?.path)}`);
+      for (const raw of page.files) if (!['ready', 'identical'].includes(String(object(raw)?.status)))
+        faults.push(`complete page has non-ready file ${String(object(raw)?.path)}`);
   }
   const pagination = object(page.page);
   if (!pagination || typeof pagination.complete !== 'boolean'
@@ -274,6 +359,14 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
       if (faults.length) { malformedResponses++; reasons.push(...faults); continue; }
       const page = object(attempt.body)!;
       const rows = page.files as Record<string, unknown>[];
+      for (const row of rows) {
+        const freshness = attempt.freshnessByPath?.[String(row.path)];
+        if (row.status === 'ready' && freshness === undefined)
+          reasons.push('ready comparison row lacks observed freshness');
+        if (freshness === 'cache-hit') reasons.push('cold comparison served cached row');
+        if (row.status === 'unavailable' || row.status === 'unsupported')
+          reasons.push('cold comparison source unavailable or unsupported');
+      }
       if (page.status === 'ready' && object(page.page)?.complete === true) { counts.completedPages++; total.completedPages++; }
       for (const row of rows) if (row.status === 'ready') { counts.completedFiles++; total.completedFiles++; }
       const cacheHits = rows.filter(row => attempt.freshnessByPath?.[String(row.path)] === 'cache-hit').length;

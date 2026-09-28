@@ -25,7 +25,8 @@ const DRAIN_TIMEOUT_MS = 15_000;
 const NS_PER_MS = 1_000_000n;
 
 export interface ExpectedWrite { path: string; sha256: string; startedAtNs: bigint; phase: 'scheduled' | 'burst' }
-export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string; key?: string; startedAtNs?: bigint; completedAtNs?: bigint }
+export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string;
+  key?: string; routeKey?: string; startedAtNs?: bigint; completedAtNs?: bigint }
 export interface CaptureArmInput {
   name: string;
   writes: ExpectedWrite[];
@@ -274,14 +275,15 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
 
 async function requestClip(url: string, token: string, change: HistoricalChange): Promise<ClipResponse> {
   const started = process.hrtime.bigint();
+  const routeKey = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
   try {
-    const response = await fetch(`${url}/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
+    const response = await fetch(`${url}${routeKey}`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
     const body = await response.json().catch(() => ({})) as { status?: unknown; fallback_reason?: unknown };
     const completed = process.hrtime.bigint();
-    return { httpStatus: response.status, status: typeof body.status === 'string' ? body.status : 'invalid-response', ...(typeof body.fallback_reason === 'string' ? { reason: body.fallback_reason } : {}), latencyMs: Number(completed - started) / 1e6, startedAtNs: started, completedAtNs: completed };
+    return { httpStatus: response.status, status: typeof body.status === 'string' ? body.status : 'invalid-response', ...(typeof body.fallback_reason === 'string' ? { reason: body.fallback_reason } : {}), latencyMs: Number(completed - started) / 1e6, routeKey, startedAtNs: started, completedAtNs: completed };
   } catch (err) {
     const completed = process.hrtime.bigint();
-    return { httpStatus: 0, status: 'request-error', error: String(err), latencyMs: Number(completed - started) / 1e6, startedAtNs: started, completedAtNs: completed };
+    return { httpStatus: 0, status: 'request-error', error: String(err), latencyMs: Number(completed - started) / 1e6, routeKey, startedAtNs: started, completedAtNs: completed };
   }
 }
 
