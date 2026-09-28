@@ -45,6 +45,21 @@ cancellation churn, worker-retirement overlap, a large-log scan sample, or
 post-shutdown child cleanup. The raw report is diagnostic evidence, not a
 registered FD5 acceptance pass.
 
+The four-arm harness that produced this report is **uncommitted prototype
+code**, preserved locally as `.context/fd5-benchmark-wip.patch`. Its scorer and
+timeout-rate definition have not passed the repository review gates. The
+committed branch contains the deadline test seam and this failure record only.
+
+Independent challenge review also identified unresolved risks: TypeScript
+worker cancellation can make subsequent requests cold; a long recorded-log
+scan can consume the entire page deadline; repeated deadlines while examining
+hidden identical files can leave the cursor unchanged; and a timeout during
+page look-ahead can return a page without a timeout marker. It also flagged
+clip queue pressure under combined load and a rejected grammar-load promise
+that remains cached in a TypeScript worker. The first four intersect the
+approved range/deadline contract and require review before changing page
+semantics. None is treated as a passed FD5 gate.
+
 Per the repository's measurement rule, stop here with the failed gate recorded.
 The next measurement needs a quiet host and the remaining FD5 cases before
 Brian can approve C/Q/W/D and acceptable rates. The production reader still
