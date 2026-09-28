@@ -334,7 +334,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
           fallback_reason: disposition.status === 'ready' ? reason : disposition.fallback_reason,
           coverage, changes: [] });
       }
-      page.status = current || page.files.some(file => file.status !== 'ready' && file.status !== 'identical') ? 'partial' : 'ready';
+      page.status = page.files.some(file => file.status !== 'ready' && file.status !== 'identical') ? 'partial' : 'ready';
       page.page = { complete: false, next_after_path: page.files.at(-1)?.path ?? req.afterPath };
       return page;
     };

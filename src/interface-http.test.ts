@@ -628,7 +628,7 @@ test('cancellation after a verified hidden file preserves metadata and retries t
   } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
-test('cancellation after an included identical file is classified before its async continuation', async () => {
+test('cancellation after an included identical file keeps ready status and an unfinished cursor', async () => {
   const { storeDir, req } = await serviceRequest('range-page-boundary-first');
   await makeEndpointEqual(req.logPath, 'src/a.ts');
   const controller = new AbortController();
@@ -638,7 +638,7 @@ test('cancellation after an included identical file is classified before its asy
   } });
   try {
     const page = await service.get({ ...req, includeIdentical: true, signal: controller.signal });
-    assert.equal(page.status, 'partial');
+    assert.equal(page.status, 'ready');
     assert.equal(page.files[0]?.path, 'src/a.ts');
     assert.equal(page.files[0]?.status, 'identical');
     assert.equal(page.page.next_after_path, 'src/a.ts');
