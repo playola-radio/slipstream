@@ -17,7 +17,7 @@ const PROJECTIONS_DIR = fileURLToPath(new URL('../schemas/projections/', import.
 
 /** The published projection schemas, by projection_version. Not gated to
  *  EVENT_TYPES: a projection is a reader-derived view, not a log event. */
-const PROJECTION_SCHEMAS = new Set<string>(['clip.v1', 'clip.v2', 'clip.v3']);
+const PROJECTION_SCHEMAS = new Set<string>(['clip.v1', 'clip.v2', 'clip.v3', 'interface.v2']);
 
 export function isValidSessionId(id: string): boolean { return UUID_RE.test(id); }
 export function isValidHex(hex: string): boolean { return HEX_RE.test(hex); }

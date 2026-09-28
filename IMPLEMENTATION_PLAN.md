@@ -696,10 +696,12 @@ per-change `interface.v1` endpoint (the v1 core and corpus stay). Decisions F1�
 were settled as A on 2026-09-27 (delegated by Brian). The contract
 (`contracts/interface/v2/`: schema, hand-written fixtures, and the
 `projection-check interface-v2-contract` validator) is written. Its slices
-(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked; FD2 has passed branch
-acceptance and is awaiting PR review on this branch, while the parallel slices
-retain their own status. No
-success criterion or ratified decision changes.
+(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2 and FD3 are merged;
+FD4 is in progress on the reader-API branch. Its production 100 ms provisional
+admission deadline times out cold Swift extraction in the standalone live check,
+so FD4 acceptance remains open and FD5 must measure D7 before any production
+value is approved. The Swift fixture-backed view remains FS2's work, and FS3
+live wiring waits for this API. No success criterion or ratified decision changes.
 
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
 

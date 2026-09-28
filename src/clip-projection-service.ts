@@ -30,7 +30,7 @@ import {
 } from './clip-projection.ts';
 import { type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
-import { createProjectionAdmission } from './projection-admission.ts';
+import { createProjectionAdmission, type ProjectionAdmission } from './projection-admission.ts';
 import type { ClipLanguage } from './clip-language.ts';
 
 export interface ClipRequest {
@@ -47,6 +47,8 @@ export interface ClipProjectionService {
 
 export interface ClipServiceOptions {
   storeDir: string;
+  /** The reader owns this when clip and interface projections share admission. */
+  admission?: ProjectionAdmission;
   /** Compute seam. Defaults to a single clip-projection worker thread. */
   compute?: ClipCompute;
   /** Blob-presence probe for revalidate-on-hit. Defaults to a filesystem check. */
@@ -153,6 +155,9 @@ class LruCache {
 }
 
 export function createClipProjectionService(opts: ClipServiceOptions): ClipProjectionService {
+  if (opts.admission && (opts.queueLimit !== undefined || opts.deadlineMs !== undefined)) {
+    throw new Error('shared clip admission cannot also set private queue or deadline');
+  }
   const queueLimit = opts.queueLimit ?? DEFAULTS.queueLimit;
   const deadlineMs = opts.deadlineMs ?? DEFAULTS.deadlineMs;
   const pool = opts.compute ? null : createClipWorkerPool();
@@ -169,7 +174,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
   // (coalesced waiters counted), reproducing the prior `maxPending` bound. The
   // budget is workload-agnostic so a future interface service can share one
   // instance; wiring that shared instance is a later step (see ADMISSION.md).
-  const budget = createProjectionAdmission({
+  const budget = opts.admission ?? createProjectionAdmission({
     C: CONCURRENCY,
     Q: queueLimit,
     W: queueLimit,
@@ -236,7 +241,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
     // Settle everything admitted to this service's budget, then terminate the
     // worker. (The budget here is private to this service; closing it never
     // affects another workload.)
-    await budget.close();
+    if (!opts.admission) await budget.close();
     await pool?.close();
   };
 

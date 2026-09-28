@@ -1,0 +1,480 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/projections/interface.v2.json",
+  "title": "interface.v2",
+  "$comment": "Reader-derived, read-only comparison of the written function interfaces between two recorded cutoffs of one capture session (FUNCTION-CHANGES.md). No log event, seq or persisted index is created. Endpoints are recorded states, never the live filesystem or Git. Shared types, effects and behaviour are not analyzed. Cross-field invariants that src/schema.ts cannot express (if/else, maxItems, additionalProperties, nullable type arrays) are enforced by tools/interface-v2-contract.ts.",
+  "type": "object",
+  "required": [
+    "projection_version",
+    "session_id",
+    "range",
+    "status",
+    "inventory",
+    "analysis",
+    "gaps",
+    "gaps_complete",
+    "files",
+    "page"
+  ],
+  "properties": {
+    "projection_version": { "const": "interface.v2" },
+    "session_id": {
+      "type": "string",
+      "$comment": "Capture scope (which worktree is watched), never authorship. A comparison never spans sessions."
+    },
+    "range": {
+      "type": "object",
+      "required": ["before_seq", "after_seq"],
+      "properties": {
+        "before_seq": { "$ref": "#/$defs/cutoff" },
+        "after_seq": { "$ref": "#/$defs/cutoff" }
+      }
+    },
+    "status": {
+      "enum": ["ready", "partial", "skipped"],
+      "$comment": "ready: every returned file is ready or identical (including an empty page); not a claim of complete inventory, history or semantics. partial: at least one returned file has another status. skipped: no file could start; files is empty and the cursor does not move."
+    },
+    "fallback_reason": {
+      "enum": ["overloaded", "timeout", "cancelled", "scan-limit"],
+      "$comment": "Present exactly when status is skipped."
+    },
+    "inventory": {
+      "oneOf": [{ "$ref": "#/$defs/resolvedInventory" }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved. No inventory claim was evaluated."
+    },
+    "analysis": { "$ref": "#/$defs/analysis" },
+    "gaps": {
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" } }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved."
+    },
+    "gaps_complete": { "type": "boolean" },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fileResult" },
+      "$comment": "Ordered by path, by exact UTF-16 code unit. identical results appear only with include_identical=true."
+    },
+    "page": {
+      "type": "object",
+      "required": ["complete", "next_after_path"],
+      "properties": {
+        "complete": {
+          "type": "boolean",
+          "$comment": "true only on the last page. Loaded totals are partial until then."
+        },
+        "next_after_path": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "Exclusive cursor for the next request. null when complete. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "resolvedInventory": {
+      "type": "object",
+      "required": [
+        "scope",
+        "baseline_completed_seq",
+        "unknown_scopes",
+        "unknown_scopes_complete",
+        "policy_exclusions"
+      ],
+      "properties": {
+        "scope": {
+          "const": "observed",
+          "$comment": "Only paths recorded in this session are compared (F2-A). Never a complete repository inventory."
+        },
+        "baseline_completed_seq": {
+          "oneOf": [{ "$ref": "#/$defs/seq" }, { "const": null }],
+          "$comment": "seq of capture.baseline.completed when it is at or before after_seq, else null. A value greater than before_seq means the baseline was still running at the before cutoff."
+        },
+        "unknown_scopes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "From capture.baseline.completed, ordered by UTF-16 code unit; empty when the baseline is not complete by after_seq."
+        },
+        "unknown_scopes_complete": {
+          "type": "boolean",
+          "$comment": "false when entries were omitted by the shared 64 KiB metadata budget; the full list is on the event stream."
+        },
+        "policy_exclusions": {
+          "type": "array",
+          "items": { "enum": ["store-directory", ".git", "symlinks"] },
+          "$comment": "Static capture policy, always exactly [\"store-directory\", \".git\", \"symlinks\"] (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them."
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["shared_types", "effects", "behavior"],
+      "properties": {
+        "shared_types": { "const": "notAnalyzed" },
+        "effects": { "const": "notAnalyzed" },
+        "behavior": { "const": "notAnalyzed" }
+      },
+      "$comment": "Decisions F3-A and F4-A. Analyzing any of these is a new projection version."
+    },
+    "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "cutoff": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "$comment": "Decimal string, arbitrary precision. 0 means the empty recorded prefix, not an empty repository."
+    },
+    "snapshot": {
+      "$comment": "The recorded snapshot tag, identical to the file.changed / file.baselined event shape.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "sha256", "size"],
+          "properties": {
+            "kind": { "const": "content" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "absent" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "unavailable" },
+            "reason": { "enum": ["oversize", "unreadable", "unstable", "io-error", "baseline-unknown"] }
+          }
+        }
+      ]
+    },
+    "gap": {
+      "type": "object",
+      "required": ["seq", "reason", "scope"],
+      "properties": {
+        "seq": { "$ref": "#/$defs/seq" },
+        "reason": { "enum": ["coalesced", "baseline-unreadable", "watcher-error", "restart", "storage"] },
+        "scope": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "session" } }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "path"],
+              "properties": {
+                "kind": { "enum": ["directory", "path"] },
+                "path": { "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "endpoint": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "record_seq", "field", "snapshot"],
+          "properties": {
+            "kind": { "const": "recorded" },
+            "record_seq": {
+              "$ref": "#/$defs/seq",
+              "$comment": "The event that recorded this state. For the first-change predecessor rule it is the later file.changed, with field before, so the response never claims the state was recorded by before_seq."
+            },
+            "field": {
+              "enum": ["snapshot", "before", "after"],
+              "$comment": "snapshot: file.baselined. before/after: that side of a file.changed."
+            },
+            "snapshot": { "$ref": "#/$defs/snapshot" },
+            "observation": {
+              "enum": ["watcher", "reconciliation"],
+              "$comment": "Present exactly when the record is a file.changed."
+            },
+            "gap_ref": {
+              "$ref": "#/$defs/seq",
+              "$comment": "Copied from a reconciliation record. Never a claim that the outage's intermediate edits were recovered."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "const": "unknownBoundary",
+              "$comment": "Projection-derived: the path has no record at or before before_seq and the first-change predecessor rule does not apply. There is no provenance because no such record exists."
+            }
+          }
+        }
+      ]
+    },
+    "coverageSide": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": ["complete", "absent", "incomplete", "unavailable", "unsupported", "notEvaluated"],
+          "$comment": "Each side reports its own extraction state even when its reason lost status precedence. identical content is notEvaluated (no parse happened)."
+        },
+        "reason": {
+          "type": "string",
+          "$comment": "Present exactly for incomplete and unavailable, e.g. parse-error, blob-missing, unknown-boundary, oversize."
+        }
+      }
+    },
+    "fileResult": {
+      "type": "object",
+      "required": ["path", "before", "after", "language", "language_version", "status", "coverage", "changes"],
+      "properties": {
+        "path": { "type": "string" },
+        "before": { "$ref": "#/$defs/endpoint" },
+        "after": {
+          "$ref": "#/$defs/endpoint",
+          "$comment": "Always recorded: a listed path has a record at or before after_seq."
+        },
+        "language": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "Plain string, never an enum. null exactly when no language module exists for the path, whatever the status."
+        },
+        "language_version": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "e.g. typescript.v2, swift.v1. null exactly when language is null."
+        },
+        "status": {
+          "enum": ["identical", "ready", "incomplete", "unavailable", "unsupported", "skipped"],
+          "$comment": "First established condition wins (FUNCTION-CHANGES.md §4.4): identical, before/after incomplete, duplicate-declaration, ambiguous-correspondence, before/after unavailable, unsupported, too-large, timeout/cancelled, ready."
+        },
+        "fallback_reason": {
+          "type": "string",
+          "$comment": "Present exactly for incomplete, unavailable, unsupported and skipped. Absent for identical and ready."
+        },
+        "coverage": {
+          "type": "object",
+          "required": ["before", "after"],
+          "properties": {
+            "before": { "$ref": "#/$defs/coverageSide" },
+            "after": { "$ref": "#/$defs/coverageSide" }
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/change" },
+          "$comment": "Non-empty only when status is ready (DA-3, per file). Ordered removed, signatureChanged, added, then by the D8 tuple."
+        }
+      }
+    },
+    "change": {
+      "type": "object",
+      "required": ["kind", "identity", "before", "after", "parameters", "result", "throws", "header"],
+      "properties": {
+        "kind": { "enum": ["added", "removed", "signatureChanged"] },
+        "identity": { "$ref": "#/$defs/identity" },
+        "before": {
+          "oneOf": [{ "$ref": "#/$defs/declarationSide" }, { "const": null }],
+          "$comment": "null for added."
+        },
+        "after": {
+          "oneOf": [{ "$ref": "#/$defs/declarationSide" }, { "const": null }],
+          "$comment": "null for removed."
+        },
+        "parameters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parameterDelta" },
+          "$comment": "Rows with a before side in before-position order, then added rows in after-position order. A parameter pairs only by a written local name occurring exactly once on each side."
+        },
+        "result": {
+          "oneOf": [{ "$ref": "#/$defs/resultDelta" }, { "const": null }],
+          "$comment": "null when neither side has a result slot (a TypeScript constructor)."
+        },
+        "throws": { "$ref": "#/$defs/throwsDelta" },
+        "header": {
+          "$ref": "#/$defs/headerDelta",
+          "$comment": "Every part of the written header not covered by parameters, result or throws."
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "required": ["kind", "scope", "name", "guards"],
+      "properties": {
+        "kind": { "type": "string" },
+        "scope": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "name"],
+            "properties": { "kind": { "type": "string" }, "name": { "type": "string" } }
+          }
+        },
+        "name": { "type": "string" },
+        "guards": { "type": "array", "items": { "type": "string" } }
+      },
+      "$comment": "A matching key scoped to the path, not proof of rename continuity. No overload ordinal or line number."
+    },
+    "declarationSide": {
+      "type": "object",
+      "required": ["display_name", "span"],
+      "properties": {
+        "display_name": { "type": "string" },
+        "span": { "$ref": "#/$defs/span" }
+      }
+    },
+    "span": {
+      "type": "object",
+      "required": ["byte_start", "byte_end"],
+      "properties": {
+        "byte_start": { "type": "integer", "minimum": 0 },
+        "byte_end": { "type": "integer", "minimum": 0 }
+      },
+      "$comment": "[byte_start, byte_end) over the raw UTF-8 bytes of that side's endpoint blob."
+    },
+    "op": {
+      "enum": ["equal", "added", "removed", "changed"],
+      "$comment": "Sides carry normalized token text. equal: both sides present and identical. added: before null. removed: after null. changed: both present and different."
+    },
+    "typeRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state", "text"],
+          "properties": {
+            "state": { "enum": ["written", "implicit"] },
+            "text": { "type": "string" }
+          },
+          "$comment": "written: the annotation in the source (a TypeScript annotation spelled unknown is written). implicit: defined by the language, e.g. Swift Void for an omitted return clause."
+        },
+        {
+          "type": "object",
+          "required": ["state", "reason"],
+          "properties": {
+            "state": { "const": "unknown" },
+            "reason": { "const": "inferred-not-computed" }
+          },
+          "$comment": "Nothing is written and the type would be inferred. Extraction is complete; the type is unknown."
+        }
+      ]
+    },
+    "parameter": {
+      "type": "object",
+      "required": ["position", "label", "name", "binding", "type", "optional", "variadic", "default", "modifiers"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "label": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "A separately written Swift argument label (including _). null when none is written, and always null in TypeScript."
+        },
+        "name": {
+          "type": "string",
+          "$comment": "The written local name, or the whole written destructuring pattern."
+        },
+        "binding": {
+          "enum": ["identifier", "pattern", "wildcard"],
+          "$comment": "pattern and wildcard (Swift _) have no pairing key and are never paired."
+        },
+        "type": { "$ref": "#/$defs/typeRef" },
+        "optional": { "type": "boolean", "$comment": "TypeScript ?." },
+        "variadic": { "type": "boolean", "$comment": "TypeScript rest or Swift variadic." },
+        "default": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "Written default expression syntax, or null."
+        },
+        "modifiers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "As written, e.g. Swift inout, TypeScript readonly/public parameter properties."
+        }
+      }
+    },
+    "parameterDelta": {
+      "type": "object",
+      "required": ["op", "before", "after"],
+      "properties": {
+        "op": { "$ref": "#/$defs/op" },
+        "before": { "oneOf": [{ "$ref": "#/$defs/parameter" }, { "const": null }] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/parameter" }, { "const": null }] }
+      }
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "type"],
+          "properties": {
+            "kind": { "const": "return" },
+            "type": { "$ref": "#/$defs/typeRef" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "failable"],
+          "properties": {
+            "kind": { "const": "initializer" },
+            "failable": {
+              "oneOf": [{ "enum": ["?", "!"] }, { "const": null }],
+              "$comment": "Swift init? / init!; null for a non-failable init. -> Self is never fabricated."
+            }
+          }
+        }
+      ]
+    },
+    "resultDelta": {
+      "type": "object",
+      "required": ["op", "before", "after"],
+      "properties": {
+        "op": { "$ref": "#/$defs/op" },
+        "before": { "oneOf": [{ "$ref": "#/$defs/result" }, { "const": null }] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/result" }, { "const": null }] }
+      }
+    },
+    "throwsClause": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["notExpressible", "none", "throws", "rethrows"],
+          "$comment": "notExpressible: TypeScript has no throws clause; never read as does-not-throw. none: Swift with no throws clause. throws/rethrows: as written; a declared throws does not mean the function actually throws."
+        },
+        "type": {
+          "type": "string",
+          "$comment": "Swift typed throws(E) only, when the pinned grammar parses it clean."
+        }
+      }
+    },
+    "throwsDelta": {
+      "type": "object",
+      "required": ["op", "before", "after"],
+      "properties": {
+        "op": { "$ref": "#/$defs/op" },
+        "before": { "oneOf": [{ "$ref": "#/$defs/throwsClause" }, { "const": null }] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/throwsClause" }, { "const": null }] }
+      }
+    },
+    "header": {
+      "type": "object",
+      "required": ["modifiers", "generic_parameters", "constraints"],
+      "properties": {
+        "modifiers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "Written order, e.g. export, async, static, public, mutating."
+        },
+        "generic_parameters": { "type": "array", "items": { "type": "string" } },
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "Swift where-clause requirements, as written."
+        }
+      }
+    },
+    "headerDelta": {
+      "type": "object",
+      "required": ["op", "before", "after"],
+      "properties": {
+        "op": { "$ref": "#/$defs/op" },
+        "before": { "oneOf": [{ "$ref": "#/$defs/header" }, { "const": null }] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/header" }, { "const": null }] }
+      }
+    }
+  }
+}
