@@ -52,6 +52,22 @@ test('legal overload set keeps one changed signature separate from implementatio
   assert.equal(compared.changes[0]!.kind, 'signatureChanged');
 });
 
+test('removed overload rows use source span order, not the old opaque signature order', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const before = extract(Buffer.from('function f(x: Z): void;\nfunction f(x: A): void;\nfunction f(x: unknown) {}'));
+  const after = extract(Buffer.from('function f(x: unknown) {}'));
+  const result = compareTypeScriptExtractions(before, after);
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(result.changes.map(row => row.before?.span.byte_start), [0, 24]);
+});
+
+test('TypeScript extraction refuses configured declaration and syntax visit ceilings', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const bytes = Buffer.from('function f(): void {}');
+  assert.throws(() => extract(bytes, { declarations: 0 }), /declarations limit/);
+  assert.throws(() => extract(bytes, { syntaxVisits: 1 }), /syntaxVisits limit/);
+});
+
 test('syntax token normalization preserves literal spaces and token boundaries', async () => {
   const extract = await createTypeScriptInterfaceExtractor('typescript');
   const before = extract(Buffer.from('function f({a,b}: P, x: Array<string> = ["a b"]): Promise<void> {}'));

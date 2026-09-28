@@ -36,8 +36,13 @@ export function verifyTypeScriptGrammarArtifact(language: 'typescript' | 'tsx',
   return bytes;
 }
 
+export interface TypeScriptLimits { inputBytes?: number; declarations?: number; syntaxVisits?: number }
+export class TypeScriptLimitError extends Error {
+  readonly limit: keyof TypeScriptLimits;
+  constructor(limit: keyof TypeScriptLimits) { super(`${limit} limit exceeded`); this.limit = limit; }
+}
 export async function createTypeScriptInterfaceExtractor(language: 'typescript' | 'tsx'):
-  Promise<(bytes: Uint8Array) => StructuredExtraction> {
+  Promise<(bytes: Uint8Array, limits?: TypeScriptLimits) => StructuredExtraction> {
   let pending = grammars.get(language);
   if (!pending) {
     pending = (async () => {
@@ -51,7 +56,7 @@ export async function createTypeScriptInterfaceExtractor(language: 'typescript' 
     grammars.set(language, pending);
   }
   const grammar = await pending;
-  return bytes => extract(bytes, grammar);
+  return (bytes, limits) => extract(bytes, grammar, limits);
 }
 
 function child(node: Node, type: string): Node | undefined {
@@ -309,7 +314,8 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   };
 }
 
-function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
+function extract(bytes: Uint8Array, grammar: Language, limits?: TypeScriptLimits): StructuredExtraction {
+  if (limits?.inputBytes !== undefined && bytes.byteLength > limits.inputBytes) throw new TypeScriptLimitError('inputBytes');
   let source: string;
   try {
     source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
@@ -322,6 +328,18 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
     parser.setLanguage(grammar);
     tree = parser.parse(source);
     if (!tree || tree.rootNode.hasError) return { status: 'incomplete', reason: 'parse-error' };
+    if (limits?.syntaxVisits !== undefined) {
+      let visits = 0;
+      const pending = [tree.rootNode];
+      while (pending.length) {
+        const node = pending.pop()!;
+        if (++visits > limits.syntaxVisits) throw new TypeScriptLimitError('syntaxVisits');
+        for (let i = node.childCount - 1; i >= 0; i--) {
+          const next = node.child(i);
+          if (next) pending.push(next);
+        }
+      }
+    }
     const table = buildUtf16ToByteTable(source);
     const declarations: StructuredDeclaration[] = [];
     const add = (n: Node, span: Node, scope: StructuredDeclaration['identity']['scope'],
@@ -329,6 +347,7 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
       const parsed = parseDeclaration(n, span, scope, mods, table, binding, bindingType);
       if (!parsed) return false;
       declarations.push(parsed);
+      if (limits?.declarations !== undefined && declarations.length > limits.declarations) throw new TypeScriptLimitError('declarations');
       return true;
     };
     const scan = (node: Node, span = node, mods: string[] = []): boolean => {
