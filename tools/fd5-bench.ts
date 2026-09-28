@@ -205,9 +205,14 @@ function startLoadWorker(kind: 'clip' | 'interface', url: string, token: string,
     if (!finished) stopReject(new Error(`FD5 load worker exited without summary (${code})`));
     if (code === 0) exitResolve(); else exitReject(new Error(`FD5 load worker exited ${code}`));
   });
+  let startDeadline: ReturnType<typeof setTimeout> | undefined;
+  const boundedReady = Promise.race([ready, new Promise<never>((_resolve, reject) => {
+    startDeadline = setTimeout(() => reject(new Error('FD5 load worker did not start within 30 seconds')), 30_000);
+  })]).catch(async error => { await worker.terminate(); throw error; })
+    .finally(() => { if (startDeadline) clearTimeout(startDeadline); });
   let stopping: Promise<LoadSummary | InterfaceLoadSummary> | undefined;
-  return { ready, stop: () => stopping ??= (async () => {
-    await ready;
+  return { ready: boundedReady, stop: () => stopping ??= (async () => {
+    await boundedReady;
     worker.postMessage('stop');
     let responseDeadline: ReturnType<typeof setTimeout> | undefined;
     let summary: LoadSummary | InterfaceLoadSummary;
