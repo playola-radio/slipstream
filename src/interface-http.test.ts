@@ -542,7 +542,7 @@ test('look-ahead interruption currently leaves a ready incomplete page with no r
 });
 
 test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
-  const { storeDir, request } = await fixture('range-page-boundary-first');
+  const { storeDir, request, expected } = await fixture('range-page-boundary-first');
   const logPath = join(storeDir, 'sessions', '11111111-1111-4111-8111-111111111111', 'events.jsonl');
   await makeEndpointEqual(logPath, 'src/b.ts');
   let interrupt = true;
@@ -565,6 +565,7 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
     assert.deepEqual(body.files.map(file => ({ path: file.path, status: file.status })),
       [{ path: 'src/a.ts', status: 'ready' }]);
     assert.deepEqual(body.page, { complete: false, next_after_path: 'src/a.ts' });
+    assert.deepEqual(body, expected, 'timeout is indistinguishable from the ordinary first page');
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
