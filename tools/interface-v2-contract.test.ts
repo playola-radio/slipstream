@@ -51,6 +51,7 @@ describe('interface.v2 contract fixtures', () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     const report = JSON.parse(out[0] ?? '{}');
+    assert.equal(report.cases, 71);
     assert.deepEqual(report.failures, []);
     assert.equal(report.negative_control_rejected, true);
     assert.equal(code, EXIT.PASS);
@@ -142,6 +143,46 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('a 400 for a well-formed request', /give 200, not 400/, (c) => { asError(c, 400); });
   rejects('an unknown harness condition', /unexpected property 'slow'/, (c) => { c.history.harness = { slow: true }; });
   rejects('a non-zero harness limit', /must be 0/, (c) => { c.history.harness = { limits: { file_result_bytes: 1 } }; });
+  rejects('a non-zero pre-first-file scan limit', /scan_records: must be 0/, (c) => {
+    c.history.harness.limits.scan_records = 1;
+  }, 'range-scan-limit-before-file');
+  rejects('an unknown pre-first-file interrupt phase', /phase.*resolve/, (c) => {
+    c.history.harness.interrupt.phase = 'after';
+  }, 'range-deadline-before-file');
+  rejects('an unknown pre-first-file interrupt reason', /reason.*timeout.*cancelled/, (c) => {
+    c.history.harness.interrupt.reason = 'overloaded';
+  }, 'range-cancelled-before-file');
+  rejects('a lookahead interruption after an unreachable file', /after_path is not a completed path/, (c) => {
+    c.history.harness.interrupt.after_path = 'src/b.ts';
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption before the page stops comparing files', /after_path must end the completed page/, (c) => {
+    c.request = c.request.replace('limit=1', 'limit=2&include_identical=true');
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption without a pending candidate', /no unchecked path/, (c) => {
+    c.request = c.request.replace('path_prefix=src/', 'path_prefix=src/a');
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption combined with a zero file budget', /cannot combine lookahead/, (c) => {
+    c.history.harness.limits = { file_result_bytes: 0 };
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page claiming to be complete', /page.complete: must be false/, (c) => {
+    c.expected.page.complete = true;
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page advancing past the last returned row', /page.next_after_path/, (c) => {
+    c.expected.page.next_after_path = 'src/b.ts';
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page claiming a file timeout', /must be ready/, (c) => {
+    c.expected.status = 'partial';
+  }, 'range-lookahead-timeout');
+  rejects('two pre-work conditions with undefined ordering', /one exclusive pre-work condition/, (c) => {
+    c.history.harness.interrupt = { phase: 'resolve', reason: 'cancelled' };
+  }, 'range-scan-limit-before-file');
+  rejects('a pre-work scan with an unreachable file interrupt', /one exclusive pre-work condition/, (c) => {
+    c.history.harness.interrupt = { at_path: 'never.ts', reason: 'timeout' };
+  }, 'range-scan-limit-before-file');
+  rejects('evaluated inventory on pre-first-file timeout', /not evaluated/, (c) => {
+    c.expected.inventory = { scope: 'observed', baseline_completed_seq: '3', unknown_scopes: [],
+      unknown_scopes_complete: true, policy_exclusions: ['store-directory', '.git', 'symlinks'] };
+  }, 'range-deadline-before-file');
   rejects('a normal page under an admission rejection', /overloaded/, (c) => { c.history.harness = { admission: 'overloaded' }; });
   rejects('a ready file under an interrupt', /precedence gives skipped \/ cancelled/, (c) => { c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'cancelled' } }; });
   rejects('a ready first file under a zero file-result budget', /precedence gives skipped \/ too-large/, (c) => { c.history.harness = { limits: { file_result_bytes: 0 } }; });

@@ -77,7 +77,9 @@ interface History {
 
 interface Harness {
   admissionOverloaded: boolean;
-  interrupt: { atPath: string; reason: string } | null;
+  interrupt: { atPath: string; reason: string } | { phase: 'resolve'; reason: string }
+    | { phase: 'lookahead'; afterPath: string; reason: string } | null;
+  noScanBudget: boolean;
   noFileResultBudget: boolean;
   noMetadataBudget: boolean;
 }
@@ -249,7 +251,8 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
  * budget is the only limit value, because it is the only one whose outcome is
  * derivable without serializing the response. */
 function checkHarness(raw: unknown, errors: string[]): Harness {
-  const harness: Harness = { admissionOverloaded: false, interrupt: null, noFileResultBudget: false, noMetadataBudget: false };
+  const harness: Harness = { admissionOverloaded: false, interrupt: null, noScanBudget: false,
+    noFileResultBudget: false, noMetadataBudget: false };
   if (raw === undefined) return harness;
   if (!isObj(raw)) {
     errors.push('history.harness: must be an object');
@@ -262,11 +265,23 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
   }
   if (raw.interrupt !== undefined) {
     const i = raw.interrupt;
-    if (!isObj(i) || typeof i.at_path !== 'string' || !['timeout', 'cancelled'].includes(i.reason as string)) {
-      errors.push("history.harness.interrupt: must be {at_path, reason: 'timeout' | 'cancelled'}");
-    } else {
+    if (!isObj(i)) {
+      errors.push('history.harness.interrupt: must be an object');
+    } else if (!['timeout', 'cancelled'].includes(i.reason as string)) {
+      errors.push("history.harness.interrupt.reason: must be 'timeout' or 'cancelled'");
+    } else if (i.phase === 'lookahead') {
+      extraKeys(i, ['phase', 'after_path', 'reason'], 'history.harness.interrupt', errors);
+      if (typeof i.after_path !== 'string') errors.push('history.harness.interrupt.after_path: must be a path');
+      else harness.interrupt = { phase: 'lookahead', afterPath: i.after_path, reason: i.reason as string };
+    } else if (i.phase !== undefined) {
+      extraKeys(i, ['phase', 'reason'], 'history.harness.interrupt', errors);
+      if (i.phase !== 'resolve') errors.push("history.harness.interrupt.phase: must be 'resolve' or 'lookahead'");
+      else harness.interrupt = { phase: 'resolve', reason: i.reason as string };
+    } else if (typeof i.at_path === 'string') {
       extraKeys(i, ['at_path', 'reason'], 'history.harness.interrupt', errors);
       harness.interrupt = { atPath: i.at_path, reason: i.reason as string };
+    } else {
+      errors.push("history.harness.interrupt: needs at_path or phase 'resolve'");
     }
   }
   if (raw.limits !== undefined) {
@@ -275,11 +290,20 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
       errors.push('history.harness.limits: must be an object');
       return harness;
     }
-    extraKeys(l, ['file_result_bytes', 'metadata_bytes'], 'history.harness.limits', errors);
+    extraKeys(l, ['file_result_bytes', 'metadata_bytes', 'scan_records'], 'history.harness.limits', errors);
     for (const [key, value] of Object.entries(l)) if (value !== 0) errors.push(`history.harness.limits.${key}: must be 0`);
+    harness.noScanBudget = l.scan_records !== undefined;
     harness.noFileResultBudget = l.file_result_bytes !== undefined;
     harness.noMetadataBudget = l.metadata_bytes !== undefined;
   }
+  const preWork = Number(harness.admissionOverloaded) + Number(harness.noScanBudget)
+    + Number(harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'resolve');
+  if (preWork > 1 || preWork > 0 && (harness.noFileResultBudget || harness.noMetadataBudget
+    || harness.interrupt !== null && ('atPath' in harness.interrupt || harness.interrupt.phase === 'lookahead'))) {
+    errors.push('history.harness: use one exclusive pre-work condition');
+  }
+  if (harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'lookahead'
+    && harness.noFileResultBudget) errors.push('history.harness: cannot combine lookahead with a zero file budget');
   return harness;
 }
 
@@ -588,44 +612,70 @@ const ENVELOPE_KEYS = [
 
 function checkEnvelope(body: Obj, req: Request, history: History, errors: string[]): void {
   const { harness } = history;
+  const preWorkReason = harness.admissionOverloaded ? 'overloaded'
+    : harness.noScanBudget ? 'scan-limit'
+      : harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'resolve' ? harness.interrupt.reason : null;
   extraKeys(body, ENVELOPE_KEYS, 'expected', errors);
   if (body.session_id !== req.sessionId) errors.push('expected.session_id: does not match the request');
   const range = body.range as Obj;
   extraKeys(range, ['before_seq', 'after_seq'], 'expected.range', errors);
   if (range.before_seq !== req.before.toString() || range.after_seq !== req.after.toString()) errors.push('expected.range: does not match the request');
 
-  const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
-  const inventory = body.inventory as Obj;
-  extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
-  if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
-  if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
-  const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
-  checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
-  const recordedGaps = history.events
-    .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
-    .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
-  checkMetadataList(body.gaps as unknown[], body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
+  if (preWorkReason !== null) {
+    if (body.inventory !== null || body.gaps !== null || body.gaps_complete !== false) {
+      errors.push('expected: pre-work skip must mark inventory and gaps not evaluated');
+    }
+  } else {
+    const completed = history.events.find((e) => e.type === COMPLETED && BigInt(e.seq as string) <= req.after);
+    const inventory = body.inventory as Obj;
+    if (!isObj(inventory)) errors.push('expected.inventory: resolved page needs inventory');
+    else {
+      extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
+      if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
+      if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
+      const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
+      checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
+    }
+    const recordedGaps = history.events
+      .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
+      .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
+    if (!Array.isArray(body.gaps)) errors.push('expected.gaps: resolved page needs gaps');
+    else checkMetadataList(body.gaps, body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
+  }
 
   const files = body.files as Obj[];
   const page = body.page as Obj;
   extraKeys(page, ['complete', 'next_after_path'], 'expected.page', errors);
   if ((body.status === 'skipped') !== (body.fallback_reason !== undefined)) errors.push('expected.fallback_reason: must be present exactly when status is skipped');
-  if (harness.admissionOverloaded) {
-    if (body.status !== 'skipped' || body.fallback_reason !== 'overloaded') errors.push('expected: an overloaded admission is a skipped page with fallback_reason overloaded');
+  if (preWorkReason !== null) {
+    if (body.status !== 'skipped' || body.fallback_reason !== preWorkReason)
+      errors.push(`expected: a pre-work ${preWorkReason} is a skipped page with fallback_reason ${preWorkReason}`);
     if (files.length > 0 || page.complete !== false || page.next_after_path !== req.afterPath) errors.push('expected: a skipped page has no files, is not complete and does not move the cursor');
     return;
   }
-  if (body.status === 'skipped') errors.push('expected.status: only a harness admission rejection makes a fixture page skipped');
+  if (body.status === 'skipped') errors.push('expected.status: only a pre-work harness condition makes a fixture page skipped');
 
   // Page membership: eligible paths in order, ended by the limit, an
   // interrupt (§4.3), or a zero file-result budget (§4.7).
   const eligible = eligiblePaths(req, history);
   let count = Math.min(req.limit, eligible.length);
   let endedEarly = false;
-  if (harness.interrupt !== null) {
+  if (harness.interrupt !== null && 'atPath' in harness.interrupt) {
     const at = eligible.indexOf(harness.interrupt.atPath);
     if (at < 0 || at >= req.limit) errors.push('history.harness.interrupt: at_path is not a path this page reaches');
     else [count, endedEarly] = [at + 1, true];
+  }
+  if (harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'lookahead') {
+    const at = eligible.indexOf(harness.interrupt.afterPath);
+    if (at < 0 || at >= req.limit) errors.push('history.harness.interrupt: after_path is not a completed path this page reaches');
+    else {
+      if (at + 1 !== count) errors.push('history.harness.interrupt: after_path must end the completed page');
+      [count, endedEarly] = [at + 1, true];
+    }
+    const unchecked = eligiblePaths({ ...req, includeIdentical: true, afterPath: harness.interrupt.afterPath }, history)[0];
+    if (unchecked === undefined || !isIdentical(resolveEndpoints(unchecked, req, history) as Endpoints, history)) {
+      errors.push('history.harness.interrupt: no unchecked path needs a lookahead retention check');
+    }
   }
   if (harness.noFileResultBudget) count = Math.min(count, 1);
   const paths = files.map((f) => f.path);
@@ -637,7 +687,7 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
 
   const { interrupt } = harness;
   files.forEach((f, i) => {
-    const forcedSkip = interrupt !== null && interrupt.atPath === f.path ? interrupt.reason
+    const forcedSkip = interrupt !== null && 'atPath' in interrupt && interrupt.atPath === f.path ? interrupt.reason
       : harness.noFileResultBudget && i === 0 ? 'too-large'
       : null;
     checkFile(f, req, history, forcedSkip, `expected.files[${i}]`, errors);

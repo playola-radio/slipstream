@@ -32,13 +32,44 @@
     },
     "status": {
       "enum": ["ready", "partial", "skipped"],
-      "$comment": "ready: every returned file is ready or identical (including an empty page); not a claim of complete inventory, history or semantics. partial: at least one returned file has another status. skipped: no file could start; files is empty and the cursor does not move."
+      "$comment": "ready: every returned file is ready or identical (including an empty page), even if look-ahead was interrupted and page.complete is false; not a claim of complete inventory, history or semantics. partial: at least one returned file has another status. skipped: no file could start; files is empty and the cursor does not move."
     },
     "fallback_reason": {
       "enum": ["overloaded", "timeout", "cancelled", "scan-limit"],
       "$comment": "Present exactly when status is skipped."
     },
     "inventory": {
+      "oneOf": [{ "$ref": "#/$defs/resolvedInventory" }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved. No inventory claim was evaluated."
+    },
+    "analysis": { "$ref": "#/$defs/analysis" },
+    "gaps": {
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" } }, { "const": null }],
+      "$comment": "null only when a skipped page stopped before the recorded range was resolved."
+    },
+    "gaps_complete": { "type": "boolean" },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fileResult" },
+      "$comment": "Ordered by path, by exact UTF-16 code unit. identical results appear only with include_identical=true."
+    },
+    "page": {
+      "type": "object",
+      "required": ["complete", "next_after_path"],
+      "properties": {
+        "complete": {
+          "type": "boolean",
+          "$comment": "true only when the scan proves this is the last page. false after look-ahead interruption, even if a continuation later finds no visible rows. Loaded totals are partial until complete is true."
+        },
+        "next_after_path": {
+          "oneOf": [{ "type": "string" }, { "const": null }],
+          "$comment": "Exclusive cursor for the next request. null when complete. After a look-ahead interruption it is the last returned path, never an unchecked candidate. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "resolvedInventory": {
       "type": "object",
       "required": [
         "scope",
@@ -82,33 +113,6 @@
       },
       "$comment": "Decisions F3-A and F4-A. Analyzing any of these is a new projection version."
     },
-    "gaps": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/gap" },
-      "$comment": "Every capture.gap at or before after_seq, ordered by seq, subject to the shared 64 KiB metadata budget."
-    },
-    "gaps_complete": { "type": "boolean" },
-    "files": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/fileResult" },
-      "$comment": "Ordered by path, by exact UTF-16 code unit. identical results appear only with include_identical=true."
-    },
-    "page": {
-      "type": "object",
-      "required": ["complete", "next_after_path"],
-      "properties": {
-        "complete": {
-          "type": "boolean",
-          "$comment": "true only on the last page. Loaded totals are partial until then."
-        },
-        "next_after_path": {
-          "oneOf": [{ "type": "string" }, { "const": null }],
-          "$comment": "Exclusive cursor for the next request. null when complete. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
-        }
-      }
-    }
-  },
-  "$defs": {
     "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
     "cutoff": {
       "type": "string",
