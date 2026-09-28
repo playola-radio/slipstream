@@ -86,7 +86,7 @@ test('throwing trace observer cannot change admission outcome or release', async
   await budget.close();
 });
 
-test('trace gives pre-aborted and post-close calls terminal units without dispatch', async () => {
+test('pre-aborted and post-close calls remain unclassified by the frozen trace union', async () => {
   const events: ProjectionTraceEvent[] = [];
   const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 }, event => events.push(event));
   const controller = new AbortController();
@@ -97,10 +97,39 @@ test('trace gives pre-aborted and post-close calls terminal units without dispat
   await budget.close();
   assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
     traceRouteKey: '/closed', run }), { kind: 'closed' });
-  assert.deepEqual(events.map(e => e.kind), ['admission', 'settle', 'admission', 'settle']);
-  assert.deepEqual(events.filter(e => e.kind === 'admission').map(e => e.disposition), ['cancelled', 'closed']);
-  assert.deepEqual(events.filter(e => e.kind === 'settle').map(e => [e.priorState, e.outcome]),
-    [['cancelled', 'cancelled'], ['closed', 'closed']]);
+  assert.deepEqual(events, []);
+});
+
+test('leader settle is traced before a released waiter can dispatch queued work', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 1, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const leader = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'same',
+    traceRouteKey: '/leader', run });
+  const waiter = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'same',
+    traceRouteKey: '/waiter', run });
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/queued', run: () => ({ promise: Promise.resolve('queued'), cancel: () => {} }) });
+  held.resolve('done');
+  await Promise.all([leader, waiter, queued]);
+  const leaderId = events.find(e => e.kind === 'admission' && e.routeKey === '/leader')!;
+  const queuedId = events.find(e => e.kind === 'admission' && e.routeKey === '/queued')!;
+  assert.ok(leaderId.kind === 'admission' && queuedId.kind === 'admission');
+  const leaderSettle = events.findIndex(e => e.kind === 'settle' && e.unitId === leaderId.unitId);
+  const queuedDispatch = events.findIndex(e => e.kind === 'dispatch' && e.unitId === queuedId.unitId);
+  assert.ok(leaderSettle >= 0 && queuedDispatch > leaderSettle);
+  await budget.close();
+});
+
+test('a rejected async trace observer cannot produce an unhandled rejection', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 },
+    async () => { throw new Error('async collector'); });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/async', run: () => ({ promise: Promise.resolve('ok'), cancel: () => {} }) }),
+  { kind: 'ok', value: 'ok' });
+  await new Promise(resolve => setImmediate(resolve));
+  await budget.close();
 });
 
 test('trace dispatches a promoted leader once before its compute starts', async () => {
@@ -113,8 +142,8 @@ test('trace dispatches a promoted leader once before its compute starts', async 
     traceRouteKey: '/second', run: () => ({ promise: Promise.resolve('second'), cancel: () => {} }) });
   held.resolve('first');
   assert.deepEqual(await Promise.all([first, second]), [{ kind: 'ok', value: 'first' }, { kind: 'ok', value: 'second' }]);
-  const queued = events.find(e => e.kind === 'admission' && e.routeKey === '/second')!;
-  assert.equal(queued.kind, 'admission');
+  const queued = events.find((e): e is Extract<ProjectionTraceEvent, { kind: 'admission' }> =>
+    e.kind === 'admission' && e.routeKey === '/second')!;
   const sequence = events.filter(e => 'unitId' in e && e.unitId === queued.unitId);
   assert.deepEqual(sequence.map(e => e.kind), ['admission', 'dispatch', 'settle']);
   assert.ok(sequence[0]!.atNs <= sequence[1]!.atNs && sequence[1]!.atNs <= sequence[2]!.atNs);

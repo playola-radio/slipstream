@@ -236,7 +236,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       signal.addEventListener('abort', task.cancel, { once: true });
       try {
         const result = await task.promise;
-        freshness = 'fresh';
+        freshness = result.comparison === null ? 'none' : 'fresh';
         if (before.bytes !== null) base.coverage.before = result.before.status === 'incomplete'
           ? { state: 'incomplete', reason: result.before.reason }
           : result.before.status === 'tooLarge' ? { state: 'notEvaluated' } : { state: 'complete' };
@@ -255,7 +255,6 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         after.bytes !== null ? { id: 'after', bytes: after.bytes } : null].filter((v): v is { id: string; bytes: Uint8Array } => v !== null);
       const results = await (options.extractSwift ?? extractSwiftSides)(sides, { signal,
         limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
-      freshness = 'fresh';
       if (results.size !== sides.length) throw new Error('Swift extractor returned unexpected side count');
       for (const side of sides) if (!results.has(side.id)) throw new Error(`Swift extractor omitted ${side.id} side`);
       for (const side of sides) {
@@ -283,6 +282,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       } else if ((left === undefined || left.status === 'complete') && (right === undefined || right.status === 'complete')) {
         const result = compareV2(left?.status === 'complete' ? left.declarations : [],
           right?.status === 'complete' ? right.declarations : []);
+        freshness = 'fresh';
         if (result.status === 'incomplete') compareReason = result.reason;
         else changes = result.changes;
       }
@@ -399,8 +399,11 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         }
         page.files.push(row);
         if (options.projectionTrace && req.traceRouteKey !== undefined) {
-          try { options.projectionTrace({ kind: 'interface-file', routeKey: req.traceRouteKey,
-            path: row.path, atNs: process.hrtime.bigint(), freshness: compared.freshness, resultStatus: row.status }); }
+          try {
+            const returned = options.projectionTrace({ kind: 'interface-file', routeKey: req.traceRouteKey,
+              path: row.path, atNs: process.hrtime.bigint(), freshness: compared.freshness, resultStatus: row.status }) as unknown;
+            if (returned instanceof Promise) void returned.catch(() => {});
+          }
           catch { /* observation cannot affect projection */ }
         }
         fileBytes += size;

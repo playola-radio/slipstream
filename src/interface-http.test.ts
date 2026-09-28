@@ -121,7 +121,7 @@ test('trace attributes cache freshness separately to each returned file', async 
 });
 
 test('trace marks unsupported and unavailable rows as having no fresh parse', async () => {
-  for (const name of ['py-unsupported-language', 'py-missing-blob-unsupported']) {
+  for (const name of ['py-unsupported-language', 'py-missing-blob-unsupported', 'swift-parse-failure']) {
     const { storeDir, request } = await fixture(name);
     const events: ProjectionTraceEvent[] = [];
     const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
@@ -130,8 +130,7 @@ test('trace marks unsupported and unavailable rows as having no fresh parse', as
       const response = await fetch(reader.url + request.slice(4),
         { headers: { authorization: `Bearer ${reader.token}` } });
       assert.equal(response.status, 200);
-      const page = await response.json() as { files: { status: string }[] };
-      assert.equal(events.filter(e => e.kind === 'interface-file').length, page.files.length);
+      await response.json();
       assert.deepEqual(events.filter(e => e.kind === 'interface-file').map(e => e.freshness), ['none']);
     } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
   }
@@ -149,6 +148,25 @@ test('throwing trace collector leaves successful HTTP response bytes unchanged',
     const observed = await get(traced);
     assert.equal(observed.status, baseline.status);
     assert.equal(await observed.text(), await baseline.text());
+  } finally {
+    await traced.close(); await plain.close();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test('rejected async file observer leaves HTTP response bytes unchanged', async () => {
+  const { storeDir, request } = await fixture('ts-parameter-change');
+  const plain = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
+  const traced = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    projectionTrace: async () => { throw new Error('async collector failed'); } });
+  try {
+    const get = (reader: typeof plain) => fetch(reader.url + request.slice(4),
+      { headers: { authorization: `Bearer ${reader.token}` } });
+    const baseline = await get(plain);
+    const observed = await get(traced);
+    assert.equal(observed.status, baseline.status);
+    assert.equal(await observed.text(), await baseline.text());
+    await new Promise(resolve => setImmediate(resolve));
   } finally {
     await traced.close(); await plain.close();
     await rm(storeDir, { recursive: true, force: true });

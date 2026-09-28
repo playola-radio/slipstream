@@ -125,7 +125,10 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
   let pumping = false;
   let nextTraceId = 0;
   const emit = (event: ProjectionTraceEvent): void => {
-    try { trace?.(event); } catch { /* observation cannot affect admission */ }
+    try {
+      const returned = trace?.(event) as unknown;
+      if (returned instanceof Promise) void returned.catch(() => {});
+    } catch { /* observation cannot affect admission */ }
   };
   const admissionEvent = (unitId: number | undefined, routeKey: string | undefined,
     workload: string, disposition: Extract<ProjectionTraceEvent, { kind: 'admission' }>['disposition']): void => {
@@ -164,6 +167,10 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
     if (unit.timer !== undefined) clearTimeout(unit.timer);
     if (unit.signal && unit.onAbort) unit.signal.removeEventListener('abort', unit.onAbort);
     live.delete(unit);
+    // Record the leader before releasing its waiters: a waiter can pump queued
+    // work, so delayed emission would make the trace briefly exceed C.
+    if (unit.traceId !== undefined) emit({ kind: 'settle', unitId: unit.traceId,
+      atNs: process.hrtime.bigint(), priorState: prev, outcome: outcome.kind });
 
     if (prev === 'running') {
       decRunning(unit.workload);
@@ -182,8 +189,6 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
       if (unit.key !== undefined) inFlight.get(flightKey(unit.workload, unit.key))?.waiters.delete(unit);
     }
 
-    if (unit.traceId !== undefined) emit({ kind: 'settle', unitId: unit.traceId,
-      atNs: process.hrtime.bigint(), priorState: prev, outcome: outcome.kind });
     unit.resolve(outcome);
     pump();
   };
@@ -252,16 +257,16 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
   };
 
   const admit = <T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
+    if (closed) return Promise.resolve({ kind: 'closed' });
+    if (req.signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
     const traceId = trace && req.traceRouteKey !== undefined &&
       (req.workload === 'interface' || req.workload === 'clip') ? ++nextTraceId : undefined;
-    const early = (kind: 'closed' | 'cancelled'): Promise<AdmitOutcome<T>> => {
-      admissionEvent(traceId, req.traceRouteKey, req.workload, kind);
-      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId,
-        atNs: process.hrtime.bigint(), priorState: kind, outcome: kind });
-      return Promise.resolve({ kind });
+    const overload = (resolve: (outcome: AdmitOutcome<T>) => void): void => {
+      admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
+      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
+        priorState: 'overloaded', outcome: 'overloaded' });
+      resolve({ kind: 'overloaded' });
     };
-    if (closed) return early('closed');
-    if (req.signal?.aborted) return early('cancelled');
     return new Promise<AdmitOutcome<T>>((resolve) => {
       const deadlineMs = req.deadlineMs ?? D;
       const unit: Unit = {
@@ -286,10 +291,7 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
       if (fk !== undefined) {
         const flight = inFlight.get(fk);
         if (flight) {
-          if (pending() >= Q || waiters >= W) { admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
-            if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
-              priorState: 'overloaded', outcome: 'overloaded' });
-            resolve({ kind: 'overloaded' }); return; }
+          if (pending() >= Q || waiters >= W) { overload(resolve); return; }
           waiters++;
           unit.state = 'waiting';
           flight.waiters.add(unit);
@@ -323,10 +325,7 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
         admissionEvent(traceId, req.traceRouteKey, req.workload, 'queued');
         return;
       }
-      admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
-      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
-        priorState: 'overloaded', outcome: 'overloaded' });
-      resolve({ kind: 'overloaded' });
+      overload(resolve);
     });
   };
 
