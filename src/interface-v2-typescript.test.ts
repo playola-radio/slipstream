@@ -325,3 +325,22 @@ test('deep syntax does not overflow normalization stack', async () => {
   const source = `function f(x: ${'Array<'.repeat(20_000)}string${'>'.repeat(20_000)}): void {}`;
   assert.equal(extract(Buffer.from(source)).status, 'complete');
 });
+
+test('deeply nested template literal type substitutions do not overflow', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  let type = 'string';
+  for (let i = 0; i < 20_000; i++) type = `\`x-\${${type}}\``;
+  const source = `function f(x: ${type}): void {}`;
+  const result = extract(Buffer.from(source));
+  assert.equal(result.status, 'complete');
+  if (result.status === 'complete') {
+    assert.equal(result.declarations[0]!.parameters[0]!.type.state, 'written');
+  }
+});
+
+test('a call wrapping a nested callback is not itself an unrepresentable class field', async () => {
+  const extract = await createTypeScriptInterfaceExtractor('typescript');
+  const result = extract(Buffer.from('class C { handler = register(() => {}); m(x: number): void {} }'));
+  assert.equal(result.status, 'complete');
+  if (result.status === 'complete') assert.deepEqual(result.declarations.map(d => d.identity.name), ['m']);
+});

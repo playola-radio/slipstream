@@ -66,43 +66,98 @@ function field(node: Node, name: string): Node | undefined {
   return node.childForFieldName(name) ?? undefined;
 }
 
-/** A wrapped function expression (parenthesized, `as`, `satisfies`) is still an unrepresentable function value. */
+/**
+ * A wrapped function expression (parenthesized, `as`, `satisfies`) is still an unrepresentable
+ * function value. This only unwraps those wrapper shells around a value's own top-level
+ * expression — it must not descend into a call's arguments or other nested expressions, or
+ * every value that merely contains a callback anywhere inside it would be misclassified as
+ * itself an unrepresentable function value.
+ */
 function containsWrappedFunction(node: Node): boolean {
-  const stack = [node];
-  while (stack.length) {
-    const current = stack.pop()!;
+  let current: Node | undefined = node;
+  while (current) {
     if (['arrow_function', 'function_expression', 'generator_function'].includes(current.type)) return true;
-    stack.push(...children(current));
+    if (!['parenthesized_expression', 'as_expression', 'satisfies_expression'].includes(current.type)) return false;
+    current = children(current)[0];
   }
   return false;
 }
 
-/** The grammar omits literal fragments between template type substitutions as nodes; recover them from source gaps. */
-function templateLiteralTypeText(node: Node): string {
+/**
+ * A unit of pending work for the explicit-stack traversal in `normalizedTokens`. `wrap` marks
+ * that once the stack unwinds back to it, every token produced since should be joined (with the
+ * normal merge rules) to render one substitution's inner expression, then spliced verbatim
+ * (no further spacing) into the enclosing template-literal-type's own raw text — a
+ * substitution's internal spacing must never leak into the literal backtick text around it.
+ */
+type TokenWork =
+  | { kind: 'node'; node: Node }
+  | { kind: 'literal'; text: string }
+  | { kind: 'wrap'; raw: boolean }
+  | { kind: 'endWrap' };
+
+/**
+ * The grammar omits literal fragments between template type substitutions as nodes; recover
+ * them from source gaps. A template-literal substitution can itself contain another template
+ * literal type nested arbitrarily deep, so this schedules each substitution's tokenization on
+ * the caller's explicit work stack rather than recursing directly — an unbounded recursive
+ * depth here would overflow the native call stack. The whole rendered node is pushed back as a
+ * single literal token: template-literal-type text is raw source text, not syntax tokens, so it
+ * must never pass back through the outer join's spacing rules.
+ */
+function scheduleTemplateLiteralType(node: Node, stack: TokenWork[]): void {
+  const work: TokenWork[] = [{ kind: 'wrap', raw: true }];
   let out = '';
   let cursor = node.startIndex;
   for (let i = 0; i < node.childCount; i++) {
     const c = node.child(i);
     if (!c) continue;
     out += node.text.slice(cursor - node.startIndex, c.startIndex - node.startIndex);
-    out += c.type === 'template_type'
-      ? `\${${normalizedTokens(children(c)[0]!)}}`
-      : c.text;
+    if (c.type === 'template_type') {
+      work.push({ kind: 'literal', text: out }, { kind: 'literal', text: '${' },
+        { kind: 'wrap', raw: false }, { kind: 'node', node: children(c)[0]! },
+        { kind: 'endWrap' }, { kind: 'literal', text: '}' });
+      out = '';
+    } else {
+      out += c.text;
+    }
     cursor = c.endIndex;
   }
   out += node.text.slice(cursor - node.startIndex);
-  return out;
+  work.push({ kind: 'literal', text: out }, { kind: 'endWrap' });
+  for (let i = work.length - 1; i >= 0; i--) stack.push(work[i]!);
 }
 
-/** Join syntax leaves, never characters: literals remain intact and identifiers cannot merge. */
+/**
+ * Join syntax leaves, never characters: literals remain intact and identifiers cannot merge.
+ * A template-literal substitution's own spacing is resolved eagerly at its `wrap` boundary
+ * (see `scheduleTemplateLiteralType`) so it becomes one opaque token before the surrounding
+ * join runs — the substitution's internal spacing must never leak into the rules around it.
+ */
 function normalizedTokens(node: Node): string {
   const tokens: string[] = [];
-  const stack: Node[] = [node];
+  const wrapAt: { start: number; raw: boolean }[] = [];
+  const stack: TokenWork[] = [{ kind: 'node', node }];
   while (stack.length) {
-    const current = stack.pop()!;
+    const item = stack.pop()!;
+    if (item.kind === 'wrap') {
+      wrapAt.push({ start: tokens.length, raw: item.raw });
+      continue;
+    }
+    if (item.kind === 'endWrap') {
+      const { start, raw } = wrapAt.pop()!;
+      const segment = tokens.splice(start, tokens.length - start);
+      tokens.push(raw ? segment.join('') : joinTokens(segment));
+      continue;
+    }
+    if (item.kind === 'literal') {
+      tokens.push(item.text);
+      continue;
+    }
+    const current = item.node;
     if (current.type === 'comment') continue;
     if (current.type === 'template_literal_type') {
-      tokens.push(templateLiteralTypeText(current));
+      scheduleTemplateLiteralType(current, stack);
       continue;
     }
     if (current.childCount === 0) {
@@ -111,9 +166,14 @@ function normalizedTokens(node: Node): string {
     }
     for (let i = current.childCount - 1; i >= 0; i--) {
       const next = current.child(i);
-      if (next) stack.push(next);
+      if (next) stack.push({ kind: 'node', node: next });
     }
   }
+  return joinTokens(tokens);
+}
+
+/** Join syntax leaves, never characters: literals remain intact and identifiers cannot merge. */
+function joinTokens(tokens: string[]): string {
   let out = '';
   let previous = '';
   const mergeable = new Set(['++', '--', '&&', '||', '??', '==', '!=', '>=', '<=',
