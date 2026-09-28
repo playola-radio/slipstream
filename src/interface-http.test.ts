@@ -530,7 +530,7 @@ test('cancellation after an included identical file is classified before its asy
   } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
-test('look-ahead interruption currently leaves a ready incomplete page with no reason', async () => {
+test('look-ahead cancellation leaves a ready incomplete page and an empty final continuation', async () => {
   const { storeDir, req } = await serviceRequest('range-page-boundary-first');
   await makeEndpointEqual(req.logPath, 'src/b.ts');
   const controller = new AbortController();
@@ -555,6 +555,76 @@ test('look-ahead interruption currently leaves a ready incomplete page with no r
     assert.deepEqual(next.files, []);
     assert.deepEqual(next.page, { complete: true, next_after_path: null });
   } finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+function manualTimeoutAdmission(): { admission: ProjectionAdmission; timeout: () => void } {
+  let fire: () => void = () => { throw new Error('interface work has not started'); };
+  const admission: ProjectionAdmission = {
+    admit: <T>(request: AdmitRequest<T>): Promise<AdmitOutcome<T>> => new Promise<AdmitOutcome<T>>(resolve => {
+      const handle = request.run();
+      fire = () => { handle.cancel(); resolve({ kind: 'timeout' }); };
+      handle.promise.then(value => resolve({ kind: 'ok', value }), () => resolve({ kind: 'error' }));
+    }),
+    close: async () => {}, snapshot: () => ({ running: 0, queued: 0, waiters: 0 }),
+  };
+  return { admission, timeout: () => fire() };
+}
+
+test('look-ahead timeout keeps the cursor before hidden and visible files', async () => {
+  const { storeDir, req, expected } = await serviceRequest('range-deadline-mid-page');
+  await makeEndpointEqual(req.logPath, 'src/b.ts');
+  const { admission, timeout } = manualTimeoutAdmission();
+  let interrupt = true;
+  const service = createInterfaceService({ storeDir, admission,
+    onRetentionCheck: (path, phase) => {
+      if (interrupt && path === 'src/b.ts' && phase === 'lookahead') {
+        interrupt = false;
+        timeout();
+      }
+    } });
+  try {
+    const first = await service.get({ ...req, limit: 1 });
+    assert.equal(first.status, 'ready');
+    assert.equal(first.fallback_reason, undefined);
+    assert.deepEqual(first.files.map(file => [file.path, file.status]), [['src/a.ts', 'ready']]);
+    assert.deepEqual(first.page, { complete: false, next_after_path: 'src/a.ts' });
+
+    const continued = await service.get({ ...req, afterPath: first.page.next_after_path, limit: 16 });
+    assert.deepEqual(continued.files.map(file => [file.path, file.status]), [['src/c.ts', 'ready']]);
+    assert.deepEqual(continued.page, { complete: true, next_after_path: null });
+
+    const hiddenSha = (expected as { files: { before: { snapshot: { sha256: string } } }[] })
+      .files[1]!.before.snapshot.sha256;
+    await unlink(blobPath(storeDir, hiddenSha));
+    const afterLoss = await service.get({ ...req, afterPath: first.page.next_after_path, limit: 1 });
+    assert.deepEqual(afterLoss.files.map(file => [file.path, file.status, file.fallback_reason]),
+      [['src/b.ts', 'unavailable', 'before-blob-missing']]);
+    assert.deepEqual(afterLoss.page, { complete: false, next_after_path: 'src/b.ts' });
+  } finally { await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('timeout during comparison preserves an established missing-blob status', async () => {
+  const { storeDir, req, expected } = await serviceRequest('swift-parameter-change');
+  const beforeSha = (expected as { files: { before: { snapshot: { sha256: string } } }[] })
+    .files[0]!.before.snapshot.sha256;
+  await unlink(blobPath(storeDir, beforeSha));
+  const { admission, timeout } = manualTimeoutAdmission();
+  const service = createInterfaceService({ storeDir, admission,
+    extractSwift: async sides => {
+      assert.deepEqual(sides.map(side => side.id), ['after']);
+      timeout();
+      throw new Error('isolated extraction stopped after deadline');
+    } });
+  try {
+    const page = await service.get(req);
+    assert.equal(page.status, 'partial');
+    assert.deepEqual(page.files.map(file => [file.path, file.status, file.fallback_reason,
+      file.coverage.before, file.coverage.after]), [[
+      'Sources/App/F.swift', 'unavailable', 'before-blob-missing',
+      { state: 'unavailable', reason: 'blob-missing' }, { state: 'notEvaluated' },
+    ]]);
+    assert.deepEqual(page.page, { complete: false, next_after_path: 'Sources/App/F.swift' });
+  } finally { await service.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
 test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
@@ -582,6 +652,15 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
     assert.equal(sawLookahead, true, 'deadline fired before the retention look-ahead');
     assert.ok(performance.now() - started >= deadlineMs - 100, 'response did not await the admission deadline');
     assert.deepEqual(await response.json(), expected, 'timeout is indistinguishable from the ordinary first page');
+    const continuation = new URL(reader.url + request.slice(4));
+    continuation.searchParams.set('after_path', 'src/a.ts');
+    const next = await fetch(continuation, { headers: { authorization: `Bearer ${reader.token}` } });
+    assert.equal(next.status, 200);
+    const final = await next.json() as { status: string; files: unknown[];
+      page: { complete: boolean; next_after_path: string | null } };
+    assert.equal(final.status, 'ready');
+    assert.deepEqual(final.files, []);
+    assert.deepEqual(final.page, { complete: true, next_after_path: null });
   } finally {
     releaseLookahead();
     await reader.close();

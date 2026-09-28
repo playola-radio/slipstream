@@ -32,6 +32,13 @@ the production admission values or the Swift ready gate can be claimed.
   `gaps_complete: false` under Brian's FD4 amendment. This distinguishes
   unevaluated metadata from an observed empty list. The amended schema,
   golden fixture, and validator remain in sync.
+- After a completed file, interruption during the remaining-file look-ahead
+  keeps `status: "ready"`, `page.complete: false`, and `next_after_path` at the
+  last returned file, with no `fallback_reason`. Here `complete: false` means
+  the scan did not finish; it does not promise another visible row. Continuing
+  from that cursor may return an empty final page. The reader does not advance
+  past unchecked files. An interruption during a file comparison has its own
+  partial-page outcome and preserves any established per-file failure status.
 
 ## Evidence and open gates
 
@@ -39,7 +46,9 @@ the production admission values or the Swift ready gate can be claimed.
 the real HTTP route, including both languages, missing blobs, status precedence,
 filtering, identical endpoints, pagination, 400/409 headers, the schema route,
 and 410. Harness conditions exercise overload, caps, and mid-page interruption
-against their golden outputs. A warmed cache followed by blob loss is tested.
+against their golden outputs. Deterministic look-ahead timeout tests cover an
+empty final continuation, a remaining visible file, and a hidden file exposed
+by later blob loss. A warmed cache followed by blob loss is tested.
 The independent `tools/fd4-live-check.ts` starts a disposable daemon with no
 UI, captures TypeScript and Swift edits, and makes authenticated HTTP requests.
 Its production-budget result on 2026-09-27 was TypeScript `ready` with one
@@ -50,7 +59,9 @@ change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
   retirement and cancellation churn. Obtain Brian's D7 approval for `C/Q/W/D`
   and timeout rates. Preserve clip's existing deadline while deciding how an
   interface deadline can accommodate Swift. Do not infer approval from FD4's
-  test-only longer deadline.
+  test-only longer deadline. Count a look-ahead admission timeout as a timeout
+  even when its returned page and files are `ready`; the JSON response alone
+  cannot identify it. No FD5 gate is waived by this pagination decision.
 - **FS3:** Once FD4/FD5 admission is settled, consume only the authenticated
   public route, schema, event stream and blob route. Freeze session, B/A,
   filters, and version across `next_after_path`; handle partial/skipped pages,
