@@ -381,7 +381,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     return { arm, repetition: repetition + 1, host: { before: hostBefore, after: hostSample() },
       capture, interface: interfaceReport,
       cleanup: { captureStopCompleted: true, quietDrainObserved: drained, readerClosed: true,
-        worktreeRemoved: true, processExitsVerified },
+        worktreeRemoved: true, processExitsVerified, traceEvidenceValid: traceFaults.length === 0 },
       raw: { writes, durableBoundaries: [...durableAtNsBySeq], clipResponses: clips?.responses ?? [],
         interfaceAttempts: interfaces ? assembly.attempts.map(a => ({ requestId: a.requestId, key: a.expected.key,
           routeKey: a.expected.routeKey, language: a.expected.language, sizeClass: a.expected.sizeClass,
@@ -446,12 +446,14 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
       const runLevelReasons = [baseline, report].flatMap(r => [
         ...(!r.cleanup.quietDrainObserved ? [`${r.arm} quiet drain timed out`] : []),
         ...(!r.cleanup.processExitsVerified ? [`${r.arm} actual process exits unverified`] : []),
+        ...(!r.cleanup.traceEvidenceValid ? [`${r.arm} trace evidence invalid`] : []),
       ]);
       return compareCaptureToBaseline(baseline.capture, report.capture, report.arm, report.repetition, sufficient, runLevelReasons);
     });
     const measuredGatesPass = comparisons.length === 9 && comparisons.every(c => c.passed)
       && reports.every(r => r.cleanup.captureStopCompleted && r.cleanup.quietDrainObserved
-        && r.cleanup.readerClosed && r.cleanup.worktreeRemoved && r.cleanup.processExitsVerified);
+        && r.cleanup.readerClosed && r.cleanup.worktreeRemoved && r.cleanup.processExitsVerified
+        && r.cleanup.traceEvidenceValid);
     const outstandingEvidence = ['trace overhead control', 'coalesced clip W pressure measurement',
       'owner-approved timeout and useful-throughput rates', 'owner-approved D7 configuration'];
     await outputFile.appendFile(encode({ type: 'final', comparisons, measuredGatesPass,

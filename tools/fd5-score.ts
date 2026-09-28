@@ -274,6 +274,7 @@ export function scoreProcessStartupTiming(processUses: Array<{ unitId: number; p
   const exits = new Map(events.filter(event => event.kind === 'process-exit')
     .map(event => [event.processId, event] as const));
   const outcomes = new Map(traces.map(trace => [trace.unitId, trace.outcome] as const));
+  const settledAt = new Map(traces.map(trace => [trace.unitId, trace.settledAtNs] as const));
   const usedByProcess = new Map<number, Set<number>>();
   for (const use of processUses) {
     const units = usedByProcess.get(use.processId) ?? new Set<number>();
@@ -288,7 +289,8 @@ export function scoreProcessStartupTiming(processUses: Array<{ unitId: number; p
     if (startup && processPhases.get(processId)?.has(startup)) continue;
     const exit = exits.get(processId);
     const interrupted = [...unitIds].every(unitId => ['timeout', 'cancelled', 'closed'].includes(outcomes.get(unitId) ?? ''));
-    const killed = exit && (exit.code !== 0 || exit.signal != null);
+    const killed = exit && (exit.code !== 0 || exit.signal != null)
+      && [...unitIds].every(unitId => exit.atNs >= (settledAt.get(unitId) ?? exit.atNs + 1n));
     if (startup && interrupted && killed) censored++;
     else faults.push(`used process ${processId} lacks startup timing`);
   }

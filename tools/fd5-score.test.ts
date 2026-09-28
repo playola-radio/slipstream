@@ -163,6 +163,16 @@ test('capture comparison checks all six latency cells and throughput independent
   assert.match(result.reasons.join(' '), /throughput/);
 });
 
+test('baseline trace faults invalidate an otherwise passing paired capture comparison', () => {
+  const capture = { written: 200, missing: 0, latency: { n: 200, p50: 10, p99: 10 },
+    scheduledLatency: { n: 100, p50: 10, p99: 10 }, burstLatency: { n: 100, p50: 10, p99: 10 },
+    throughputPerSecond: 100 } as Parameters<typeof compareCaptureToBaseline>[0];
+  const result = compareCaptureToBaseline(capture, capture, 'clip-only', 1, true,
+    ['baseline trace evidence invalid']);
+  assert.equal(result.passed, false);
+  assert.match(result.reasons.join(' '), /baseline trace evidence invalid/);
+});
+
 test('joins legal same-key overload retry by route and disjoint monotonic interval', () => {
   const x = passing();
   x.attempts[0]!.body = { ...page(x.attempts[0]!.expected) as object,
@@ -249,6 +259,9 @@ test('killed-before-ready process is censored; successful work without startup t
     [{ ...trace, outcome: 'ok' }]).faults.join(' '), /lacks startup timing/);
   assert.match(scoreProcessStartupTiming(uses, [{ ...events[0]! },
     { kind: 'process-exit', processId: 8, code: 0, atNs: 2n }], new Map(),
+  [trace]).faults.join(' '), /lacks startup timing/);
+  assert.match(scoreProcessStartupTiming(uses, [{ ...events[0]! },
+    { kind: 'process-exit', processId: 8, code: 1, atNs: 1n }], new Map(),
   [trace]).faults.join(' '), /lacks startup timing/);
 });
 
