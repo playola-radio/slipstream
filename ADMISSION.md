@@ -1,11 +1,8 @@
 # Shared projection admission budget (T5b.1)
 
-**FD4 status (2026-09-27):** the reader now owns the provisional shared budget
-and passes it to clip and interface services. The values below remain
-**UNAPPROVED**. The standalone live FD4 check returned a TypeScript ready row
-and a Swift `skipped/timeout` row at `D = 100 ms`; FD5 must measure all four
-arms and obtain Brian's D7 disposition. This wiring does not approve a longer
-deadline or complete FD5.
+**FD4 status (2026-09-27):** the reader now shares this provisional budget across
+clip and interface work. Values remain **UNAPPROVED**; see `docs/FD4-READER-API.md`
+for live evidence and the FD5 handoff.
 
 Clip projection and the upcoming interface projection (T5b.2) both turn a change's
 before/after blobs into a derived view on demand, in terminable workers. Two

@@ -181,13 +181,12 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     return found.value;
   };
 
-  async function compareFile(file: RangeFile, signal: AbortSignal): Promise<{ result: InterfaceFileResult; blobBytes: number }> {
+  async function compareFile(file: RangeFile, signal: AbortSignal, equalAndRetained: boolean): Promise<{ result: InterfaceFileResult; blobBytes: number }> {
     const language = languageFor(file.path);
     const base: InterfaceFileResult = { path: file.path, before: file.before, after: file.after,
       language: language?.name ?? null, language_version: language?.version ?? null,
       status: 'ready', coverage: { before: sideFallback(file.before), after: sideFallback(file.after) }, changes: [] };
-    if (file.endpointsEqual && await retainedContent(options.storeDir, file.before)
-      && await retainedContent(options.storeDir, file.after)) {
+    if (equalAndRetained) {
       base.status = 'identical';
       return { result: base, blobBytes: 0 };
     }
@@ -201,7 +200,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     }
     const blobBytes = before.readBytes + after.readBytes;
     if (signal.aborted) throw new Error('interface page cancelled');
-    const key = `${tag(file.before)}|${tag(file.after)}|${language?.name ?? 'unsupported'}|${language?.version ?? 'none'}|interface.v2`;
+    const key = `${tag(file.before)}|${tag(file.after)}|${language?.name ?? 'unsupported'}|${language?.version ?? 'none'}|${language?.grammar ?? 'none'}|interface.v2`;
     if (!before.tooLarge && !after.tooLarge && before.coverage.state !== 'unavailable' && after.coverage.state !== 'unavailable') {
       const hit = cacheGet(key);
       if (hit) return { result: { ...base, ...hit }, blobBytes };
@@ -232,6 +231,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         after.bytes !== null ? { id: 'after', bytes: after.bytes } : null].filter((v): v is { id: string; bytes: Uint8Array } => v !== null);
       const results = await (options.extractSwift ?? extractSwiftSides)(sides, { signal,
         limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
+      for (const side of sides) if (!results.has(side.id)) throw new Error(`Swift extractor omitted ${side.id} side`);
       for (const side of ['before', 'after'] as const) {
         const extracted = results.get(side);
         if (extracted?.status === 'complete') base.coverage[side] = { state: 'complete' };
@@ -252,7 +252,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     const disposition = statusReason(base.coverage, base.language, compareReason, before.tooLarge || after.tooLarge);
     Object.assign(base, disposition);
     base.changes = base.status === 'ready' ? changes : [];
-    if (base.status !== 'unavailable' && !before.tooLarge && !after.tooLarge) cacheSet(key, base);
+    cacheSet(key, base);
     return { result: base, blobBytes };
   }
 
@@ -273,6 +273,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     let resolved = false;
     let current: RangeFile | undefined;
     let sealed = false;
+    let failure: unknown;
     const interruptPage = (reason: 'timeout' | 'cancelled') => {
       if (!resolved || page.files.length === 0 && !current) {
         page.status = 'skipped'; page.fallback_reason = reason;
@@ -289,7 +290,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
           fallback_reason: disposition.status === 'ready' ? reason : disposition.fallback_reason,
           coverage, changes: [] });
       }
-      page.status = 'partial';
+      page.status = current || page.files.some(file => file.status !== 'ready' && file.status !== 'identical') ? 'partial' : 'ready';
       page.page = { complete: false, next_after_path: page.files.at(-1)?.path ?? req.afterPath };
       return page;
     };
@@ -317,13 +318,15 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (page.files.length >= Math.min(req.limit, FILES_PER_PAGE)) break;
         const equalAndRetained = file.endpointsEqual && await retainedContent(options.storeDir, file.before);
+        if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
+        if (equalAndRetained && !req.includeIdentical) { examined = file.path; continue; }
         const upcoming = equalAndRetained ? 0
           : (file.before.kind === 'recorded' && file.before.snapshot.kind === 'content' ? file.before.snapshot.size : 0)
             + (file.after.snapshot.kind === 'content' ? file.after.snapshot.size : 0);
         if (page.files.length > 0 && blobBytes + upcoming > (options.pageBlobBytes ?? PAGE_BLOB_BYTES)) break;
         current = file;
         options.onFileStart?.(file.path);
-        const compared = await compareFile(file, abort.signal);
+        const compared = await compareFile(file, abort.signal, equalAndRetained);
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         current = undefined;
         examined = file.path;
@@ -352,8 +355,10 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       for (const file of result.files) {
         if (file.path <= (examined ?? '')) continue;
         if (!file.endpointsEqual || req.includeIdentical || !(await retainedContent(options.storeDir, file.before))) {
+          if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
           remaining = true; break;
         }
+        if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
       }
       page.page = { complete: !remaining, next_after_path: remaining ? examined : null };
       page.status = page.files.some(file => file.status !== 'ready' && file.status !== 'identical') ? 'partial' : 'ready';
@@ -367,9 +372,9 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     };
     // The runner begins only after admission grants the local interface slot.
     // Progress remains outside admission's value, so a timeout retains finished rows.
-    const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1,
+    const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1, signal: req.signal,
       run: () => {
-        const task = run();
+        const task = run().catch(error => { failure = error; throw error; });
         active.add(task);
         void task.finally(() => active.delete(task)).catch(() => {});
         return { promise: task, cancel: () => { sealed = true; abort.abort(); } };
@@ -378,7 +383,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     if (outcome.kind === 'ok') return outcome.value;
     sealed = true;
     abort.abort();
-    if (outcome.kind === 'error') throw new Error('interface projection failed');
+    if (outcome.kind === 'error') throw failure instanceof Error ? failure : new Error('interface projection failed');
     if (outcome.kind === 'overloaded') {
       page.status = 'skipped'; page.fallback_reason = 'overloaded';
       return page;

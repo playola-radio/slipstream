@@ -64,3 +64,11 @@ change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
   An abnormal host exit is an internal text `500`; a reproducible crash on one
   file can block later paths on a page. A per-file recovery status would need a
   separate contract decision.
+- **FD5 measurement risk:** A page may inspect many identical paths while seeking
+  the next visible row. The admission deadline includes that retention scan, so
+  large recorded inventories can return a skipped or partial timeout even when
+  most files are unchanged. Measure this case under the provisional budget.
+- **Internal failures:** A corrupt retained blob, filesystem I/O failure, or
+  TypeScript worker failure also returns text `500`; the schema has no truthful
+  per-file status for these failures. A repeated failure can block the same page
+  until the underlying store or worker problem is resolved.

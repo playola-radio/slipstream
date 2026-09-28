@@ -39,6 +39,38 @@ test('an immediately runnable leader is admitted even when Q is 0', async () => 
   await budget.close();
 });
 
+test('a disconnected queued request releases its admission slot immediately', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 1000 });
+  const held = gate();
+  const first = budget.admit({ workload: 'clip', localConcurrency: 1,
+    run: () => ({ promise: held.promise, cancel: () => {} }) });
+  const controller = new AbortController();
+  let ran = false;
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1, signal: controller.signal,
+    run: () => { ran = true; return { promise: Promise.resolve('queued'), cancel: () => {} }; } });
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 1, waiters: 0 });
+  controller.abort();
+  assert.deepEqual(await queued, { kind: 'cancelled' });
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 0, waiters: 0 });
+  assert.equal(ran, false);
+  held.resolve('done');
+  await first;
+  await budget.close();
+});
+
+test('a disconnected running request cancels compute and frees capacity', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 });
+  const controller = new AbortController();
+  let cancelled = 0;
+  const pending = budget.admit({ workload: 'interface', localConcurrency: 1, signal: controller.signal,
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => { cancelled++; } }) });
+  controller.abort();
+  assert.deepEqual(await pending, { kind: 'cancelled' });
+  assert.equal(cancelled, 1);
+  assert.deepEqual(budget.snapshot(), { running: 0, queued: 0, waiters: 0 });
+  await budget.close();
+});
+
 test('combined demand across two workloads over the bound is rejected as overloaded', async () => {
   const budget = createProjectionAdmission({ C: 1, Q: 1, W: 1, D: 1000 });
   const g = gate();

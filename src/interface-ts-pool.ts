@@ -8,6 +8,7 @@ export function createTypeScriptPool() {
   let active: { id: number; resolve: (value: TypeScriptResult) => void; reject: (error: Error) => void } | null = null;
   let serial = 0;
   let closed = false;
+  let current: Worker | null = null;
   const retiring = new Set<Promise<unknown>>();
   const retire = (worker: Worker): void => {
     const completion = worker.terminate().catch(() => {});
@@ -27,34 +28,35 @@ export function createTypeScriptPool() {
       if (worker !== current) return; // a retired worker must not fail its replacement's job
       const task = active;
       active = null;
+      current = null;
       retire(worker);
-      if (!closed) current = spawn();
       task?.reject(error);
     });
     worker.on('exit', code => {
       if (closed || worker !== current) return;
       const task = active;
       active = null;
-      current = spawn();
+      current = null;
       task?.reject(new Error(`TypeScript parser worker exited ${code}`));
     });
     return worker;
   };
-  let current = spawn();
   const run = (input: Omit<TypeScriptJob, 'id'>) => {
     if (closed || active) throw new Error('TypeScript parser worker unavailable');
+    current ??= spawn();
+    const worker = current;
     const id = ++serial;
     const promise = new Promise<TypeScriptResult>((resolve, reject) => {
       active = { id, resolve, reject };
-      current.postMessage({ ...input, id } satisfies TypeScriptJob);
+      worker.postMessage({ ...input, id } satisfies TypeScriptJob);
     });
     const cancel = () => {
       const task = active;
       if (!task || task.id !== id) return;
       active = null;
       task.reject(new Error('TypeScript extraction cancelled'));
-      retire(current);
-      if (!closed) current = spawn();
+      if (current === worker) current = null;
+      retire(worker);
     };
     return { promise, cancel };
   };
@@ -64,7 +66,7 @@ export function createTypeScriptPool() {
     const task = active;
     active = null;
     task?.reject(new Error('TypeScript parser worker closed'));
-    await current.terminate().catch(() => {});
+    if (current) await current.terminate().catch(() => {});
     await Promise.all(retiring);
   };
   return { run, close };

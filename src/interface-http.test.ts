@@ -40,21 +40,6 @@ async function fixture(name: string) {
   return { storeDir, request, expected, expectedError, harness: (history as { harness?: unknown }).harness };
 }
 
-test('reader serves a TypeScript comparison from recorded history', async () => {
-  const { storeDir, request, expected } = await fixture('ts-parameter-change');
-  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
-  try {
-    const path = request.slice('GET '.length);
-    const response = await fetch(reader.url + path, { headers: { authorization: `Bearer ${reader.token}` } });
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
-    assert.deepEqual(await response.json(), expected);
-  } finally {
-    await reader.close();
-    await rm(storeDir, { recursive: true, force: true });
-  }
-});
-
 test('reader serves the public interface.v2 projection schema with authentication', async () => {
   const { storeDir } = await fixture('ts-parameter-change');
   const reader = await startReaderServer({ storeDir });
@@ -66,8 +51,8 @@ test('reader serves the public interface.v2 projection schema with authenticatio
     const response = await fetch(reader.url + path, { headers: { authorization: `Bearer ${reader.token}` } });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
-    const schema = await response.json() as { title: string };
-    assert.equal(schema.title, 'interface.v2');
+    assert.equal(await response.text(), await readFile(fileURLToPath(
+      new URL('../contracts/interface/v2/schema.json', import.meta.url)), 'utf8'));
   } finally {
     await reader.close();
     await rm(storeDir, { recursive: true, force: true });
@@ -76,7 +61,7 @@ test('reader serves the public interface.v2 projection schema with authenticatio
 
 const HARNESS_ONLY = new Set(['range-admission-skipped', 'range-cancelled-mid-page',
   'range-deadline-mid-page', 'range-gap-cap', 'range-too-large-first-file']);
-for (const name of (await readdir(CASES)).filter(name => !HARNESS_ONLY.has(name) && name !== 'ts-parameter-change')) {
+for (const name of (await readdir(CASES)).filter(name => !HARNESS_ONLY.has(name))) {
   test(`reader comparison matches recorded ${name} history`, async () => {
     const { storeDir, request, expected, expectedError } = await fixture(name);
     const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
@@ -93,6 +78,7 @@ for (const name of (await readdir(CASES)).filter(name => !HARNESS_ONLY.has(name)
         await response.text();
       } else {
         assert.equal(response.status, 200);
+        assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
         assert.deepEqual(await response.json(), expected);
       }
     } finally {
@@ -129,10 +115,8 @@ test('next_after_path pages the same frozen comparison', async () => {
     })).json();
     const first = await get(request.slice(4)) as { page: { next_after_path: string | null }; range: unknown };
     assert.deepEqual(first, expected);
-    assert.equal(first.page.next_after_path, 'src/a.ts');
     const next = await get(second.request.slice(4));
     assert.deepEqual(next, second.expected);
-    assert.deepEqual((next as { range: unknown }).range, first.range);
   } finally {
     await reader.close();
     await rm(storeDir, { recursive: true, force: true });
@@ -197,7 +181,10 @@ test('reader compares a recorded TSX function binding', async () => {
   }
   const storeDir = await mkdtemp(join(tmpdir(), 'slip-fd4-tsx-'));
   await mkdir(join(storeDir, 'sessions', original.session_id), { recursive: true });
-  await writeFile(join(storeDir, 'sessions', original.session_id, 'events.jsonl'), original.events.map(e => JSON.stringify(e)).join('\n') + '\n');
+  const logPath = join(storeDir, 'sessions', original.session_id, 'events.jsonl');
+  const tsEvents = structuredClone(original.events);
+  for (const event of tsEvents) if (event.data.path === 'src/Card.tsx') event.data.path = 'src/Card.ts';
+  await writeFile(logPath, tsEvents.map(e => JSON.stringify(e)).join('\n') + '\n');
   for (const { sha256, source } of replacements.values()) {
     const path = blobPath(storeDir, sha256);
     await mkdir(join(storeDir, 'blobs', 'sha256', sha256.slice(0, 2)), { recursive: true });
@@ -205,13 +192,21 @@ test('reader compares a recorded TSX function binding', async () => {
   }
   const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
   try {
+    const path = `/v1/sessions/${original.session_id}/interfaces?before_seq=3&after_seq=4`;
+    const headers = { authorization: `Bearer ${reader.token}` };
+    const tsResponse = await fetch(reader.url + path, { headers });
+    assert.equal(tsResponse.status, 200);
+    const tsBody = await tsResponse.json() as { files: { status: string }[] };
+    assert.equal(tsBody.files[0]?.status, 'incomplete');
+    await writeFile(logPath, original.events.map(e => JSON.stringify(e)).join('\n') + '\n');
     const response = await fetch(`${reader.url}/v1/sessions/${original.session_id}/interfaces?before_seq=3&after_seq=4`, {
-      headers: { authorization: `Bearer ${reader.token}` },
+      headers,
     });
     assert.equal(response.status, 200);
-    const body = await response.json() as { files: { path: string; language: string; changes: { kind: string }[] }[] };
+    const body = await response.json() as { files: { path: string; language: string; status: string; changes: { kind: string }[] }[] };
     assert.equal(body.files[0]?.path, 'src/Card.tsx');
     assert.equal(body.files[0]?.language, 'typescript');
+    assert.equal(body.files[0]?.status, 'ready');
     assert.deepEqual(body.files[0]?.changes.map(row => row.kind), ['signatureChanged']);
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
@@ -267,22 +262,42 @@ test('isolated Swift host failure stays a text HTTP 500 and does not imply no ch
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
-test('reader shutdown settles an in-flight interface page and terminates its parser', async () => {
+test('a Swift host reply missing a requested side fails closed as text HTTP 500', async () => {
   const { storeDir, request } = await fixture('swift-parameter-change');
-  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
+  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    interfaceExtractSwift: async () => new Map() });
+  try {
+    const response = await fetch(reader.url + request.slice(4), {
+      headers: { authorization: `Bearer ${reader.token}` },
+    });
+    assert.equal(response.status, 500);
+    assert.equal(await response.text(), 'internal error');
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('reader shutdown aborts in-flight isolated Swift work before closing', async () => {
+  const { storeDir, request } = await fixture('swift-parameter-change');
+  let started!: () => void;
+  const didStart = new Promise<void>(resolve => { started = resolve; });
+  let aborted = false;
+  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    interfaceExtractSwift: async (_sides, options) => {
+      const signal = options?.signal;
+      started();
+      await new Promise<void>((_resolve, reject) => {
+        if (signal?.aborted) { aborted = true; reject(new Error('aborted')); return; }
+        signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+      });
+      return new Map();
+    } });
   try {
     const pending = fetch(reader.url + request.slice(4), {
       headers: { authorization: `Bearer ${reader.token}` },
     }).catch(() => null);
-    await delay(35);
+    await didStart;
     await reader.close();
-    const response = await pending;
-    if (response) {
-      assert.equal(response.status, 200);
-      const body = await response.json() as { status: string; fallback_reason?: string };
-      assert.ok(body.status === 'skipped' && body.fallback_reason === 'cancelled'
-        || body.status === 'partial' || body.status === 'ready');
-    }
+    await pending;
+    assert.equal(aborted, true);
   } finally { await rm(storeDir, { recursive: true, force: true }); }
 });
 

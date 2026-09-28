@@ -24,7 +24,7 @@ export interface ReaderServerOptions {
   /** Test seam only; the daemon uses the provisional D7 values. */
   projectionAdmissionConfig?: AdmissionConfig;
   /** Test seam for deterministic contract budget fixtures. */
-  interfaceLimits?: Pick<InterfaceServiceOptions, 'scanBudget' | 'fileResultBytes' | 'metadataBytes'>;
+  interfaceLimits?: Pick<InterfaceServiceOptions, 'fileResultBytes' | 'metadataBytes'>;
   /** Test seam for an isolated Swift host failure. */
   interfaceExtractSwift?: InterfaceServiceOptions['extractSwift'];
   /** Standalone single-session view (`serve`). Ignored when {@link registry} is

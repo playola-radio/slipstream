@@ -35,6 +35,8 @@ export interface AdmitRequest<T> {
   localConcurrency: number;
   /** Coalescing key; identical concurrent keys share one compute. Undefined never coalesces. */
   key?: string;
+  /** Cancels this request when its HTTP consumer disconnects. */
+  signal?: AbortSignal;
   /** Starts the compute; called once, when a running slot is granted. */
   run: () => ComputeHandle<T>;
 }
@@ -44,6 +46,7 @@ export type AdmitOutcome<T> =
   | { kind: 'timeout' }
   | { kind: 'overloaded' }
   | { kind: 'closed' }
+  | { kind: 'cancelled' }
   | { kind: 'error' };
 
 export interface AdmissionConfig {
@@ -87,6 +90,8 @@ interface Unit {
   deadlineAt: number;
   timer: ReturnType<typeof setTimeout> | undefined;
   handle: ComputeHandle<unknown> | undefined;
+  signal?: AbortSignal;
+  onAbort?: () => void;
 }
 
 interface Flight {
@@ -140,13 +145,14 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     const prev = unit.state;
     unit.state = 'settled';
     if (unit.timer !== undefined) clearTimeout(unit.timer);
+    if (unit.signal && unit.onAbort) unit.signal.removeEventListener('abort', unit.onAbort);
     live.delete(unit);
 
     if (prev === 'running') {
       decRunning(unit.workload);
       // Cancel only when forcibly ending unfinished work; ok/error already settled.
       // Fire-and-forget: a throwing cancel must not skip flight release or resolution.
-      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed')) {
+      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed' || outcome.kind === 'cancelled')) {
         try { unit.handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
       }
       releaseFlight(unit, outcome);
@@ -227,6 +233,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
 
   const admit = <T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
     if (closed) return Promise.resolve({ kind: 'closed' });
+    if (req.signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
     return new Promise<AdmitOutcome<T>>((resolve) => {
       const unit: Unit = {
         workload: req.workload,
@@ -238,7 +245,9 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         deadlineAt: Date.now() + D,
         timer: undefined,
         handle: undefined,
+        signal: req.signal,
       };
+      unit.onAbort = () => settle(unit, { kind: 'cancelled' });
 
       const fk = req.key !== undefined ? flightKey(req.workload, req.key) : undefined;
 
@@ -253,6 +262,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
           flight.waiters.add(unit);
           arm(unit);
           live.add(unit);
+          req.signal?.addEventListener('abort', unit.onAbort, { once: true });
           return;
         }
       }
@@ -264,6 +274,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
         arm(unit);
         live.add(unit);
+        req.signal?.addEventListener('abort', unit.onAbort, { once: true });
         startCompute(unit);
         return;
       }
@@ -273,6 +284,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
         arm(unit);
         live.add(unit);
+        req.signal?.addEventListener('abort', unit.onAbort, { once: true });
         return;
       }
       resolve({ kind: 'overloaded' });
