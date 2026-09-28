@@ -22,7 +22,11 @@ export function createTypeScriptPool() {
       if (!task || task.id !== reply.id) return;
       active = null;
       if (reply.ok) task.resolve(reply.result);
-      else task.reject(new Error('TypeScript extraction failed'));
+      else {
+        if (worker === current) current = null;
+        retire(worker);
+        task.reject(new Error('TypeScript extraction failed'));
+      }
     });
     worker.on('error', (error: Error) => {
       if (worker !== current) return; // a retired worker must not fail its replacement's job

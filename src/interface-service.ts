@@ -59,7 +59,7 @@ export interface InterfaceServiceOptions {
   /** Test harness interrupt seam; production does not set this. */
   onFileStart?: (path: string) => void;
   /** Test harness seam after a recorded content-retention probe. */
-  onRetentionCheck?: (path: string, phase: 'scan' | 'lookahead') => void;
+  onRetentionCheck?: (path: string, phase: 'scan' | 'lookahead') => void | Promise<void>;
   /** Test seam for isolated child failures; production uses extractSwiftSides. */
   extractSwift?: typeof extractSwiftSides;
 }
@@ -354,7 +354,10 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (page.files.length >= Math.min(req.limit, FILES_PER_PAGE)) break;
         const equalAndRetained = file.endpointsEqual && await retainedContent(options.storeDir, file.before);
-        if (file.endpointsEqual) options.onRetentionCheck?.(file.path, 'scan');
+        if (file.endpointsEqual) {
+          const check = options.onRetentionCheck?.(file.path, 'scan');
+          if (check) await check;
+        }
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (equalAndRetained && !req.includeIdentical) { examined = file.path; continue; }
         const upcoming = equalAndRetained ? 0
@@ -397,7 +400,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
           remaining = true; break;
         }
         const retained = await retainedContent(options.storeDir, file.before);
-        options.onRetentionCheck?.(file.path, 'lookahead');
+        const check = options.onRetentionCheck?.(file.path, 'lookahead');
+        if (check) await check;
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (!retained) { remaining = true; break; }
       }

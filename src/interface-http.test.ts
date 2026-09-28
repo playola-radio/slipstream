@@ -9,7 +9,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { blobPath } from './store-reader.ts';
 import { startReaderServer } from './http-reader.ts';
 import { createInterfaceService } from './interface-service.ts';
-import { SwiftExtractTimeout } from './swift-interface.ts';
 import { createProjectionAdmission, type ProjectionAdmission, type AdmitRequest, type AdmitOutcome } from './projection-admission.ts';
 
 const CASES = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
@@ -562,28 +561,32 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
   const { storeDir, request, expected } = await fixture('range-page-boundary-first');
   const logPath = join(storeDir, 'sessions', '11111111-1111-4111-8111-111111111111', 'events.jsonl');
   await makeEndpointEqual(logPath, 'src/b.ts');
-  let interrupt = true;
+  let sawLookahead = false;
+  let releaseLookahead = () => {};
+  const holdLookahead = new Promise<void>(resolve => { releaseLookahead = resolve; });
+  const deadlineMs = 1500;
   const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    interfaceDeadlineMs: deadlineMs,
     interfaceOnRetentionCheck: (path, phase) => {
-      if (interrupt && path === 'src/b.ts' && phase === 'lookahead') {
-        interrupt = false;
-        throw new SwiftExtractTimeout('test deadline during look-ahead');
+      if (path === 'src/b.ts' && phase === 'lookahead') {
+        sawLookahead = true;
+        return holdLookahead;
       }
     } });
   try {
+    const started = performance.now();
     const response = await fetch(reader.url + request.slice(4), {
       headers: { authorization: `Bearer ${reader.token}` },
     });
     assert.equal(response.status, 200);
-    const body = await response.json() as { status: string; fallback_reason?: string;
-      files: { path: string; status: string }[]; page: { complete: boolean; next_after_path: string | null } };
-    assert.equal(body.status, 'ready');
-    assert.equal(body.fallback_reason, undefined);
-    assert.deepEqual(body.files.map(file => ({ path: file.path, status: file.status })),
-      [{ path: 'src/a.ts', status: 'ready' }]);
-    assert.deepEqual(body.page, { complete: false, next_after_path: 'src/a.ts' });
-    assert.deepEqual(body, expected, 'timeout is indistinguishable from the ordinary first page');
-  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+    assert.equal(sawLookahead, true, 'deadline fired before the retention look-ahead');
+    assert.ok(performance.now() - started >= deadlineMs - 100, 'response did not await the admission deadline');
+    assert.deepEqual(await response.json(), expected, 'timeout is indistinguishable from the ordinary first page');
+  } finally {
+    releaseLookahead();
+    await reader.close();
+    await rm(storeDir, { recursive: true, force: true });
+  }
 });
 
 test('page blob budget ends before the next file with an exclusive cursor', async () => {

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { Language, Parser } from 'web-tree-sitter';
 import { createTypeScriptInterfaceExtractor, verifyTypeScriptGrammarArtifact } from './interface-v2-typescript.ts';
 import { compareStructuredExtractions as compareTypeScriptExtractions } from './interface-v2-comparison.ts';
@@ -151,6 +152,21 @@ test('UTF-8 byte spans include a leading BOM and reject invalid bytes', async ()
 
 test('grammar loader rejects an artifact changed under typescript.v2', () => {
   assert.throws(() => verifyTypeScriptGrammarArtifact('typescript', '0'.repeat(64)), /hash mismatch/);
+});
+
+test('parser initialization consumes the exact runtime WASM bytes that were verified', async (t) => {
+  const realInit = Parser.init.bind(Parser);
+  let loadedBinary: Uint8Array | undefined;
+  t.mock.method(Parser, 'init', async (options: Parameters<typeof Parser.init>[0]) => {
+    loadedBinary = (options as { wasmBinary?: Uint8Array } | undefined)?.wasmBinary;
+    return realInit(options);
+  });
+  const loader = await import(new URL('./interface-v2-typescript.ts?verified-runtime-test', import.meta.url).href);
+  const extract = await loader.createTypeScriptInterfaceExtractor('typescript');
+  assert.equal(extract(Buffer.from('function verified(): void {}')).status, 'complete');
+  assert.ok(loadedBinary);
+  assert.equal(createHash('sha256').update(loadedBinary).digest('hex'),
+    'f38dcc4b43b818f9a0785bc1c6d5611a75ac4cdd428ff3f02757c34ca4e46d7f');
 });
 
 test('a recoverable grammar-load failure does not poison later extraction', async (t) => {

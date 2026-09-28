@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { createTypeScriptPool } from './interface-ts-pool.ts';
+import type { TypeScriptJob } from './interface-ts-worker.ts';
 
 test('cancelled TypeScript work retires its worker and a later comparison still runs', async () => {
   const pool = createTypeScriptPool();
@@ -16,6 +17,29 @@ test('cancelled TypeScript work retires its worker and a later comparison still 
     const result = await second.promise;
     assert.equal(result.comparison?.status, 'ready');
     assert.equal(result.comparison?.changes.length, 1);
+  } finally { await pool.close(); }
+});
+
+test('a failed parser reply retires its worker before the next comparison', async (t) => {
+  const realPost = Worker.prototype.postMessage;
+  let poisoned: Worker | undefined;
+  t.mock.method(Worker.prototype, 'postMessage', function (this: Worker, job: TypeScriptJob) {
+    poisoned ??= this;
+    if (this === poisoned) {
+      queueMicrotask(() => this.emit('message', { id: job.id, ok: false }));
+      return;
+    }
+    realPost.call(this, job);
+  });
+  const pool = createTypeScriptPool();
+  try {
+    const input = { language: 'typescript' as const,
+      before: Buffer.from('function f(x: number): void {}'),
+      after: Buffer.from('function f(x: string): void {}') };
+    await assert.rejects(pool.run(input).promise, /extraction failed/);
+    const replacement = await pool.run(input).promise;
+    assert.equal(replacement.comparison?.status, 'ready');
+    assert.equal(replacement.comparison?.changes.length, 1);
   } finally { await pool.close(); }
 });
 

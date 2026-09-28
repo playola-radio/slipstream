@@ -17,13 +17,15 @@ const GRAMMAR_SHA256 = {
 const RUNTIME_VERSION = '0.25.10';
 const RUNTIME_WASM_SHA256 = 'f38dcc4b43b818f9a0785bc1c6d5611a75ac4cdd428ff3f02757c34ca4e46d7f';
 
-function verifyParserRuntime(): void {
+function verifyParserRuntime(): Uint8Array {
   const root = dirname(require.resolve('web-tree-sitter'));
   const version = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }).version;
-  const actual = createHash('sha256').update(readFileSync(join(root, 'tree-sitter.wasm'))).digest('hex');
+  const bytes = readFileSync(join(root, 'tree-sitter.wasm'));
+  const actual = createHash('sha256').update(bytes).digest('hex');
   if (version !== RUNTIME_VERSION || actual !== RUNTIME_WASM_SHA256) {
     throw new Error('typescript.v2 parser runtime version or WASM hash mismatch');
   }
+  return bytes;
 }
 
 /** A language_version must never silently select different grammar bytes. */
@@ -38,8 +40,7 @@ export function verifyTypeScriptGrammarArtifact(language: 'typescript' | 'tsx',
 
 export interface TypeScriptLimits { inputBytes?: number; declarations?: number; syntaxVisits?: number }
 export class TypeScriptLimitError extends Error {
-  readonly limit: keyof TypeScriptLimits;
-  constructor(limit: keyof TypeScriptLimits) { super(`${limit} limit exceeded`); this.limit = limit; }
+  constructor(limit: keyof TypeScriptLimits) { super(`${limit} limit exceeded`); }
 }
 export async function createTypeScriptInterfaceExtractor(language: 'typescript' | 'tsx'):
   Promise<(bytes: Uint8Array, limits?: TypeScriptLimits) => StructuredExtraction> {
@@ -47,8 +48,8 @@ export async function createTypeScriptInterfaceExtractor(language: 'typescript' 
   if (!pending) {
     pending = (async () => {
       initialization ??= Promise.resolve().then(() => {
-        verifyParserRuntime();
-        return Parser.init();
+        const runtime = verifyParserRuntime();
+        return Parser.init({ wasmBinary: runtime } as Parameters<typeof Parser.init>[0]);
       }).catch(error => {
         initialization = undefined;
         throw error;
