@@ -173,6 +173,24 @@ test('a request that expires while running is cancelled and settles timeout', as
   await budget.close();
 });
 
+test('the deadline timer grants the full duration when the wall clock ticks during admission', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let clockReads = 0;
+  t.mock.method(Date, 'now', () => (++clockReads === 1 ? 1000 : 1001));
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 100 });
+  let settled = false;
+  const outcome = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1,
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => {} }),
+  }).then((value) => { settled = true; return value; });
+  t.mock.timers.tick(99);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await outcome, { kind: 'timeout' });
+  await budget.close();
+});
+
 test('an internal interface deadline does not extend clip running or queue wait', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const budget = createProjectionAdmission({ C: 1, Q: 2, W: 0, D: 100 });

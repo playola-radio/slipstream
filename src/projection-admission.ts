@@ -128,9 +128,8 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   };
   const pending = (): number => queue.length + waiters;
 
-  const arm = (unit: Unit): void => {
-    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }),
-      Math.max(0, unit.deadlineAt - Date.now()));
+  const arm = (unit: Unit, deadlineMs: number): void => {
+    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }), deadlineMs);
     unit.timer.unref(); // a pending deadline must never hold the process open
   };
 
@@ -238,6 +237,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     if (closed) return Promise.resolve({ kind: 'closed' });
     if (req.signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
     return new Promise<AdmitOutcome<T>>((resolve) => {
+      const deadlineMs = req.deadlineMs ?? D;
       const unit: Unit = {
         workload: req.workload,
         localConcurrency: req.localConcurrency,
@@ -245,7 +245,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         run: req.run as () => ComputeHandle<unknown>,
         resolve: resolve as (outcome: AdmitOutcome<unknown>) => void,
         state: 'queued',
-        deadlineAt: Date.now() + (req.deadlineMs ?? D),
+        deadlineAt: Date.now() + deadlineMs,
         timer: undefined,
         handle: undefined,
         signal: req.signal,
@@ -263,7 +263,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
           waiters++;
           unit.state = 'waiting';
           flight.waiters.add(unit);
-          arm(unit);
+          arm(unit, deadlineMs);
           live.add(unit);
           req.signal?.addEventListener('abort', unit.onAbort, { once: true });
           return;
@@ -275,7 +275,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         unit.state = 'running';
         incRunning(req.workload);
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
-        arm(unit);
+        arm(unit, deadlineMs);
         live.add(unit);
         req.signal?.addEventListener('abort', unit.onAbort, { once: true });
         startCompute(unit);
@@ -285,7 +285,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         unit.state = 'queued';
         queue.push(unit);
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
-        arm(unit);
+        arm(unit, deadlineMs);
         live.add(unit);
         req.signal?.addEventListener('abort', unit.onAbort, { once: true });
         return;
