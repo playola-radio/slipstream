@@ -263,6 +263,37 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
     processExitsVerified: [...processes.values()].every(process => process.exitedAtNs !== undefined),
     clipCacheBypasses, processUses };
 }
+
+/** Startup samples are censored when cancellation kills a process before ready. */
+export function scoreProcessStartupTiming(processUses: Array<{ unitId: number; processId: number }>,
+  events: ProjectionTraceEvent[], processPhases: Map<number, Set<string>>, traces: AdmissionTrace[]):
+  { faults: string[]; censored: number } {
+  const faults: string[] = [];
+  const starts = new Map(events.filter(event => event.kind === 'process-start')
+    .map(event => [event.processId, event.process] as const));
+  const exits = new Map(events.filter(event => event.kind === 'process-exit')
+    .map(event => [event.processId, event] as const));
+  const outcomes = new Map(traces.map(trace => [trace.unitId, trace.outcome] as const));
+  const usedByProcess = new Map<number, Set<number>>();
+  for (const use of processUses) {
+    const units = usedByProcess.get(use.processId) ?? new Set<number>();
+    units.add(use.unitId);
+    usedByProcess.set(use.processId, units);
+  }
+  let censored = 0;
+  for (const [processId, unitIds] of usedByProcess) {
+    const process = starts.get(processId);
+    const startup = process === 'swift-child' ? 'swift:child-startup' : process === 'ts-worker'
+      ? 'typescript:worker-startup' : process === 'clip-worker' ? 'clip:worker-startup' : undefined;
+    if (startup && processPhases.get(processId)?.has(startup)) continue;
+    const exit = exits.get(processId);
+    const interrupted = [...unitIds].every(unitId => ['timeout', 'cancelled', 'closed'].includes(outcomes.get(unitId) ?? ''));
+    const killed = exit && (exit.code !== 0 || exit.signal != null);
+    if (startup && interrupted && killed) censored++;
+    else faults.push(`used process ${processId} lacks startup timing`);
+  }
+  return { faults, censored };
+}
 export interface InterfaceLoadInput {
   attempts: InterfaceAttempt[];
   traces: AdmissionTrace[];

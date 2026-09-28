@@ -15,7 +15,8 @@ import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.
 import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
   waitForQuietCapture, type BenchmarkConfig, type HistoricalChange, type LoadSummary } from '../src/clip-bench.ts';
-import { assembleProjectionTrace, compareCaptureToBaseline, scoreClipTrace, scoreInterfaceLoad, type ExpectedFile,
+import { assembleProjectionTrace, compareCaptureToBaseline, scoreClipTrace, scoreInterfaceLoad,
+  scoreProcessStartupTiming, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 
@@ -327,15 +328,9 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
       for (const phase of needed) if (!names.has(phase))
         phaseFaults.push(`unit ${trace.unitId} lacks ${phase} timing`);
     }
-    const processKinds = new Map(observed.events.filter(event => event.kind === 'process-start')
-      .map(event => [event.processId, event.process] as const));
-    for (const processId of new Set(assembly.processUses.map(use => use.processId))) {
-      const process = processKinds.get(processId);
-      const startup = process === 'swift-child' ? 'swift:child-startup' : process === 'ts-worker'
-        ? 'typescript:worker-startup' : process === 'clip-worker' ? 'clip:worker-startup' : undefined;
-      if (!startup || !observed.processPhases.get(processId)?.has(startup))
-        phaseFaults.push(`used process ${processId} lacks startup timing`);
-    }
+    const startup = scoreProcessStartupTiming(assembly.processUses, observed.events,
+      observed.processPhases, assembly.traces);
+    phaseFaults.push(...startup.faults);
     const successfulRoutes = new Map<string, number>();
     for (const attempt of interfaces?.attempts ?? []) if (attempt.httpStatus === 200)
       successfulRoutes.set(attempt.expected.routeKey, (successfulRoutes.get(attempt.expected.routeKey) ?? 0) + 1);
@@ -349,7 +344,8 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     for (const routeKey of observed.routePhases.keys()) if (!successfulRoutes.has(routeKey))
       phaseFaults.push(`HTTP timing has no successful client response for ${routeKey}`);
     const traceFaults = [...observed.faults, ...assembly.faults, ...phaseFaults];
-    const processExitsVerified = assembly.processExitsVerified && !traceFaults.some(fault => /process|exit|spawn/.test(fault));
+    const processExitsVerified = assembly.processExitsVerified && !assembly.faults.some(fault =>
+      fault === 'reader process has no actual exit' || fault === 'orphan or duplicate process exit');
     const cleanupComplete = processExitsVerified && traceFaults.length === 0;
     const writes = written.map(item => ({ path: item.path, sha256: hash(item.body), startedAtNs: BigInt(item.startedAtNs), phase: item.phase }));
     const capture = scoreCaptureArm({ name: (clips ? 'saturation' : arm) + ` repetition ${repetition + 1}`,
@@ -392,6 +388,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
           startedAtNs: a.startedAtNs, completedAtNs: a.completedAtNs, httpStatus: a.httpStatus,
           body: a.body, error: a.error, freshnessByPath: a.freshnessByPath })) : [],
         admissionTraces: assembly.traces, traceFaults, phaseTimings: observed.phases,
+        startupCensoredProcesses: startup.censored,
         clipCacheBypasses: assembly.clipCacheBypasses,
         lifecycleEvents: observed.events.filter(event => ['task-finished', 'parser-request', 'process-start',
           'process-use', 'process-retire', 'process-exit', 'process-spawn-failed'].includes(event.kind)) } };

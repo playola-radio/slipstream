@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assembleProjectionTrace, compareCaptureToBaseline, scoreInterfaceLoad, validateInterfacePage,
+import { assembleProjectionTrace, compareCaptureToBaseline, scoreInterfaceLoad, scoreProcessStartupTiming, validateInterfacePage,
   type AdmissionTrace, type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { scoreCaptureArm } from '../src/clip-bench.ts';
 
@@ -233,6 +233,23 @@ test('actual process exit and task completion are both required after a running 
     && event.kind !== 'process-retire'), []);
   assert.equal(noLink.traces[0]!.exitedAtNs, undefined);
   assert.match(noLink.faults.join(' '), /parser request has no linked process/);
+});
+
+test('killed-before-ready process is censored; successful work without startup timing is a fault', () => {
+  const uses = [{ unitId: 4, processId: 8 }];
+  const events = [{ kind: 'process-start', processId: 8, process: 'swift-child', atNs: 1n },
+    { kind: 'process-exit', processId: 8, code: null, signal: 'SIGKILL', atNs: 2n }] as const;
+  const trace: AdmissionTrace = { unitId: 4, routeKey: '/swift', workload: 'interface',
+    submittedAtNs: 0n, admittedAtNs: 0n, startedAtNs: 0n, settledAtNs: 2n,
+    exitedAtNs: 2n, outcome: 'timeout' };
+  const censored = scoreProcessStartupTiming(uses, [...events], new Map(), [trace]);
+  assert.deepEqual(censored.faults, []);
+  assert.equal(censored.censored, 1);
+  assert.match(scoreProcessStartupTiming(uses, [...events], new Map(),
+    [{ ...trace, outcome: 'ok' }]).faults.join(' '), /lacks startup timing/);
+  assert.match(scoreProcessStartupTiming(uses, [{ ...events[0]! },
+    { kind: 'process-exit', processId: 8, code: 0, atNs: 2n }], new Map(),
+  [trace]).faults.join(' '), /lacks startup timing/);
 });
 
 test('per-file freshness does not credit cached rows on a fresh multi-file page', () => {
