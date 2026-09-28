@@ -54,20 +54,21 @@ const FOLD_CONTRACT_HEADER = 'slipstream-fold-contract';
 const SSE_HEARTBEAT_MS = 15000;
 const DRAIN_DEADLINE_MS = 10000;
 
-function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {}) {
+function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {},
+  onFinish?: () => void) {
   res.writeHead(status, { 'cache-control': 'no-store', ...headers });
-  res.end(body);
+  if (onFinish) res.end(body, onFinish); else res.end(body);
 }
 function sendJson(res: ServerResponse, status: number, value: unknown,
-  trace?: { observer: ProjectionTraceObserver; routeKey: string }) {
+  trace?: { observer: ProjectionTraceObserver; routeKey: string; scope: 'clip' | 'interface' }) {
   const startedAtNs = trace ? process.hrtime.bigint() : undefined;
   const body = JSON.stringify(value);
-  emitProjectionPhase(trace?.observer, 'serialization', startedAtNs, { routeKey: trace?.routeKey });
-  if (!trace) { send(res, status, body, { 'content-type': 'application/json; charset=utf-8' }); return; }
-  const writeStartedAtNs = process.hrtime.bigint();
-  res.writeHead(status, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' });
-  res.end(body, () => emitProjectionPhase(trace.observer, 'http-completion', writeStartedAtNs,
-    { routeKey: trace.routeKey }));
+  if (trace) emitProjectionPhase(trace.observer, 'serialization', startedAtNs,
+    { scope: trace.scope, routeKey: trace.routeKey });
+  const writeStartedAtNs = trace ? process.hrtime.bigint() : undefined;
+  send(res, status, body, { 'content-type': 'application/json; charset=utf-8' }, trace
+    ? () => emitProjectionPhase(trace.observer, 'http-completion', writeStartedAtNs,
+      { scope: trace.scope, routeKey: trace.routeKey }) : undefined);
 }
 
 function isFollow(params: URLSearchParams): boolean {
@@ -321,7 +322,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     const projection = await clipService.get({ changeSeq: seqStr, before, after,
       language: languageForPath(path), traceRouteKey });
     sendJson(res, 200, projection, opts.projectionTrace && traceRouteKey
-      ? { observer: opts.projectionTrace, routeKey: traceRouteKey } : undefined);
+      ? { observer: opts.projectionTrace, routeKey: traceRouteKey, scope: 'clip' } : undefined);
   }
 
   async function handleInterfaces(req: IncomingMessage, res: ServerResponse, id: string,
@@ -370,7 +371,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
         traceRouteKey: opts.projectionTrace ? req.url : undefined });
       if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
       if (!res.destroyed) sendJson(res, 200, page, opts.projectionTrace && req.url
-        ? { observer: opts.projectionTrace, routeKey: req.url } : undefined);
+        ? { observer: opts.projectionTrace, routeKey: req.url, scope: 'interface' } : undefined);
     } catch (error) {
       if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
       throw error;

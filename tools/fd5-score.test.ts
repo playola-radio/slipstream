@@ -213,7 +213,9 @@ test('actual process exit and task completion are both required after a running 
   const events = [
     { kind: 'admission', unitId: 1, routeKey: e.routeKey, workload: 'interface', atNs: ns(1), disposition: 'running' },
     { kind: 'dispatch', unitId: 1, atNs: ns(2) },
+    { kind: 'parser-request', unitId: 1, atNs: ns(2) },
     { kind: 'process-start', processId: 9, process: 'ts-worker', atNs: ns(3) },
+    { kind: 'process-use', processId: 9, unitId: 1, atNs: ns(3) },
     { kind: 'settle', unitId: 1, atNs: ns(4), priorState: 'running', outcome: 'timeout' },
     { kind: 'process-retire', processId: 9, unitId: 1, atNs: ns(5) },
     { kind: 'task-finished', unitId: 1, atNs: ns(6) },
@@ -227,6 +229,10 @@ test('actual process exit and task completion are both required after a running 
   assert.deepEqual(withExit.faults, []);
   assert.equal(withExit.traces[0]!.exitedAtNs, ns(7));
   assert.equal(withExit.processExitsVerified, true);
+  const noLink = assembleProjectionTrace(events.filter(event => event.kind !== 'process-use'
+    && event.kind !== 'process-retire'), []);
+  assert.equal(noLink.traces[0]!.exitedAtNs, undefined);
+  assert.match(noLink.faults.join(' '), /parser request has no linked process/);
 });
 
 test('per-file freshness does not credit cached rows on a fresh multi-file page', () => {

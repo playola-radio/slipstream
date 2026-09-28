@@ -33,6 +33,8 @@ export async function extractSwiftSides(
     catch { failures.set(id, { status: 'incomplete', reason: 'parse-error' }); }
   }
   if (!decoded.length) return failures;
+  if (options.trace && options.traceUnitId !== undefined) emitProjectionTrace(options.trace,
+    { kind: 'parser-request', unitId: options.traceUnitId, atNs: process.hrtime.bigint() });
   try {
     const result = await runSwiftParseChild({ op: 'extract', sides: decoded, limits: options.limits,
       ...(options.trace ? { traceTimings: true } : {}) },
@@ -42,9 +44,9 @@ export async function extractSwiftSides(
       && Number.isSafeInteger(result.traceTimings.grammarLoadNs) && result.traceTimings.grammarLoadNs >= 0
       && Number.isSafeInteger(result.traceTimings.parseCompareNs) && result.traceTimings.parseCompareNs >= 0) {
       const atNs = process.hrtime.bigint();
-      emitProjectionTrace(options.trace, { kind: 'phase', phase: 'grammar-load', atNs,
+      emitProjectionTrace(options.trace, { kind: 'phase', scope: 'swift', phase: 'grammar-load', atNs,
         durationNs: BigInt(result.traceTimings.grammarLoadNs), unitId: options.traceUnitId });
-      emitProjectionTrace(options.trace, { kind: 'phase', phase: 'parse-compare', atNs,
+      emitProjectionTrace(options.trace, { kind: 'phase', scope: 'swift', phase: 'parse-compare', atNs,
         durationNs: BigInt(result.traceTimings.parseCompareNs), unitId: options.traceUnitId });
     }
     for (const { id, side } of result.results) failures.set(id, side);

@@ -10,7 +10,9 @@ import { createTypeScriptInterfaceExtractor } from '../src/interface-v2-typescri
 import { compareStructuredExtractions } from '../src/interface-v2-comparison.ts';
 import { createCas } from '../src/cas.ts';
 import { blobPath } from '../src/store-reader.ts';
-import { extractSwiftSides } from '../src/swift-interface.ts';
+import { extractSwiftSides, SwiftExtractCancelled } from '../src/swift-interface.ts';
+import { createTypeScriptPool } from '../src/interface-ts-pool.ts';
+import type { ProjectionTraceEvent } from '../src/projection-trace.ts';
 import { compareV2 } from '../src/interface-v2-core.ts';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
@@ -134,15 +136,24 @@ test('real authenticated reader events join TS, TSX and Swift HTTP responses thr
     const observed = collector.snapshot();
     const assembled = assembleProjectionTrace(observed.events, attempts);
     assert.deepEqual(observed.faults, []);
-    for (const phase of ['range-scan', 'cas-read', 'cas-hash', 'grammar-load', 'parse-compare',
-      'worker-startup', 'worker-roundtrip', 'serialization', 'http-completion'])
+    for (const phase of ['interface:range-scan', 'interface:cas-read', 'interface:cas-hash',
+      'typescript:grammar-load', 'typescript:parse-compare', 'typescript:worker-startup',
+      'typescript:worker-roundtrip', 'swift:grammar-load', 'swift:parse-compare',
+      'swift:child-startup', 'swift:child-lifecycle', 'interface:serialization', 'interface:http-completion'])
       assert.ok((observed.phases[phase]?.count ?? 0) > 0, `missing ${phase} timing`);
     assert.deepEqual(assembled.faults, []);
     assert.equal(assembled.processExitsVerified, true);
     assert.deepEqual(assembled.traces.map(trace => trace.outcome), ['ok', 'ok', 'ok']);
-    for (const trace of assembled.traces) for (const phase of ['range-scan', 'cas-read', 'cas-hash',
-      'grammar-load', 'parse-compare', 'worker-roundtrip'])
-      assert.ok(observed.unitPhases.get(trace.unitId)?.has(phase), `unit ${trace.unitId} lacks ${phase}`);
+    assert.equal(observed.events.filter(event => event.kind === 'parser-request').length, 3);
+    assert.equal(new Set(assembled.processUses.map(use => use.unitId)).size, 3);
+    for (const [index, trace] of assembled.traces.entries()) {
+      const phases = ['interface:range-scan', 'interface:cas-read', 'interface:cas-hash',
+        ...(corpus[index]!.expected.language === 'swift'
+          ? ['swift:grammar-load', 'swift:parse-compare', 'swift:child-startup', 'swift:child-lifecycle']
+          : ['typescript:grammar-load', 'typescript:parse-compare', 'typescript:worker-roundtrip'])];
+      for (const phase of phases) assert.ok(observed.unitPhases.get(trace.unitId)?.has(phase),
+        `unit ${trace.unitId} lacks ${phase}`);
+    }
     for (const page of corpus) assert.deepEqual(observed.routePhases.get(page.expected.routeKey),
       { serialization: 1, completion: 1 });
     assert.deepEqual(assembled.attempts.map(attempt => Object.values(attempt.freshnessByPath ?? {})),
@@ -187,4 +198,31 @@ test('real clip cache bypass is separate from admission and blob loss forces a n
     await reader?.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('cancelled TypeScript worker and Swift child report actual exits', async () => {
+  const tsEvents: ProjectionTraceEvent[] = [];
+  const pool = createTypeScriptPool(event => tsEvents.push(event));
+  try {
+    const task = pool.run({ language: 'typescript', before: Buffer.from('function f(): number { return 1 }'),
+      after: Buffer.from('function f(): string { return "x" }') }, 71);
+    task.cancel();
+    await assert.rejects(task.promise);
+  } finally { await pool.close(); }
+  const tsRetired = tsEvents.find(event => event.kind === 'process-retire');
+  assert.ok(tsRetired);
+  assert.ok(tsEvents.some(event => event.kind === 'process-exit' && event.processId === tsRetired.processId));
+
+  const swiftEvents: ProjectionTraceEvent[] = [];
+  const controller = new AbortController();
+  await assert.rejects(extractSwiftSides([{ id: 'before', bytes: Buffer.from('func f(x: Int) -> Int { x }') }], {
+    signal: controller.signal, traceUnitId: 72, trace: event => {
+      swiftEvents.push(event);
+      if (event.kind === 'process-start' && event.process === 'swift-child') controller.abort();
+    },
+  }), SwiftExtractCancelled);
+  const swiftStart = swiftEvents.find((event): event is Extract<ProjectionTraceEvent, { kind: 'process-start' }> =>
+    event.kind === 'process-start' && event.process === 'swift-child');
+  assert.ok(swiftStart);
+  assert.ok(swiftEvents.some(event => event.kind === 'process-exit' && event.processId === swiftStart.processId));
 });

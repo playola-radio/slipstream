@@ -19,25 +19,53 @@ export interface AdmissionTrace {
   exitedAtNs?: bigint;
 }
 
+function tracesWithin(group: AdmissionTrace[], start: bigint, end: bigint): AdmissionTrace[] {
+  let low = 0, high = group.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (group[middle]!.submittedAtNs < start) low = middle + 1;
+    else high = middle;
+  }
+  const matches: AdmissionTrace[] = [];
+  for (let index = low; index < group.length && group[index]!.submittedAtNs <= end; index++) {
+    if (group[index]!.settledAtNs <= end) matches.push(group[index]!);
+    if (matches.length > 1) break; // ambiguity is already conclusive
+  }
+  return matches;
+}
+
 /** A cold clip HTTP attempt must have one real admission, never a response-cache bypass. */
 export function scoreClipTrace(responses: ClipResponse[], traces: AdmissionTrace[],
   bypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[]): string[] {
   const faults: string[] = [];
   const clipTraces = traces.filter(trace => trace.workload === 'clip');
+  const byRoute = new Map<string, AdmissionTrace[]>();
+  for (const trace of clipTraces) {
+    const group = byRoute.get(trace.routeKey) ?? [];
+    group.push(trace);
+    byRoute.set(trace.routeKey, group);
+  }
+  for (const group of byRoute.values()) group.sort((a, b) =>
+    a.submittedAtNs < b.submittedAtNs ? -1 : a.submittedAtNs > b.submittedAtNs ? 1 : 0);
+  const bypassByRoute = new Map<string, bigint[]>();
+  for (const bypass of bypasses) {
+    const times = bypassByRoute.get(bypass.routeKey) ?? [];
+    times.push(bypass.atNs);
+    bypassByRoute.set(bypass.routeKey, times);
+  }
   const used = new Set<number>();
   for (const response of responses) {
     if (response.routeKey === undefined || response.startedAtNs === undefined || response.completedAtNs === undefined) {
       faults.push('clip response lacks route or interval evidence'); continue;
     }
-    const candidates = clipTraces.filter(trace => trace.routeKey === response.routeKey
-      && trace.submittedAtNs >= response.startedAtNs! && trace.settledAtNs <= response.completedAtNs!);
+    const candidates = tracesWithin(byRoute.get(response.routeKey) ?? [], response.startedAtNs, response.completedAtNs);
     if (candidates.length !== 1 || used.has(candidates[0]!.unitId)) {
       faults.push('clip request lacks unique admission outcome'); continue;
     }
     const trace = candidates[0]!;
     used.add(trace.unitId);
-    if (bypasses.some(event => event.routeKey === response.routeKey
-      && event.atNs >= response.startedAtNs! && event.atNs <= response.completedAtNs!))
+    if ((bypassByRoute.get(response.routeKey) ?? []).some(atNs =>
+      atNs >= response.startedAtNs! && atNs <= response.completedAtNs!))
       faults.push('cold clip request bypassed admission cache');
     if (response.httpStatus !== 200 || response.error) faults.push('clip HTTP failure');
     if (response.status !== 'ready' && !(response.status === 'skipped'
@@ -94,15 +122,32 @@ export interface InterfaceAttempt {
 export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts: InterfaceAttempt[]):
   { traces: AdmissionTrace[]; attempts: InterfaceAttempt[]; faults: string[];
     processExitsVerified: boolean; clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[];
-    phases: Extract<ProjectionTraceEvent, { kind: 'phase' }>[] } {
+    processUses: Array<{ unitId: number; processId: number }> } {
   const faults: string[] = [];
   const units = new Map<number, { trace: Partial<AdmissionTrace>; disposition: 'running' | 'queued' | 'waiting' | 'overloaded';
     settled: boolean; dispatched: boolean }>();
   const joinedAttempts = attempts.map(a => ({ ...a, freshnessByPath: { ...a.freshnessByPath } }));
+  const attemptsByRoute = new Map<string, InterfaceAttempt[]>();
+  for (const attempt of joinedAttempts) {
+    const group = attemptsByRoute.get(attempt.expected.routeKey) ?? [];
+    group.push(attempt);
+    attemptsByRoute.set(attempt.expected.routeKey, group);
+  }
+  for (const group of attemptsByRoute.values()) {
+    group.sort((a, b) => a.startedAtNs < b.startedAtNs ? -1 : a.startedAtNs > b.startedAtNs ? 1 : 0);
+    let coveredThrough: bigint | undefined;
+    for (const attempt of group) {
+      if (coveredThrough !== undefined && attempt.startedAtNs <= coveredThrough)
+        faults.push('same-route HTTP attempts overlap');
+      const completed = attempt.completedAtNs ?? attempt.startedAtNs;
+      if (coveredThrough === undefined || completed > coveredThrough) coveredThrough = completed;
+    }
+  }
   const finished = new Map<number, bigint>();
+  const parserRequests = new Set<number>();
   const processes = new Map<number, { startedAtNs: bigint; exitedAtNs?: bigint; unitIds: Set<number> }>();
   const clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[] = [];
-  const phases: Extract<ProjectionTraceEvent, { kind: 'phase' }>[] = [];
+  const processUses: Array<{ unitId: number; processId: number }> = [];
   for (const event of events) {
     if (event.kind === 'admission') {
       if (units.has(event.unitId)) { faults.push('duplicate admission unit'); continue; }
@@ -129,10 +174,17 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
       unit.trace.outcome = event.outcome;
       unit.settled = true;
     } else if (event.kind === 'interface-file') {
-      const candidates = joinedAttempts.filter(a => a.expected.routeKey === event.routeKey
-        && a.startedAtNs <= event.atNs && event.atNs <= (a.completedAtNs ?? -1n));
-      if (candidates.length !== 1) { faults.push('interface-file event has no unique HTTP attempt'); continue; }
-      const target = candidates[0]!;
+      const group = attemptsByRoute.get(event.routeKey) ?? [];
+      let low = 0, high = group.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (group[middle]!.startedAtNs <= event.atNs) low = middle + 1;
+        else high = middle;
+      }
+      const target = group[low - 1];
+      if (!target || event.atNs > (target.completedAtNs ?? -1n)) {
+        faults.push('interface-file event has no unique HTTP attempt'); continue;
+      }
       if (!target.expected.files.some(f => f.path === event.path)) { faults.push('interface-file event names unexpected path'); continue; }
       if (target.freshnessByPath?.[event.path] !== undefined) { faults.push('duplicate interface-file event'); continue; }
       const row = (object(target.body)?.files as unknown[] | undefined)?.find(raw => object(raw)?.path === event.path);
@@ -141,10 +193,25 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
     } else if (event.kind === 'task-finished') {
       if (!units.has(event.unitId) || finished.has(event.unitId)) faults.push('invalid task completion');
       else finished.set(event.unitId, event.atNs);
+    } else if (event.kind === 'parser-request') {
+      if (!units.has(event.unitId)) faults.push('invalid parser request');
+      else parserRequests.add(event.unitId);
     } else if (event.kind === 'process-start') {
       if (processes.has(event.processId)) faults.push('duplicate process start');
-      else processes.set(event.processId, { startedAtNs: event.atNs,
-        unitIds: new Set(event.unitId === undefined ? [] : [event.unitId]) });
+      else {
+        processes.set(event.processId, { startedAtNs: event.atNs,
+          unitIds: new Set(event.unitId === undefined ? [] : [event.unitId]) });
+        if (event.unitId !== undefined) {
+          if (!parserRequests.has(event.unitId)) faults.push('process started without parser request');
+          processUses.push({ unitId: event.unitId, processId: event.processId });
+        }
+      }
+    } else if (event.kind === 'process-use') {
+      const process = processes.get(event.processId);
+      if (!process || !units.has(event.unitId) || !parserRequests.has(event.unitId)
+        || process.exitedAtNs !== undefined)
+        faults.push('invalid process use');
+      else { process.unitIds.add(event.unitId); processUses.push({ unitId: event.unitId, processId: event.processId }); }
     } else if (event.kind === 'process-retire') {
       const process = processes.get(event.processId);
       if (!process || !units.has(event.unitId) || process.exitedAtNs !== undefined)
@@ -160,22 +227,30 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
     } else if (event.kind === 'clip-cache-bypass') {
       clipCacheBypasses.push(event);
     } else if (event.kind === 'phase') {
-      if (event.durationNs < 0n) faults.push('negative phase duration');
-      phases.push(event);
+      faults.push('phase event bypassed bounded collector');
     } else {
       event satisfies never;
       faults.push('unknown trace event');
     }
   }
   const traces: AdmissionTrace[] = [];
+  const linkedByUnit = new Map<number, Array<{ exitedAtNs?: bigint }>>();
+  for (const process of processes.values()) for (const unitId of process.unitIds) {
+    const linked = linkedByUnit.get(unitId) ?? [];
+    linked.push(process);
+    linkedByUnit.set(unitId, linked);
+  }
   for (const unit of units.values()) {
     if (!unit.settled) { faults.push('admission unit has no settlement'); continue; }
     if (unit.disposition === 'running' && !unit.dispatched) faults.push('running admission has no dispatch');
     if (unit.dispatched && !finished.has(unit.trace.unitId!)) faults.push('dispatched task has no completion');
+    const linked = linkedByUnit.get(unit.trace.unitId!) ?? [];
+    if (parserRequests.has(unit.trace.unitId!) && linked.length === 0)
+      faults.push('parser request has no linked process');
     if (unit.dispatched && ['timeout', 'cancelled', 'closed'].includes(String(unit.trace.outcome))) {
-      const linked = [...processes.values()].filter(process => process.unitIds.has(unit.trace.unitId!));
       const taskAt = finished.get(unit.trace.unitId!);
-      if (taskAt !== undefined && linked.every(process => process.exitedAtNs !== undefined))
+      if (taskAt !== undefined && (!parserRequests.has(unit.trace.unitId!) || linked.length > 0)
+        && linked.every(process => process.exitedAtNs !== undefined))
         unit.trace.exitedAtNs = linked.reduce((at, process) => process.exitedAtNs! > at ? process.exitedAtNs! : at, taskAt);
     }
     traces.push(unit.trace as AdmissionTrace);
@@ -186,7 +261,7 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
   }
   return { traces, attempts: joinedAttempts, faults,
     processExitsVerified: [...processes.values()].every(process => process.exitedAtNs !== undefined),
-    clipCacheBypasses, phases };
+    clipCacheBypasses, processUses };
 }
 export interface InterfaceLoadInput {
   attempts: InterfaceAttempt[];
@@ -258,9 +333,8 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
   // A complete ready page is an exhaustive claim. Interrupted pages retain only a prefix.
   if (page.status === 'ready' && object(page.page)?.complete === true) {
     for (const path of byPath.keys()) if (!seen.has(path)) faults.push(`missing file ${path}`);
-    if (object(page.page)?.complete === true)
-      for (const raw of page.files) if (!['ready', 'identical'].includes(String(object(raw)?.status)))
-        faults.push(`complete page has non-ready file ${String(object(raw)?.path)}`);
+    for (const raw of page.files) if (!['ready', 'identical'].includes(String(object(raw)?.status)))
+      faults.push(`complete page has non-ready file ${String(object(raw)?.path)}`);
   }
   const pagination = object(page.page);
   if (!pagination || typeof pagination.complete !== 'boolean'
@@ -295,6 +369,8 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
     group.push(trace);
     byRoute.set(trace.routeKey, group);
   }
+  for (const group of byRoute.values()) group.sort((a, b) =>
+    a.submittedAtNs < b.submittedAtNs ? -1 : a.submittedAtNs > b.submittedAtNs ? 1 : 0);
   const matched = new Map<string, AdmissionTrace>();
   const usedUnits = new Set<number>();
   const keys = new Set(input.corpusKeys);
@@ -323,8 +399,8 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
         reasons.push('cold key repeated without completed uncached overload');
     }
     prior.set(attempt.expected.key, attempt);
-    const candidates = (byRoute.get(attempt.expected.routeKey) ?? []).filter(trace =>
-      trace.submittedAtNs >= attempt.startedAtNs && trace.settledAtNs <= (attempt.completedAtNs ?? -1n));
+    const candidates = tracesWithin(byRoute.get(attempt.expected.routeKey) ?? [],
+      attempt.startedAtNs, attempt.completedAtNs ?? -1n);
     const trace = candidates.length === 1 ? candidates[0] : undefined;
     if (!trace || usedUnits.has(trace.unitId)) {
       counts.unclassified++; total.unclassified++;

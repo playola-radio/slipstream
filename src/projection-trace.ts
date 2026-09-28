@@ -9,13 +9,17 @@ export type ProjectionTraceEvent =
   | { kind: 'interface-file'; routeKey: string; path: string; atNs: bigint;
       freshness: 'fresh' | 'cache-hit' | 'none'; resultStatus: string }
   | { kind: 'task-finished'; unitId: number; atNs: bigint }
+  | { kind: 'parser-request'; unitId: number; atNs: bigint }
   | { kind: 'process-start'; processId: number; process: 'clip-worker' | 'ts-worker' | 'swift-child';
       unitId?: number; atNs: bigint }
+  | { kind: 'process-use'; processId: number; unitId: number; atNs: bigint }
   | { kind: 'process-retire'; processId: number; unitId: number; atNs: bigint }
   | { kind: 'process-exit'; processId: number; atNs: bigint; code: number | null; signal?: string | null }
   | { kind: 'process-spawn-failed'; processId: number; unitId?: number; atNs: bigint }
   | { kind: 'clip-cache-bypass'; routeKey: string; atNs: bigint }
-  | { kind: 'phase'; phase: string; durationNs: bigint; atNs: bigint;
+  /** atNs is parent observation time for worker/child durations, not the interval end. */
+  | { kind: 'phase'; scope: 'clip' | 'interface' | 'typescript' | 'swift'; phase: string;
+      durationNs: bigint; atNs: bigint;
       unitId?: number; path?: string; routeKey?: string; processId?: number };
 
 export type ProjectionTraceObserver = (event: ProjectionTraceEvent) => void;
@@ -32,7 +36,8 @@ export function emitProjectionTrace(observer: ProjectionTraceObserver | undefine
 }
 
 export function emitProjectionPhase(observer: ProjectionTraceObserver | undefined, phase: string,
-  startedAtNs: bigint | undefined, detail: { unitId?: number; path?: string; routeKey?: string; processId?: number } = {}): void {
+  startedAtNs: bigint | undefined, detail: { scope: 'clip' | 'interface' | 'typescript' | 'swift';
+    unitId?: number; path?: string; routeKey?: string; processId?: number }): void {
   if (!observer || startedAtNs === undefined) return;
   const atNs = process.hrtime.bigint();
   emitProjectionTrace(observer, { kind: 'phase', phase, durationNs: atNs - startedAtNs, atNs, ...detail });

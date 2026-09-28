@@ -278,26 +278,63 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     const observed = collector.snapshot();
     const assembly = assembleProjectionTrace(observed.events, interfaces?.attempts ?? []);
     const requiredPhases = new Set<string>();
-    if (clips || interfaces) for (const phase of ['worker-startup', 'worker-roundtrip', 'grammar-load',
-      'parse-compare', 'cas-read', 'serialization', 'http-completion']) requiredPhases.add(phase);
-    if (interfaces) for (const phase of ['range-scan', 'cas-hash']) requiredPhases.add(phase);
+    if (clips) for (const phase of ['worker-startup', 'worker-roundtrip', 'grammar-load',
+      'parse-compare', 'cas-read', 'serialization', 'http-completion']) requiredPhases.add(`clip:${phase}`);
+    if (interfaces) {
+      for (const phase of ['range-scan', 'cas-read', 'cas-hash', 'serialization', 'http-completion'])
+        requiredPhases.add(`interface:${phase}`);
+      for (const phase of ['worker-startup', 'worker-roundtrip', 'grammar-load', 'parse-compare'])
+        requiredPhases.add(`typescript:${phase}`);
+      for (const phase of ['child-startup', 'child-lifecycle', 'grammar-load', 'parse-compare'])
+        requiredPhases.add(`swift:${phase}`);
+    }
     const phaseFaults = [...requiredPhases].filter(phase => (observed.phases[phase]?.count ?? 0) === 0)
       .map(phase => `missing ${phase} timing`);
+    const interfaceAttemptsByRoute = new Map<string, InterfaceAttempt[]>();
+    for (const attempt of assembly.attempts) {
+      const group = interfaceAttemptsByRoute.get(attempt.expected.routeKey) ?? [];
+      group.push(attempt);
+      interfaceAttemptsByRoute.set(attempt.expected.routeKey, group);
+    }
+    const clipResponsesByRoute = new Map<string, LoadSummary['responses']>();
+    for (const response of clips?.responses ?? []) if (response.routeKey) {
+      const group = clipResponsesByRoute.get(response.routeKey) ?? [];
+      group.push(response);
+      clipResponsesByRoute.set(response.routeKey, group);
+    }
     for (const trace of assembly.traces) {
       if (trace.outcome !== 'ok') continue;
       const names = observed.unitPhases.get(trace.unitId) ?? new Set<string>();
-      const interfaceAttempt = trace.workload === 'interface' ? assembly.attempts.find(attempt =>
-        attempt.expected.routeKey === trace.routeKey && attempt.startedAtNs <= trace.submittedAtNs
-          && trace.settledAtNs <= (attempt.completedAtNs ?? -1n)) : undefined;
+      const interfaceCandidates = trace.workload === 'interface'
+        ? (interfaceAttemptsByRoute.get(trace.routeKey) ?? []).filter(attempt =>
+        attempt.startedAtNs <= trace.submittedAtNs
+          && trace.settledAtNs <= (attempt.completedAtNs ?? -1n)) : [];
+      if (trace.workload === 'interface' && interfaceCandidates.length !== 1)
+        phaseFaults.push(`unit ${trace.unitId} lacks unique HTTP timing join`);
+      const interfaceAttempt = interfaceCandidates.length === 1 ? interfaceCandidates[0] : undefined;
       const freshInterface = interfaceAttempt && (interfaceAttempt.body as { files?: Array<{ path?: string; status?: string }> } | undefined)
         ?.files?.some(row => row.status === 'ready' && interfaceAttempt.freshnessByPath?.[String(row.path)] === 'fresh');
-      const readyClip = trace.workload === 'clip' && clips?.responses.some(response => response.routeKey === trace.routeKey
-        && response.status === 'ready' && response.startedAtNs !== undefined && response.completedAtNs !== undefined
+      const readyClip = trace.workload === 'clip' && (clipResponsesByRoute.get(trace.routeKey) ?? []).some(response =>
+        response.status === 'ready' && response.startedAtNs !== undefined && response.completedAtNs !== undefined
         && response.startedAtNs <= trace.submittedAtNs && trace.settledAtNs <= response.completedAtNs);
-      const needed = freshInterface ? ['range-scan', 'cas-read', 'cas-hash', 'worker-roundtrip', 'grammar-load', 'parse-compare']
-        : readyClip ? ['cas-read', 'worker-roundtrip', 'grammar-load', 'parse-compare'] : [];
+      const needed = freshInterface ? [
+        'interface:range-scan', 'interface:cas-read', 'interface:cas-hash',
+        ...(interfaceAttempt!.expected.language === 'swift'
+          ? ['swift:child-startup', 'swift:child-lifecycle', 'swift:grammar-load', 'swift:parse-compare']
+          : ['typescript:worker-roundtrip', 'typescript:grammar-load', 'typescript:parse-compare']),
+      ] : readyClip ? ['clip:cas-read', 'clip:worker-roundtrip', 'clip:grammar-load', 'clip:parse-compare']
+        : trace.workload === 'interface' ? ['interface:range-scan'] : [];
       for (const phase of needed) if (!names.has(phase))
         phaseFaults.push(`unit ${trace.unitId} lacks ${phase} timing`);
+    }
+    const processKinds = new Map(observed.events.filter(event => event.kind === 'process-start')
+      .map(event => [event.processId, event.process] as const));
+    for (const processId of new Set(assembly.processUses.map(use => use.processId))) {
+      const process = processKinds.get(processId);
+      const startup = process === 'swift-child' ? 'swift:child-startup' : process === 'ts-worker'
+        ? 'typescript:worker-startup' : process === 'clip-worker' ? 'clip:worker-startup' : undefined;
+      if (!startup || !observed.processPhases.get(processId)?.has(startup))
+        phaseFaults.push(`used process ${processId} lacks startup timing`);
     }
     const successfulRoutes = new Map<string, number>();
     for (const attempt of interfaces?.attempts ?? []) if (attempt.httpStatus === 200)
@@ -309,6 +346,8 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
       if (phases?.serialization !== count || phases.completion !== count)
         phaseFaults.push(`HTTP route ${routeKey} lacks serialization or completion timing`);
     }
+    for (const routeKey of observed.routePhases.keys()) if (!successfulRoutes.has(routeKey))
+      phaseFaults.push(`HTTP timing has no successful client response for ${routeKey}`);
     const traceFaults = [...observed.faults, ...assembly.faults, ...phaseFaults];
     const processExitsVerified = assembly.processExitsVerified && !traceFaults.some(fault => /process|exit|spawn/.test(fault));
     const cleanupComplete = processExitsVerified && traceFaults.length === 0;
@@ -353,7 +392,9 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
           startedAtNs: a.startedAtNs, completedAtNs: a.completedAtNs, httpStatus: a.httpStatus,
           body: a.body, error: a.error, freshnessByPath: a.freshnessByPath })) : [],
         admissionTraces: assembly.traces, traceFaults, phaseTimings: observed.phases,
-        clipCacheBypasses: assembly.clipCacheBypasses } };
+        clipCacheBypasses: assembly.clipCacheBypasses,
+        lifecycleEvents: observed.events.filter(event => ['task-finished', 'parser-request', 'process-start',
+          'process-use', 'process-retire', 'process-exit', 'process-spawn-failed'].includes(event.kind)) } };
   } finally {
     await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
     off?.();

@@ -28,19 +28,21 @@ export function createTypeScriptPool(trace?: ProjectionTraceObserver) {
     if (processId !== undefined) {
       identities.set(worker, processId);
       emitProjectionTrace(trace, { kind: 'process-start', processId, process: 'ts-worker', atNs: process.hrtime.bigint() });
-      worker.once('online', () => emitProjectionPhase(trace, 'worker-startup', startedAtNs, { processId }));
+      worker.once('online', () => emitProjectionPhase(trace, 'worker-startup', startedAtNs,
+        { scope: 'typescript', processId }));
     }
     worker.on('message', (reply: TypeScriptReply) => {
       const task = active;
       if (!task || task.id !== reply.id) return;
       active = null;
-      emitProjectionPhase(trace, 'worker-roundtrip', task.startedAtNs, { unitId: task.traceUnitId, processId });
+      emitProjectionPhase(trace, 'worker-roundtrip', task.startedAtNs,
+        { scope: 'typescript', unitId: task.traceUnitId, processId });
       if (reply.ok) {
         if (reply.result.traceTimings && processId !== undefined) {
           const atNs = process.hrtime.bigint();
-          emitProjectionTrace(trace, { kind: 'phase', phase: 'grammar-load', atNs,
+          emitProjectionTrace(trace, { kind: 'phase', scope: 'typescript', phase: 'grammar-load', atNs,
             durationNs: reply.result.traceTimings.grammarLoadNs, unitId: task.traceUnitId, processId });
-          emitProjectionTrace(trace, { kind: 'phase', phase: 'parse-compare', atNs,
+          emitProjectionTrace(trace, { kind: 'phase', scope: 'typescript', phase: 'parse-compare', atNs,
             durationNs: reply.result.traceTimings.parseCompareNs, unitId: task.traceUnitId, processId });
         }
         task.resolve(reply.result);
@@ -75,6 +77,9 @@ export function createTypeScriptPool(trace?: ProjectionTraceObserver) {
     current ??= spawn();
     const worker = current;
     const id = ++serial;
+    const processId = identities.get(worker);
+    if (processId !== undefined && traceUnitId !== undefined) emitProjectionTrace(trace,
+      { kind: 'process-use', processId, unitId: traceUnitId, atNs: process.hrtime.bigint() });
     const promise = new Promise<TypeScriptResult>((resolve, reject) => {
       active = { id, traceUnitId, startedAtNs: trace ? process.hrtime.bigint() : undefined, resolve, reject };
       worker.postMessage({ ...input, id, ...(trace ? { traceTimings: true } : {}) } satisfies TypeScriptJob);

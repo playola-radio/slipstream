@@ -87,7 +87,9 @@ async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: str
   const execArgv = unisolated ? [] : ['--liftoff-only'];
   const env = unisolated ? { ...process.env, [SWIFT_UNISOLATED_ENV]: '1' } : process.env;
   const startedAtNs = opts.trace ? process.hrtime.bigint() : undefined;
-  const child = spawn(process.execPath, [...execArgv, HOST_PATH, ...hostArgs], { stdio: ['pipe', 'pipe', 'pipe'], env });
+  const child = spawn(process.execPath,
+    [...execArgv, HOST_PATH, ...(opts.trace ? ['--fd5-trace-startup'] : []), ...hostArgs],
+    { stdio: ['pipe', 'pipe', 'pipe'], env });
   const processId = opts.trace ? traceProcessId() : undefined;
   if (processId !== undefined) {
     let spawned = false;
@@ -95,7 +97,8 @@ async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: str
       spawned = true;
       emitProjectionTrace(opts.trace, { kind: 'process-start', processId, process: 'swift-child',
         ...(opts.traceUnitId === undefined ? {} : { unitId: opts.traceUnitId }), atNs: process.hrtime.bigint() });
-      emitProjectionPhase(opts.trace, 'worker-startup', startedAtNs, { processId, unitId: opts.traceUnitId });
+      emitProjectionPhase(opts.trace, 'child-spawn', startedAtNs,
+        { scope: 'swift', processId, unitId: opts.traceUnitId });
     });
     child.once('error', () => {
       if (!spawned) emitProjectionTrace(opts.trace, { kind: 'process-spawn-failed', processId,
@@ -103,7 +106,8 @@ async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: str
     });
     child.once('close', (code, signal) => {
       if (spawned) {
-        emitProjectionPhase(opts.trace, 'worker-roundtrip', startedAtNs, { processId, unitId: opts.traceUnitId });
+        emitProjectionPhase(opts.trace, 'child-lifecycle', startedAtNs,
+          { scope: 'swift', processId, unitId: opts.traceUnitId });
         emitProjectionTrace(opts.trace, { kind: 'process-exit', processId,
           code, signal, atNs: process.hrtime.bigint() });
       }
@@ -112,9 +116,17 @@ async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: str
 
   let stdout = '';
   let stderr = '';
+  let startupObserved = false;
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (d: string) => { stdout += d; });
+  child.stdout.on('data', (d: string) => {
+    stdout += d;
+    if (!startupObserved && processId !== undefined && stdout.includes('FD5_CHILD_READY\n')) {
+      startupObserved = true;
+      emitProjectionPhase(opts.trace, 'child-startup', startedAtNs,
+        { scope: 'swift', processId, unitId: opts.traceUnitId });
+    }
+  });
   child.stderr.on('data', (d: string) => { stderr += d; });
   // Terminating the child while its stdin still holds buffered input emits EPIPE
   // on the write side; swallow it so a cancellation never escapes the

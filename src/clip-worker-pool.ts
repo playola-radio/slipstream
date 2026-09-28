@@ -60,7 +60,7 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
     if (processId !== undefined) {
       identities.set(w, processId);
       emitProjectionTrace(trace, { kind: 'process-start', processId, process: 'clip-worker', atNs: process.hrtime.bigint() });
-      w.once('online', () => emitProjectionPhase(trace, 'worker-startup', startedAtNs, { processId }));
+      w.once('online', () => emitProjectionPhase(trace, 'worker-startup', startedAtNs, { scope: 'clip', processId }));
       w.on('exit', code => emitProjectionTrace(trace,
         { kind: 'process-exit', processId, code, atNs: process.hrtime.bigint() }));
     }
@@ -68,9 +68,10 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
       const cur = current;
       if (!cur || cur.id !== resp.id) return; // stale message from before a cancel
       current = null;
-      emitProjectionPhase(trace, 'worker-roundtrip', cur.startedAtNs, { unitId: cur.traceUnitId, processId });
+      emitProjectionPhase(trace, 'worker-roundtrip', cur.startedAtNs,
+        { scope: 'clip', unitId: cur.traceUnitId, processId });
       if (resp.ok && trace && processId !== undefined && resp.traceTimings) for (const timing of resp.traceTimings)
-        emitProjectionTrace(trace, { kind: 'phase', phase: timing.phase, durationNs: timing.durationNs,
+        emitProjectionTrace(trace, { kind: 'phase', scope: 'clip', phase: timing.phase, durationNs: timing.durationNs,
           atNs: process.hrtime.bigint(), unitId: cur.traceUnitId, processId });
       cur.resolve(resp.ok ? resp.result : workerErrorResult());
     });
@@ -92,6 +93,9 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
       return { promise: Promise.resolve(workerErrorResult()), cancel: () => {} };
     }
     let settled = false;
+    const processId = identities.get(worker);
+    if (processId !== undefined && traceUnitId !== undefined) emitProjectionTrace(trace,
+      { kind: 'process-use', processId, unitId: traceUnitId, atNs: process.hrtime.bigint() });
     const promise = new Promise<ClipProjection>((resolve) => {
       const id = ++jobId;
       current = { id, traceUnitId, startedAtNs: trace ? process.hrtime.bigint() : undefined,

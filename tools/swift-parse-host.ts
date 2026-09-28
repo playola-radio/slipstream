@@ -43,7 +43,7 @@ async function readStdin(): Promise<string> {
 }
 
 async function readRequest(): Promise<HostRequest> {
-  const [mode, path] = process.argv.slice(2);
+  const [mode, path] = process.argv.slice(2).filter(arg => arg !== '--fd5-trace-startup');
   if (mode === '--parse-file') {
     if (path === undefined) throw new Error('--parse-file requires a path');
     return { op: 'parse', source: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await readFile(path)) };
@@ -109,6 +109,7 @@ export function runInWorker(source: string, workerUrl: URL = WORKER_URL): {
 }
 
 async function main(): Promise<number> {
+  if (process.argv.includes('--fd5-trace-startup')) process.stdout.write('FD5_CHILD_READY\n');
   const request = await readRequest();
 
   if (request.op === 'cancel-demo') {

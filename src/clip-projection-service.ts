@@ -220,6 +220,8 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       traceRouteKey: req.traceRouteKey,
       run: traceUnitId => {
         isLeader = true;
+        if (traceUnitId !== undefined) emitProjectionTrace(opts.projectionTrace,
+          { kind: 'parser-request', unitId: traceUnitId, atNs: process.hrtime.bigint() });
         return compute({
           storeDir: opts.storeDir,
           before: req.before,

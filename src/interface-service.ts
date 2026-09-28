@@ -9,7 +9,7 @@ import { extractSwiftSides, SwiftExtractCancelled, SwiftExtractTimeout } from '.
 import { createTypeScriptPool } from './interface-ts-pool.ts';
 import type { StructuredChange } from './interface-v2-comparison.ts';
 import type { ProjectionAdmission } from './projection-admission.ts';
-import { emitProjectionPhase, type ProjectionTraceObserver } from './projection-trace.ts';
+import { emitProjectionPhase, emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 const FILES_PER_PAGE = 16;
 const SIDE_BYTES = 1024 * 1024;
@@ -100,6 +100,7 @@ async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number
   const forced = sideFallback(endpoint);
   if (endpoint.kind === 'unknownBoundary' || endpoint.snapshot.kind !== 'content')
     return { coverage: forced, bytes: null, tooLarge: false, readBytes: 0 };
+  const readStartedAtNs = trace ? process.hrtime.bigint() : undefined;
   let handle;
   try { handle = await open(blobPath(storeDir, endpoint.snapshot.sha256), constants.O_RDONLY | constants.O_NOFOLLOW); }
   catch (error) {
@@ -113,9 +114,10 @@ async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number
     if (stat.size > limit || endpoint.snapshot.size > limit)
       return { coverage: { state: 'notEvaluated' }, bytes: null, tooLarge: true, readBytes: 0 };
     const bytes = await handle.readFile();
+    emitProjectionPhase(trace, 'cas-read', readStartedAtNs, { scope: 'interface', unitId: traceUnitId, path });
     const hashStartedAtNs = trace ? process.hrtime.bigint() : undefined;
     const digest = Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes)).toString('hex');
-    emitProjectionPhase(trace, 'cas-hash', hashStartedAtNs, { unitId: traceUnitId, path });
+    emitProjectionPhase(trace, 'cas-hash', hashStartedAtNs, { scope: 'interface', unitId: traceUnitId, path });
     if (bytes.length !== endpoint.snapshot.size || digest !== endpoint.snapshot.sha256)
       throw new Error('content-addressed blob does not match recorded snapshot');
     return { coverage: { state: 'notEvaluated' }, bytes, tooLarge: false, readBytes: bytes.length };
@@ -206,20 +208,13 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       base.status = 'identical';
       return { result: base, blobBytes: 0, freshness: 'none' };
     }
-    const timedRead = async (endpoint: RangeEndpoint): Promise<ReadSide> => {
-      const startedAtNs = options.projectionTrace ? process.hrtime.bigint() : undefined;
-      try { return await readSide(options.storeDir, endpoint, SIDE_BYTES,
-        options.projectionTrace, traceUnitId, file.path); }
-      finally { emitProjectionPhase(options.projectionTrace, 'cas-read', startedAtNs,
-        { unitId: traceUnitId, path: file.path }); }
-    };
     const [before, after] = await Promise.all([
-      timedRead(file.before).then(side => {
+      readSide(options.storeDir, file.before, SIDE_BYTES, options.projectionTrace, traceUnitId, file.path).then(side => {
         base.coverage.before = side.coverage;
         progress.tooLarge ||= side.tooLarge;
         return side;
       }),
-      timedRead(file.after).then(side => {
+      readSide(options.storeDir, file.after, SIDE_BYTES, options.projectionTrace, traceUnitId, file.path).then(side => {
         base.coverage.after = side.coverage;
         progress.tooLarge ||= side.tooLarge;
         return side;
@@ -241,6 +236,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     let changes: InterfaceFileResult['changes'] = [];
     if (language?.name === 'typescript' && !before.tooLarge && !after.tooLarge &&
       (before.bytes !== null || after.bytes !== null)) {
+      if (traceUnitId !== undefined) emitProjectionTrace(options.projectionTrace,
+        { kind: 'parser-request', unitId: traceUnitId, atNs: process.hrtime.bigint() });
       const task = pool.run({ language: language.grammar!, before: before.bytes, after: after.bytes,
         limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } }, traceUnitId);
       signal.addEventListener('abort', task.cancel, { once: true });
@@ -357,7 +354,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         pathPrefix: req.pathPrefix, afterPath: req.afterPath,
         scanBudget: options.scanBudget ?? SCAN, signal: abort.signal }).finally(() =>
         emitProjectionPhase(options.projectionTrace, 'range-scan', scanStartedAtNs,
-          { unitId: traceUnitId, routeKey: req.traceRouteKey }));
+          { scope: 'interface', unitId: traceUnitId, routeKey: req.traceRouteKey }));
       if (sealed) return page;
       if (result.kind === 'beyondDurable') throw new Error('range exceeded frozen durable boundary');
       if (result.kind === 'scanLimit') {
@@ -376,7 +373,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         const startedAtNs = options.projectionTrace ? process.hrtime.bigint() : undefined;
         try { return await retainedContent(options.storeDir, endpoint); }
         finally { emitProjectionPhase(options.projectionTrace, 'retention-probe', startedAtNs,
-          { unitId: traceUnitId, path }); }
+          { scope: 'interface', unitId: traceUnitId, path }); }
       };
       for (const file of result.files) {
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
@@ -419,12 +416,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         }
         page.files.push(row);
         if (options.projectionTrace && req.traceRouteKey !== undefined) {
-          try {
-            const returned = options.projectionTrace({ kind: 'interface-file', routeKey: req.traceRouteKey,
-              path: row.path, atNs: process.hrtime.bigint(), freshness: compared.freshness, resultStatus: row.status }) as unknown;
-            if (returned instanceof Promise) void returned.catch(() => {});
-          }
-          catch { /* observation cannot affect projection */ }
+          emitProjectionTrace(options.projectionTrace, { kind: 'interface-file', routeKey: req.traceRouteKey,
+            path: row.path, atNs: process.hrtime.bigint(), freshness: compared.freshness, resultStatus: row.status });
         }
         fileBytes += size;
       }

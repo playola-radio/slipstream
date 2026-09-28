@@ -60,30 +60,33 @@ export async function resolveClipSide(
   onPhase?: (phase: string, durationNs: bigint) => void,
 ): Promise<SideInput> {
   const startedAtNs = onPhase ? process.hrtime.bigint() : undefined;
+  let readOccurred = false;
   try {
-  if (snap.kind === 'absent') return { kind: 'absent' };
-  if (snap.kind === 'unavailable') return { kind: 'unavailable', reason: snap.reason };
-  if (snap.size > maxBytes) return { kind: 'oversize' };
-  if (!isValidHex(snap.sha256)) return { kind: 'missing', reason: 'invalid-hex' };
-  // O_NOFOLLOW: a symlink planted at a valid CAS path must serve nothing but the
-  // blob it names, never the link target's bytes.
-  let handle;
-  try {
-    handle = await open(blobPath(storeDir, snap.sha256), constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch (err) {
-    return { kind: 'missing', reason: (err as NodeJS.ErrnoException).code ?? 'open-failed' };
-  }
-  try {
-    const { size } = await handle.stat();
-    if (size > maxBytes) return { kind: 'oversize' };
-    return { kind: 'bytes', bytes: await handle.readFile() };
-  } catch (err) {
-    return { kind: 'missing', reason: (err as NodeJS.ErrnoException).code ?? 'read-failed' };
+    if (snap.kind === 'absent') return { kind: 'absent' };
+    if (snap.kind === 'unavailable') return { kind: 'unavailable', reason: snap.reason };
+    if (snap.size > maxBytes) return { kind: 'oversize' };
+    if (!isValidHex(snap.sha256)) return { kind: 'missing', reason: 'invalid-hex' };
+    // O_NOFOLLOW: a symlink planted at a valid CAS path must serve nothing but the
+    // blob it names, never the link target's bytes.
+    let handle;
+    try {
+      handle = await open(blobPath(storeDir, snap.sha256), constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (err) {
+      return { kind: 'missing', reason: (err as NodeJS.ErrnoException).code ?? 'open-failed' };
+    }
+    try {
+      const { size } = await handle.stat();
+      if (size > maxBytes) return { kind: 'oversize' };
+      const bytes = await handle.readFile();
+      readOccurred = true;
+      return { kind: 'bytes', bytes };
+    } catch (err) {
+      return { kind: 'missing', reason: (err as NodeJS.ErrnoException).code ?? 'read-failed' };
+    } finally {
+      await handle.close();
+    }
   } finally {
-    await handle.close();
-  }
-  } finally {
-    if (startedAtNs !== undefined) onPhase?.('cas-read', process.hrtime.bigint() - startedAtNs);
+    if (readOccurred && startedAtNs !== undefined) onPhase?.('cas-read', process.hrtime.bigint() - startedAtNs);
   }
 }
 
