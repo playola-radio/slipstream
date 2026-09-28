@@ -1,16 +1,20 @@
 /** FD5 four-arm driver. Run only in an authorized measurement window. */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { loadavg, freemem, tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { mkdir, mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
+import { arch, cpus, release, tmpdir } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { isMainModule } from '../src/entrypoint.ts';
 import { createCas } from '../src/cas.ts';
 import { createLog } from '../src/log.ts';
 import { startCapture, type CaptureSession } from '../src/session.ts';
 import { startReaderServer } from '../src/http-reader.ts';
+import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
+import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
-  startContinuousLoad, waitForQuietCapture, type BenchmarkConfig } from '../src/clip-bench.ts';
+  waitForQuietCapture, type BenchmarkConfig, type HistoricalChange, type LoadSummary } from '../src/clip-bench.ts';
 import { compareCaptureToBaseline, scoreInterfaceLoad, type AdmissionTrace, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 
@@ -42,8 +46,10 @@ export function validateConfig(raw: unknown): FD5Config {
   if (c.repetitions !== 3 || c.scheduledWrites !== 100 || c.scheduledIntervalMs !== 120 || c.burstWrites !== 100
     || c.requestSlots !== 16 || a?.clipDeadlineMs !== 100)
     throw new Error('FD5 config cannot weaken the fixed B2 repetition, write, slot or clip deadline protocol');
-  for (const value of [c.clipCorpusChanges, c.interfaceCorpusPages, a?.C, a?.Q, a?.W, a?.interfaceDeadlineMs])
+  for (const value of [c.clipCorpusChanges, c.interfaceCorpusPages, a?.C, a?.interfaceDeadlineMs])
     if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error('FD5 config has an invalid positive bound');
+  for (const value of [a?.Q, a?.W])
+    if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error('FD5 config has an invalid queue/waiter bound');
   if ((c.clipCorpusChanges as number) < 8192 || (c.interfaceCorpusPages as number) < 8192)
     throw new Error('FD5 cold corpus must contain at least 8192 keys per workload');
   if ((a!.W as number) > (a!.Q as number)) throw new Error('W exceeds Q');
@@ -51,7 +57,7 @@ export function validateConfig(raw: unknown): FD5Config {
   return raw as FD5Config;
 }
 
-interface CorpusPage { expected: ExpectedInterfaceRequest; limit: 1 | 4 | 16 }
+export interface CorpusPage { expected: ExpectedInterfaceRequest; limit: 1 | 4 | 16 }
 interface Fixture { before: string; after: string; changes: unknown[]; extension: string; languageVersion: string }
 async function fixture(name: string): Promise<Fixture> {
   const root = new URL(`../contracts/interface/v2/cases/${name}/`, import.meta.url);
@@ -69,8 +75,11 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
   const swift = await fixture('swift-labels-defaults-effects');
   const pages: CorpusPage[] = [];
   for (let index = 0; index < pageCount; index++) {
-    const limit = [1, 4, 16][index % 3]! as 1 | 4 | 16;
-    const sessionId = randomUUID();
+    const limit = [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16;
+    const pageLanguage = LANGUAGES[index % LANGUAGES.length]!;
+    const sizeClass = Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative';
+    const idHex = createHash('sha256').update(`${seed}:session:${index}`).digest('hex');
+    const sessionId = `${idHex.slice(0, 8)}-${idHex.slice(8, 12)}-4${idHex.slice(13, 16)}-8${idHex.slice(17, 20)}-${idHex.slice(20, 32)}`;
     await mkdir(join(storeDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
     const log = await createLog({ filePath: join(storeDir, 'sessions', sessionId, 'events.jsonl'), sessionId });
     try {
@@ -78,11 +87,14 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
         data: { root: '/synthetic-fd5-corpus', max_bytes: 1024 * 1024 } });
       const files: Array<ExpectedFile & { beforeSize: number; afterSize: number }> = [];
       for (let j = 0; j < limit; j++) {
-        const language = LANGUAGES[(index + j) % LANGUAGES.length]!;
+        const language = pageLanguage;
         const source = language === 'swift' ? swift : ts;
+        const filler = sizeClass === 'representative' ? Array.from({ length: 96 }, (_, n) => language === 'swift'
+          ? `func fd5Filler${n}(x: Int) -> Int { x }\n`
+          : `function fd5Filler${n}(x: number): number { return x; }\n`).join('') : '';
         const path = `file-${String(j).padStart(2, '0')}.${language === 'tsx' ? 'tsx' : source.extension}`;
-        const before = await cas.put(Buffer.from(source.before));
-        const after = await cas.put(Buffer.from(`${source.after}// fd5 ${seed} ${index}:${j}\n`));
+        const before = await cas.put(Buffer.from(`${source.before}${filler}`));
+        const after = await cas.put(Buffer.from(`${source.after}${filler}// fd5 ${seed} ${index}:${j}\n`));
         files.push({ path, language: language === 'swift' ? 'swift' : 'typescript', languageVersion: source.languageVersion,
           beforeSha256: before.sha256, afterSha256: after.sha256, changes: source.changes,
           beforeSize: before.size, afterSize: after.size });
@@ -101,7 +113,9 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
         lastSeq = event.seq;
       }
       const key = createHash('sha256').update(JSON.stringify(files.map(f => [f.beforeSha256, f.afterSha256, f.language, f.languageVersion]))).digest('hex');
-      pages.push({ limit, expected: { key, language: LANGUAGES[index % LANGUAGES.length]!, sessionId,
+      const routeKey = `/v1/sessions/${sessionId}/interfaces?${new URLSearchParams({ before_seq: baseline.seq,
+        after_seq: lastSeq, limit: String(limit) })}`;
+      pages.push({ limit, expected: { key, routeKey, language: pageLanguage, sizeClass, sessionId,
         beforeSeq: baseline.seq, afterSeq: lastSeq,
         files: files.map(({ beforeSize: _a, afterSize: _b, ...file }) => file) } });
     } finally { await log.close(); }
@@ -113,10 +127,8 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
 async function requestInterface(url: string, token: string, page: CorpusPage): Promise<InterfaceAttempt> {
   const startedAtNs = process.hrtime.bigint();
   const requestId = randomUUID();
-  const query = new URLSearchParams({ before_seq: page.expected.beforeSeq, after_seq: page.expected.afterSeq,
-    limit: String(page.limit) });
   try {
-    const response = await fetch(`${url}/v1/sessions/${page.expected.sessionId}/interfaces?${query}`, {
+    const response = await fetch(`${url}${page.expected.routeKey}`, {
       headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
     const body: unknown = await response.json().catch(() => null);
     return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(),
@@ -126,9 +138,9 @@ async function requestInterface(url: string, token: string, page: CorpusPage): P
   }
 }
 
-interface InterfaceLoadSummary { attempts: InterfaceAttempt[]; maxConcurrentRequests: number;
+export interface InterfaceLoadSummary { attempts: InterfaceAttempt[]; maxConcurrentRequests: number;
   startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
-function startInterfaceLoad(url: string, token: string, corpus: CorpusPage[], slots: number): { stop: () => Promise<InterfaceLoadSummary> } {
+export function startInterfaceLoad(url: string, token: string, corpus: CorpusPage[], slots: number): { stop: () => Promise<InterfaceLoadSummary> } {
   const startedAtNs = process.hrtime.bigint();
   const attempts: InterfaceAttempt[] = [];
   let next = 0, submitted = 0, active = 0, maxConcurrentRequests = 0;
@@ -161,17 +173,55 @@ function startInterfaceLoad(url: string, token: string, corpus: CorpusPage[], sl
 
 const hash = (body: string): string => createHash('sha256').update(body).digest('hex');
 const encode = (value: unknown): string => JSON.stringify(value, (_key, v: unknown) => typeof v === 'bigint' ? v.toString() : v);
+function startLoadWorker(kind: 'clip', url: string, token: string, corpus: HistoricalChange[], slots: number):
+  { ready: Promise<void>; stop: () => Promise<LoadSummary> };
+function startLoadWorker(kind: 'interface', url: string, token: string, corpus: CorpusPage[], slots: number):
+  { ready: Promise<void>; stop: () => Promise<InterfaceLoadSummary> };
+function startLoadWorker(kind: 'clip' | 'interface', url: string, token: string,
+  corpus: HistoricalChange[] | CorpusPage[], slots: number) {
+  const worker = new Worker(new URL('./fd5-load-worker.ts', import.meta.url), {
+    workerData: { kind, url, token, corpus, slots },
+  });
+  let started = false, finished = false;
+  let readyResolve!: () => void, readyReject!: (error: Error) => void;
+  let stopResolve!: (value: LoadSummary | InterfaceLoadSummary) => void, stopReject!: (error: Error) => void;
+  let exitResolve!: () => void, exitReject!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  const stopped = new Promise<LoadSummary | InterfaceLoadSummary>((resolve, reject) => { stopResolve = resolve; stopReject = reject; });
+  const exited = new Promise<void>((resolve, reject) => { exitResolve = resolve; exitReject = reject; });
+  void stopped.catch(() => {});
+  void exited.catch(() => {});
+  worker.on('message', (message: { type: string; summary?: LoadSummary | InterfaceLoadSummary; error?: string }) => {
+    if (message.type === 'started') { started = true; readyResolve(); }
+    else if (message.type === 'summary' && message.summary) { finished = true; stopResolve(message.summary); }
+    else if (message.type === 'error') { finished = true; stopReject(new Error(message.error)); }
+  });
+  worker.on('error', error => { if (!started) readyReject(error); if (!finished) stopReject(error); });
+  worker.on('exit', code => {
+    if (!started) readyReject(new Error(`FD5 load worker exited before start (${code})`));
+    if (!finished) stopReject(new Error(`FD5 load worker exited without summary (${code})`));
+    if (code === 0) exitResolve(); else exitReject(new Error(`FD5 load worker exited ${code}`));
+  });
+  let stopping: Promise<LoadSummary | InterfaceLoadSummary> | undefined;
+  return { ready, stop: () => stopping ??= (async () => {
+    await ready;
+    worker.postMessage('stop');
+    const summary = await stopped;
+    // A completed response is not enough; prove this client worker actually exited.
+    await exited;
+    return summary;
+  })() };
+}
 async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus: Awaited<ReturnType<typeof createHistoricalCorpus>>,
   interfaceCorpus: CorpusPage[], config: FD5Config) {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-wt-'));
   let session: CaptureSession | undefined;
   let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
-  let clipLoad: ReturnType<typeof startContinuousLoad> | undefined;
-  let interfaceLoad: ReturnType<typeof startInterfaceLoad> | undefined;
+  let clipLoad: { ready: Promise<void>; stop: () => Promise<LoadSummary> } | undefined;
+  let interfaceLoad: { ready: Promise<void>; stop: () => Promise<InterfaceLoadSummary> } | undefined;
   let off: (() => void) | undefined;
   const hostBefore = hostSample();
   const durableAtNsBySeq = new Map<string, bigint>();
-  let cleaned = false;
   try {
     session = await startCapture({ root, storeDir });
     let highWater = BigInt(session.health.snapshot().durable_seq);
@@ -184,8 +234,9 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     server = await startReaderServer({ storeDir, active: { id: session.sessionId, health: session.health, logPath: session.logPath },
       projectionAdmissionConfig: { C: config.admission.C, Q: config.admission.Q, W: config.admission.W, D: config.admission.clipDeadlineMs },
       interfaceDeadlineMs: config.admission.interfaceDeadlineMs });
-    if (arm === 'clip-only' || arm === 'combined') clipLoad = startContinuousLoad(server.url, server.token, clipCorpus, config.requestSlots);
-    if (arm === 'interface-only' || arm === 'combined') interfaceLoad = startInterfaceLoad(server.url, server.token, interfaceCorpus, config.requestSlots);
+    if (arm === 'clip-only' || arm === 'combined') clipLoad = startLoadWorker('clip', server.url, server.token, clipCorpus, config.requestSlots);
+    if (arm === 'interface-only' || arm === 'combined') interfaceLoad = startLoadWorker('interface', server.url, server.token, interfaceCorpus, config.requestSlots);
+    await Promise.all([clipLoad?.ready, interfaceLoad?.ready]);
     const writerConfig: BenchmarkConfig = { repetitions: config.repetitions, scheduledWrites: config.scheduledWrites,
       scheduledIntervalMs: config.scheduledIntervalMs, burstWrites: config.burstWrites,
       concurrentClipRequests: config.requestSlots, corpusChanges: config.clipCorpusChanges };
@@ -197,7 +248,6 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     const records = await readRecords(session.logPath);
     await server.close(); server = undefined;
     await rm(root, { recursive: true, force: true });
-    cleaned = true;
     const writes = written.map(item => ({ path: item.path, sha256: hash(item.body), startedAtNs: BigInt(item.startedAtNs), phase: item.phase }));
     const capture = scoreCaptureArm({ name: (clips ? 'saturation' : arm) + ` repetition ${repetition + 1}`,
       writes, records, durableAtNsBySeq, clipResponses: clips?.responses ?? [], requestedClipKeys: clips?.requested ?? [],
@@ -205,7 +255,14 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
       coldCacheServerFresh: Boolean(clips), loadStartedAtNs: clips?.startedAtNs, loadStoppedAtNs: clips?.stoppedAtNs,
       corpusExhausted: clips?.corpusExhausted, attemptLimitReached: clips?.attemptLimitReached, drainTimedOut: !drained });
     const first = writes.reduce<bigint | undefined>((min, w) => min === undefined || w.startedAtNs < min ? w.startedAtNs : min, undefined);
-    const last = [...durableAtNsBySeq.values()].reduce<bigint | undefined>((max, n) => max === undefined || n > max ? n : max, undefined);
+    const expectedHashes = new Set(writes.map(w => `${w.path}\0${w.sha256}`));
+    const last = records.reduce<bigint | undefined>((max, record) => {
+      if (record.type !== 'slipstream.file.changed.v1') return max;
+      const data = record.data as { path?: string; after?: { kind?: string; sha256?: string } };
+      if (!expectedHashes.has(`${data.path}\0${data.after?.sha256}`)) return max;
+      const at = durableAtNsBySeq.get(record.seq);
+      return at !== undefined && (max === undefined || at > max) ? at : max;
+    }, undefined);
     const interfaceInput: InterfaceLoadInput | undefined = interfaces && first !== undefined && last !== undefined ? {
       ...interfaces, traces: [] as AdmissionTrace[], corpusKeys: interfaceCorpus.map(c => c.expected.key),
       freshServer: true, loadStartedAtNs: interfaces.startedAtNs, loadStoppedAtNs: interfaces.stoppedAtNs,
@@ -213,45 +270,89 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     } : undefined;
     const interfaceReport = interfaceInput ? scoreInterfaceLoad(interfaceInput) : null;
     return { arm, repetition: repetition + 1, host: { before: hostBefore, after: hostSample() },
-      capture, interface: interfaceReport, instrumentation: { admission: 'unavailable', phases: 'unavailable', actualExits: 'unavailable' },
-      cleanup: { captureStopped: drained, readerClosed: cleaned, processExitsVerified: false } };
+      capture, interface: interfaceReport,
+      cleanup: { captureStopCompleted: true, quietDrainObserved: drained, readerClosed: true,
+        worktreeRemoved: true, processExitsVerified: false },
+      raw: { writes, durableBoundaries: [...durableAtNsBySeq], clipResponses: clips?.responses ?? [],
+        interfaceAttempts: interfaces?.attempts.map(a => ({ requestId: a.requestId, key: a.expected.key,
+          routeKey: a.expected.routeKey, language: a.expected.language, sizeClass: a.expected.sizeClass,
+          startedAtNs: a.startedAtNs, completedAtNs: a.completedAtNs, httpStatus: a.httpStatus,
+          body: a.body, error: a.error, freshnessByPath: a.freshnessByPath })) ?? [],
+        admissionTraces: [] as AdmissionTrace[] } };
   } finally {
     await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
     off?.();
     await server?.close().catch(() => {});
     await session?.stop().catch(() => {});
-    if (!cleaned) await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   }
 }
 
 export async function runFD5(config: FD5Config, outputPath: string): Promise<void> {
-  const repository = resolve(new URL('..', import.meta.url).pathname);
+  const repository = await realpath(fileURLToPath(new URL('..', import.meta.url)));
+  const parentRepository = resolve(repository, '../..');
   const output = resolve(outputPath);
-  if (output === repository || output.startsWith(repository + sep)) throw new Error('FD5 output must be outside the repository');
+  const outputParent = await realpath(dirname(output));
+  const realOutput = join(outputParent, basename(output));
+  const within = (root: string): boolean => {
+    const candidate = process.platform === 'darwin' ? realOutput.toLowerCase() : realOutput;
+    const base = process.platform === 'darwin' ? root.toLowerCase() : root;
+    return candidate === base || candidate.startsWith(base + sep);
+  };
+  if (within(repository) || within(parentRepository)) throw new Error('FD5 output must be outside both worktrees');
+  if (execFileSync('git', ['status', '--porcelain'], { cwd: repository, encoding: 'utf8' }).trim())
+    throw new Error('FD5 measurement requires a clean committed harness');
   const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim();
   const configSha256 = createHash('sha256').update(JSON.stringify(config)).digest('hex');
-  const storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-store-'));
-  const reports: Awaited<ReturnType<typeof runArm>>[] = [];
+  const parserArtifacts = { typescript: createHash('sha256').update(verifyTypeScriptGrammarArtifact('typescript')).digest('hex'),
+    tsx: createHash('sha256').update(verifyTypeScriptGrammarArtifact('tsx')).digest('hex'), swift: SWIFT_V1 };
+  const outputFile = await open(output, 'ax', 0o600);
+  let storeDir: string | undefined;
+  const reports: Array<Omit<Awaited<ReturnType<typeof runArm>>, 'raw'>> = [];
   try {
+    await outputFile.appendFile(encode({ type: 'started', revision, config, configSha256,
+      node: process.version, platform: process.platform, osRelease: release(), arch: arch(), cpu: cpus()[0]?.model,
+      parserArtifacts }) + '\n');
+    await outputFile.sync();
+    storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-store-'));
     const clipCorpus = await createHistoricalCorpus(storeDir, config.clipCorpusChanges);
     const interfaceCorpus = await createInterfaceCorpus(storeDir, config.interfaceCorpusPages, config.seed);
     for (let repetition = 0; repetition < 3; repetition++) for (const arm of rotations[repetition]!) {
       const report = await runArm(arm, repetition, storeDir, clipCorpus, interfaceCorpus, config);
-      reports.push(report);
-      process.stderr.write(encode({ completed: `${arm} repetition ${repetition + 1}`, report }) + '\n');
+      const { raw, ...summary } = report;
+      reports.push(summary);
+      await outputFile.appendFile(encode({ type: 'arm', report }) + '\n');
+      await outputFile.sync();
+      process.stderr.write(encode({ completed: `${arm} repetition ${repetition + 1}`, capture: report.capture,
+        interface: report.interface }) + '\n');
     }
     const comparisons = reports.filter(r => r.arm !== 'baseline').map(report => {
       const baseline = reports.find(r => r.arm === 'baseline' && r.repetition === report.repetition)!;
       const sufficient = (report.arm === 'interface-only' ? true : report.capture.load.sufficient)
         && (report.arm === 'clip-only' ? true : (report.interface?.sufficient ?? false));
-      return compareCaptureToBaseline(baseline.capture, report.capture, report.arm, report.repetition, sufficient);
+      const runLevelReasons = [baseline, report].flatMap(r => [
+        ...(!r.cleanup.quietDrainObserved ? [`${r.arm} quiet drain timed out`] : []),
+        ...(!r.cleanup.processExitsVerified ? [`${r.arm} actual process exits unverified`] : []),
+      ]);
+      return compareCaptureToBaseline(baseline.capture, report.capture, report.arm, report.repetition, sufficient, runLevelReasons);
     });
-    const result = { protocol: 'FD5 four-arm recovery measurement', config, revision, configSha256,
-      node: process.version, platform: process.platform,
-      loadAverageAtFinish: loadavg(), freeMemoryAtFinish: freemem(), reports, comparisons,
-      validForD7: false, reason: 'correlated admission, phase, freshness and actual-exit runtime trace hooks are not integrated' };
-    await writeFile(output, encode(result) + '\n', { flag: 'wx', mode: 0o600 });
-  } finally { await rm(storeDir, { recursive: true, force: true }); }
+    const measuredGatesPass = comparisons.length === 9 && comparisons.every(c => c.passed)
+      && reports.every(r => r.cleanup.captureStopCompleted && r.cleanup.quietDrainObserved
+        && r.cleanup.readerClosed && r.cleanup.worktreeRemoved && r.cleanup.processExitsVerified);
+    const outstandingEvidence = ['bounded phase timing', 'trace overhead control', 'coalesced clip W diagnostic',
+      'owner-approved timeout and useful-throughput rates', 'owner-approved D7 configuration'];
+    await outputFile.appendFile(encode({ type: 'final', comparisons, measuredGatesPass,
+      d7Decision: 'pending', outstandingEvidence,
+      measurementStatus: measuredGatesPass ? 'further evidence required' : 'measurement gates failed' }) + '\n');
+    await outputFile.sync();
+  } catch (error) {
+    await outputFile.appendFile(encode({ type: 'failed', error: String(error), completedArms: reports.length }) + '\n');
+    await outputFile.sync();
+    throw error;
+  } finally {
+    if (storeDir) await rm(storeDir, { recursive: true, force: true });
+    await outputFile.close();
+  }
 }
 
 async function main(): Promise<void> {

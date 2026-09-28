@@ -1,12 +1,22 @@
 /** Pure FD5 evidence scorer. A ready HTTP page is not proof of admitted or fresh work. */
-import { scoreCaptureArm, type CaptureArmInput } from '../src/clip-bench.ts';
+import { isDeepStrictEqual } from 'node:util';
+import { scoreCaptureArm } from '../src/clip-bench.ts';
 
 export type Language = 'typescript' | 'tsx' | 'swift';
-export type Workload = 'clip' | 'interface';
 export type AdmissionOutcome = 'ok' | 'timeout' | 'overloaded' | 'cancelled' | 'closed' | 'error';
+/** Frozen test-only FD4 observer wire shape; see .context/fd5-trace-seam-handoff.md. */
+export type ProjectionTraceEvent =
+  | { kind: 'admission'; unitId: number; routeKey: string; workload: 'interface' | 'clip';
+      atNs: bigint; disposition: 'running' | 'queued' | 'waiting' | 'overloaded' }
+  | { kind: 'dispatch'; unitId: number; atNs: bigint }
+  | { kind: 'settle'; unitId: number; atNs: bigint;
+      priorState: 'running' | 'queued' | 'waiting' | 'overloaded'; outcome: AdmissionOutcome }
+  | { kind: 'interface-file'; routeKey: string; path: string; atNs: bigint;
+      freshness: 'fresh' | 'cache-hit' | 'none'; resultStatus: string };
 export interface AdmissionTrace {
-  requestId: string;
-  workload: Workload;
+  unitId: number;
+  routeKey: string;
+  workload: 'clip' | 'interface';
   submittedAtNs: bigint;
   admittedAtNs?: bigint;
   startedAtNs?: bigint;
@@ -26,7 +36,10 @@ export interface ExpectedFile {
 }
 export interface ExpectedInterfaceRequest {
   key: string;
+  /** Raw HTTP request target; repeated overload retries share this route key. */
+  routeKey: string;
   language: Language;
+  sizeClass: 'tiny' | 'representative';
   sessionId: string;
   beforeSeq: string;
   afterSeq: string;
@@ -40,8 +53,54 @@ export interface InterfaceAttempt {
   httpStatus?: number;
   body?: unknown;
   error?: string;
-  /** Test-only service observation, never inferred from HTTP readiness. */
-  freshness?: 'fresh' | 'cache-hit' | 'none';
+  /** Test-only per-file service observations, never inferred from HTTP readiness. */
+  freshnessByPath?: Record<string, 'fresh' | 'cache-hit' | 'none'>;
+}
+export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts: InterfaceAttempt[]):
+  { traces: AdmissionTrace[]; attempts: InterfaceAttempt[]; faults: string[] } {
+  const faults: string[] = [];
+  const units = new Map<number, { trace: Partial<AdmissionTrace>; disposition: 'running' | 'queued' | 'waiting' | 'overloaded'; settled: boolean }>();
+  const joinedAttempts = attempts.map(a => ({ ...a, freshnessByPath: { ...a.freshnessByPath } }));
+  for (const event of events) {
+    if (event.kind === 'admission') {
+      if (units.has(event.unitId)) { faults.push('duplicate admission unit'); continue; }
+      units.set(event.unitId, { disposition: event.disposition, settled: false,
+        trace: { unitId: event.unitId, routeKey: event.routeKey, workload: event.workload,
+          submittedAtNs: event.atNs,
+          ...(event.disposition === 'overloaded' ? {} : { admittedAtNs: event.atNs }),
+          ...(event.disposition === 'running' ? { startedAtNs: event.atNs } : {}) } });
+    } else if (event.kind === 'dispatch') {
+      const unit = units.get(event.unitId);
+      if (!unit || unit.settled || unit.disposition !== 'queued' || unit.trace.startedAtNs !== undefined) {
+        faults.push('invalid admission dispatch'); continue;
+      }
+      unit.trace.startedAtNs = event.atNs;
+    } else if (event.kind === 'settle') {
+      const unit = units.get(event.unitId);
+      if (!unit || unit.settled || (unit.disposition === 'overloaded' && event.outcome !== 'overloaded')) {
+        faults.push('invalid admission settlement'); continue;
+      }
+      const state = unit.disposition === 'queued' && unit.trace.startedAtNs !== undefined ? 'running' : unit.disposition;
+      if (event.priorState !== state) faults.push('admission settlement state mismatch');
+      unit.trace.settledAtNs = event.atNs;
+      unit.trace.outcome = event.outcome;
+      unit.settled = true;
+    } else {
+      const candidates = joinedAttempts.filter(a => a.expected.routeKey === event.routeKey
+        && a.startedAtNs <= event.atNs && event.atNs <= (a.completedAtNs ?? -1n));
+      if (candidates.length !== 1) { faults.push('interface-file event has no unique HTTP attempt'); continue; }
+      const target = candidates[0]!;
+      if (!target.expected.files.some(f => f.path === event.path)) { faults.push('interface-file event names unexpected path'); continue; }
+      if (target.freshnessByPath?.[event.path] !== undefined) { faults.push('duplicate interface-file event'); continue; }
+      target.freshnessByPath![event.path] = event.freshness;
+    }
+  }
+  const traces: AdmissionTrace[] = [];
+  for (const unit of units.values()) {
+    if (!unit.settled) { faults.push('admission unit has no settlement'); continue; }
+    traces.push(unit.trace as AdmissionTrace);
+  }
+  return { traces, attempts: joinedAttempts, faults };
 }
 export interface InterfaceLoadInput {
   attempts: InterfaceAttempt[];
@@ -67,10 +126,10 @@ const emptyCounts = (): Counts => ({ submitted: 0, rejected: 0, admitted: 0, que
   usefulComparisons: 0, cacheHits: 0, unclassified: 0, admittedTimeoutFraction: null,
   overloadFraction: 0, usefulPerSecond: 0 });
 const object = (x: unknown): Record<string, unknown> | null => x !== null && typeof x === 'object' && !Array.isArray(x) ? x as Record<string, unknown> : null;
-const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 const sha = (x: unknown): string | null => {
   const endpoint = object(x);
-  const snapshot = object(endpoint?.snapshot) ?? endpoint;
+  const snapshot = object(endpoint?.snapshot);
   return snapshot?.kind === 'content' && typeof snapshot.sha256 === 'string' ? snapshot.sha256 : null;
 };
 
@@ -107,7 +166,7 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
     }
   }
   // A complete ready page is an exhaustive claim. Interrupted pages retain only a prefix.
-  if (page.status === 'ready') {
+  if (page.status === 'ready' && object(page.page)?.complete === true) {
     for (const path of byPath.keys()) if (!seen.has(path)) faults.push(`missing file ${path}`);
     if (object(page.page)?.complete === true)
       for (const raw of page.files) if (object(raw)?.status !== 'ready') faults.push(`complete page has non-ready file ${String(object(raw)?.path)}`);
@@ -135,8 +194,18 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   const reasons: string[] = [];
   const byLanguage: Record<Language, Counts> = { typescript: emptyCounts(), tsx: emptyCounts(), swift: emptyCounts() };
   const total = emptyCounts();
-  const traces = new Map(input.traces.map(t => [t.requestId, t]));
-  if (traces.size !== input.traces.length) reasons.push('duplicate admission trace IDs');
+  const interfaceTraces = input.traces.filter(t => t.workload === 'interface');
+  const byRoute = new Map<string, AdmissionTrace[]>();
+  const unitIds = new Set<number>();
+  for (const trace of interfaceTraces) {
+    if (unitIds.has(trace.unitId)) reasons.push('duplicate admission unit ID');
+    unitIds.add(trace.unitId);
+    const group = byRoute.get(trace.routeKey) ?? [];
+    group.push(trace);
+    byRoute.set(trace.routeKey, group);
+  }
+  const matched = new Map<string, AdmissionTrace>();
+  const usedUnits = new Set<number>();
   const keys = new Set(input.corpusKeys);
   if (keys.size !== input.corpusKeys.length) reasons.push('cold corpus repeats a key');
   const ordered = [...input.attempts].sort((a, b) => a.startedAtNs < b.startedAtNs ? -1 : a.startedAtNs > b.startedAtNs ? 1 : 0);
@@ -147,24 +216,39 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   for (const attempt of ordered) {
     const counts = byLanguage[attempt.expected.language];
     counts.submitted++; total.submitted++;
+    const extension = attempt.expected.language === 'swift' ? '.swift'
+      : attempt.expected.language === 'tsx' ? '.tsx' : '.ts';
+    if (attempt.expected.files.some(file => !file.path.endsWith(extension)))
+      reasons.push('page language label mixes file languages or extensions');
     if (seenIds.has(attempt.requestId)) reasons.push('duplicate request ID');
     seenIds.add(attempt.requestId);
     if (!keys.has(attempt.expected.key)) reasons.push('request key is outside cold corpus');
     const previous = prior.get(attempt.expected.key);
     if (previous) {
-      const preceding = traces.get(previous.requestId);
+      const preceding = matched.get(previous.requestId);
       const priorPage = object(previous.body);
       if (preceding?.outcome !== 'overloaded' || priorPage?.status !== 'skipped' || priorPage.fallback_reason !== 'overloaded'
         || previous.completedAtNs === undefined || previous.completedAtNs > attempt.startedAtNs)
         reasons.push('cold key repeated without completed uncached overload');
     }
     prior.set(attempt.expected.key, attempt);
-    const trace = traces.get(attempt.requestId);
-    if (!trace || trace.workload !== 'interface' || trace.submittedAtNs < attempt.startedAtNs || trace.settledAtNs > (attempt.completedAtNs ?? -1n)) {
+    const candidates = (byRoute.get(attempt.expected.routeKey) ?? []).filter(trace =>
+      trace.submittedAtNs >= attempt.startedAtNs && trace.settledAtNs <= (attempt.completedAtNs ?? -1n));
+    const trace = candidates.length === 1 ? candidates[0] : undefined;
+    if (!trace || usedUnits.has(trace.unitId)) {
       counts.unclassified++; total.unclassified++;
       reasons.push('request lacks correlated admission outcome');
       continue;
     }
+    matched.set(attempt.requestId, trace);
+    usedUnits.add(trace.unitId);
+    if (trace.settledAtNs < trace.submittedAtNs
+      || (trace.admittedAtNs !== undefined && (trace.admittedAtNs < trace.submittedAtNs || trace.admittedAtNs > trace.settledAtNs))
+      || (trace.startedAtNs !== undefined && (trace.admittedAtNs === undefined || trace.startedAtNs < trace.admittedAtNs || trace.startedAtNs > trace.settledAtNs)))
+      reasons.push('admission trace timestamps are contradictory');
+    if ((trace.outcome === 'overloaded' && (trace.admittedAtNs !== undefined || trace.startedAtNs !== undefined))
+      || (trace.outcome !== 'overloaded' && trace.admittedAtNs === undefined))
+      reasons.push('admission trace disposition contradicts outcome');
     if (trace.outcome === 'overloaded') { counts.rejected++; total.rejected++; }
     else if (trace.admittedAtNs !== undefined) { counts.admitted++; total.admitted++; }
     else { counts.unclassified++; total.unclassified++; reasons.push('trace has no admission disposition'); }
@@ -186,9 +270,11 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
       const rows = page.files as Record<string, unknown>[];
       if (page.status === 'ready' && object(page.page)?.complete === true) { counts.completedPages++; total.completedPages++; }
       for (const row of rows) if (row.status === 'ready') { counts.completedFiles++; total.completedFiles++; }
-      if (attempt.freshness === 'cache-hit') { counts.cacheHits++; total.cacheHits++; }
-      if (attempt.freshness === 'fresh' && trace.startedAtNs !== undefined && trace.outcome === 'ok') {
-        const useful = rows.filter(row => row.status === 'ready' && Array.isArray(row.changes) && row.changes.length > 0).length;
+      const cacheHits = rows.filter(row => attempt.freshnessByPath?.[String(row.path)] === 'cache-hit').length;
+      counts.cacheHits += cacheHits; total.cacheHits += cacheHits;
+      if (trace.startedAtNs !== undefined && trace.outcome === 'ok') {
+        const useful = rows.filter(row => row.status === 'ready' && Array.isArray(row.changes)
+          && row.changes.length > 0 && attempt.freshnessByPath?.[String(row.path)] === 'fresh').length;
         counts.usefulComparisons += useful; total.usefulComparisons += useful;
       }
       // Partial rows may already be ready, but the request timed out in look-ahead.
@@ -200,7 +286,8 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
         reasons.push('overload trace disagrees with HTTP page');
     }
   }
-  if (input.attempts.length !== input.traces.length) reasons.push('admission trace count differs from request count');
+  if (input.attempts.length !== interfaceTraces.length || usedUnits.size !== interfaceTraces.length)
+    reasons.push('admission trace count differs from request count');
   const duration = Number(input.lastDurableAtNs - input.firstWriteAtNs) / 1e9;
   for (const counts of [...Object.values(byLanguage), total]) {
     counts.admittedTimeoutFraction = counts.admitted ? (counts.queueTimeout + counts.runningTimeout) / counts.admitted : null;
@@ -235,10 +322,11 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
       const end = input.firstWriteAtNs + span * BigInt(i + 1) / BigInt(windows);
       activityWindows.push({
         ready: intervals.filter(a => a.startedAtNs >= start && a.completedAtNs! <= end
-          && a.freshness === 'fresh' && traces.get(a.requestId)?.outcome === 'ok'
+          && matched.get(a.requestId)?.outcome === 'ok'
           && object(a.body)?.status === 'ready' && object(object(a.body)?.page)?.complete === true
-          && (object(a.body)?.files as unknown[] | undefined)?.some(row => object(row)?.status === 'ready' && (object(row)?.changes as unknown[] | undefined)?.length)).length,
-        overloaded: intervals.filter(a => a.completedAtNs! >= start && a.completedAtNs! < end && traces.get(a.requestId)?.outcome === 'overloaded').length,
+          && (object(a.body)?.files as unknown[] | undefined)?.some(row => object(row)?.status === 'ready'
+            && a.freshnessByPath?.[String(object(row)?.path)] === 'fresh' && (object(row)?.changes as unknown[] | undefined)?.length)).length,
+        overloaded: intervals.filter(a => a.completedAtNs! >= start && a.completedAtNs! < end && matched.get(a.requestId)?.outcome === 'overloaded').length,
       });
     }
   }
@@ -254,9 +342,10 @@ export interface FD5CaptureComparison {
   throughputCell: { baseline: number; loaded: number; minimum: number; passed: boolean };
 }
 export function compareCaptureToBaseline(baseline: ReturnType<typeof scoreCaptureArm>, loaded: ReturnType<typeof scoreCaptureArm>,
-  arm: string, repetition: number, loadSufficient: boolean): FD5CaptureComparison {
+  arm: string, repetition: number, loadSufficient: boolean, runLevelReasons: string[] = []): FD5CaptureComparison {
   const reasons: string[] = [];
   if (!loadSufficient) reasons.push('load insufficient');
+  reasons.push(...runLevelReasons);
   for (const report of [baseline, loaded]) {
     if (report.written !== 200 || report.scheduledLatency.n !== 100 || report.burstLatency.n !== 100)
       reasons.push('arm did not produce 100 scheduled and 100 burst durable writes');
@@ -279,6 +368,3 @@ export function compareCaptureToBaseline(baseline: ReturnType<typeof scoreCaptur
   if (!throughputCell.passed) reasons.push('throughput below 0.95x baseline');
   return { arm, repetition, passed: reasons.length === 0, reasons, latencyCells, throughputCell };
 }
-
-/** Reuse B2's durable capture scorer unchanged. */
-export const scoreFD5Capture = (input: CaptureArmInput) => scoreCaptureArm(input);
