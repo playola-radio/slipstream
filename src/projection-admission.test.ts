@@ -173,6 +173,27 @@ test('a request that expires while running is cancelled and settles timeout', as
   await budget.close();
 });
 
+test('an internal interface deadline does not extend clip running or queue wait', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 0, D: 100 });
+  const interfaceGate = gate();
+  let interfaceCancelled = false;
+  let queuedClipRan = false;
+  const interfaceWork = budget.admit<string>({ workload: 'interface', localConcurrency: 1,
+    deadlineMs: 250,
+    run: () => ({ promise: interfaceGate.promise, cancel: () => { interfaceCancelled = true; } }) });
+  const queuedClip = budget.admit<string>({ workload: 'clip', localConcurrency: 1,
+    run: () => { queuedClipRan = true; return { promise: Promise.resolve('clip'), cancel: () => {} }; } });
+  t.mock.timers.tick(101);
+  assert.deepEqual(await queuedClip, { kind: 'timeout' });
+  assert.equal(queuedClipRan, false);
+  assert.equal(interfaceCancelled, false);
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 0, waiters: 0 });
+  interfaceGate.resolve('interface');
+  assert.deepEqual(await interfaceWork, { kind: 'ok', value: 'interface' });
+  await budget.close();
+});
+
 test('coalesced waiters are bounded by W independently of Q', async () => {
   const budget = createProjectionAdmission({ C: 1, Q: 8, W: 2, D: 1000 });
   const g = gate();

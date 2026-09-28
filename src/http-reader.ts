@@ -23,6 +23,8 @@ export interface ReaderServerOptions {
   storeDir: string;
   /** Test seam only; the daemon uses the provisional D7 values. */
   projectionAdmissionConfig?: AdmissionConfig;
+  /** Test seam for measuring interface deadlines without relaxing clip's D. */
+  interfaceDeadlineMs?: number;
   /** Test seam for deterministic contract budget fixtures. */
   interfaceLimits?: Pick<InterfaceServiceOptions, 'fileResultBytes' | 'metadataBytes'>;
   /** Test seam for an isolated Swift host failure. */
@@ -92,7 +94,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION);
   const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission });
   const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
-    ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift });
+    ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
+    admissionDeadlineMs: opts.interfaceDeadlineMs });
 
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);

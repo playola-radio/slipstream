@@ -59,6 +59,22 @@ test('reader serves the public interface.v2 projection schema with authenticatio
   }
 });
 
+test('reader test seam extends only the interface deadline for an isolated Swift parse', async () => {
+  const { storeDir, request } = await fixture('swift-parameter-change');
+  const reader = await startReaderServer({ storeDir,
+    projectionAdmissionConfig: { C: 2, Q: 8, W: 8, D: 1 }, interfaceDeadlineMs: 2_000 });
+  try {
+    const response = await fetch(reader.url + request.slice(4), {
+      headers: { authorization: `Bearer ${reader.token}` },
+    });
+    assert.equal(response.status, 200);
+    const page = await response.json() as { status: string; files: { status: string; changes: unknown[] }[] };
+    assert.equal(page.status, 'ready');
+    assert.equal(page.files[0]?.status, 'ready');
+    assert.ok(page.files[0]?.changes.length);
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
 const HARNESS_ONLY = new Set(['range-admission-skipped', 'range-cancelled-mid-page',
   'range-deadline-mid-page', 'range-gap-cap', 'range-too-large-first-file',
   'range-scan-limit-before-file', 'range-deadline-before-file', 'range-cancelled-before-file']);

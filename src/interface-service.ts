@@ -50,6 +50,8 @@ export interface InterfaceRequest {
 export interface InterfaceServiceOptions {
   storeDir: string;
   admission: ProjectionAdmission;
+  /** Internal benchmark seam; absent uses shared admission D. */
+  admissionDeadlineMs?: number;
   scanBudget?: typeof SCAN;
   fileResultBytes?: number;
   metadataBytes?: number;
@@ -385,7 +387,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     };
     // The runner begins only after admission grants the local interface slot.
     // Progress remains outside admission's value, so a timeout retains finished rows.
-    const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1, signal: req.signal,
+    const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1,
+      deadlineMs: options.admissionDeadlineMs, signal: req.signal,
       run: () => {
         const task = run().catch(error => { failure = error; throw error; });
         active.add(task);

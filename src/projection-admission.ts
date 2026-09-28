@@ -33,6 +33,8 @@ export interface AdmitRequest<T> {
   workload: string;
   /** Max computes this workload may run at once (clip: 1 single worker). */
   localConcurrency: number;
+  /** Internal workload deadline; defaults to the shared D. Includes queue wait. */
+  deadlineMs?: number;
   /** Coalescing key; identical concurrent keys share one compute. Undefined never coalesces. */
   key?: string;
   /** Cancels this request when its HTTP consumer disconnects. */
@@ -127,7 +129,8 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   const pending = (): number => queue.length + waiters;
 
   const arm = (unit: Unit): void => {
-    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }), D);
+    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }),
+      Math.max(0, unit.deadlineAt - Date.now()));
     unit.timer.unref(); // a pending deadline must never hold the process open
   };
 
@@ -242,7 +245,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         run: req.run as () => ComputeHandle<unknown>,
         resolve: resolve as (outcome: AdmitOutcome<unknown>) => void,
         state: 'queued',
-        deadlineAt: Date.now() + D,
+        deadlineAt: Date.now() + (req.deadlineMs ?? D),
         timer: undefined,
         handle: undefined,
         signal: req.signal,
