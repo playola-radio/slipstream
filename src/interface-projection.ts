@@ -144,7 +144,7 @@ function exactKey(d: Declaration): string {
   return JSON.stringify([groupingKey(d.identity), d.signature]);
 }
 
-function hasDuplicate(decls: Declaration[]): boolean {
+export function hasDuplicate(decls: Declaration[]): boolean {
   const seen = new Set<string>();
   for (const d of decls) {
     const k = exactKey(d);
