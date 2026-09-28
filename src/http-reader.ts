@@ -17,12 +17,15 @@ import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-regist
 import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
 import { createInterfaceService, type InterfaceServiceOptions } from './interface-service.ts';
+import type { ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
 export interface ReaderServerOptions {
   storeDir: string;
   /** Test seam only; the daemon uses the provisional D7 values. */
   projectionAdmissionConfig?: AdmissionConfig;
+  /** Test-only, synchronous and nonreentrant observer; unset by the daemon. */
+  projectionTrace?: ProjectionTraceObserver;
   /** Test seam for measuring interface deadlines without relaxing clip's D. */
   interfaceDeadlineMs?: number;
   /** Test seam for deterministic contract budget fixtures. */
@@ -93,12 +96,13 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   // disposably (no log, no persistence). The service owns the worker pool + bounded
   // admission so a burst of cold-cache requests cannot starve capture; the server
   // closes it on shutdown.
-  const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION);
+  const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION,
+    opts.projectionTrace);
   const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission });
   const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
     ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
     onRetentionCheck: opts.interfaceOnRetentionCheck,
-    admissionDeadlineMs: opts.interfaceDeadlineMs });
+    admissionDeadlineMs: opts.interfaceDeadlineMs, projectionTrace: opts.projectionTrace });
 
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);
@@ -350,7 +354,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     try {
       const page = await interfaceService.get({ sessionId: id, logPath, durableSeq: H,
         beforeSeq, afterSeq, pathPrefix: prefix, afterPath: values.get('after_path') ?? null,
-        includeIdentical: identical === 'true', limit, signal: abort.signal });
+        includeIdentical: identical === 'true', limit, signal: abort.signal,
+        traceRouteKey: opts.projectionTrace ? req.url : undefined });
       if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
       if (!res.destroyed) sendJson(res, 200, page);
     } catch (error) {

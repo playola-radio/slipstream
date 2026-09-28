@@ -22,6 +22,8 @@
  * responsibility; the budget bounds admitted running work as a proxy.
  */
 
+import type { ProjectionTraceEvent, ProjectionTraceObserver } from './projection-trace.ts';
+
 export interface ComputeHandle<T> {
   promise: Promise<T>;
   /** Stop the running compute. Fire-and-forget; the budget never awaits it. */
@@ -37,6 +39,8 @@ export interface AdmitRequest<T> {
   deadlineMs?: number;
   /** Coalescing key; identical concurrent keys share one compute. Undefined never coalesces. */
   key?: string;
+  /** Test-only HTTP route identity. Unset for ordinary daemon/clip work. */
+  traceRouteKey?: string;
   /** Cancels this request when its HTTP consumer disconnects. */
   signal?: AbortSignal;
   /** Starts the compute; called once, when a running slot is granted. */
@@ -83,6 +87,7 @@ export const PROVISIONAL_SHARED_ADMISSION: AdmissionConfig = { C: 2, Q: 8, W: 8,
 type UnitState = 'running' | 'queued' | 'waiting' | 'settled';
 
 interface Unit {
+  traceId?: number;
   workload: string;
   localConcurrency: number;
   key?: string;
@@ -101,7 +106,7 @@ interface Flight {
   waiters: Set<Unit>;
 }
 
-export function createProjectionAdmission(config: AdmissionConfig): ProjectionAdmission {
+export function createProjectionAdmission(config: AdmissionConfig, trace?: ProjectionTraceObserver): ProjectionAdmission {
   const { C, Q, W, D } = config;
 
   let running = 0;
@@ -118,6 +123,16 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   const live = new Set<Unit>();
   let closed = false;
   let pumping = false;
+  let nextTraceId = 0;
+  const emit = (event: ProjectionTraceEvent): void => {
+    try { trace?.(event); } catch { /* observation cannot affect admission */ }
+  };
+  const admissionEvent = (unitId: number | undefined, routeKey: string | undefined,
+    workload: string, disposition: Extract<ProjectionTraceEvent, { kind: 'admission' }>['disposition']): void => {
+    if (unitId === undefined || routeKey === undefined || (workload !== 'interface' && workload !== 'clip')) return;
+    emit({ kind: 'admission', unitId, routeKey, workload,
+      atNs: process.hrtime.bigint(), disposition });
+  };
 
   const runningOf = (w: string): number => runningByWorkload.get(w) ?? 0;
   const incRunning = (w: string): void => { running++; runningByWorkload.set(w, runningOf(w) + 1); };
@@ -167,11 +182,14 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       if (unit.key !== undefined) inFlight.get(flightKey(unit.workload, unit.key))?.waiters.delete(unit);
     }
 
+    if (unit.traceId !== undefined) emit({ kind: 'settle', unitId: unit.traceId,
+      atNs: process.hrtime.bigint(), priorState: prev, outcome: outcome.kind });
     unit.resolve(outcome);
     pump();
   };
 
   const startCompute = (unit: Unit): void => {
+    if (unit.traceId !== undefined) emit({ kind: 'dispatch', unitId: unit.traceId, atNs: process.hrtime.bigint() });
     let handle: ComputeHandle<unknown>;
     try {
       handle = unit.run();
@@ -234,11 +252,20 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   };
 
   const admit = <T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
-    if (closed) return Promise.resolve({ kind: 'closed' });
-    if (req.signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
+    const traceId = trace && req.traceRouteKey !== undefined &&
+      (req.workload === 'interface' || req.workload === 'clip') ? ++nextTraceId : undefined;
+    const early = (kind: 'closed' | 'cancelled'): Promise<AdmitOutcome<T>> => {
+      admissionEvent(traceId, req.traceRouteKey, req.workload, kind);
+      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId,
+        atNs: process.hrtime.bigint(), priorState: kind, outcome: kind });
+      return Promise.resolve({ kind });
+    };
+    if (closed) return early('closed');
+    if (req.signal?.aborted) return early('cancelled');
     return new Promise<AdmitOutcome<T>>((resolve) => {
       const deadlineMs = req.deadlineMs ?? D;
       const unit: Unit = {
+        traceId,
         workload: req.workload,
         localConcurrency: req.localConcurrency,
         key: req.key,
@@ -259,13 +286,17 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       if (fk !== undefined) {
         const flight = inFlight.get(fk);
         if (flight) {
-          if (pending() >= Q || waiters >= W) { resolve({ kind: 'overloaded' }); return; }
+          if (pending() >= Q || waiters >= W) { admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
+            if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
+              priorState: 'overloaded', outcome: 'overloaded' });
+            resolve({ kind: 'overloaded' }); return; }
           waiters++;
           unit.state = 'waiting';
           flight.waiters.add(unit);
           arm(unit, deadlineMs);
           live.add(unit);
           req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+          admissionEvent(traceId, req.traceRouteKey, req.workload, 'waiting');
           return;
         }
       }
@@ -278,6 +309,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         arm(unit, deadlineMs);
         live.add(unit);
         req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+        admissionEvent(traceId, req.traceRouteKey, req.workload, 'running');
         startCompute(unit);
         return;
       }
@@ -288,8 +320,12 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         arm(unit, deadlineMs);
         live.add(unit);
         req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+        admissionEvent(traceId, req.traceRouteKey, req.workload, 'queued');
         return;
       }
+      admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
+      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
+        priorState: 'overloaded', outcome: 'overloaded' });
       resolve({ kind: 'overloaded' });
     });
   };

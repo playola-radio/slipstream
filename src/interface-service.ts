@@ -9,6 +9,7 @@ import { extractSwiftSides, SwiftExtractCancelled, SwiftExtractTimeout } from '.
 import { createTypeScriptPool } from './interface-ts-pool.ts';
 import type { StructuredChange } from './interface-v2-comparison.ts';
 import type { ProjectionAdmission } from './projection-admission.ts';
+import type { ProjectionTraceObserver } from './projection-trace.ts';
 
 const FILES_PER_PAGE = 16;
 const SIDE_BYTES = 1024 * 1024;
@@ -46,10 +47,13 @@ export interface InterfaceRequest {
   sessionId: string; logPath: string; durableSeq: bigint; beforeSeq: bigint; afterSeq: bigint;
   pathPrefix: string; afterPath: string | null; includeIdentical: boolean; limit: number;
   signal?: AbortSignal;
+  /** Test-only raw HTTP request target used to join trace events. */
+  traceRouteKey?: string;
 }
 export interface InterfaceServiceOptions {
   storeDir: string;
   admission: ProjectionAdmission;
+  projectionTrace?: ProjectionTraceObserver;
   /** Internal benchmark seam; absent uses shared admission D. */
   admissionDeadlineMs?: number;
   scanBudget?: typeof SCAN;
@@ -187,7 +191,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
   };
 
   async function compareFile(file: RangeFile, signal: AbortSignal, equalAndRetained: boolean,
-    progress: FileProgress): Promise<{ result: InterfaceFileResult; blobBytes: number }> {
+    progress: FileProgress): Promise<{ result: InterfaceFileResult; blobBytes: number;
+      freshness: 'fresh' | 'cache-hit' | 'none' }> {
     const language = languageFor(file.path);
     const base: InterfaceFileResult = { path: file.path, before: file.before, after: file.after,
       language: language?.name ?? null, language_version: language?.version ?? null,
@@ -196,7 +201,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     if (equalAndRetained) {
       progress.identical = true;
       base.status = 'identical';
-      return { result: base, blobBytes: 0 };
+      return { result: base, blobBytes: 0, freshness: 'none' };
     }
     const [before, after] = await Promise.all([
       readSide(options.storeDir, file.before, SIDE_BYTES).then(side => {
@@ -219,8 +224,9 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     const key = `${tag(file.before)}|${tag(file.after)}|${language?.name ?? 'unsupported'}|${language?.version ?? 'none'}|${language?.grammar ?? 'none'}|interface.v2`;
     if (!before.tooLarge && !after.tooLarge && before.coverage.state !== 'unavailable' && after.coverage.state !== 'unavailable') {
       const hit = cacheGet(key);
-      if (hit) return { result: { ...base, ...hit }, blobBytes };
+      if (hit) return { result: { ...base, ...hit }, blobBytes, freshness: 'cache-hit' };
     }
+    let freshness: 'fresh' | 'none' = 'none';
     let compareReason: string | undefined;
     let changes: InterfaceFileResult['changes'] = [];
     if (language?.name === 'typescript' && !before.tooLarge && !after.tooLarge &&
@@ -230,6 +236,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       signal.addEventListener('abort', task.cancel, { once: true });
       try {
         const result = await task.promise;
+        freshness = 'fresh';
         if (before.bytes !== null) base.coverage.before = result.before.status === 'incomplete'
           ? { state: 'incomplete', reason: result.before.reason }
           : result.before.status === 'tooLarge' ? { state: 'notEvaluated' } : { state: 'complete' };
@@ -248,6 +255,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         after.bytes !== null ? { id: 'after', bytes: after.bytes } : null].filter((v): v is { id: string; bytes: Uint8Array } => v !== null);
       const results = await (options.extractSwift ?? extractSwiftSides)(sides, { signal,
         limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
+      freshness = 'fresh';
       if (results.size !== sides.length) throw new Error('Swift extractor returned unexpected side count');
       for (const side of sides) if (!results.has(side.id)) throw new Error(`Swift extractor omitted ${side.id} side`);
       for (const side of sides) {
@@ -284,7 +292,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     Object.assign(base, disposition);
     base.changes = base.status === 'ready' ? changes : [];
     cacheSet(key, base);
-    return { result: base, blobBytes };
+    return { result: base, blobBytes, freshness };
   }
 
   const envelope = (req: InterfaceRequest): InterfacePage => ({
@@ -390,6 +398,11 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
           size = Buffer.byteLength(JSON.stringify(row));
         }
         page.files.push(row);
+        if (options.projectionTrace && req.traceRouteKey !== undefined) {
+          try { options.projectionTrace({ kind: 'interface-file', routeKey: req.traceRouteKey,
+            path: row.path, atNs: process.hrtime.bigint(), freshness: compared.freshness, resultStatus: row.status }); }
+          catch { /* observation cannot affect projection */ }
+        }
         fileBytes += size;
       }
       if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
@@ -418,7 +431,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     // The runner begins only after admission grants the local interface slot.
     // Progress remains outside admission's value, so a timeout retains finished rows.
     const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1,
-      deadlineMs: options.admissionDeadlineMs, signal: req.signal,
+      deadlineMs: options.admissionDeadlineMs, signal: req.signal, traceRouteKey: req.traceRouteKey,
       run: () => {
         const task = run().catch(error => { failure = error; throw error; });
         active.add(task);

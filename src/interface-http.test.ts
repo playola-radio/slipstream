@@ -11,6 +11,7 @@ import { startReaderServer } from './http-reader.ts';
 import { createInterfaceService } from './interface-service.ts';
 import type { SwiftSide } from './swift-interface.ts';
 import { createProjectionAdmission, type ProjectionAdmission, type AdmitRequest, type AdmitOutcome } from './projection-admission.ts';
+import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 const CASES = fileURLToPath(new URL('../contracts/interface/v2/cases/', import.meta.url));
 const FIXTURE_BUDGET = { C: 2, Q: 8, W: 8, D: 30_000 };
@@ -56,6 +57,100 @@ test('reader serves the public interface.v2 projection schema with authenticatio
       new URL('../contracts/interface/v2/schema.json', import.meta.url)), 'utf8'));
   } finally {
     await reader.close();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test('trace keeps overloaded HTTP bytes and separates repeated URL attempts', async () => {
+  const { storeDir, request } = await fixture('ts-parameter-change');
+  const path = request.slice(4);
+  const config = { C: 0, Q: 0, W: 0, D: 100 };
+  const events: ProjectionTraceEvent[] = [];
+  const traced = await startReaderServer({ storeDir, projectionAdmissionConfig: config,
+    projectionTrace: event => events.push(event) });
+  const plain = await startReaderServer({ storeDir, projectionAdmissionConfig: config });
+  try {
+    const get = (reader: typeof traced) => fetch(reader.url + path,
+      { headers: { authorization: `Bearer ${reader.token}` } });
+    const baseline = await (await get(plain)).text();
+    for (let i = 0; i < 2; i++) {
+      const response = await get(traced);
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), baseline);
+    }
+    const admissions = events.filter(e => e.kind === 'admission');
+    const settles = events.filter(e => e.kind === 'settle');
+    assert.equal(admissions.length, 2);
+    assert.equal(settles.length, 2);
+    assert.equal(admissions[0]!.routeKey, path);
+    assert.equal(admissions[1]!.routeKey, path);
+    assert.notEqual(admissions[0]!.unitId, admissions[1]!.unitId);
+    assert.ok(settles[0]!.atNs <= admissions[1]!.atNs);
+    assert.deepEqual(admissions.map(e => e.disposition), ['overloaded', 'overloaded']);
+  } finally {
+    await traced.close(); await plain.close();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test('trace attributes cache freshness separately to each returned file', async () => {
+  const { storeDir, request } = await fixture('range-page-boundary-first');
+  const path = request.slice(4);
+  const events: ProjectionTraceEvent[] = [];
+  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    projectionTrace: event => events.push(event) });
+  try {
+    const get = async (route: string) => {
+      const response = await fetch(reader.url + route,
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ files: { path: string }[] }>;
+    };
+    assert.deepEqual((await get(path)).files.map(f => f.path), ['src/a.ts']);
+    events.length = 0;
+    const both = path.replace('limit=1', 'limit=2');
+    assert.deepEqual((await get(both)).files.map(f => f.path), ['src/a.ts', 'src/b.ts']);
+    assert.deepEqual(events.filter(e => e.kind === 'interface-file').map(e =>
+      [e.routeKey, e.path, e.freshness, e.resultStatus]),
+    [[both, 'src/a.ts', 'cache-hit', 'ready'], [both, 'src/b.ts', 'fresh', 'ready']]);
+    const admission = events.find(e => e.kind === 'admission')!;
+    const settled = events.find(e => e.kind === 'settle')!;
+    assert.ok(events.filter(e => e.kind === 'interface-file').every(e =>
+      admission.atNs <= e.atNs && e.atNs <= settled.atNs));
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('trace marks unsupported and unavailable rows as having no fresh parse', async () => {
+  for (const name of ['py-unsupported-language', 'py-missing-blob-unsupported']) {
+    const { storeDir, request } = await fixture(name);
+    const events: ProjectionTraceEvent[] = [];
+    const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+      projectionTrace: event => events.push(event) });
+    try {
+      const response = await fetch(reader.url + request.slice(4),
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      assert.equal(response.status, 200);
+      const page = await response.json() as { files: { status: string }[] };
+      assert.equal(events.filter(e => e.kind === 'interface-file').length, page.files.length);
+      assert.deepEqual(events.filter(e => e.kind === 'interface-file').map(e => e.freshness), ['none']);
+    } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+  }
+});
+
+test('throwing trace collector leaves successful HTTP response bytes unchanged', async () => {
+  const { storeDir, request } = await fixture('ts-parameter-change');
+  const plain = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
+  const traced = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
+    projectionTrace: () => { throw new Error('collector failed'); } });
+  try {
+    const get = (reader: typeof plain) => fetch(reader.url + request.slice(4),
+      { headers: { authorization: `Bearer ${reader.token}` } });
+    const baseline = await get(plain);
+    const observed = await get(traced);
+    assert.equal(observed.status, baseline.status);
+    assert.equal(await observed.text(), await baseline.text());
+  } finally {
+    await traced.close(); await plain.close();
     await rm(storeDir, { recursive: true, force: true });
   }
 });
@@ -637,7 +732,9 @@ test('a late Swift result cannot change a timed-out page or populate its cache',
     [side.id, { status: 'complete', declarations: [] }]));
   let calls = 0;
   let firstSides: { id: string }[] = [];
+  const trace: ProjectionTraceEvent[] = [];
   const service = createInterfaceService({ storeDir, admission,
+    projectionTrace: event => trace.push(event),
     extractSwift: async sides => {
       calls++;
       if (calls === 1) {
@@ -648,17 +745,20 @@ test('a late Swift result cannot change a timed-out page or populate its cache',
       return complete(sides);
     } });
   try {
-    const timedOut = await service.get(req);
+    const timedOut = await service.get({ ...req, traceRouteKey: '/swift-retry' });
     assert.equal(timedOut.status, 'partial');
     assert.deepEqual(timedOut.files.map(file => [file.status, file.fallback_reason]), [['skipped', 'timeout']]);
     const frozen = structuredClone(timedOut);
     releaseLate!(complete(firstSides));
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(timedOut, frozen, 'late extraction changed the returned response');
+    assert.equal(trace.filter(event => event.kind === 'interface-file').length, 0,
+      'late extraction emitted a freshness event');
 
-    const retried = await service.get(req);
+    const retried = await service.get({ ...req, traceRouteKey: '/swift-retry' });
     assert.equal(retried.status, 'ready');
     assert.equal(calls, 2, 'cancelled extraction was reused from the cache');
+    assert.deepEqual(trace.filter(event => event.kind === 'interface-file').map(event => event.freshness), ['fresh']);
   } finally {
     releaseLate?.(new Map());
     await service.close();

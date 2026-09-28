@@ -5,6 +5,7 @@ import {
   type AdmitOutcome,
   type ComputeHandle,
 } from './projection-admission.ts';
+import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 // A test-only synthetic workload: a fake compute with a controllable resolution
 // and a cancel spy. It stands in for the future interface-projection service so
@@ -24,6 +25,101 @@ function gate(): Gate {
 function later(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+test('trace records distinct overload, dispatch, queue expiry and one terminal transition', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 40 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const first = budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/same', run });
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/queued', run });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/same', run }),
+    { kind: 'overloaded' });
+  t.mock.timers.tick(41);
+  assert.deepEqual(await first, { kind: 'timeout' });
+  assert.deepEqual(await queued, { kind: 'timeout' });
+  held.resolve('late');
+  await Promise.resolve();
+  const admissions = events.filter(e => e.kind === 'admission');
+  assert.deepEqual(admissions.map(e => e.disposition), ['running', 'queued', 'overloaded']);
+  assert.equal(new Set(admissions.map(e => e.unitId)).size, 3);
+  const dispatches = events.filter(e => e.kind === 'dispatch');
+  assert.deepEqual(dispatches.map(e => e.unitId), [admissions[0]!.unitId]);
+  const settles = events.filter(e => e.kind === 'settle');
+  assert.equal(settles.length, 3);
+  assert.deepEqual(settles.map(e => [e.priorState, e.outcome]),
+    [['overloaded', 'overloaded'], ['running', 'timeout'], ['queued', 'timeout']]);
+  for (const admission of admissions) {
+    const terminal = settles.find(e => e.unitId === admission.unitId)!;
+    assert.ok(terminal.atNs >= admission.atNs);
+  }
+  await budget.close();
+});
+
+test('trace records waiter cancellation and close without changing admission results', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 1, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const leader = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'K', traceRouteKey: '/leader', run });
+  const controller = new AbortController();
+  const waiter = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'K',
+    traceRouteKey: '/waiter', signal: controller.signal, run });
+  controller.abort();
+  assert.deepEqual(await waiter, { kind: 'cancelled' });
+  await budget.close();
+  assert.deepEqual(await leader, { kind: 'closed' });
+  assert.deepEqual(events.filter(e => e.kind === 'settle').map(e => [e.priorState, e.outcome]),
+    [['waiting', 'cancelled'], ['running', 'closed']]);
+  held.resolve('late');
+  await Promise.resolve();
+  assert.equal(events.filter(e => e.kind === 'settle').length, 2);
+});
+
+test('throwing trace observer cannot change admission outcome or release', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 }, () => { throw new Error('collector'); });
+  const outcome = await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/x', run: () => ({ promise: Promise.resolve('ok'), cancel: () => {} }) });
+  assert.deepEqual(outcome, { kind: 'ok', value: 'ok' });
+  assert.deepEqual(budget.snapshot(), { running: 0, queued: 0, waiters: 0 });
+  await budget.close();
+});
+
+test('trace gives pre-aborted and post-close calls terminal units without dispatch', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 }, event => events.push(event));
+  const controller = new AbortController();
+  controller.abort();
+  const run = () => ({ promise: Promise.resolve('never'), cancel: () => {} });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/aborted', signal: controller.signal, run }), { kind: 'cancelled' });
+  await budget.close();
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/closed', run }), { kind: 'closed' });
+  assert.deepEqual(events.map(e => e.kind), ['admission', 'settle', 'admission', 'settle']);
+  assert.deepEqual(events.filter(e => e.kind === 'admission').map(e => e.disposition), ['cancelled', 'closed']);
+  assert.deepEqual(events.filter(e => e.kind === 'settle').map(e => [e.priorState, e.outcome]),
+    [['cancelled', 'cancelled'], ['closed', 'closed']]);
+});
+
+test('trace dispatches a promoted leader once before its compute starts', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const first = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/first', run: () => ({ promise: held.promise, cancel: () => {} }) });
+  const second = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/second', run: () => ({ promise: Promise.resolve('second'), cancel: () => {} }) });
+  held.resolve('first');
+  assert.deepEqual(await Promise.all([first, second]), [{ kind: 'ok', value: 'first' }, { kind: 'ok', value: 'second' }]);
+  const queued = events.find(e => e.kind === 'admission' && e.routeKey === '/second')!;
+  assert.equal(queued.kind, 'admission');
+  const sequence = events.filter(e => 'unitId' in e && e.unitId === queued.unitId);
+  assert.deepEqual(sequence.map(e => e.kind), ['admission', 'dispatch', 'settle']);
+  assert.ok(sequence[0]!.atNs <= sequence[1]!.atNs && sequence[1]!.atNs <= sequence[2]!.atNs);
+  await budget.close();
+});
 
 test('an immediately runnable leader is admitted even when Q is 0', async () => {
   // Regression: a design that reserves a queue slot first would reject the very
