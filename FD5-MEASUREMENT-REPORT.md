@@ -1,8 +1,8 @@
-# FD5 admission measurement — failed preliminary run
+# FD5 admission measurement — failed preliminary runs
 
-**Status: no D7 production values approved. PR #44 stays draft.** This run does
-not satisfy FD5 and must not be used to claim capture safety or acceptable
-timeout rates. It ran on 2026-09-28 from the FD4 reader branch, with a test-only
+**Status: no D7 production values approved. PR #44 stays draft.** Neither run
+satisfies FD5 or establishes capture safety or acceptable timeout rates. The
+first ran on 2026-09-28 from the FD4 reader branch, with a test-only
 400 ms interface deadline. Clip retained its 100 ms deadline. The shared
 provisional capacity and queue were C=2, Q=8, W=8.
 
@@ -64,3 +64,32 @@ Per the repository's measurement rule, stop here with the failed gate recorded.
 The next measurement needs a quiet host and the remaining FD5 cases before
 Brian can approve C/Q/W/D and acceptable rates. The production reader still
 uses the provisional 100 ms deadline for both workloads.
+
+## Second run during the requested quiet window
+
+The same four-arm prototype ran again on 2026-09-28 at test-only interface
+`D=400 ms`, clip `D=100 ms`, and shared `C=2/Q=8/W=8`. It created a **new**
+benchmark-owned disposable store; the raw 12-arm report is in the ignored
+`.context/fd5-full-quiet-400.json`. The host was quieter at points, but sampled
+one-minute load averages at arm boundaries still ranged from 6.2 to 14.7 on
+the 10-logical-CPU Mac. The harness's missing FD5 cases and review gates listed
+above remain missing.
+
+| Gate | Second-run result |
+|---|---|
+| Capture writes | 2,400/2,400 observed; zero missing |
+| B2 paired capture bar | 8/9 loaded arms passed; interface-only repetition 3 failed scheduled-latency p99 at **1.34×** its baseline (limit 1.20×) |
+| Clip-only cold-load sufficiency | 0/3 passed; each had a time window without both a completed cold parse and overload |
+| Interface-only load sufficiency | 2/3 passed; repetition 2 hit the 100,000-request attempt cap |
+| Combined load sufficiency | 3/3 passed for clips and interfaces |
+
+Admitted Swift interface timeout counts were 125/152, 115/148 and 132/154 in
+interface-only arms (82.2%, 77.7%, 85.7%), and 135/138, 139/143 and 133/137
+in combined arms (97.8%, 97.2%, 97.1%). Overloaded requests are excluded from
+these denominators. No acceptable timeout-rate threshold has been approved.
+
+The improved capture ratios show that host conditions matter, but the failed
+capture arm, insufficient clip-only load, request-attempt cap and high Swift
+timeout rates prevent a D7 decision. Do not select new production values or
+claim FD5 complete from either run. Per the measurement rule, record the
+failure and stop; Brian must decide the next measurement or design direction.
