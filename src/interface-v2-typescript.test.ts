@@ -154,7 +154,7 @@ test('grammar loader rejects an artifact changed under typescript.v2', () => {
   assert.throws(() => verifyTypeScriptGrammarArtifact('typescript', '0'.repeat(64)), /hash mismatch/);
 });
 
-test('parser initialization consumes the exact runtime WASM bytes that were verified', async (t) => {
+test('parser initialization receives the exact runtime WASM bytes that were verified', async (t) => {
   const realInit = Parser.init.bind(Parser);
   let loadedBinary: Uint8Array | undefined;
   t.mock.method(Parser, 'init', async (options: Parameters<typeof Parser.init>[0]) => {
