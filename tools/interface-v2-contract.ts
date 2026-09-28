@@ -269,9 +269,9 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
     } else if (!['timeout', 'cancelled'].includes(i.reason as string)) {
       errors.push("history.harness.interrupt.reason: must be 'timeout' or 'cancelled'");
     } else if (i.phase !== undefined) {
-      if (i.phase !== 'resolve') errors.push("history.harness.interrupt.phase: must be 'resolve'");
       extraKeys(i, ['phase', 'reason'], 'history.harness.interrupt', errors);
-      if (i.phase === 'resolve') harness.interrupt = { phase: 'resolve', reason: i.reason as string };
+      if (i.phase !== 'resolve') errors.push("history.harness.interrupt.phase: must be 'resolve'");
+      else harness.interrupt = { phase: 'resolve', reason: i.reason as string };
     } else if (typeof i.at_path === 'string') {
       extraKeys(i, ['at_path', 'reason'], 'history.harness.interrupt', errors);
       harness.interrupt = { atPath: i.at_path, reason: i.reason as string };
@@ -290,6 +290,12 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
     harness.noScanBudget = l.scan_records !== undefined;
     harness.noFileResultBudget = l.file_result_bytes !== undefined;
     harness.noMetadataBudget = l.metadata_bytes !== undefined;
+  }
+  const preWork = Number(harness.admissionOverloaded) + Number(harness.noScanBudget)
+    + Number(harness.interrupt !== null && 'phase' in harness.interrupt);
+  if (preWork > 1 || preWork > 0 && (harness.noFileResultBudget || harness.noMetadataBudget
+    || harness.interrupt !== null && 'atPath' in harness.interrupt)) {
+    errors.push('history.harness: use one exclusive pre-work condition');
   }
   return harness;
 }

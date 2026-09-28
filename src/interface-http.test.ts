@@ -352,15 +352,20 @@ async function serviceRequest(name: string) {
   } };
 }
 
-for (const [name, reason] of [
-  ['range-scan-limit-before-file', 'scan-limit'],
-  ['range-deadline-before-file', 'timeout'],
-  ['range-cancelled-before-file', 'cancelled'],
-] as const) {
-  test(`pre-first-file ${reason} matches its recorded golden through the service`, async () => {
-    const { storeDir, req, expected } = await serviceRequest(name);
+for (const name of ['range-scan-limit-before-file', 'range-deadline-before-file',
+  'range-cancelled-before-file'] as const) {
+  test(`${name} matches its recorded golden through the service`, async () => {
+    const { storeDir, req, expected, harness: rawHarness } = await serviceRequest(name);
+    const harness = rawHarness as { limits?: { scan_records?: number };
+      interrupt?: { phase: string; reason: 'timeout' | 'cancelled' } };
+    const scan = harness.limits?.scan_records === 0;
+    const reason = harness.interrupt?.reason;
+    if (!scan) {
+      assert.equal(harness.interrupt?.phase, 'resolve');
+      assert.ok(reason === 'timeout' || reason === 'cancelled');
+    }
     const controller = new AbortController();
-    const admission: ProjectionAdmission = reason === 'scan-limit'
+    const admission: ProjectionAdmission = scan
       ? createProjectionAdmission(FIXTURE_BUDGET)
       : {
         admit: async <T>(request: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
@@ -375,11 +380,21 @@ for (const [name, reason] of [
         close: async () => {}, snapshot: () => ({ running: 0, queued: 0, waiters: 0 }),
       };
     const service = createInterfaceService({ storeDir, admission,
-      scanBudget: reason === 'scan-limit' ? { records: 0, bytes: 0 } : undefined });
+      scanBudget: scan ? { records: harness.limits!.scan_records!, bytes: 16 * 1024 * 1024 } : undefined });
     try { assert.deepEqual(await service.get({ ...req, signal: controller.signal }), expected); }
     finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
   });
 }
+
+test('an already-aborted request never starts resolution under real admission', async () => {
+  const { storeDir, req, expected } = await serviceRequest('range-cancelled-before-file');
+  const admission = createProjectionAdmission(FIXTURE_BUDGET);
+  const controller = new AbortController();
+  controller.abort();
+  const service = createInterfaceService({ storeDir, admission });
+  try { assert.deepEqual(await service.get({ ...req, signal: controller.signal }), expected); }
+  finally { await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
 
 test('mid-page cancellation preserves finished rows and advances after_path', async () => {
   const { storeDir, req, expected } = await serviceRequest('range-cancelled-mid-page');

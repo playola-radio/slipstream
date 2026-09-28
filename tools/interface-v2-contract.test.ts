@@ -152,6 +152,12 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('an unknown pre-first-file interrupt reason', /reason.*timeout.*cancelled/, (c) => {
     c.history.harness.interrupt.reason = 'overloaded';
   }, 'range-cancelled-before-file');
+  rejects('two pre-work conditions with undefined ordering', /one exclusive pre-work condition/, (c) => {
+    c.history.harness.interrupt = { phase: 'resolve', reason: 'cancelled' };
+  }, 'range-scan-limit-before-file');
+  rejects('a pre-work scan with an unreachable file interrupt', /one exclusive pre-work condition/, (c) => {
+    c.history.harness.interrupt = { at_path: 'never.ts', reason: 'timeout' };
+  }, 'range-scan-limit-before-file');
   rejects('evaluated inventory on pre-first-file timeout', /not evaluated/, (c) => {
     c.expected.inventory = { scope: 'observed', baseline_completed_seq: '3', unknown_scopes: [],
       unknown_scopes_complete: true, policy_exclusions: ['store-directory', '.git', 'symlinks'] };

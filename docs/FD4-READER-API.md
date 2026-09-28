@@ -59,7 +59,9 @@ change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
 - **Contract owner:** Brian approved the narrow pre-first-file harness extension.
   Three additional goldens cover scan-limit, deadline and cancellation during
   resolution; the validator now checks 69 cases with its negative control.
-  Each new case is replayed through the actual interface service.
+  A later interruption with no file row can also be `skipped`, retaining the
+  inventory and gaps already resolved; these goldens specify only the
+  pre-resolution outcome.
 - **Swift host crash:** The current v2 schema has no dedicated per-file status.
   An abnormal host exit is an internal text `500`; a reproducible crash on one
   file can block later paths on a page. A per-file recovery status would need a

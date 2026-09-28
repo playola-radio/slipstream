@@ -955,7 +955,15 @@ accepts: write them as the session's log, put `blobs` in the CAS, and leave
 - `missing_blobs` (optional): SHA-256s referenced by events whose CAS object
   is gone.
 - `harness` (optional): execution conditions a recorded history cannot express.
-  - `admission: "overloaded"`: the page is rejected before any file starts.
+  - `admission: "overloaded"`: the page is rejected before range resolution.
+  - `limits: { scan_records: 0 }`: the bounded recorded-log scan stops before
+    its first complete record, before inventory or gaps can be evaluated.
+  - `interrupt: { phase: "resolve", reason: "timeout" | "cancelled" }`:
+    interruption occurs during range resolution, before any file starts.
+    These three pre-work forms are mutually exclusive and cannot be combined
+    with another harness condition. Their page is `skipped` with no files,
+    `inventory: null`, `gaps: null`, `gaps_complete: false`, and an unchanged
+    `after_path` cursor. The record scan's deadline starts at admission.
   - `interrupt: { at_path, reason: "timeout" | "cancelled" }`: the deadline or
     cancellation hits while that file is being compared.
   - `limits: { file_result_bytes: 0, metadata_bytes: 0 }`: zeroes a ceiling.
@@ -983,8 +991,9 @@ on trust:
   including the first-change predecessor rule and unknown boundaries;
 - the page lists exactly the eligible paths in UTF-16 order (a record at or
   before `A`, inside `path_prefix` and past `after_path`, `identical` ones only
-  with `include_identical`), ended only by `limit`, an interrupt or a zero
-  file-result budget; `page.complete`, the cursor and the page `status` follow;
+  with `include_identical`), ended by `limit`, an interrupt, a zero
+  file-result budget, or a pre-work skip; `page.complete`, the cursor and the
+  page `status` follow;
 - each file's `status` and `fallback_reason` follow the §4.4 precedence from
   its endpoints, coverage, language and harness condition; each side's
   coverage matches what its endpoint forces (`absent`, `blob-missing`,
