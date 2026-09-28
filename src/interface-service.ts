@@ -9,7 +9,7 @@ import { extractSwiftSides, SwiftExtractCancelled, SwiftExtractTimeout } from '.
 import { createTypeScriptPool } from './interface-ts-pool.ts';
 import type { StructuredChange } from './interface-v2-comparison.ts';
 import type { ProjectionAdmission } from './projection-admission.ts';
-import type { ProjectionTraceObserver } from './projection-trace.ts';
+import { emitProjectionPhase, type ProjectionTraceObserver } from './projection-trace.ts';
 
 const FILES_PER_PAGE = 16;
 const SIDE_BYTES = 1024 * 1024;
@@ -95,7 +95,8 @@ const statusReason = (coverage: InterfaceFileResult['coverage'], language: strin
 
 type ReadSide = { coverage: Coverage; bytes: Uint8Array | null; tooLarge: boolean; readBytes: number };
 type FileProgress = { coverage?: InterfaceFileResult['coverage']; tooLarge: boolean; identical: boolean };
-async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number): Promise<ReadSide> {
+async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number,
+  trace?: ProjectionTraceObserver, traceUnitId?: number, path?: string): Promise<ReadSide> {
   const forced = sideFallback(endpoint);
   if (endpoint.kind === 'unknownBoundary' || endpoint.snapshot.kind !== 'content')
     return { coverage: forced, bytes: null, tooLarge: false, readBytes: 0 };
@@ -112,7 +113,9 @@ async function readSide(storeDir: string, endpoint: RangeEndpoint, limit: number
     if (stat.size > limit || endpoint.snapshot.size > limit)
       return { coverage: { state: 'notEvaluated' }, bytes: null, tooLarge: true, readBytes: 0 };
     const bytes = await handle.readFile();
+    const hashStartedAtNs = trace ? process.hrtime.bigint() : undefined;
     const digest = Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes)).toString('hex');
+    emitProjectionPhase(trace, 'cas-hash', hashStartedAtNs, { unitId: traceUnitId, path });
     if (bytes.length !== endpoint.snapshot.size || digest !== endpoint.snapshot.sha256)
       throw new Error('content-addressed blob does not match recorded snapshot');
     return { coverage: { state: 'notEvaluated' }, bytes, tooLarge: false, readBytes: bytes.length };
@@ -161,7 +164,7 @@ function boundedMetadata(source: { inventory: { scope: 'observed'; baselineCompl
 }
 
 export function createInterfaceService(options: InterfaceServiceOptions) {
-  const pool = createTypeScriptPool();
+  const pool = createTypeScriptPool(options.projectionTrace);
   const cache = new Map<string, { value: Pick<InterfaceFileResult, 'status' | 'fallback_reason' | 'coverage' | 'changes'>; bytes: number }>();
   let cachedBytes = 0;
   let closed = false;
@@ -191,7 +194,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
   };
 
   async function compareFile(file: RangeFile, signal: AbortSignal, equalAndRetained: boolean,
-    progress: FileProgress): Promise<{ result: InterfaceFileResult; blobBytes: number;
+    progress: FileProgress, traceUnitId?: number): Promise<{ result: InterfaceFileResult; blobBytes: number;
       freshness: 'fresh' | 'cache-hit' | 'none' }> {
     const language = languageFor(file.path);
     const base: InterfaceFileResult = { path: file.path, before: file.before, after: file.after,
@@ -203,13 +206,20 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       base.status = 'identical';
       return { result: base, blobBytes: 0, freshness: 'none' };
     }
+    const timedRead = async (endpoint: RangeEndpoint): Promise<ReadSide> => {
+      const startedAtNs = options.projectionTrace ? process.hrtime.bigint() : undefined;
+      try { return await readSide(options.storeDir, endpoint, SIDE_BYTES,
+        options.projectionTrace, traceUnitId, file.path); }
+      finally { emitProjectionPhase(options.projectionTrace, 'cas-read', startedAtNs,
+        { unitId: traceUnitId, path: file.path }); }
+    };
     const [before, after] = await Promise.all([
-      readSide(options.storeDir, file.before, SIDE_BYTES).then(side => {
+      timedRead(file.before).then(side => {
         base.coverage.before = side.coverage;
         progress.tooLarge ||= side.tooLarge;
         return side;
       }),
-      readSide(options.storeDir, file.after, SIDE_BYTES).then(side => {
+      timedRead(file.after).then(side => {
         base.coverage.after = side.coverage;
         progress.tooLarge ||= side.tooLarge;
         return side;
@@ -232,7 +242,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     if (language?.name === 'typescript' && !before.tooLarge && !after.tooLarge &&
       (before.bytes !== null || after.bytes !== null)) {
       const task = pool.run({ language: language.grammar!, before: before.bytes, after: after.bytes,
-        limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
+        limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } }, traceUnitId);
       signal.addEventListener('abort', task.cancel, { once: true });
       try {
         const result = await task.promise;
@@ -254,7 +264,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       const sides = [before.bytes !== null ? { id: 'before', bytes: before.bytes } : null,
         after.bytes !== null ? { id: 'after', bytes: after.bytes } : null].filter((v): v is { id: string; bytes: Uint8Array } => v !== null);
       const results = await (options.extractSwift ?? extractSwiftSides)(sides, { signal,
-        limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 } });
+        limits: { inputBytes: SIDE_BYTES, declarations: 4096, syntaxVisits: 100_000 },
+        trace: options.projectionTrace, traceUnitId });
       if (results.size !== sides.length) throw new Error('Swift extractor returned unexpected side count');
       for (const side of sides) if (!results.has(side.id)) throw new Error(`Swift extractor omitted ${side.id} side`);
       for (const side of sides) {
@@ -338,12 +349,15 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       page.page = { complete: false, next_after_path: page.files.at(-1)?.path ?? req.afterPath };
       return page;
     };
-    const run = async (): Promise<InterfacePage> => {
+    const run = async (traceUnitId?: number): Promise<InterfacePage> => {
       try {
+      const scanStartedAtNs = options.projectionTrace ? process.hrtime.bigint() : undefined;
       const result = await resolveRecordedRange({ logPath: req.logPath, sessionId: req.sessionId,
         durableSeq: req.durableSeq, beforeSeq: req.beforeSeq, afterSeq: req.afterSeq,
         pathPrefix: req.pathPrefix, afterPath: req.afterPath,
-        scanBudget: options.scanBudget ?? SCAN, signal: abort.signal });
+        scanBudget: options.scanBudget ?? SCAN, signal: abort.signal }).finally(() =>
+        emitProjectionPhase(options.projectionTrace, 'range-scan', scanStartedAtNs,
+          { unitId: traceUnitId, routeKey: req.traceRouteKey }));
       if (sealed) return page;
       if (result.kind === 'beyondDurable') throw new Error('range exceeded frozen durable boundary');
       if (result.kind === 'scanLimit') {
@@ -358,10 +372,16 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       let blobBytes = 0;
       let fileBytes = 0;
       let examined = req.afterPath;
+      const checkRetention = async (endpoint: RangeEndpoint, path: string): Promise<boolean> => {
+        const startedAtNs = options.projectionTrace ? process.hrtime.bigint() : undefined;
+        try { return await retainedContent(options.storeDir, endpoint); }
+        finally { emitProjectionPhase(options.projectionTrace, 'retention-probe', startedAtNs,
+          { unitId: traceUnitId, path }); }
+      };
       for (const file of result.files) {
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         if (page.files.length >= Math.min(req.limit, FILES_PER_PAGE)) break;
-        const equalAndRetained = file.endpointsEqual && await retainedContent(options.storeDir, file.before);
+        const equalAndRetained = file.endpointsEqual && await checkRetention(file.before, file.path);
         if (file.endpointsEqual) {
           const check = options.onRetentionCheck?.(file.path, 'scan');
           if (check) await check;
@@ -375,7 +395,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         current = file;
         currentProgress = { tooLarge: false, identical: false };
         options.onFileStart?.(file.path);
-        const compared = await compareFile(file, abort.signal, equalAndRetained, currentProgress);
+        const compared = await compareFile(file, abort.signal, equalAndRetained, currentProgress, traceUnitId);
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
         current = undefined;
         currentProgress = undefined;
@@ -415,7 +435,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
         if (!file.endpointsEqual || req.includeIdentical) {
           remaining = true; break;
         }
-        const retained = await retainedContent(options.storeDir, file.before);
+        const retained = await checkRetention(file.before, file.path);
         const check = options.onRetentionCheck?.(file.path, 'lookahead');
         if (check) await check;
         if (sealed || abort.signal.aborted) return sealed ? page : interruptPage('cancelled');
@@ -435,8 +455,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     // Progress remains outside admission's value, so a timeout retains finished rows.
     const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1,
       deadlineMs: options.admissionDeadlineMs, signal: req.signal, traceRouteKey: req.traceRouteKey,
-      run: () => {
-        const task = run().catch(error => { failure = error; throw error; });
+      run: traceUnitId => {
+        const task = run(traceUnitId).catch(error => { failure = error; throw error; });
         active.add(task);
         void task.finally(() => active.delete(task)).catch(() => {});
         return { promise: task, cancel: () => { sealed = true; abort.abort(); } };

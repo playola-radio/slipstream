@@ -11,9 +11,10 @@ import { Worker } from 'node:worker_threads';
 import { CLIP_PROJECTION_VERSION, type ClipProjection } from './clip-projection.ts';
 import type { ClipJob } from './clip-blob-reader.ts';
 import type { ClipWorkerRequest, ClipWorkerResponse } from './clip-projection-worker.ts';
+import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ClipComputeHandle { promise: Promise<ClipProjection>; cancel: () => void }
-export type ClipCompute = (job: ClipJob) => ClipComputeHandle;
+export type ClipCompute = (job: ClipJob, traceUnitId?: number) => ClipComputeHandle;
 
 export interface ClipWorkerPool { run: ClipCompute; close: () => Promise<void> }
 
@@ -29,8 +30,9 @@ function workerErrorResult(): ClipProjection {
   };
 }
 
-export function createClipWorkerPool(): ClipWorkerPool {
-  let current: { id: number; resolve: (v: ClipProjection) => void } | null = null;
+export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorkerPool {
+  let current: { id: number; traceUnitId?: number; startedAtNs?: bigint;
+    resolve: (v: ClipProjection) => void } | null = null;
   let jobId = 0;
   let closed = false;
   // Terminations started by cancel()/error (fire-and-forget from the caller's
@@ -40,25 +42,42 @@ export function createClipWorkerPool(): ClipWorkerPool {
   // only the current worker would let shutdown finish while the actual
   // CPU-heavy worker is still mid-terminate.
   const pendingTerminations = new Set<Promise<unknown>>();
+  const identities = new WeakMap<Worker, number>();
 
-  const trackTermination = (w: Worker): void => {
+  const trackTermination = (w: Worker, traceUnitId?: number): void => {
+    const processId = identities.get(w);
+    if (processId !== undefined && traceUnitId !== undefined)
+      emitProjectionTrace(trace, { kind: 'process-retire', processId, unitId: traceUnitId, atNs: process.hrtime.bigint() });
     const p = w.terminate().catch(() => {});
     pendingTerminations.add(p);
     p.finally(() => pendingTerminations.delete(p));
   };
 
   const spawn = (): Worker => {
+    const startedAtNs = trace ? process.hrtime.bigint() : undefined;
     const w = new Worker(WORKER_URL);
+    const processId = trace ? traceProcessId() : undefined;
+    if (processId !== undefined) {
+      identities.set(w, processId);
+      emitProjectionTrace(trace, { kind: 'process-start', processId, process: 'clip-worker', atNs: process.hrtime.bigint() });
+      w.once('online', () => emitProjectionPhase(trace, 'worker-startup', startedAtNs, { processId }));
+      w.on('exit', code => emitProjectionTrace(trace,
+        { kind: 'process-exit', processId, code, atNs: process.hrtime.bigint() }));
+    }
     w.on('message', (resp: ClipWorkerResponse) => {
       const cur = current;
       if (!cur || cur.id !== resp.id) return; // stale message from before a cancel
       current = null;
+      emitProjectionPhase(trace, 'worker-roundtrip', cur.startedAtNs, { unitId: cur.traceUnitId, processId });
+      if (resp.ok && trace && processId !== undefined && resp.traceTimings) for (const timing of resp.traceTimings)
+        emitProjectionTrace(trace, { kind: 'phase', phase: timing.phase, durationNs: timing.durationNs,
+          atNs: process.hrtime.bigint(), unitId: cur.traceUnitId, processId });
       cur.resolve(resp.ok ? resp.result : workerErrorResult());
     });
     w.on('error', () => {
       const cur = current;
       current = null;
-      trackTermination(w);
+      trackTermination(w, cur?.traceUnitId);
       if (!closed) worker = spawn();
       if (cur) cur.resolve(workerErrorResult());
     });
@@ -67,7 +86,7 @@ export function createClipWorkerPool(): ClipWorkerPool {
 
   let worker = spawn();
 
-  const run: ClipCompute = (job) => {
+  const run: ClipCompute = (job, traceUnitId) => {
     if (closed || current !== null) {
       // Admission should prevent this; fail safe rather than block.
       return { promise: Promise.resolve(workerErrorResult()), cancel: () => {} };
@@ -75,15 +94,16 @@ export function createClipWorkerPool(): ClipWorkerPool {
     let settled = false;
     const promise = new Promise<ClipProjection>((resolve) => {
       const id = ++jobId;
-      current = { id, resolve: (v) => { if (!settled) { settled = true; resolve(v); } } };
-      worker.postMessage({ id, job } satisfies ClipWorkerRequest);
+      current = { id, traceUnitId, startedAtNs: trace ? process.hrtime.bigint() : undefined,
+        resolve: (v) => { if (!settled) { settled = true; resolve(v); } } };
+      worker.postMessage({ id, job, ...(trace ? { traceTimings: true } : {}) } satisfies ClipWorkerRequest);
     });
     const cancel = () => {
       if (settled || current === null) return;
       current.resolve(workerErrorResult());
       current = null;
       const stale = worker;
-      trackTermination(stale);
+      trackTermination(stale, traceUnitId);
       if (!closed) worker = spawn();
     };
     return { promise, cancel };

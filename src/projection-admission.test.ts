@@ -42,6 +42,7 @@ test('trace records distinct overload, dispatch, queue expiry and one terminal t
   held.resolve('late');
   await Promise.resolve();
   const admissions = events.filter(e => e.kind === 'admission');
+  assert.deepEqual(events.filter(e => e.kind === 'task-finished').map(e => e.unitId), [admissions[0]!.unitId]);
   assert.deepEqual(admissions.map(e => e.disposition), ['running', 'queued', 'overloaded']);
   assert.equal(new Set(admissions.map(e => e.unitId)).size, 3);
   const dispatches = events.filter(e => e.kind === 'dispatch');
@@ -145,7 +146,7 @@ test('trace dispatches a promoted leader once before its compute starts', async 
   const queued = events.find((e): e is Extract<ProjectionTraceEvent, { kind: 'admission' }> =>
     e.kind === 'admission' && e.routeKey === '/second')!;
   const sequence = events.filter(e => 'unitId' in e && e.unitId === queued.unitId);
-  assert.deepEqual(sequence.map(e => e.kind), ['admission', 'dispatch', 'settle']);
+  assert.deepEqual(sequence.map(e => e.kind), ['admission', 'dispatch', 'task-finished', 'settle']);
   assert.ok(sequence[0]!.atNs <= sequence[1]!.atNs && sequence[1]!.atNs <= sequence[2]!.atNs);
   await budget.close();
 });

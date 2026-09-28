@@ -17,7 +17,7 @@ import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-regist
 import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
 import { createInterfaceService, type InterfaceServiceOptions } from './interface-service.ts';
-import type { ProjectionTraceObserver } from './projection-trace.ts';
+import { emitProjectionPhase, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
 export interface ReaderServerOptions {
@@ -58,8 +58,16 @@ function send(res: ServerResponse, status: number, body: string | Buffer, header
   res.writeHead(status, { 'cache-control': 'no-store', ...headers });
   res.end(body);
 }
-function sendJson(res: ServerResponse, status: number, value: unknown) {
-  send(res, status, JSON.stringify(value), { 'content-type': 'application/json; charset=utf-8' });
+function sendJson(res: ServerResponse, status: number, value: unknown,
+  trace?: { observer: ProjectionTraceObserver; routeKey: string }) {
+  const startedAtNs = trace ? process.hrtime.bigint() : undefined;
+  const body = JSON.stringify(value);
+  emitProjectionPhase(trace?.observer, 'serialization', startedAtNs, { routeKey: trace?.routeKey });
+  if (!trace) { send(res, status, body, { 'content-type': 'application/json; charset=utf-8' }); return; }
+  const writeStartedAtNs = process.hrtime.bigint();
+  res.writeHead(status, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' });
+  res.end(body, () => emitProjectionPhase(trace.observer, 'http-completion', writeStartedAtNs,
+    { routeKey: trace.routeKey }));
 }
 
 function isFollow(params: URLSearchParams): boolean {
@@ -98,7 +106,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   // closes it on shutdown.
   const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION,
     opts.projectionTrace);
-  const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission });
+  const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission,
+    projectionTrace: opts.projectionTrace });
   const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
     ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
     onRetentionCheck: opts.interfaceOnRetentionCheck,
@@ -173,7 +182,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     }
     const clipsMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/changes\/([0-9]+)\/clips$/);
     if (clipsMatch) {
-      await handleClips(res, decodeURIComponent(clipsMatch[1]!), clipsMatch[2]!);
+      await handleClips(res, decodeURIComponent(clipsMatch[1]!), clipsMatch[2]!,
+        opts.projectionTrace ? req.url : undefined);
       return;
     }
     const interfacesMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/interfaces$/);
@@ -252,7 +262,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     return staticBoundary(await onDiskHighWater(sessionLogPath(opts.storeDir, id)));
   }
 
-  async function handleClips(res: ServerResponse, id: string, seqStr: string): Promise<void> {
+  async function handleClips(res: ServerResponse, id: string, seqStr: string,
+    traceRouteKey?: string): Promise<void> {
     if (!isValidSessionId(id)) { send(res, 404, 'not found'); return; }
     if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
     const logPath = sessionLogPath(opts.storeDir, id);
@@ -308,8 +319,9 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     // status with a reason, served as a normal 200. The HTTP status reports whether
     // the request succeeded, not whether the content is still retained.
     const projection = await clipService.get({ changeSeq: seqStr, before, after,
-      language: languageForPath(path) });
-    sendJson(res, 200, projection);
+      language: languageForPath(path), traceRouteKey });
+    sendJson(res, 200, projection, opts.projectionTrace && traceRouteKey
+      ? { observer: opts.projectionTrace, routeKey: traceRouteKey } : undefined);
   }
 
   async function handleInterfaces(req: IncomingMessage, res: ServerResponse, id: string,
@@ -357,7 +369,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
         includeIdentical: identical === 'true', limit, signal: abort.signal,
         traceRouteKey: opts.projectionTrace ? req.url : undefined });
       if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
-      if (!res.destroyed) sendJson(res, 200, page);
+      if (!res.destroyed) sendJson(res, 200, page, opts.projectionTrace && req.url
+        ? { observer: opts.projectionTrace, routeKey: req.url } : undefined);
     } catch (error) {
       if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
       throw error;

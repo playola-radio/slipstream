@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { SWIFT_UNISOLATED_ENV } from '../src/swift-grammar.ts';
 import type { HostRequest, HostResult } from './swift-parse-host.ts';
+import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from '../src/projection-trace.ts';
 
 export const SWIFT_CORPUS_DIR = fileURLToPath(new URL('../contracts/swift-syntax/v1/', import.meta.url));
 const HOST_PATH = fileURLToPath(new URL('./swift-parse-host.ts', import.meta.url));
@@ -43,6 +44,8 @@ export class SwiftChildError extends Error {
 interface RunChildOpts {
   deadlineMs?: number;
   signal?: AbortSignal;
+  trace?: ProjectionTraceObserver;
+  traceUnitId?: number;
   /** Default true. Set false ONLY for the negative control that proves the
    * default launch aborts (the child is expected to crash). This also passes the
    * isolation-guard escape env so the child reaches the load before aborting. */
@@ -83,7 +86,29 @@ async function runSwiftHost<T extends HostResult>(hostArgs: string[], input: str
   const unisolated = opts.liftoffOnly === false;
   const execArgv = unisolated ? [] : ['--liftoff-only'];
   const env = unisolated ? { ...process.env, [SWIFT_UNISOLATED_ENV]: '1' } : process.env;
+  const startedAtNs = opts.trace ? process.hrtime.bigint() : undefined;
   const child = spawn(process.execPath, [...execArgv, HOST_PATH, ...hostArgs], { stdio: ['pipe', 'pipe', 'pipe'], env });
+  const processId = opts.trace ? traceProcessId() : undefined;
+  if (processId !== undefined) {
+    let spawned = false;
+    child.once('spawn', () => {
+      spawned = true;
+      emitProjectionTrace(opts.trace, { kind: 'process-start', processId, process: 'swift-child',
+        ...(opts.traceUnitId === undefined ? {} : { unitId: opts.traceUnitId }), atNs: process.hrtime.bigint() });
+      emitProjectionPhase(opts.trace, 'worker-startup', startedAtNs, { processId, unitId: opts.traceUnitId });
+    });
+    child.once('error', () => {
+      if (!spawned) emitProjectionTrace(opts.trace, { kind: 'process-spawn-failed', processId,
+        ...(opts.traceUnitId === undefined ? {} : { unitId: opts.traceUnitId }), atNs: process.hrtime.bigint() });
+    });
+    child.once('close', (code, signal) => {
+      if (spawned) {
+        emitProjectionPhase(opts.trace, 'worker-roundtrip', startedAtNs, { processId, unitId: opts.traceUnitId });
+        emitProjectionTrace(opts.trace, { kind: 'process-exit', processId,
+          code, signal, atNs: process.hrtime.bigint() });
+      }
+    });
+  }
 
   let stdout = '';
   let stderr = '';

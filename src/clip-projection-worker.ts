@@ -10,17 +10,19 @@
 import { parentPort } from 'node:worker_threads';
 import { computeClipProjection, type ClipJob } from './clip-blob-reader.ts';
 
-export interface ClipWorkerRequest { id: number; job: ClipJob }
+export interface ClipWorkerRequest { id: number; job: ClipJob; traceTimings?: boolean }
 export type ClipWorkerResponse =
-  | { id: number; ok: true; result: import('./clip-projection.ts').ClipProjection }
+  | { id: number; ok: true; result: import('./clip-projection.ts').ClipProjection;
+      traceTimings?: Array<{ phase: string; durationNs: bigint }> }
   | { id: number; ok: false };
 
 if (!parentPort) throw new Error('clip-projection-worker must run as a worker thread');
 const port = parentPort;
 
 port.on('message', (msg: ClipWorkerRequest) => {
-  computeClipProjection(msg.job).then(
-    (result) => port.postMessage({ id: msg.id, ok: true, result } satisfies ClipWorkerResponse),
+  const traceTimings: Array<{ phase: string; durationNs: bigint }> | undefined = msg.traceTimings ? [] : undefined;
+  computeClipProjection(msg.job, traceTimings ? (phase, durationNs) => traceTimings.push({ phase, durationNs }) : undefined).then(
+    (result) => port.postMessage({ id: msg.id, ok: true, result, traceTimings } satisfies ClipWorkerResponse),
     () => port.postMessage({ id: msg.id, ok: false } satisfies ClipWorkerResponse),
   );
 });

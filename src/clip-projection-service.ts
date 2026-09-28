@@ -32,12 +32,15 @@ import { type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
 import { createProjectionAdmission, type ProjectionAdmission } from './projection-admission.ts';
 import type { ClipLanguage } from './clip-language.ts';
+import { emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ClipRequest {
   changeSeq: string;
   language?: ClipLanguage;
   before: ClipSnapshot;
   after: ClipSnapshot;
+  /** Test-only raw HTTP target used for admission correlation. */
+  traceRouteKey?: string;
 }
 
 export interface ClipProjectionService {
@@ -57,6 +60,7 @@ export interface ClipServiceOptions {
   cacheEntries?: number;
   cacheBytes?: number;
   deadlineMs?: number;
+  projectionTrace?: ProjectionTraceObserver;
 }
 
 // B1 runs exactly one clip worker (CPU stays off the capture path); concurrency
@@ -160,7 +164,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
   }
   const queueLimit = opts.queueLimit ?? DEFAULTS.queueLimit;
   const deadlineMs = opts.deadlineMs ?? DEFAULTS.deadlineMs;
-  const pool = opts.compute ? null : createClipWorkerPool();
+  const pool = opts.compute ? null : createClipWorkerPool(opts.projectionTrace);
   const compute: ClipCompute = opts.compute ?? pool!.run;
   const hasBlob = opts.hasBlob ?? ((sha256: string) =>
     access(blobPath(opts.storeDir, sha256), constants.F_OK).then(() => true, () => false));
@@ -179,7 +183,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
     Q: queueLimit,
     W: queueLimit,
     D: deadlineMs,
-  });
+  }, opts.projectionTrace);
   let closed = false;
 
   const stamp = (value: ClipProjection, changeSeq: string): ClipProjection =>
@@ -196,7 +200,11 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
 
     const hit = cache.get(key);
     if (hit) {
-      if (await blobsPresent(req)) return stamp(hit, req.changeSeq);
+      if (await blobsPresent(req)) {
+        if (req.traceRouteKey !== undefined) emitProjectionTrace(opts.projectionTrace,
+          { kind: 'clip-cache-bypass', routeKey: req.traceRouteKey, atNs: process.hrtime.bigint() });
+        return stamp(hit, req.changeSeq);
+      }
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
@@ -209,14 +217,15 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       workload: 'clip',
       localConcurrency: CONCURRENCY,
       key,
-      run: () => {
+      traceRouteKey: req.traceRouteKey,
+      run: traceUnitId => {
         isLeader = true;
         return compute({
           storeDir: opts.storeDir,
           before: req.before,
           after: req.after,
           opts: { changeSeq: req.changeSeq, language: req.language },
-        });
+        }, traceUnitId);
       },
     });
 

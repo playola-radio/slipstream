@@ -18,7 +18,7 @@ const WORKER_URL = new URL('./swift-parse-worker.ts', import.meta.url);
 
 export type HostRequest =
   | { op: 'parse'; source: string }
-  | { op: 'extract'; sides: { id: string; source: string }[]; limits?: SwiftLimits }
+  | { op: 'extract'; sides: { id: string; source: string }[]; limits?: SwiftLimits; traceTimings?: boolean }
   | { op: 'survive'; source: string; holdMs: number }
   | { op: 'measure'; sources: { label: string; source: string }[] }
   | { op: 'cancel-demo'; pathologicalSource: string; cleanSource: string };
@@ -30,7 +30,8 @@ interface ParseTimings {
 
 export type HostResult =
   | { op: 'parse'; provenance: ArtifactProvenance; result: SwiftParseResult; timings: ParseTimings }
-  | { op: 'extract'; results: { id: string; side: SwiftSide }[] }
+  | { op: 'extract'; results: { id: string; side: SwiftSide }[];
+      traceTimings?: { grammarLoadNs: number; parseCompareNs: number } }
   | { op: 'survive'; result: SwiftParseResult; heldMs: number }
   | { op: 'measure'; provenance: ArtifactProvenance; initAndLoadMs: number; parses: { label: string; byteLength: number; clean: boolean; firstParseMs: number; warmParseMs: number }[] }
   | { op: 'cancel-demo'; startedBeforeCancel: boolean; inProgressAtCancel: boolean; terminateMs: number; replacement: { clean: boolean; rootType: string } };
@@ -160,8 +161,12 @@ async function main(): Promise<number> {
   }
 
   if (request.op === 'extract') {
+    const parseStarted = request.traceTimings ? performance.now() : undefined;
     const results = request.sides.map(({ id, source }) => ({ id, side: extractSwiftSource(loaded.language, source, request.limits) }));
-    print({ op: 'extract', results });
+    print({ op: 'extract', results,
+      ...(parseStarted === undefined ? {} : { traceTimings: {
+        grammarLoadNs: Math.round(initAndLoadMs * 1e6),
+        parseCompareNs: Math.round((performance.now() - parseStarted) * 1e6) } }) });
     return 0;
   }
 

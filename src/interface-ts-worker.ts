@@ -9,11 +9,13 @@ export interface TypeScriptJob {
   before: Uint8Array | null;
   after: Uint8Array | null;
   limits?: TypeScriptLimits;
+  traceTimings?: boolean;
 }
 export type TypeScriptResult = {
   before: StructuredExtraction | { status: 'tooLarge' };
   after: StructuredExtraction | { status: 'tooLarge' };
   comparison: ReturnType<typeof compareStructuredExtractions> | null;
+  traceTimings?: { grammarLoadNs: bigint; parseCompareNs: bigint };
 };
 export type TypeScriptReply = { id: number; ok: true; result: TypeScriptResult } | { id: number; ok: false };
 
@@ -21,7 +23,9 @@ if (!parentPort) throw new Error('interface-ts-worker must run in a worker threa
 const port = parentPort;
 port.on('message', (job: TypeScriptJob) => {
   void (async () => {
+    const loadStarted = job.traceTimings ? process.hrtime.bigint() : undefined;
     const extract = await createTypeScriptInterfaceExtractor(job.language);
+    const parseStarted = job.traceTimings ? process.hrtime.bigint() : undefined;
     const side = (bytes: Uint8Array | null): StructuredExtraction | { status: 'tooLarge' } => {
       if (bytes === null) return { status: 'absent' };
       try { return extract(bytes, job.limits); }
@@ -34,7 +38,10 @@ port.on('message', (job: TypeScriptJob) => {
     const after = side(job.after);
     const comparison = before.status === 'tooLarge' || after.status === 'tooLarge'
       ? null : compareStructuredExtractions(before, after);
-    return { before, after, comparison };
+    return { before, after, comparison,
+      ...(loadStarted !== undefined && parseStarted !== undefined ? { traceTimings: {
+        grammarLoadNs: parseStarted - loadStarted,
+        parseCompareNs: process.hrtime.bigint() - parseStarted } } : {}) };
   })().then(
     result => port.postMessage({ id: job.id, ok: true, result } satisfies TypeScriptReply),
     () => port.postMessage({ id: job.id, ok: false } satisfies TypeScriptReply),

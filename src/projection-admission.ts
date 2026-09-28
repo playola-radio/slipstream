@@ -22,7 +22,7 @@
  * responsibility; the budget bounds admitted running work as a proxy.
  */
 
-import type { ProjectionTraceEvent, ProjectionTraceObserver } from './projection-trace.ts';
+import { emitProjectionTrace, type ProjectionTraceEvent, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ComputeHandle<T> {
   promise: Promise<T>;
@@ -44,7 +44,7 @@ export interface AdmitRequest<T> {
   /** Cancels this request when its HTTP consumer disconnects. */
   signal?: AbortSignal;
   /** Starts the compute; called once, when a running slot is granted. */
-  run: () => ComputeHandle<T>;
+  run: (traceUnitId?: number) => ComputeHandle<T>;
 }
 
 export type AdmitOutcome<T> =
@@ -91,7 +91,7 @@ interface Unit {
   workload: string;
   localConcurrency: number;
   key?: string;
-  run: () => ComputeHandle<unknown>;
+  run: (traceUnitId?: number) => ComputeHandle<unknown>;
   resolve: (outcome: AdmitOutcome<unknown>) => void;
   state: UnitState;
   deadlineAt: number;
@@ -124,12 +124,7 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
   let closed = false;
   let pumping = false;
   let nextTraceId = 0;
-  const emit = (event: ProjectionTraceEvent): void => {
-    try {
-      const returned = trace?.(event) as unknown;
-      if (returned instanceof Promise) void returned.catch(() => {});
-    } catch { /* observation cannot affect admission */ }
-  };
+  const emit = (event: ProjectionTraceEvent): void => emitProjectionTrace(trace, event);
   const admissionEvent = (unitId: number | undefined, routeKey: string | undefined,
     workload: string, disposition: Extract<ProjectionTraceEvent, { kind: 'admission' }>['disposition']): void => {
     if (unitId === undefined || routeKey === undefined || (workload !== 'interface' && workload !== 'clip')) return;
@@ -195,10 +190,14 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
 
   const startCompute = (unit: Unit): void => {
     if (unit.traceId !== undefined) emit({ kind: 'dispatch', unitId: unit.traceId, atNs: process.hrtime.bigint() });
+    const finished = (): void => {
+      if (unit.traceId !== undefined) emit({ kind: 'task-finished', unitId: unit.traceId, atNs: process.hrtime.bigint() });
+    };
     let handle: ComputeHandle<unknown>;
     try {
-      handle = unit.run();
+      handle = unit.run(unit.traceId);
     } catch {
+      finished();
       if (unit.state === 'settled') return; // reentrant settle already resolved it
       // A synchronous throw after the deadline is a timeout, mirroring the async path.
       if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
@@ -211,12 +210,13 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
     // rejection now that no handler is attached.
     if (unit.state === 'settled') {
       try { handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
-      handle.promise.catch(() => {});
+      handle.promise.then(finished, finished);
       return;
     }
     unit.handle = handle;
     handle.promise.then(
       (value) => {
+        finished();
         if (unit.state === 'settled') return; // late completion ignored
         // A finished result is never discarded for lateness: the deadline bounds
         // WAITING (its timer already fired 'timeout' if it elapsed), not completed
@@ -224,6 +224,7 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
         settle(unit, { kind: 'ok', value });
       },
       () => {
+        finished();
         if (unit.state === 'settled') return;
         // A rejection after the deadline is a timeout, not a worker error.
         if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
@@ -274,7 +275,7 @@ export function createProjectionAdmission(config: AdmissionConfig, trace?: Proje
         workload: req.workload,
         localConcurrency: req.localConcurrency,
         key: req.key,
-        run: req.run as () => ComputeHandle<unknown>,
+        run: req.run as (traceUnitId?: number) => ComputeHandle<unknown>,
         resolve: resolve as (outcome: AdmitOutcome<unknown>) => void,
         state: 'queued',
         deadlineAt: Date.now() + deadlineMs,
