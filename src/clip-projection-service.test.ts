@@ -167,6 +167,43 @@ test('coalesced clip waiters consume W and trace separately from their running l
   } finally { release(); await svc.close(); }
 });
 
+test('optional dispatch barrier holds one admitted clip leader while same-key waiters consume W', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    queueLimit: 2, deadlineMs: 1_000, dispatchBarrier: () => held,
+    compute: job => { computes++; return { promise: Promise.resolve(fallback(job.opts.changeSeq)), cancel: () => {} }; } });
+  const req = contentReq('1', 1);
+  try {
+    const leader = svc.get(req);
+    const waiterA = svc.get({ ...req, changeSeq: '2' });
+    const waiterB = svc.get({ ...req, changeSeq: '3' });
+    const rejected = await svc.get({ ...req, changeSeq: '4' });
+    assert.equal(rejected.fallback_reason, 'overloaded');
+    assert.equal(computes, 0, 'barrier must hold the actual worker dispatch');
+    release();
+    assert.deepEqual((await Promise.all([leader, waiterA, waiterB])).map(v => v.change_seq), ['1', '2', '3']);
+    assert.equal(computes, 1);
+  } finally { release(); await svc.close(); }
+});
+
+test('clip deadline includes the optional barrier and prevents late compute', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    deadlineMs: 10, dispatchBarrier: () => held,
+    compute: job => { computes++; return { promise: Promise.resolve(fallback(job.opts.changeSeq)), cancel: () => {} }; } });
+  try {
+    const result = await svc.get(contentReq('1', 1));
+    assert.equal(result.fallback_reason, 'timeout');
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(computes, 0);
+  } finally { release(); await svc.close(); }
+});
+
 test('a coalesced waiter does not redundantly re-write the leader\'s cache entry', async (t) => {
   // LruCache.set() is the only caller of JSON.stringify in this module's hot
   // path, so counting calls to it is a precise proxy for "how many times was

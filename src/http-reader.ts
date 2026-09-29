@@ -10,7 +10,7 @@ import {
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
 import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
 import { parseClipSnapshot } from './clip-blob-reader.ts';
-import { createClipProjectionService } from './clip-projection-service.ts';
+import { createClipProjectionService, type ClipServiceOptions } from './clip-projection-service.ts';
 import { languageForPath } from './clip-language.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
@@ -34,6 +34,8 @@ export interface ReaderServerOptions {
   interfaceExtractSwift?: InterfaceServiceOptions['extractSwift'];
   /** Test seam for interruption after a recorded content-retention probe. */
   interfaceOnRetentionCheck?: InterfaceServiceOptions['onRetentionCheck'];
+  /** Test-only delay after clip admission; unset in normal daemon operation. */
+  clipDispatchBarrier?: ClipServiceOptions['dispatchBarrier'];
   /** Standalone single-session view (`serve`). Ignored when {@link registry} is
    * given; internally it becomes a one-entry registry. */
   active?: ActiveSession;
@@ -108,7 +110,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION,
     opts.projectionTrace);
   const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission,
-    projectionTrace: opts.projectionTrace });
+    projectionTrace: opts.projectionTrace, dispatchBarrier: opts.clipDispatchBarrier });
   const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
     ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
     onRetentionCheck: opts.interfaceOnRetentionCheck,

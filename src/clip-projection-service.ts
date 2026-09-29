@@ -32,7 +32,7 @@ import { type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
 import { createProjectionAdmission, type ProjectionAdmission } from './projection-admission.ts';
 import type { ClipLanguage } from './clip-language.ts';
-import { emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
+import { emitProjectionPhase, emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ClipRequest {
   changeSeq: string;
@@ -61,6 +61,8 @@ export interface ClipServiceOptions {
   cacheBytes?: number;
   deadlineMs?: number;
   projectionTrace?: ProjectionTraceObserver;
+  /** Test-only delay after admission, before the clip worker starts. */
+  dispatchBarrier?: () => Promise<void>;
 }
 
 // B1 runs exactly one clip worker (CPU stays off the capture path); concurrency
@@ -220,14 +222,34 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       traceRouteKey: req.traceRouteKey,
       run: traceUnitId => {
         isLeader = true;
-        if (traceUnitId !== undefined) emitProjectionTrace(opts.projectionTrace,
-          { kind: 'parser-request', unitId: traceUnitId, atNs: process.hrtime.bigint() });
-        return compute({
+        const start = () => {
+          if (traceUnitId !== undefined) emitProjectionTrace(opts.projectionTrace,
+            { kind: 'parser-request', unitId: traceUnitId, atNs: process.hrtime.bigint() });
+          return compute({
           storeDir: opts.storeDir,
           before: req.before,
           after: req.after,
           opts: { changeSeq: req.changeSeq, language: req.language },
-        }, traceUnitId);
+          }, traceUnitId);
+        };
+        if (!opts.dispatchBarrier) return start();
+        const beganAtNs = opts.projectionTrace ? process.hrtime.bigint() : undefined;
+        let cancelBarrier!: (reason: Error) => void;
+        const cancelled = new Promise<never>((_resolve, reject) => { cancelBarrier = reject; });
+        let inner: ReturnType<ClipCompute> | undefined;
+        let wasCancelled = false;
+        const promise = Promise.race([Promise.resolve().then(opts.dispatchBarrier), cancelled]).then(() => {
+          if (wasCancelled) throw new Error('clip dispatch cancelled');
+          emitProjectionPhase(opts.projectionTrace, 'dispatch-barrier', beganAtNs,
+            { scope: 'clip', unitId: traceUnitId });
+          inner = start();
+          return inner.promise;
+        });
+        return { promise, cancel: () => {
+          wasCancelled = true;
+          cancelBarrier(new Error('clip dispatch cancelled'));
+          inner?.cancel();
+        } };
       },
     });
 
