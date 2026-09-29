@@ -703,7 +703,11 @@ so FD4 acceptance remains open. A preliminary FD5 four-arm run at a test-only
 400 ms interface deadline failed the paired capture and load-sufficiency gates
 (`FD5-MEASUREMENT-REPORT.md`); D7 production values remain unapproved. The
 bounded FD5 diagnostic driver and optional W barrier are implemented on FD4's
-draft branch, but no bounded diagnostics have been executed or approved yet.
+draft branch. A bounded smoke passed on 2026-09-29, but its v1 tracing-overhead
+mode exceeded the approved latency tolerance and stopped the sequence; the raw
+failure remains preserved. The revised v2 interface scorer is integrated for
+future diagnostics, with no v2 execution authorized. Observer cost, D7 values
+and FD4 acceptance remain open.
 The Swift fixture-backed view remains FS2's work, and FS3
 live wiring waits for this API. No success criterion or ratified decision changes.
 
