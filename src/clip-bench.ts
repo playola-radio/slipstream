@@ -199,20 +199,24 @@ export async function readRecords(path: string): Promise<AnyEvent[]> {
   return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line) as AnyEvent);
 }
 
-export async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
+export async function waitForQuietCapture(session: CaptureSession, signal?: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     let quietTimer = setTimeout(() => done(true), QUIET_MS);
     const deadline = setTimeout(() => done(false), DRAIN_TIMEOUT_MS);
     const off = session.health.subscribe(() => { clearTimeout(quietTimer); quietTimer = setTimeout(() => done(true), QUIET_MS); });
+    const onAbort = (): void => done(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
     function done(quiet: boolean): void {
       if (settled) return;
       settled = true;
       clearTimeout(quietTimer);
       clearTimeout(deadline);
+      signal?.removeEventListener('abort', onAbort);
       off();
       resolve(quiet);
     }
+    if (signal?.aborted) done(false);
   });
 }
 

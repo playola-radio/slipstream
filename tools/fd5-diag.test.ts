@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { describeDiagnosticMode, parseDiagnosticArgs, validateDiagnosticConfig } from './fd5-diag.ts';
-import { runBoundedDiagnostic, scoreDiagnosticOverhead } from './fd5-diag-run.ts';
+import { acquireWithin, executionApprovalFaults, runBoundedDiagnostic, scoreDiagnosticOverhead } from './fd5-diag-run.ts';
 import type { CaptureArmReport } from '../src/clip-bench.ts';
 
 const proposal = JSON.parse(await readFile(new URL('./fd5-diagnostic-config.json', import.meta.url), 'utf8')) as unknown;
@@ -49,13 +49,48 @@ test('execute refuses unset owner decisions before creating output or measuring'
     /owner execution decisions are incomplete/);
 });
 
+test('explicit approvals reject denial and expired windows without running a mode', () => {
+  const config = structuredClone(validateDiagnosticConfig(proposal));
+  config.approvalRequired = {
+    measurementWindow: { approved: true, hostVetoesApproved: true,
+      startUtc: '2026-09-28T00:00:00Z', endUtc: '2026-09-28T02:00:00Z' },
+    tracingOverheadTolerance: { approved: true,
+      maxCaptureLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 },
+      maxRequestLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 },
+      minCaptureThroughputRatio: 0.95, minReadyRatio: 0.95 },
+    diagnosticDeadlinePoints: { approved: true, interfaceMs: [400, 800],
+      conditional800: true, cellsAndCountsApproved: true },
+    wPressureRuntimeHook: { approved: true },
+    clipHistoricalComparison: { approved: true, treatment: 'historical-only' },
+  };
+  assert.deepEqual(executionApprovalFaults(config, Date.parse('2026-09-28T01:00:00Z')), []);
+  assert.match(executionApprovalFaults(config, Date.parse('2026-09-28T03:00:00Z')).join(' '), /window/);
+  config.approvalRequired.wPressureRuntimeHook = { approved: false };
+  assert.match(executionApprovalFaults(config, Date.parse('2026-09-28T01:00:00Z')).join(' '), /W runtime/);
+});
+
+test('late startup after a wall cap invokes ownership cleanup', async () => {
+  const controller = new AbortController();
+  let finish!: (value: number) => void;
+  const startup = new Promise<number>(resolve => { finish = resolve; });
+  const cleaned: number[] = [];
+  const pending = acquireWithin(startup, controller.signal, async value => { cleaned.push(value); });
+  controller.abort(new Error('cap'));
+  finish(7);
+  await assert.rejects(pending, /cap/);
+  assert.deepEqual(cleaned, [7]);
+});
+
 test('overhead comparison pairs off/on and on/off within each workload', () => {
-  const report = (p95: number): CaptureArmReport => ({ latency: { n: 100, p50: p95, p95, p99: p95 },
-    throughputPerSecond: 100 } as CaptureArmReport);
+  const report = (p95: number) => ({ capture: ({ latency: { n: 100, p50: p95, p95, p99: p95 },
+    throughputPerSecond: 100 } as CaptureArmReport), requestLatency: { n: 100, p50: p95, p95, p99: p95 } });
   const reports = [report(10), report(11), report(11), report(10), report(10), report(11), report(11), report(10)];
-  const tolerance = { maxLatencyRatio: { p50: 1.1, p95: 1.1, p99: 1.1 }, minThroughputRatio: 0.95 };
+  const tolerance = { approved: true as const,
+    maxCaptureLatencyRatio: { p50: 1.1, p95: 1.1, p99: 1.1 },
+    maxRequestLatencyRatio: { p50: 1.1, p95: 1.1, p99: 1.1 },
+    minCaptureThroughputRatio: 0.95, minReadyRatio: 0.95 };
   assert.equal(scoreDiagnosticOverhead(reports, tolerance).length, 4);
   assert(scoreDiagnosticOverhead(reports, tolerance).every(item => item.passed));
   assert(scoreDiagnosticOverhead(reports, { ...tolerance,
-    maxLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 } }).every(item => !item.passed));
+    maxRequestLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 } }).every(item => !item.passed));
 });

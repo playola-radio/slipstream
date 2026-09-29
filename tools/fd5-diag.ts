@@ -12,7 +12,7 @@ export interface DiagnosticConfig {
   protocol: string; seed: string; maxPreparationSeconds: number;
   admission: { C: number; Q: number; W: number; clipDeadlineMs: number;
     interfaceDeadlineMs: number; conditionalInterfaceDeadlineMs: number };
-  smoke: { repetitions: number; arms: string[]; scheduledWrites: number; burstWrites: number;
+  smoke: { scheduledWrites: number; burstWrites: number;
     clipSlots: number; interfaceSlots: number; coldKeysPerWorkload: number; maxArmSeconds: number;
     minRequestIntervalMs: number };
   overhead: { workloads: string[]; traceOrder: string[]; scheduledWritesPerArm: number;
@@ -21,15 +21,14 @@ export interface DiagnosticConfig {
   unqueued: { C: number; Q: number; W: number; observationsPerCell: number;
     cells: Array<{ language: 'typescript' | 'tsx' | 'swift'; size: 'tiny' | 'representative';
       files: 1 | 4 | 16; warmth: 'fresh-worker' | 'initialized-worker-new-content' | 'fresh-child' }>;
-    warmupRequests: number; cacheControlRequestsPerVariant: number; cacheControlPrerequisite: string;
-    conditionalSwiftRepeatTrigger: string; maxRequestsIncludingConditional: number; maxSecondsPerCell: number };
-  queue: { C: number; queueWaiterCells: Array<[number, number]>; repetitionsPerCell: number;
+    cacheControlRequestsPerVariant: number; maxRequestsIncludingConditional: number; maxSecondsPerCell: number };
+  queue: { queueWaiterCells: Array<[number, number]>; repetitionsPerCell: number;
     clipSlots: number; interfaceSlots: number; scheduledWritesPerCell: number;
     scheduledIntervalMs: number; burstWritesPerCell: number; coldKeysPerWorkload: number; maxAttemptsPerCell: number;
     maxCellSecondsIncludingDrain: number; minRequestIntervalMs: number };
   wPressure: { C: number; Q: number; waiterCaps: number[]; groupsPerCap: number;
-    leadersPerGroup: number; sameKeyWaitersPerGroup: number; maxBarrierMs: number;
-    maxSecondsPerCap: number; maxRequests: number; retries: number };
+    sameKeyWaitersPerGroup: number; maxBarrierMs: number;
+    maxSecondsPerCap: number; maxRequests: number };
   host: { preflightQuietSeconds: number; maxFiveMinuteLoadFractionOfPhysicalCores: number;
     maxSwapGrowthBytes: number; requireAcPower: boolean; requireNormalThermal: boolean;
     requireNoMemoryPressureWarning: boolean; sampleIntervalSeconds: number };
@@ -97,8 +96,8 @@ export function parseDiagnosticArgs(argv: string[]): { configPath: string; mode:
 
 export function describeDiagnosticMode(config: DiagnosticConfig, mode: DiagnosticMode): Record<string, number> {
   switch (mode) {
-    case 'smoke': return { arms: config.smoke.arms.length,
-      writes: config.smoke.arms.length * (config.smoke.scheduledWrites + config.smoke.burstWrites),
+    case 'smoke': return { arms: 2,
+      writes: 2 * (config.smoke.scheduledWrites + config.smoke.burstWrites),
       maxRequests: config.smoke.coldKeysPerWorkload * 2 };
     case 'overhead': return { arms: config.overhead.workloads.length * config.overhead.traceOrder.length,
       writes: config.overhead.workloads.length * config.overhead.traceOrder.length
@@ -107,7 +106,7 @@ export function describeDiagnosticMode(config: DiagnosticConfig, mode: Diagnosti
         * config.overhead.maxAttemptsPerArm };
     case 'unqueued': return { cells: config.unqueued.cells.length,
       measured: config.unqueued.cells.length * config.unqueued.observationsPerCell,
-      warmups: config.unqueued.warmupRequests,
+      warmups: config.unqueued.cells.filter(cell => cell.warmth === 'initialized-worker-new-content').length,
       cacheControlsMaximum: 3 * config.unqueued.cacheControlRequestsPerVariant,
       conditionalSwiftMaximum: config.unqueued.cells.filter(cell => cell.language === 'swift').length
         * config.unqueued.observationsPerCell,

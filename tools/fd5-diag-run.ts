@@ -1,14 +1,17 @@
 /** Deliberately separate from the registered 12-arm FD5 campaign. Raw diagnostic evidence only. */
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
-import { mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
+import { execFile, execFileSync } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { mkdtemp, open, realpath, rm } from 'node:fs/promises';
 import { arch, availableParallelism, cpus, loadavg, release, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createInterface as createLineReader } from 'node:readline';
+import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startCapture, type CaptureSession } from '../src/session.ts';
 import { startReaderServer } from '../src/http-reader.ts';
-import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
+import { createHistoricalCorpus, readRecords, runWriter, scoreCaptureArm, waitForQuietCapture,
   type BenchmarkConfig, type HistoricalChange, type WorkerWrite, type CaptureArmReport } from '../src/clip-bench.ts';
 import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
@@ -16,27 +19,38 @@ import { createInterfaceCorpus, type CorpusPage } from './fd5-bench.ts';
 import { assembleProjectionTrace, scoreClipTrace, scoreProcessStartupTiming, validateInterfacePage,
   type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
-import { startDiagnosticLoad, type DiagnosticLoad, type DiagnosticAttempt } from './fd5-diag-load.ts';
+import { startDiagnosticLoad, type DiagnosticLoad } from './fd5-diag-load.ts';
+import { startDiagnosticHttpClient } from './fd5-diag-http-client.ts';
 import type { DiagnosticConfig, DiagnosticMode } from './fd5-diag.ts';
 
 const encode = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) =>
   typeof item === 'bigint' ? item.toString() : item);
 const sha = (body: string | Uint8Array): string => createHash('sha256').update(body).digest('hex');
+interface DiagnosticLatency { n: number; p50: number | null; p95: number | null; p99: number | null }
+function latency(samples: number[]): DiagnosticLatency {
+  const sorted = samples.filter(Number.isFinite).sort((a, b) => a - b);
+  const at = (percent: number): number | null => sorted.length
+    ? sorted[Math.max(0, Math.ceil(sorted.length * percent / 100) - 1)]! : null;
+  return { n: sorted.length, p50: at(50), p95: at(95), p99: at(99) };
+}
 
 /** Every record is appended in order. Result/failure records are durably synced. */
 class Journal {
   private pending = Promise.resolve();
+  private fault: Error | undefined;
   private readonly file: Awaited<ReturnType<typeof open>>;
   constructor(file: Awaited<ReturnType<typeof open>>) { this.file = file; }
   record(value: unknown, durable = false): Promise<void> {
     const next = this.pending.then(async () => {
+      if (this.fault) return;
       await this.file.appendFile(encode(value) + '\n');
       if (durable) await this.file.sync();
-    });
+    }).catch(error => { this.fault = error instanceof Error ? error : new Error(String(error)); });
     this.pending = next;
     return next;
   }
-  async close(): Promise<void> { await this.pending; await this.file.close(); }
+  async assertHealthy(): Promise<void> { await this.pending; if (this.fault) throw this.fault; }
+  async close(): Promise<void> { await this.pending; await this.file.close(); if (this.fault) throw this.fault; }
 }
 
 function startCap(seconds: number): { signal: AbortSignal; expired: () => boolean; close: () => void } {
@@ -47,49 +61,57 @@ function startCap(seconds: number): { signal: AbortSignal; expired: () => boolea
 }
 async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) throw signal.reason;
-  return Promise.race([work, new Promise<never>((_, reject) =>
-    signal.addEventListener('abort', () => reject(signal.reason), { once: true }))]);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => { signal.removeEventListener('abort', onAbort); reject(signal.reason); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void work.then(value => { signal.removeEventListener('abort', onAbort); resolve(value); }, error => {
+      signal.removeEventListener('abort', onAbort); reject(error);
+    });
+  });
 }
 async function cleanupWithin<T>(work: Promise<T>): Promise<T> {
   return bounded(work, AbortSignal.timeout(5_000));
 }
-async function quietDrain(session: CaptureSession, signal: AbortSignal): Promise<boolean> {
-  return new Promise(resolve => {
-    let done = false;
-    let quietTimer: ReturnType<typeof setTimeout>;
-    const finish = (quiet: boolean): void => {
-      if (done) return;
-      done = true; clearTimeout(quietTimer); off(); signal.removeEventListener('abort', onAbort); resolve(quiet);
-    };
-    const onAbort = (): void => finish(false);
-    const off = session.health.subscribe(() => { clearTimeout(quietTimer); quietTimer = setTimeout(() => finish(true), 500); });
-    quietTimer = setTimeout(() => finish(true), 500);
-    signal.addEventListener('abort', onAbort, { once: true });
-    if (signal.aborted) finish(false);
-  });
+export async function acquireWithin<T>(work: Promise<T>, signal: AbortSignal,
+  cleanup: (value: T) => Promise<void>): Promise<T> {
+  try { return await bounded(work, signal); }
+  catch (error) {
+    if (signal.aborted) {
+      const lateCleanup = work.then(cleanup);
+      void lateCleanup.catch(() => {});
+      await cleanupWithin(lateCleanup).catch(() => {});
+    }
+    throw error;
+  }
 }
-
-function command(binary: string, args: string[]): string | null {
-  try { return execFileSync(binary, args, { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+const execFileAsync = promisify(execFile);
+async function command(binary: string, args: string[]): Promise<string | null> {
+  try { return (await execFileAsync(binary, args, { encoding: 'utf8', timeout: 2000,
+    maxBuffer: 64 * 1024 })).stdout.trim(); }
   catch { return null; }
 }
-function hostEvidence(config: DiagnosticConfig): { at: string; load5: number; physicalCores: number;
+async function hostEvidence(config: DiagnosticConfig): Promise<{ at: string; load5: number; physicalCores: number | null;
   acPower: boolean | null; normalThermal: boolean | null; noMemoryWarning: boolean | null;
-  swapUsedBytes: number | null; faults: string[] } {
-  const batt = command('pmset', ['-g', 'batt']);
-  const therm = command('pmset', ['-g', 'therm']);
-  const memory = command('memory_pressure', ['-Q']);
-  const swap = command('sysctl', ['vm.swapusage']);
+  swapUsedBytes: number | null; faults: string[] }> {
+  const [batt, therm, memoryLevel, swap, cores] = await Promise.all([
+    command('pmset', ['-g', 'batt']), command('pmset', ['-g', 'therm']),
+    command('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
+    command('sysctl', ['vm.swapusage']), command('sysctl', ['-n', 'hw.physicalcpu']),
+  ]);
   const used = swap?.match(/used\s*=\s*([\d.]+)([KMG])/i);
   const scale = used?.[2]?.toUpperCase() === 'G' ? 2 ** 30 : used?.[2]?.toUpperCase() === 'M' ? 2 ** 20 : 2 ** 10;
   const swapUsedBytes = used ? Math.round(Number(used[1]) * scale) : null;
   const load5 = loadavg()[1]!;
-  const physicalCores = Number(command('sysctl', ['-n', 'hw.physicalcpu'])) || availableParallelism();
+  const physicalCores = cores !== null && Number.isSafeInteger(Number(cores)) && Number(cores) > 0
+    ? Number(cores) : null;
   const acPower = batt === null ? null : batt.includes('AC Power');
-  const normalThermal = therm === null ? null : !/thermal level\s*:\s*[1-9]|CPU_Speed_Limit\s*=\s*(?!100\b)/i.test(therm);
-  const noMemoryWarning = memory === null ? null : !/critical|warning/i.test(memory);
+  const normalThermal = therm === null ? null :
+    therm.includes('No thermal warning level has been recorded') &&
+    therm.includes('No performance warning level has been recorded');
+  const noMemoryWarning = memoryLevel === null ? null : memoryLevel === '1';
   const faults = [
-    ...(load5 >= config.host.maxFiveMinuteLoadFractionOfPhysicalCores * physicalCores ? ['host load veto'] : []),
+    ...(physicalCores === null ? ['physical core count unverified'] :
+      load5 >= config.host.maxFiveMinuteLoadFractionOfPhysicalCores * physicalCores ? ['host load veto'] : []),
     ...(config.host.requireAcPower && acPower !== true ? ['AC power unverified or absent'] : []),
     ...(config.host.requireNormalThermal && normalThermal !== true ? ['normal thermal state unverified'] : []),
     ...(config.host.requireNoMemoryPressureWarning && noMemoryWarning !== true ? ['memory pressure unverified or warned'] : []),
@@ -99,9 +121,11 @@ function hostEvidence(config: DiagnosticConfig): { at: string; load5: number; ph
     noMemoryWarning, swapUsedBytes, faults };
 }
 async function preflight(config: DiagnosticConfig, journal: Journal): Promise<void> {
-  let first: ReturnType<typeof hostEvidence> | undefined;
+  let first: Awaited<ReturnType<typeof hostEvidence>> | undefined;
   for (let i = 0; i <= config.host.preflightQuietSeconds; i++) {
-    const sample = hostEvidence(config);
+    const sample = await hostEvidence(config);
+    const window = config.approvalRequired.measurementWindow as { endUtc: string };
+    if (Date.now() >= Date.parse(window.endUtc)) throw new Error('approved measurement window ended during preflight');
     if (!first) first = sample;
     const swapGrowth = first.swapUsedBytes !== null && sample.swapUsedBytes !== null
       ? sample.swapUsedBytes - first.swapUsedBytes : null;
@@ -115,35 +139,30 @@ async function preflight(config: DiagnosticConfig, journal: Journal): Promise<vo
 function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => Promise<string[]> } {
   const faults: string[] = [];
   let previousSwap: number | null = null;
-  const sample = (): void => {
-    const item = hostEvidence(config);
+  let previousSampleAt: bigint | undefined;
+  let pending = Promise.resolve();
+  const sample = async (): Promise<void> => {
+    const startedAt = process.hrtime.bigint();
+    if (previousSampleAt !== undefined && Number(startedAt - previousSampleAt) / 1e9 >
+      config.host.sampleIntervalSeconds * 1.5) faults.push('host sample interval exceeded');
+    previousSampleAt = startedAt;
+    const item = await hostEvidence(config);
+    const window = config.approvalRequired.measurementWindow as { endUtc: string };
+    if (Date.now() >= Date.parse(window.endUtc)) faults.push('approved measurement window ended');
     const hadPrevious = previousSwap !== null;
     const growth = hadPrevious && item.swapUsedBytes !== null ? item.swapUsedBytes - previousSwap! : null;
     previousSwap = item.swapUsedBytes;
     faults.push(...item.faults);
     if (hadPrevious && (growth === null || growth > config.host.maxSwapGrowthBytes))
       faults.push('host swap growth unknown or positive');
-    void journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
+    await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
   };
-  sample();
-  const timer = setInterval(sample, config.host.sampleIntervalSeconds * 1000);
-  return { stop: async () => { clearInterval(timer); await journal.record({ type: 'host-monitor-ended' });
+  const schedule = (): void => { pending = pending.then(sample).catch(error => { faults.push(`host sample: ${error}`); }); };
+  schedule();
+  const timer = setInterval(schedule, config.host.sampleIntervalSeconds * 1000);
+  return { stop: async () => { clearInterval(timer); await pending;
+    await journal.record({ type: 'host-monitor-ended' });
     return [...new Set(faults)]; } };
-}
-
-async function requestInterface(server: Awaited<ReturnType<typeof startReaderServer>>, page: CorpusPage,
-  timeoutMs: number, signal: AbortSignal): Promise<InterfaceAttempt> {
-  const startedAtNs = process.hrtime.bigint();
-  const requestId = sha(`${startedAtNs}:${page.expected.key}`).slice(0, 32);
-  try {
-    const response = await fetch(server.url + page.expected.routeKey, { headers: { authorization: `Bearer ${server.token}` },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
-    const body: unknown = await response.json().catch(() => null);
-    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(),
-      httpStatus: response.status, body };
-  } catch (error) {
-    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(), error: String(error) };
-  }
 }
 
 async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeDir: string,
@@ -151,10 +170,11 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
     name: string; clip: boolean; interfaces: boolean; trace: boolean; C: number; Q: number; W: number;
     interfaceDeadlineMs: number; scheduled: number; burst: number; intervalMs: number;
     clipSlots: number; interfaceSlots: number; maxAttempts: number; maxSeconds: number; minRequestIntervalMs: number;
-  }): Promise<{ valid: boolean; faults: string[]; capture: CaptureArmReport }> {
+  }): Promise<{ valid: boolean; faults: string[]; capture: CaptureArmReport;
+    requestLatency: DiagnosticLatency }> {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-wt-'));
   const cap = startCap(spec.maxSeconds);
-  const collector = createProjectionTraceCollector();
+  const collector = createProjectionTraceCollector(100_000);
   const written: WorkerWrite[] = [];
   const durableAtNsBySeq = new Map<string, bigint>();
   let session: CaptureSession | undefined, server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
@@ -167,7 +187,8 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
   let clipSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
   let interfaceSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
   try {
-    session = await bounded(startCapture({ root, storeDir }), cap.signal);
+    session = await acquireWithin(startCapture({ root, storeDir }), cap.signal,
+      late => late.stop());
     let highWater = BigInt(session.health.snapshot().durable_seq);
     off = session.health.subscribe(() => {
       const next = BigInt(session!.health.snapshot().durable_seq);
@@ -175,10 +196,11 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
       for (let seq = highWater + 1n; seq <= next; seq++) durableAtNsBySeq.set(seq.toString(), at);
       highWater = next;
     });
-    server = await bounded(startReaderServer({ storeDir,
+    server = await acquireWithin(startReaderServer({ storeDir,
       active: { id: session.sessionId, health: session.health, logPath: session.logPath },
       projectionAdmissionConfig: { C: spec.C, Q: spec.Q, W: spec.W, D: config.admission.clipDeadlineMs },
-      interfaceDeadlineMs: spec.interfaceDeadlineMs, ...(spec.trace ? { projectionTrace: collector.observe } : {}) }), cap.signal);
+      interfaceDeadlineMs: spec.interfaceDeadlineMs, ...(spec.trace ? { projectionTrace: collector.observe } : {}) }),
+    cap.signal, late => late.close());
     const loadOptions = { url: server.url, token: server.token, maxAttempts: spec.maxAttempts, sharedCount,
       minRequestIntervalMs: spec.minRequestIntervalMs, requestTimeoutMs: spec.interfaceDeadlineMs + 2000,
       onEvidence: (event: unknown) => { void journal.record({ type: 'load-evidence', cell: spec.name, event }); } };
@@ -191,19 +213,19 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
       corpusChanges: clipCorpus.length };
     await bounded(runWriter(root, 0, writerConfig, { signal: cap.signal, requireExit: true,
       onWrite: write => { written.push(write); void journal.record({ type: 'write', cell: spec.name, write }); } }), cap.signal);
-    drained = await quietDrain(session, cap.signal);
+    drained = await waitForQuietCapture(session, cap.signal);
     if (!drained) faults.push('capture quiet drain missing before cap');
   } catch (error) { faults.push(String(error)); }
   finally {
     off?.();
-    const results = await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
+    const results = await Promise.allSettled([clipLoad?.stop(cap.expired()), interfaceLoad?.stop(cap.expired())]);
     if (results[0]?.status === 'fulfilled') clipSummary = results[0].value;
     else if (results[0]?.status === 'rejected') faults.push(`clip client exit: ${results[0].reason}`);
     if (results[1]?.status === 'fulfilled') interfaceSummary = results[1].value;
     else if (results[1]?.status === 'rejected') faults.push(`interface client exit: ${results[1].reason}`);
-    try { if (session) await cleanupWithin(session.stop()); captureStopped = true; }
+    try { if (session) { await cleanupWithin(session.stop()); captureStopped = true; } }
     catch (error) { faults.push(`capture stop: ${error}`); }
-    try { if (server) await cleanupWithin(server.close()); readerClosed = true; }
+    try { if (server) { await cleanupWithin(server.close()); readerClosed = true; } }
     catch (error) { faults.push(`reader close: ${error}`); }
     try { await cleanupWithin(rm(root, { recursive: true, force: true })); worktreeRemoved = true; }
     catch (error) { faults.push(`worktree cleanup: ${error}`); }
@@ -227,8 +249,31 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
     coldCacheServerFresh: Boolean(spec.clip), loadStartedAtNs: clipSummary?.startedAtNs,
     loadStoppedAtNs: clipSummary?.stoppedAtNs, corpusExhausted: clipSummary?.corpusExhausted,
     attemptLimitReached: clipSummary?.attemptLimitReached, drainTimedOut: !drained });
+  const requestLatency = latency([
+    ...(clipLoad?.attempts.flatMap(item => item.kind === 'clip' && item.attempt.httpStatus === 200
+      && item.attempt.status === 'ready'
+      ? [item.attempt.latencyMs] : []) ?? []),
+    ...(interfaceLoad?.attempts.flatMap(item => item.kind === 'interface' && item.attempt.httpStatus === 200
+      && item.attempt.completedAtNs !== undefined
+      && (item.attempt.body as { status?: string; files?: Array<{ status?: string }> } | null)?.status === 'ready'
+      && (item.attempt.body as { files?: Array<{ status?: string }> } | null)?.files?.some(file => file.status === 'ready')
+      ? [Number(item.attempt.completedAtNs - item.attempt.startedAtNs) / 1e6] : []) ?? []),
+  ]);
   if (capture.missing > 0 || capture.written !== spec.scheduled + spec.burst)
     faults.push('expected capture writes are missing or incomplete');
+  if ((spec.clip || spec.interfaces) && requestLatency.n === 0)
+    faults.push('loaded arm has no ready HTTP latency evidence');
+  for (const item of clipLoad?.attempts ?? []) if (item.kind === 'clip') {
+    const response = item.attempt;
+    if (response.httpStatus !== 200 || response.error ||
+      !(response.status === 'ready' || response.status === 'skipped'
+        && ['overloaded', 'timeout'].includes(response.reason ?? '')))
+      faults.push('clip HTTP outcome invalid');
+  }
+  for (const item of interfaceLoad?.attempts ?? []) if (item.kind === 'interface') {
+    if (item.attempt.httpStatus !== 200 || item.attempt.error) faults.push('interface HTTP outcome invalid');
+    else faults.push(...validateInterfacePage(item.attempt.body, item.attempt.expected));
+  }
   if (spec.trace) {
     const observed = collector.snapshot();
     const interfaces = interfaceLoad?.attempts.filter(item => item.kind === 'interface').map(item => item.attempt) ?? [];
@@ -241,8 +286,6 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
     if (spec.clip) faults.push(...scoreClipTrace(clipLoad?.attempts.filter(item => item.kind === 'clip')
       .map(item => item.attempt) ?? [], assembly.traces, assembly.clipCacheBypasses));
     for (const attempt of assembly.attempts) {
-      if (attempt.httpStatus === 200) faults.push(...validateInterfacePage(attempt.body, attempt.expected));
-      else faults.push('interface HTTP outcome is not 200');
       const traces = assembly.traces.filter(trace => trace.workload === 'interface'
         && trace.routeKey === attempt.expected.routeKey && trace.submittedAtNs >= attempt.startedAtNs
         && trace.settledAtNs <= (attempt.completedAtNs ?? -1n));
@@ -281,12 +324,12 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
       reason: 'admission, freshness, parser exits and interface load sufficiency unknown' });
   }
   await journal.record({ type: 'cell', cell: spec.name, diagnosticValid: faults.length === 0,
-    faults: [...new Set(faults)], capture, cleanup: { captureStopped, readerClosed, worktreeRemoved,
+    faults: [...new Set(faults)], capture, requestLatency, cleanup: { captureStopped, readerClosed, worktreeRemoved,
       clipClientExit: clipSummary?.actualWorkerExit ?? !spec.clip,
       interfaceClientExit: interfaceSummary?.actualWorkerExit ?? !spec.interfaces },
-    bounds: { requests: Atomics.load(new Int32Array(sharedCount), 0), seconds: spec.maxSeconds,
-      capHit: cap.expired() }, host: { before: hostSample(), faults: hostFaults } }, true);
-  return { valid: faults.length === 0, faults, capture };
+    bounds: { requests: Atomics.load(new Int32Array(sharedCount), 0), maxSeconds: spec.maxSeconds,
+      capHit: cap.expired() }, hostFaults }, true);
+  return { valid: faults.length === 0, faults, capture, requestLatency };
 }
 
 async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: DiagnosticConfig,
@@ -329,11 +372,11 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
       intervalMs: config.queue.scheduledIntervalMs, maxAttempts: config.queue.maxAttemptsPerCell,
       maxSeconds: config.queue.maxCellSecondsIncludingDrain, minRequestIntervalMs: config.queue.minRequestIntervalMs,
     })));
-  const reports: CaptureArmReport[] = [];
+  const reports: Array<{ capture: CaptureArmReport; requestLatency: DiagnosticLatency }> = [];
   for (const cell of cells) {
     const report = await runCaptureCell(config, journal, storeDir, clipCorpus, interfaceCorpus, cell);
     if (!report.valid) throw new Error(`diagnostic cell ${cell.name} invalid: ${report.faults.join('; ')}`);
-    reports.push(report.capture);
+    reports.push({ capture: report.capture, requestLatency: report.requestLatency });
   }
   if (mode === 'overhead') {
     const tolerance = config.approvalRequired.tracingOverheadTolerance as OverheadTolerance;
@@ -343,11 +386,15 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
   }
 }
 
-export interface OverheadTolerance { maxLatencyRatio: { p50: number; p95: number; p99: number };
-  minThroughputRatio: number }
-export function scoreDiagnosticOverhead(reports: CaptureArmReport[], tolerance: OverheadTolerance):
-  Array<{ workload: string; pair: number; ratios: { p50: number; p95: number; p99: number;
-    throughput: number }; passed: boolean }> {
+export interface OverheadTolerance { approved: true;
+  maxCaptureLatencyRatio: { p50: number; p95: number; p99: number };
+  maxRequestLatencyRatio: { p50: number; p95: number; p99: number };
+  minCaptureThroughputRatio: number; minReadyRatio: number }
+export function scoreDiagnosticOverhead(reports: Array<{ capture: CaptureArmReport;
+  requestLatency: DiagnosticLatency }>, tolerance: OverheadTolerance):
+  Array<{ workload: string; pair: number; captureRatios: { p50: number; p95: number; p99: number;
+    throughput: number }; requestRatios: { p50: number; p95: number; p99: number;
+    readyCount: number }; passed: boolean }> {
   if (reports.length !== 8) throw new Error('overhead comparison requires eight fixed arms');
   const output = [];
   for (let workloadIndex = 0; workloadIndex < 2; workloadIndex++) for (let pair = 0; pair < 2; pair++) {
@@ -355,13 +402,25 @@ export function scoreDiagnosticOverhead(reports: CaptureArmReport[], tolerance: 
     const off = reports[index + (pair === 0 ? 0 : 3)]!;
     const on = reports[index + (pair === 0 ? 1 : 2)]!;
     const divide = (a: number | null, b: number | null): number => a !== null && b !== null && b > 0 ? a / b : Infinity;
-    const ratios = { p50: divide(on.latency.p50, off.latency.p50),
-      p95: divide(on.latency.p95, off.latency.p95), p99: divide(on.latency.p99, off.latency.p99),
-      throughput: divide(on.throughputPerSecond, off.throughputPerSecond) };
-    output.push({ workload: workloadIndex === 0 ? 'clip' : 'interface', pair: pair + 1, ratios,
-      passed: ratios.p50 <= tolerance.maxLatencyRatio.p50 && ratios.p95 <= tolerance.maxLatencyRatio.p95
-        && ratios.p99 <= tolerance.maxLatencyRatio.p99
-        && ratios.throughput >= tolerance.minThroughputRatio });
+    const captureRatios = { p50: divide(on.capture.latency.p50, off.capture.latency.p50),
+      p95: divide(on.capture.latency.p95, off.capture.latency.p95),
+      p99: divide(on.capture.latency.p99, off.capture.latency.p99),
+      throughput: divide(on.capture.throughputPerSecond, off.capture.throughputPerSecond) };
+    const requestRatios = { p50: divide(on.requestLatency.p50, off.requestLatency.p50),
+      p95: divide(on.requestLatency.p95, off.requestLatency.p95),
+      p99: divide(on.requestLatency.p99, off.requestLatency.p99),
+      readyCount: divide(on.requestLatency.n, off.requestLatency.n) };
+    output.push({ workload: workloadIndex === 0 ? 'clip' : 'interface', pair: pair + 1,
+      captureRatios, requestRatios,
+      passed: Number.isFinite(captureRatios.throughput)
+        && captureRatios.p50 <= tolerance.maxCaptureLatencyRatio.p50
+        && captureRatios.p95 <= tolerance.maxCaptureLatencyRatio.p95
+        && captureRatios.p99 <= tolerance.maxCaptureLatencyRatio.p99
+        && captureRatios.throughput >= tolerance.minCaptureThroughputRatio
+        && requestRatios.p50 <= tolerance.maxRequestLatencyRatio.p50
+        && requestRatios.p95 <= tolerance.maxRequestLatencyRatio.p95
+        && requestRatios.p99 <= tolerance.maxRequestLatencyRatio.p99
+        && requestRatios.readyCount >= tolerance.minReadyRatio });
   }
   return output;
 }
@@ -374,13 +433,15 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
   const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<number> => {
     const cap = startCap(config.unqueued.maxSecondsPerCell);
     let pages: CorpusPage[];
+    let hostFaults: string[] = [];
     try {
       pages = await createInterfaceCorpus(storeDir,
         config.unqueued.observationsPerCell + (cell.warmth === 'initialized-worker-new-content' ? 1 : 0),
         `${config.seed}-${label}`, { language: cell.language, sizeClass: cell.size, files: cell.files }, cap.signal);
     } catch (error) { cap.close(); throw error; }
     let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
-    let collector = createProjectionTraceCollector();
+    const client = startDiagnosticHttpClient();
+    let collector = createProjectionTraceCollector(100_000);
     let attempts: InterfaceAttempt[] = [];
     const purposeById = new Map<string, string>();
     let useful = 0;
@@ -397,6 +458,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       if (!assembly.processExitsVerified) faults.push('actual parser process exit missing');
       for (const attempt of assembly.attempts) {
         if (attempt.httpStatus === 200) faults.push(...validateInterfacePage(attempt.body, attempt.expected));
+        else faults.push('unqueued HTTP request failed or did not return 200');
         const body = attempt.body as { files?: Array<{ path?: string; status?: string }> } | null;
         if (purposeById.get(attempt.requestId) === 'measured' && body?.files?.some(row => row.status === 'ready' &&
           attempt.freshnessByPath?.[String(row.path)] === 'fresh')) useful++;
@@ -408,24 +470,27 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       await journal.record({ type: 'unqueued-trace', cell: label, attempts: assembly.attempts,
         traces: assembly.traces, phases: snapshot.phases, events: snapshot.events, faults: snapshot.faults });
       attempts = [];
-      collector = createProjectionTraceCollector();
+      collector = createProjectionTraceCollector(100_000);
     };
     const openServer = async (): Promise<void> => {
-      server = await bounded(startReaderServer({ storeDir,
+      server = await acquireWithin(startReaderServer({ storeDir,
         projectionAdmissionConfig: { C: config.unqueued.C,
           Q: config.unqueued.Q, W: config.unqueued.W, D: config.admission.clipDeadlineMs },
-        interfaceDeadlineMs: deadlineMs, projectionTrace: collector.observe }), cap.signal);
+        interfaceDeadlineMs: deadlineMs, projectionTrace: collector.observe }),
+      cap.signal, late => late.close());
     };
     const request = async (page: CorpusPage, purpose: string): Promise<InterfaceAttempt> => {
       if (++requested > config.unqueued.maxRequestsIncludingConditional)
         throw new Error('unqueued global request cap reached');
-      const attempt = await bounded(requestInterface(server!, page, deadlineMs + 2000, cap.signal), cap.signal);
+      const attempt = await bounded(client.interface(server!.url, server!.token, page,
+        deadlineMs + 2000, cap.signal), cap.signal);
       attempts.push(attempt);
       purposeById.set(attempt.requestId, purpose);
       await journal.record({ type: 'unqueued-attempt', cell: label, purpose, attempt });
       return attempt;
     };
     try {
+      await bounded(client.ready, cap.signal);
       if (cell.warmth !== 'fresh-worker') await openServer();
       let start = 0;
       if (cell.warmth === 'initialized-worker-new-content') { await request(pages[0]!, 'warmup'); start = 1; }
@@ -443,8 +508,11 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
         if (cell.warmth === 'fresh-worker') await finishServer();
       }
     } catch (error) { faults.push(String(error)); }
-    finally { await finishServer(); cap.close(); }
-    faults.push(...await host.stop());
+    finally { try { await finishServer(); } finally {
+      try { await client.stop(); } catch (error) { faults.push(`HTTP client exit: ${error}`); }
+      cap.close(); hostFaults = await host.stop();
+    } }
+    faults.push(...hostFaults);
     if (cap.expired()) faults.push('cell wall-time cap hit');
     await journal.record({ type: 'unqueued-cell', cell: label, deadlineMs, observations: config.unqueued.observationsPerCell,
       usefulFresh: useful, cacheControlAvailable: cacheDone.has(cell.language), requested,
@@ -479,23 +547,26 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   let totalRequests = 0;
   for (const [capIndex, W] of spec.waiterCaps.entries()) {
     const timer = startCap(spec.maxSecondsPerCap);
-    const collector = createProjectionTraceCollector();
+    const collector = createProjectionTraceCollector(100_000);
     const host = monitorHost(config, journal);
     let release: (() => void) | undefined;
     let entered: (() => void) | undefined;
     let enteredPromise: Promise<void> = Promise.resolve();
-    let barrierEnteredAt = 0;
+    let barrierEnteredAtNs = 0n;
     let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+    const client = startDiagnosticHttpClient();
     const faults: string[] = [];
     const responses: Array<{ group: number; status: number; body: unknown; error?: string;
       startedAtNs: bigint; completedAtNs: bigint }> = [];
     try {
-      server = await bounded(startReaderServer({ storeDir,
+      server = await acquireWithin(startReaderServer({ storeDir,
         projectionAdmissionConfig: { C: spec.C, Q: spec.Q, W, D: config.admission.clipDeadlineMs },
         projectionTrace: collector.observe,
         clipDispatchBarrier: () => new Promise<void>(resolve => {
-          barrierEnteredAt = Date.now(); release = resolve; entered?.();
-        }) }), timer.signal);
+          if (release) { faults.push('more than one leader entered the W barrier'); resolve(); return; }
+          barrierEnteredAtNs = process.hrtime.bigint(); release = resolve; entered?.();
+        }) }), timer.signal, late => late.close());
+      await bounded(client.ready, timer.signal);
       for (let group = 0; group < spec.groupsPerCap; group++) {
         if (timer.signal.aborted) throw timer.signal.reason;
         const change = corpus[capIndex * spec.groupsPerCap + group]!;
@@ -504,17 +575,16 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
         const route = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
         const send = async (): Promise<void> => {
           if (++totalRequests > spec.maxRequests) throw new Error('W request cap exceeded');
-          const startedAtNs = process.hrtime.bigint();
           try {
-            const response = await fetch(server!.url + route,
-              { headers: { authorization: `Bearer ${server!.token}` },
-                signal: AbortSignal.any([timer.signal, AbortSignal.timeout(config.admission.clipDeadlineMs + 2000)]) });
-            const body: unknown = await response.json().catch(() => null);
-            const item = { group, status: response.status, body, startedAtNs, completedAtNs: process.hrtime.bigint() };
+            const response = await client.clip(server!.url, server!.token, change,
+              config.admission.clipDeadlineMs + 2000, timer.signal);
+            const item = { group, status: response.httpStatus,
+              body: { status: response.status, fallback_reason: response.reason },
+              error: response.error, startedAtNs: response.startedAtNs!, completedAtNs: response.completedAtNs! };
             responses.push(item);
             await journal.record({ type: 'w-http', W, item });
           } catch (error) {
-            const item = { group, status: 0, body: null, error: String(error), startedAtNs,
+            const item = { group, status: 0, body: null, error: String(error), startedAtNs: process.hrtime.bigint(),
               completedAtNs: process.hrtime.bigint() };
             responses.push(item);
             await journal.record({ type: 'w-http', W, item });
@@ -524,7 +594,8 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
         await bounded(enteredPromise, timer.signal);
         const waiters = Array.from({ length: spec.sameKeyWaitersPerGroup }, () => send());
         const admitted = async (): Promise<void> => {
-          while (Date.now() - barrierEnteredAt < spec.maxBarrierMs && !timer.signal.aborted) {
+          while (Number(process.hrtime.bigint() - barrierEnteredAtNs) / 1e6 < spec.maxBarrierMs
+            && !timer.signal.aborted) {
             const count = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route).length;
             if (count >= 1 + spec.sameKeyWaitersPerGroup) return;
             await delay(1);
@@ -532,7 +603,7 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
         };
         await admitted();
         const beforeRelease = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route);
-        const barrierMs = Date.now() - barrierEnteredAt;
+        const barrierMs = Number(process.hrtime.bigint() - barrierEnteredAtNs) / 1e6;
         if (barrierMs > spec.maxBarrierMs) faults.push(`group ${group} exceeded barrier cap`);
         (release as (() => void) | undefined)?.();
         await journal.record({ type: 'w-before-release', W, group, route, barrierMs, admissions: beforeRelease }, true);
@@ -562,6 +633,7 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
     finally {
       release?.();
       try { if (server) await cleanupWithin(server.close()); } catch (error) { faults.push(`reader close: ${error}`); }
+      try { await client.stop(); } catch (error) { faults.push(`HTTP client exit: ${error}`); }
       timer.close();
     }
     faults.push(...await host.stop());
@@ -591,15 +663,38 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   if (totalRequests !== spec.maxRequests) throw new Error('W request count differs from frozen bound');
 }
 
-function approvalsComplete(config: DiagnosticConfig): boolean {
+export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now()): string[] {
   const approvals = config.approvalRequired;
   const tolerance = approvals.tracingOverheadTolerance as Partial<OverheadTolerance> | null;
+  const window = approvals.measurementWindow as { approved?: unknown; startUtc?: unknown; endUtc?: unknown;
+    hostVetoesApproved?: unknown } | null;
+  const points = approvals.diagnosticDeadlinePoints as { approved?: unknown; interfaceMs?: unknown;
+    conditional800?: unknown; cellsAndCountsApproved?: unknown } | null;
+  const w = approvals.wPressureRuntimeHook as { approved?: unknown } | null;
+  const clip = approvals.clipHistoricalComparison as { approved?: unknown; treatment?: unknown } | null;
   const numeric = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
-  return Object.entries(approvals).every(([key, value]) => key === 'tracingOverheadTolerance'
-    ? tolerance !== null && typeof tolerance === 'object'
-      && numeric(tolerance.maxLatencyRatio?.p50) && numeric(tolerance.maxLatencyRatio?.p95)
-      && numeric(tolerance.maxLatencyRatio?.p99) && numeric(tolerance.minThroughputRatio)
-    : typeof value === 'string' && value.trim().length > 0);
+  const ratios = (value: Partial<{ p50: number; p95: number; p99: number }> | undefined): boolean =>
+    numeric(value?.p50) && numeric(value?.p95) && numeric(value?.p99);
+  const start = typeof window?.startUtc === 'string' ? Date.parse(window.startUtc) : NaN;
+  const end = typeof window?.endUtc === 'string' ? Date.parse(window.endUtc) : NaN;
+  const utc = (value: unknown): boolean => typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
+  return [
+    ...(window?.approved === true && window.hostVetoesApproved === true
+      && utc(window.startUtc) && utc(window.endUtc) && Number.isFinite(start)
+      && Number.isFinite(end) && start <= now && now < end ? [] : ['measurement window or host veto approval missing']),
+    ...(tolerance?.approved === true && ratios(tolerance.maxCaptureLatencyRatio)
+      && ratios(tolerance.maxRequestLatencyRatio) && numeric(tolerance.minCaptureThroughputRatio)
+      && numeric(tolerance.minReadyRatio)
+      ? [] : ['tracing overhead tolerance missing']),
+    ...(points?.approved === true && JSON.stringify(points.interfaceMs) === JSON.stringify([
+      config.admission.interfaceDeadlineMs, config.admission.conditionalInterfaceDeadlineMs])
+      && points.conditional800 === true && points.cellsAndCountsApproved === true
+      ? [] : ['diagnostic deadline points or selected cells/counts approval missing']),
+    ...(w?.approved === true ? [] : ['W runtime hook approval missing']),
+    ...(clip?.approved === true && clip.treatment === 'historical-only'
+      ? [] : ['clip historical comparison disposition missing']),
+  ];
 }
 const previousMode: Partial<Record<DiagnosticMode, DiagnosticMode>> = {
   overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued', 'w-pressure': 'queue',
@@ -609,17 +704,25 @@ async function readPrior(path: string | undefined, mode: DiagnosticMode, revisio
   const expected = previousMode[mode];
   if (!expected) { if (path) throw new Error('smoke has no prior diagnostic'); return {}; }
   if (!path) throw new Error(`${mode} requires the preceding ${expected} report`);
-  const lines = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>);
-  const started = lines.find(line => line.type === 'started');
-  const final = lines.at(-1);
+  let started: Record<string, unknown> | undefined, final: Record<string, unknown> | undefined;
+  const useful: Record<string, unknown>[] = [];
+  const lines = createLineReader({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line) continue;
+    if (!/^\{"type":"(?:started|final|unqueued-cell|failed)"/.test(line)) { final = undefined; continue; }
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record.type === 'started') started = record;
+    if (record.type === 'unqueued-cell') useful.push(record);
+    final = record;
+  }
   if (started?.mode !== expected || started.revision !== revision || started.configSha256 !== configSha256
     || final?.type !== 'final' || final.diagnosticValid !== true)
     throw new Error(`preceding ${expected} report is incomplete, invalid or from another head/config`);
   if (mode !== 'queue') return {};
-  const useful = lines.filter(line => line.type === 'unqueued-cell' && Number(line.usefulFresh) > 0
+  const swiftRows = useful.filter(line => Number(line.usefulFresh) > 0
     && String(line.cell).includes('swift'));
-  const deadlines = useful.map(line => Number(line.deadlineMs));
-  const swiftUseful = useful.length > 0;
+  const deadlines = swiftRows.map(line => Number(line.deadlineMs));
+  const swiftUseful = swiftRows.length > 0;
   if (!swiftUseful) throw new Error('queue requires useful unqueued Swift completion');
   const selectedDeadlineMs = Math.min(...deadlines.filter(Number.isFinite));
   if (!Number.isFinite(selectedDeadlineMs)) throw new Error('queue diagnostic deadline lacks useful evidence');
@@ -627,13 +730,19 @@ async function readPrior(path: string | undefined, mode: DiagnosticMode, revisio
 }
 export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: DiagnosticMode,
   outputPath: string, priorPath?: string): Promise<void> {
-  if (!approvalsComplete(config)) throw new Error('owner execution decisions are incomplete in approvalRequired');
+  const approvalFaults = executionApprovalFaults(config);
+  if (approvalFaults.length) throw new Error(`owner execution decisions are incomplete in approvalRequired: ${approvalFaults.join('; ')}`);
   const repository = await realpath(fileURLToPath(new URL('..', import.meta.url)));
   const output = resolve(outputPath);
   const parent = await realpath(dirname(output));
   const target = join(parent, basename(output));
-  const excluded = [repository, resolve(repository, '../..')];
-  if (excluded.some(root => target === root || target.startsWith(root + sep)))
+  const common = execFileSync('git', ['rev-parse', '--git-common-dir'],
+    { cwd: repository, encoding: 'utf8' }).trim();
+  const mainCheckout = dirname(await realpath(resolve(repository, common)));
+  const normalized = (path: string): string => process.platform === 'darwin' ? path.toLowerCase() : path;
+  const excluded = [repository, mainCheckout];
+  if (excluded.some(root => normalized(target) === normalized(root)
+    || normalized(target).startsWith(normalized(root) + sep)))
     throw new Error('diagnostic report must be outside both worktrees');
   if (execFileSync('git', ['status', '--porcelain'], { cwd: repository, encoding: 'utf8' }).trim())
     throw new Error('diagnostics require a clean committed harness');
@@ -647,7 +756,7 @@ export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: Diagn
     await journal.record({ type: 'started', mode, diagnostic: true, d7Decision: 'pending', revision,
       config, configSha256, at: new Date().toISOString(), startedAtNs: process.hrtime.bigint(),
       node: process.version, platform: process.platform, osRelease: release(), arch: arch(),
-      cpu: cpus()[0]?.model, physicalCores: availableParallelism(),
+      cpu: cpus()[0]?.model, availableCpuThreads: availableParallelism(),
       parserArtifacts: { typescript: sha(verifyTypeScriptGrammarArtifact('typescript')),
         tsx: sha(verifyTypeScriptGrammarArtifact('tsx')), swift: SWIFT_V1 } }, true);
     await preflight(config, journal);
@@ -656,8 +765,14 @@ export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: Diagn
       await runCaptureMode(mode, config, journal, storeDir, prior.selectedDeadlineMs);
     else if (mode === 'unqueued') await runUnqueued(config, journal, storeDir);
     else await runWPressure(config, journal, storeDir);
+    const endingRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim();
+    const endingStatus = execFileSync('git', ['status', '--porcelain'], { cwd: repository, encoding: 'utf8' }).trim();
+    if (endingRevision !== revision || endingStatus) throw new Error('harness head or working tree changed during diagnostic');
+    await cleanupWithin(rm(storeDir, { recursive: true, force: true }));
+    storeDir = undefined;
     await journal.record({ type: 'final', diagnosticValid: true, d7Decision: 'pending',
       fullCampaignSufficiency: 'not evaluated', at: new Date().toISOString() }, true);
+    await journal.assertHealthy();
   } catch (error) {
     await journal.record({ type: 'failed', error: String(error), diagnosticValid: false,
       d7Decision: 'pending', at: new Date().toISOString() }, true);

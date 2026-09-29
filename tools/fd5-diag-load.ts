@@ -9,7 +9,7 @@ export type DiagnosticAttempt = { kind: 'clip'; attempt: ClipResponse & { reques
 export type DiagnosticLoadSummary = { startedAtNs: bigint; stoppedAtNs: bigint;
   maxConcurrentRequests: number; corpusExhausted: boolean; attemptLimitReached: boolean;
   actualWorkerExit: boolean; incompleteRequestIds: string[] };
-export type DiagnosticLoad = { ready: Promise<void>; stop: () => Promise<DiagnosticLoadSummary>;
+export type DiagnosticLoad = { ready: Promise<void>; stop: (abortInFlight?: boolean) => Promise<DiagnosticLoadSummary>;
   attempts: DiagnosticAttempt[] };
 
 export function startDiagnosticLoad(input: { kind: 'clip' | 'interface'; url: string; token: string;
@@ -50,11 +50,12 @@ export function startDiagnosticLoad(input: { kind: 'clip' | 'interface'; url: st
     exitResolve(code);
   });
   let stopping: Promise<DiagnosticLoadSummary> | undefined;
-  return { ready, attempts, stop: () => stopping ??= (async () => {
-    worker.postMessage('stop');
+  return { ready, attempts, stop: (abortInFlight = false) => stopping ??= (async () => {
+    worker.postMessage(abortInFlight ? 'abort' : 'stop');
     let code: number;
     try { code = await Promise.race([exit, new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => reject(new Error('diagnostic load worker exit timeout')), 2500);
+      const timer = setTimeout(() => reject(new Error('diagnostic load worker exit timeout')),
+        input.requestTimeoutMs + 1000);
       void exit.finally(() => clearTimeout(timer));
     })]); }
     catch (cause) { await worker.terminate(); throw cause; }

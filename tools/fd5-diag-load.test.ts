@@ -64,3 +64,31 @@ test('bounded parent retains streamed attempts and verifies actual worker exit',
       client.attempts.length);
   } finally { server.close(); }
 });
+
+test('normal diagnostic stop lets an admitted HTTP request finish', async () => {
+  const server = createServer((_request, response) => {
+    setTimeout(() => { response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"status":"ready"}'); }, 80);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('no test port');
+  let started!: () => void;
+  const requestStarted = new Promise<void>(resolve => { started = resolve; });
+  const client = startDiagnosticLoad({ kind: 'clip', url: `http://127.0.0.1:${address.port}`,
+    token: 'test-token', slots: 1, corpus: [{ sessionId: '11111111-1111-4111-8111-111111111111',
+      seq: '1', key: 'one' }], maxAttempts: 2, sharedCount: new SharedArrayBuffer(4),
+    minRequestIntervalMs: 0, requestTimeoutMs: 1000, onEvidence: value => {
+      if ((value as { type?: string }).type === 'start') started();
+    } });
+  try {
+    await client.ready;
+    await requestStarted;
+    const summary = await client.stop();
+    assert.equal(summary.actualWorkerExit, true);
+    assert.deepEqual(summary.incompleteRequestIds, []);
+    assert.equal(client.attempts.length, 1);
+    assert.equal(client.attempts[0]?.attempt.httpStatus, 200);
+  } finally { server.close(); }
+});
