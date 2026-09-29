@@ -4,15 +4,9 @@
   "range": { "before_seq": "3", "after_seq": "4" },
   "status": "skipped",
   "fallback_reason": "overloaded",
-  "inventory": {
-    "scope": "observed",
-    "baseline_completed_seq": "3",
-    "unknown_scopes": [],
-    "unknown_scopes_complete": true,
-    "policy_exclusions": ["store-directory", ".git", "symlinks"]
-  },
+  "inventory": null,
   "analysis": { "shared_types": "notAnalyzed", "effects": "notAnalyzed", "behavior": "notAnalyzed" },
-  "gaps": [], "gaps_complete": true,
+  "gaps": null, "gaps_complete": false,
   "files": [],
   "page": { "complete": false, "next_after_path": null }
 }
