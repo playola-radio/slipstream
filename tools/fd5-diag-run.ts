@@ -14,6 +14,7 @@ import { startReaderServer } from '../src/http-reader.ts';
 import { createHistoricalCorpus, readRecords, runWriter, scoreCaptureArm, waitForQuietCapture,
   type BenchmarkConfig, type HistoricalChange, type WorkerWrite, type CaptureArmReport } from '../src/clip-bench.ts';
 import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
+import type { ProjectionTraceEvent } from '../src/projection-trace.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createInterfaceCorpus, type CorpusPage } from './fd5-bench.ts';
 import { assembleProjectionTrace, scoreClipTrace, scoreProcessStartupTiming, validateInterfacePage,
@@ -141,6 +142,7 @@ function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => 
   let previousSwap: number | null = null;
   let previousSampleAt: bigint | undefined;
   let pending = Promise.resolve();
+  let sampling = false;
   const sample = async (): Promise<void> => {
     const startedAt = process.hrtime.bigint();
     if (previousSampleAt !== undefined && Number(startedAt - previousSampleAt) / 1e9 >
@@ -157,7 +159,12 @@ function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => 
       faults.push('host swap growth unknown or positive');
     await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
   };
-  const schedule = (): void => { pending = pending.then(sample).catch(error => { faults.push(`host sample: ${error}`); }); };
+  const schedule = (): void => {
+    if (sampling) { faults.push('host sample missed its interval'); return; }
+    sampling = true;
+    pending = sample().catch(error => { faults.push(`host sample: ${error}`); })
+      .finally(() => { sampling = false; });
+  };
   schedule();
   const timer = setInterval(schedule, config.host.sampleIntervalSeconds * 1000);
   return { stop: async () => { clearInterval(timer); await pending;
@@ -553,6 +560,9 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
     let entered: (() => void) | undefined;
     let enteredPromise: Promise<void> = Promise.resolve();
     let barrierEnteredAtNs = 0n;
+    let currentRoute = '';
+    let admissionCount = 0;
+    let currentAdmissions: Array<Extract<ProjectionTraceEvent, { kind: 'admission' }>> = [];
     let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
     const client = startDiagnosticHttpClient();
     const faults: string[] = [];
@@ -561,7 +571,12 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
     try {
       server = await acquireWithin(startReaderServer({ storeDir,
         projectionAdmissionConfig: { C: spec.C, Q: spec.Q, W, D: config.admission.clipDeadlineMs },
-        projectionTrace: collector.observe,
+        projectionTrace: event => {
+          collector.observe(event);
+          if (event.kind === 'admission' && event.routeKey === currentRoute) {
+            admissionCount++; currentAdmissions.push(event);
+          }
+        },
         clipDispatchBarrier: () => new Promise<void>(resolve => {
           if (release) { faults.push('more than one leader entered the W barrier'); resolve(); return; }
           barrierEnteredAtNs = process.hrtime.bigint(); release = resolve; entered?.();
@@ -573,6 +588,9 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
         enteredPromise = new Promise<void>(resolve => { entered = resolve; });
         release = undefined;
         const route = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
+        currentRoute = route;
+        admissionCount = 0;
+        currentAdmissions = [];
         const send = async (): Promise<void> => {
           if (++totalRequests > spec.maxRequests) throw new Error('W request cap exceeded');
           try {
@@ -596,20 +614,18 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
         const admitted = async (): Promise<void> => {
           while (Number(process.hrtime.bigint() - barrierEnteredAtNs) / 1e6 < spec.maxBarrierMs
             && !timer.signal.aborted) {
-            const count = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route).length;
-            if (count >= 1 + spec.sameKeyWaitersPerGroup) return;
+            if (admissionCount >= 1 + spec.sameKeyWaitersPerGroup) return;
             await delay(1);
           }
         };
         await admitted();
-        const beforeRelease = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route);
+        const beforeRelease = [...currentAdmissions];
         const barrierMs = Number(process.hrtime.bigint() - barrierEnteredAtNs) / 1e6;
         if (barrierMs > spec.maxBarrierMs) faults.push(`group ${group} exceeded barrier cap`);
         (release as (() => void) | undefined)?.();
         await journal.record({ type: 'w-before-release', W, group, route, barrierMs, admissions: beforeRelease }, true);
         await bounded(Promise.all([leader, ...waiters]), timer.signal);
-        const admissions = collector.snapshot().events.filter((event): event is Extract<typeof event, { kind: 'admission' }> =>
-          event.kind === 'admission' && event.routeKey === route);
+        const admissions = [...currentAdmissions];
         await journal.record({ type: 'w-group', W, group, route, admissions }, true);
         if (admissions.length !== 1 + spec.sameKeyWaitersPerGroup) faults.push(`group ${group} missing admissions`);
         if (admissions.filter(item => item.disposition === 'running').length !== 1)

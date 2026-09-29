@@ -103,7 +103,8 @@ export function describeDiagnosticMode(config: DiagnosticConfig, mode: Diagnosti
       writes: config.overhead.workloads.length * config.overhead.traceOrder.length
         * (config.overhead.scheduledWritesPerArm + config.overhead.burstWritesPerArm),
       maxRequests: config.overhead.workloads.length * config.overhead.traceOrder.length
-        * config.overhead.maxAttemptsPerArm };
+        * Math.min(config.overhead.maxAttemptsPerArm, config.overhead.coldKeysPerWorkload),
+      perArmGuard: config.overhead.maxAttemptsPerArm };
     case 'unqueued': return { cells: config.unqueued.cells.length,
       measured: config.unqueued.cells.length * config.unqueued.observationsPerCell,
       warmups: config.unqueued.cells.filter(cell => cell.warmth === 'initialized-worker-new-content').length,
@@ -115,7 +116,8 @@ export function describeDiagnosticMode(config: DiagnosticConfig, mode: Diagnosti
       writes: config.queue.queueWaiterCells.length * config.queue.repetitionsPerCell
         * (config.queue.scheduledWritesPerCell + config.queue.burstWritesPerCell),
       maxRequests: config.queue.queueWaiterCells.length * config.queue.repetitionsPerCell
-        * config.queue.maxAttemptsPerCell,
+        * Math.min(config.queue.maxAttemptsPerCell, 2 * config.queue.coldKeysPerWorkload),
+      perCellGuard: config.queue.maxAttemptsPerCell,
       maxCellSecondsIncludingDrain: config.queue.maxCellSecondsIncludingDrain };
     case 'w-pressure': return { groups: config.wPressure.waiterCaps.length * config.wPressure.groupsPerCap,
       maxRequests: config.wPressure.maxRequests, maxSecondsPerCap: config.wPressure.maxSecondsPerCap };

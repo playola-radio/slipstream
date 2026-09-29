@@ -27,10 +27,12 @@ test('bounded diagnostic CLI requires one named mode and an explicit execution s
 test('configuration pins bounded counts, separate modes and approval fields', () => {
   const config = validateDiagnosticConfig(proposal);
   assert.deepEqual(describeDiagnosticMode(config, 'smoke'), { arms: 2, writes: 28, maxRequests: 128 });
-  assert.deepEqual(describeDiagnosticMode(config, 'overhead'), { arms: 8, writes: 1600, maxRequests: 40000 });
+  assert.deepEqual(describeDiagnosticMode(config, 'overhead'), { arms: 8, writes: 1600,
+    maxRequests: 9600, perArmGuard: 5000 });
   assert.deepEqual(describeDiagnosticMode(config, 'unqueued'), { cells: 7, measured: 350,
     warmups: 2, cacheControlsMaximum: 60, conditionalSwiftMaximum: 150, maxRequests: 562 });
-  assert.deepEqual(describeDiagnosticMode(config, 'queue'), { cells: 6, writes: 1200, maxRequests: 30000,
+  assert.deepEqual(describeDiagnosticMode(config, 'queue'), { cells: 6, writes: 1200, maxRequests: 14400,
+    perCellGuard: 5000,
     maxCellSecondsIncludingDrain: 30 });
   assert.deepEqual(describeDiagnosticMode(config, 'w-pressure'), { groups: 40, maxRequests: 200,
     maxSecondsPerCap: 15 });
