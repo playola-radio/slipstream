@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, mkdir, link, unlink, open, realpath, lstat, stat } from 'node:fs/promises';
+import { readFile, link, unlink, open, realpath, lstat, stat } from 'node:fs/promises';
 import { resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProjectionTraceCollector, type PhaseSummary } from './fd5-trace.ts';
@@ -233,6 +233,7 @@ async function child(source: string, expectedToolSha: string): Promise<void> {
     syntheticPhaseEvents: true,
     reconstruction: 'Histogram lower bounds; phase order and associations are synthetic.',
     measuredScope: 'Direct collector.observe(event) only; events were built before timing.',
+    heapSampleMeaning: 'Absolute process heap at iteration boundaries; not collector allocation or GC cost.',
     bounds: { arms: 2, iterationsPerArm: 20, iterationsPerOrder: 10,
       collectorCallsPerArm: 177900, armSeconds: 10, childSeconds: 25, resultBytes: MAX_RESULT_BYTES },
     arms };
@@ -244,6 +245,7 @@ async function child(source: string, expectedToolSha: string): Promise<void> {
 export async function publishExclusive(path: string, bytes: Buffer): Promise<void> {
   const temp = `${path}.tmp-${randomBytes(8).toString('hex')}`;
   let created = false;
+  let linked = false;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(temp, 'wx', 0o600);
@@ -253,8 +255,12 @@ export async function publishExclusive(path: string, bytes: Buffer): Promise<voi
     await handle.close();
     handle = undefined;
     await link(temp, path);
+    linked = true;
     const directory = await open(dirname(path), 'r');
     try { await directory.sync(); } finally { await directory.close(); }
+  } catch (error) {
+    if (linked) await unlink(path).catch(() => {});
+    throw error;
   } finally {
     await handle?.close().catch(() => {});
     if (created) await unlink(temp).catch(() => {});
@@ -291,7 +297,6 @@ async function parent(argv: string[]): Promise<void> {
   if (ignored.status !== 0) throw new Error('result path is not gitignored');
   await requireAbsent(outputPath);
   await requireAbsent(`${outputPath}.sha256`);
-  await mkdir(dirname(outputPath), { recursive: true });
   const realOutputDir = await realpath(dirname(outputPath));
   const realContextDir = await realpath(contextDir);
   if (realOutputDir !== realContextDir && !realOutputDir.startsWith(realContextDir + sep))
@@ -319,7 +324,8 @@ async function parent(argv: string[]): Promise<void> {
 if (process.argv[1] && resolve(process.argv[1]) === TOOL_PATH) {
   const run = process.argv[2] === '--child'
     ? process.argv[6] && process.env[CHILD_TOKEN_ENV] === process.argv[6]
-      ? (assertCleanHead(process.argv[5]!), child(process.argv[3]!, process.argv[4]!))
+      ? Promise.resolve().then(() => { assertCleanHead(process.argv[5]!);
+        return child(process.argv[3]!, process.argv[4]!); })
       : Promise.reject(new Error('private profile child requires parent token'))
     : parent(process.argv.slice(2));
   run.catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });
