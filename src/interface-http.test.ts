@@ -238,6 +238,34 @@ test('cache hit does not hide loss of a recorded content blob', async () => {
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
+test('restored blob replaces unavailable coverage from an incomplete cached comparison', async () => {
+  const { storeDir, request, expected } = await fixture('ts-parse-failure');
+  const afterSha = (expected as { files: { after: { snapshot: { sha256: string } } }[] })
+    .files[0]!.after.snapshot.sha256;
+  const path = blobPath(storeDir, afterSha);
+  const bytes = await readFile(path);
+  const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET });
+  try {
+    const get = async () => {
+      const response = await fetch(reader.url + request.slice(4),
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ files: { status: string; fallback_reason?: string;
+        coverage: { before: { state: string }; after: { state: string; reason?: string } } }[] }>;
+    };
+    await unlink(path);
+    const missing = await get();
+    assert.equal(missing.files[0]?.status, 'incomplete');
+    assert.equal(missing.files[0]?.fallback_reason, 'before-parse-error');
+    assert.deepEqual(missing.files[0]?.coverage.after, { state: 'unavailable', reason: 'blob-missing' });
+    await writeFile(path, bytes);
+    const restored = await get();
+    assert.equal(restored.files[0]?.status, 'incomplete');
+    assert.equal(restored.files[0]?.coverage.before.state, 'incomplete');
+    assert.deepEqual(restored.files[0]?.coverage.after, { state: 'complete' });
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
 test('next_after_path pages the same frozen comparison', async () => {
   const { storeDir, request, expected } = await fixture('range-page-boundary-first');
   const second = await fixture('range-page-boundary-second');

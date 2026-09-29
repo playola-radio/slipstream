@@ -173,6 +173,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
   const active = new Set<Promise<unknown>>();
   const cacheSet = (key: string, value: InterfaceFileResult) => {
     if (!['ready', 'incomplete', 'unsupported'].includes(value.status)) return;
+    if (value.coverage.before.state === 'unavailable' || value.coverage.after.state === 'unavailable') return;
     const entry = { value: { status: value.status, fallback_reason: value.fallback_reason,
       coverage: value.coverage, changes: value.changes }, bytes: Buffer.byteLength(JSON.stringify(value)) };
     if (entry.bytes > 16 * 1024 * 1024) return;
