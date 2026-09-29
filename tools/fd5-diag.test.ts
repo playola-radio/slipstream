@@ -211,11 +211,15 @@ test('real incomplete-ready and file-level timeout pages never count as ready or
     files: [{ status: 'ready' }, { status: 'skipped', fallback_reason: 'timeout' }] };
   observed[2]!.body = { status: 'partial', page: { complete: true, next_after_path: null },
     files: [{ status: 'unavailable', fallback_reason: 'after-blob-missing' }] };
+  observed[3]!.body = { status: 'partial', page: { complete: false, next_after_path: 'later.ts' },
+    files: [{ status: 'unavailable', fallback_reason: 'after-blob-missing' },
+      { status: 'skipped', fallback_reason: 'timeout' }] };
   const report = scoreInterfaceCohort(plan, observed);
-  assert.equal(report.readyCount, 177);
+  assert.equal(report.readyCount, 176);
   assert.equal(report.httpLatency.n, 180);
   assert.equal(report.transitionsByKey[0]!.outcome, 'partial');
   assert.equal(report.transitionsByKey[0]!.completion, 'unfinished');
   assert.equal(report.transitionsByKey[1]!.completion, 'unfinished');
   assert.equal(report.transitionsByKey[2]!.completion, 'failed');
+  assert.equal(report.transitionsByKey[3]!.completion, 'failed');
 });

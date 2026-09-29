@@ -124,8 +124,9 @@ export function scoreInterfaceCohort(planned: PlannedInterface[], attempts: Inte
     const explicitFailure = body?.files?.some(file =>
       file.status === 'unavailable' || file.status === 'unsupported' || file.status === 'incomplete') ?? false;
     const reason = pageReason ?? fileReasons[0] ?? (body?.page?.complete === false ? 'incomplete-page' : null);
-    const completion = interrupted || body?.page?.complete === false && !explicitFailure && outcome !== 'skipped'
-      ? 'unfinished' : outcome === 'ready' ? 'observed' : outcome === 'skipped' ? 'refused' : 'failed';
+    const completion = explicitFailure ? 'failed'
+      : interrupted || body?.page?.complete === false && outcome !== 'skipped'
+        ? 'unfinished' : outcome === 'ready' ? 'observed' : outcome === 'skipped' ? 'refused' : 'failed';
     rows.push({ key: plannedRow.key, cell: plannedRow.cell, outcome, reason,
       httpDurationMs: duration, completion });
     const cell = byCell[plannedRow.cell] ??= { ready: 0, outcomes: emptyOutcomes(),
@@ -509,7 +510,9 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
     const tolerance = config.approvalRequired.tracingOverheadTolerance as OverheadTolerance;
     const comparisons = scoreDiagnosticOverhead(reports, tolerance);
     await journal.record({ type: 'overhead-comparison', comparisons }, true);
-    if (comparisons.some(item => !item.valid)) throw new Error('diagnostic overhead comparison invalid');
+    if (comparisons.some(item => !item.valid)) throw new Error(comparisons.some(item => item.valid && !item.passed)
+      ? 'diagnostic overhead comparison invalid; tracing overhead exceeded approved tolerance'
+      : 'diagnostic overhead comparison invalid');
     if (comparisons.some(item => !item.passed)) throw new Error('tracing overhead exceeded approved tolerance');
   }
 }
