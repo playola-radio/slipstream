@@ -105,7 +105,7 @@ test('an unavailable observation remains the endpoint and never equals another u
   });
 });
 
-test('all 65 successful fixture histories replay through the production resolver', async () => {
+test('all 67 successful fixture histories replay through the production resolver', async () => {
   let resolvedCases = 0;
   let errorCases = 0;
   for (const name of (await readdir(casesDir)).sort()) {
@@ -148,7 +148,7 @@ test('all 65 successful fixture histories replay through the production resolver
       const completed = history.events.find((e) => e.type === 'slipstream.capture.baseline.completed.v1'
         && BigInt(e.seq) <= request.after);
       assert.equal(result.inventory.baselineCompletedSeq,
-        expected.inventory?.baseline_completed_seq ?? completed?.seq ?? null, name);
+        expected.inventory === null ? completed?.seq ?? null : expected.inventory.baseline_completed_seq, name);
       assert.deepEqual(result.inventory.policyExclusions,
         expected.inventory?.policy_exclusions ?? ['store-directory', '.git', 'symlinks'], name);
       const eligible = [...new Set(history.events.filter((e) =>
@@ -192,7 +192,7 @@ test('all 65 successful fixture histories replay through the production resolver
         expected.files.map((f) => f.path), `${name}: expected row order`);
     });
   }
-  assert.equal(resolvedCases, 65);
+  assert.equal(resolvedCases, 67);
   assert.equal(errorCases, 4);
 });
 

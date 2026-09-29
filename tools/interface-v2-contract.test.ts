@@ -51,7 +51,7 @@ describe('interface.v2 contract fixtures', () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     const report = JSON.parse(out[0] ?? '{}');
-    assert.equal(report.cases, 69);
+    assert.equal(report.cases, 71);
     assert.deepEqual(report.failures, []);
     assert.equal(report.negative_control_rejected, true);
     assert.equal(code, EXIT.PASS);
@@ -152,6 +152,30 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('an unknown pre-first-file interrupt reason', /reason.*timeout.*cancelled/, (c) => {
     c.history.harness.interrupt.reason = 'overloaded';
   }, 'range-cancelled-before-file');
+  rejects('a lookahead interruption after an unreachable file', /after_path is not a completed path/, (c) => {
+    c.history.harness.interrupt.after_path = 'src/b.ts';
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption before the page stops comparing files', /after_path must end the completed page/, (c) => {
+    c.request = c.request.replace('limit=1', 'limit=2&include_identical=true');
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption without a pending candidate', /no unchecked path/, (c) => {
+    c.request = c.request.replace('path_prefix=src/', 'path_prefix=src/a');
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption when identical rows are included', /no unchecked path needs a lookahead retention check/, (c) => {
+    c.request = c.request.replace('limit=1', 'limit=1&include_identical=true');
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead interruption combined with a zero file budget', /cannot combine lookahead/, (c) => {
+    c.history.harness.limits = { file_result_bytes: 0 };
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page claiming to be complete', /page.complete: must be false/, (c) => {
+    c.expected.page.complete = true;
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page advancing past the last returned row', /page.next_after_path/, (c) => {
+    c.expected.page.next_after_path = 'src/b.ts';
+  }, 'range-lookahead-timeout');
+  rejects('a lookahead page claiming a file timeout', /must be ready/, (c) => {
+    c.expected.status = 'partial';
+  }, 'range-lookahead-timeout');
   rejects('two pre-work conditions with undefined ordering', /one exclusive pre-work condition/, (c) => {
     c.history.harness.interrupt = { phase: 'resolve', reason: 'cancelled' };
   }, 'range-scan-limit-before-file');
@@ -188,6 +212,14 @@ describe('interface.v2 contract validator rejects', () => {
 });
 
 describe('interface.v2 contract validator accepts', () => {
+  it('a lookahead interruption while checking an equal file whose blob is now missing', () => {
+    assert.deepEqual(errorsAfter((c) => {
+      const hash = event(c, '3').data.snapshot.sha256 as string;
+      c.history.missing_blobs = [hash];
+      delete c.history.blobs[hash];
+    }, 'range-lookahead-timeout'), []);
+  });
+
   it('an interrupt that leaves one side unevaluated while a parse error wins', () => {
     assert.deepEqual(errorsAfter((c) => {
       c.history.harness = { interrupt: { at_path: 'src/f.ts', reason: 'timeout' } };

@@ -77,7 +77,8 @@ interface History {
 
 interface Harness {
   admissionOverloaded: boolean;
-  interrupt: { atPath: string; reason: string } | { phase: 'resolve'; reason: string } | null;
+  interrupt: { atPath: string; reason: string } | { phase: 'resolve'; reason: string }
+    | { phase: 'lookahead'; afterPath: string; reason: string } | null;
   noScanBudget: boolean;
   noFileResultBudget: boolean;
   noMetadataBudget: boolean;
@@ -268,15 +269,19 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
       errors.push('history.harness.interrupt: must be an object');
     } else if (!['timeout', 'cancelled'].includes(i.reason as string)) {
       errors.push("history.harness.interrupt.reason: must be 'timeout' or 'cancelled'");
+    } else if (i.phase === 'lookahead') {
+      extraKeys(i, ['phase', 'after_path', 'reason'], 'history.harness.interrupt', errors);
+      if (typeof i.after_path !== 'string') errors.push('history.harness.interrupt.after_path: must be a path');
+      else harness.interrupt = { phase: 'lookahead', afterPath: i.after_path, reason: i.reason as string };
     } else if (i.phase !== undefined) {
       extraKeys(i, ['phase', 'reason'], 'history.harness.interrupt', errors);
-      if (i.phase !== 'resolve') errors.push("history.harness.interrupt.phase: must be 'resolve'");
+      if (i.phase !== 'resolve') errors.push("history.harness.interrupt.phase: must be 'resolve' or 'lookahead'");
       else harness.interrupt = { phase: 'resolve', reason: i.reason as string };
     } else if (typeof i.at_path === 'string') {
       extraKeys(i, ['at_path', 'reason'], 'history.harness.interrupt', errors);
       harness.interrupt = { atPath: i.at_path, reason: i.reason as string };
     } else {
-      errors.push("history.harness.interrupt: needs at_path or phase 'resolve'");
+      errors.push("history.harness.interrupt: needs at_path or phase 'resolve' | 'lookahead'");
     }
   }
   if (raw.limits !== undefined) {
@@ -292,11 +297,13 @@ function checkHarness(raw: unknown, errors: string[]): Harness {
     harness.noMetadataBudget = l.metadata_bytes !== undefined;
   }
   const preWork = Number(harness.admissionOverloaded) + Number(harness.noScanBudget)
-    + Number(harness.interrupt !== null && 'phase' in harness.interrupt);
+    + Number(harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'resolve');
   if (preWork > 1 || preWork > 0 && (harness.noFileResultBudget || harness.noMetadataBudget
-    || harness.interrupt !== null && 'atPath' in harness.interrupt)) {
+    || harness.interrupt !== null && ('atPath' in harness.interrupt || harness.interrupt.phase === 'lookahead'))) {
     errors.push('history.harness: use one exclusive pre-work condition');
   }
+  if (harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'lookahead'
+    && harness.noFileResultBudget) errors.push('history.harness: cannot combine lookahead with a zero file budget');
   return harness;
 }
 
@@ -481,14 +488,21 @@ function forcedCoverage(endpoint: Obj, history: History): Obj | null {
   return null;
 }
 
-/** §4.4 row 0: equal endpoints whose content is still retained. */
-function isIdentical(endpoints: Endpoints, history: History): boolean {
+/** Recorded endpoint equality before the separate CAS retention check. */
+function endpointsEqual(endpoints: Endpoints): boolean {
   const { before, after } = endpoints;
   if (before.kind !== 'recorded' || after.kind !== 'recorded') return false;
   const b = before.snapshot as Obj;
   const a = after.snapshot as Obj;
   if (b.kind === 'absent' && a.kind === 'absent') return true;
-  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256 && !history.missing.has(b.sha256 as string);
+  return b.kind === 'content' && a.kind === 'content' && b.sha256 === a.sha256;
+}
+
+/** §4.4 row 0: equal endpoints whose content is still retained. */
+function isIdentical(endpoints: Endpoints, history: History): boolean {
+  if (!endpointsEqual(endpoints)) return false;
+  const snapshot = endpoints.before.snapshot as Obj;
+  return snapshot.kind === 'absent' || !history.missing.has(snapshot.sha256 as string);
 }
 
 /** The §4.4 status the first established condition forces. Extraction-only
@@ -607,7 +621,7 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
   const { harness } = history;
   const preWorkReason = harness.admissionOverloaded ? 'overloaded'
     : harness.noScanBudget ? 'scan-limit'
-      : harness.interrupt !== null && 'phase' in harness.interrupt ? harness.interrupt.reason : null;
+      : harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'resolve' ? harness.interrupt.reason : null;
   extraKeys(body, ENVELOPE_KEYS, 'expected', errors);
   if (body.session_id !== req.sessionId) errors.push('expected.session_id: does not match the request');
   const range = body.range as Obj;
@@ -657,6 +671,16 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
     const at = eligible.indexOf(harness.interrupt.atPath);
     if (at < 0 || at >= req.limit) errors.push('history.harness.interrupt: at_path is not a path this page reaches');
     else [count, endedEarly] = [at + 1, true];
+  }
+  if (harness.interrupt !== null && 'phase' in harness.interrupt && harness.interrupt.phase === 'lookahead') {
+    const at = eligible.indexOf(harness.interrupt.afterPath);
+    if (at < 0) errors.push('history.harness.interrupt: after_path is not a completed path this page reaches');
+    else if (at + 1 !== count) errors.push('history.harness.interrupt: after_path must end the completed page');
+    else endedEarly = true;
+    const unchecked = eligiblePaths({ ...req, includeIdentical: true, afterPath: harness.interrupt.afterPath }, history)[0];
+    if (req.includeIdentical || unchecked === undefined || !endpointsEqual(resolveEndpoints(unchecked, req, history) as Endpoints)) {
+      errors.push('history.harness.interrupt: no unchecked path needs a lookahead retention check');
+    }
   }
   if (harness.noFileResultBudget) count = Math.min(count, 1);
   const paths = files.map((f) => f.path);

@@ -192,7 +192,8 @@ test('reader test seam extends only the interface deadline for an isolated Swift
 
 const HARNESS_ONLY = new Set(['range-admission-skipped', 'range-cancelled-mid-page',
   'range-deadline-mid-page', 'range-gap-cap', 'range-too-large-first-file',
-  'range-scan-limit-before-file', 'range-deadline-before-file', 'range-cancelled-before-file']);
+  'range-scan-limit-before-file', 'range-deadline-before-file', 'range-cancelled-before-file',
+  'range-lookahead-timeout']);
 for (const name of (await readdir(CASES)).filter(name => !HARNESS_ONLY.has(name))) {
   test(`reader comparison matches recorded ${name} history`, async () => {
     const { storeDir, request, expected, expectedError } = await fixture(name);
@@ -786,9 +787,10 @@ test('a late Swift result cannot change a timed-out page or populate its cache',
 });
 
 test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
-  const { storeDir, request, expected } = await fixture('range-page-boundary-first');
-  const logPath = join(storeDir, 'sessions', '11111111-1111-4111-8111-111111111111', 'events.jsonl');
-  await makeEndpointEqual(logPath, 'src/b.ts');
+  const { storeDir, request, expected } = await fixture('range-lookahead-timeout');
+  const continuationDir = join(CASES, 'range-lookahead-empty-continuation');
+  const continuationRequest = (await readFile(join(continuationDir, 'request.txt'), 'utf8')).trim();
+  const continuationExpected = JSON.parse(await readFile(join(continuationDir, 'expected.json'), 'utf8')) as unknown;
   let sawLookahead = false;
   let releaseLookahead = () => {};
   const holdLookahead = new Promise<void>(resolve => { releaseLookahead = resolve; });
@@ -809,16 +811,11 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
     assert.equal(response.status, 200);
     assert.equal(sawLookahead, true, 'deadline fired before the retention look-ahead');
     assert.ok(performance.now() - started >= deadlineMs - 100, 'response did not await the admission deadline');
-    assert.deepEqual(await response.json(), expected, 'timeout is indistinguishable from the ordinary first page');
-    const continuation = new URL(reader.url + request.slice(4));
-    continuation.searchParams.set('after_path', 'src/a.ts');
-    const next = await fetch(continuation, { headers: { authorization: `Bearer ${reader.token}` } });
+    assert.deepEqual(await response.json(), expected);
+    const next = await fetch(reader.url + continuationRequest.slice(4),
+      { headers: { authorization: `Bearer ${reader.token}` } });
     assert.equal(next.status, 200);
-    const final = await next.json() as { status: string; files: unknown[];
-      page: { complete: boolean; next_after_path: string | null } };
-    assert.equal(final.status, 'ready');
-    assert.deepEqual(final.files, []);
-    assert.deepEqual(final.page, { complete: true, next_after_path: null });
+    assert.deepEqual(await next.json(), continuationExpected);
   } finally {
     releaseLookahead();
     await reader.close();

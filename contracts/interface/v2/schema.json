@@ -32,7 +32,7 @@
     },
     "status": {
       "enum": ["ready", "partial", "skipped"],
-      "$comment": "ready: every returned file is ready or identical (including an empty page); not a claim of complete inventory, history or semantics. partial: at least one returned file has another status. skipped: no file could start; files is empty and the cursor does not move."
+      "$comment": "ready: every returned file is ready or identical (including an empty page), even if look-ahead was interrupted and page.complete is false; not a claim of complete inventory, history or semantics. partial: at least one returned file has another status. skipped: no file could start; files is empty and the cursor does not move."
     },
     "fallback_reason": {
       "enum": ["overloaded", "timeout", "cancelled", "scan-limit"],
@@ -44,7 +44,7 @@
     },
     "analysis": { "$ref": "#/$defs/analysis" },
     "gaps": {
-      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" } }, { "const": null }],
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/gap" }, "$comment": "Every capture.gap at or before after_seq, ordered by seq, subject to the shared 64 KiB metadata budget." }, { "const": null }],
       "$comment": "null only when a skipped page stopped before the recorded range was resolved."
     },
     "gaps_complete": { "type": "boolean" },
@@ -59,11 +59,11 @@
       "properties": {
         "complete": {
           "type": "boolean",
-          "$comment": "true only on the last page. Loaded totals are partial until then."
+          "$comment": "true only when the scan proves this is the last page. false after look-ahead interruption, even if a continuation later finds no visible rows. Loaded totals are partial until complete is true."
         },
         "next_after_path": {
           "oneOf": [{ "type": "string" }, { "const": null }],
-          "$comment": "Exclusive cursor for the next request. null when complete. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
+          "$comment": "Exclusive cursor for the next request. null when complete. After a look-ahead interruption it is the last returned path, never an unchecked candidate. On a skipped page it repeats the request's after_path (null when none), so the cursor does not move."
         }
       }
     }

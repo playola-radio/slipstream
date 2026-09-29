@@ -5,8 +5,8 @@
 > [Decisions](#3-decisions-for-brian)). The authoritative contract is
 > `contracts/interface/v2/schema.json` plus the validated fixtures under
 > `contracts/interface/v2/cases/` (§5.3). The JSON in this document illustrates
-> it; where they differ, the schema and fixtures win. FD4 is adding the reader
-> route; FD5 remains the measured admission gate (§6).
+> it; where they differ, the schema and fixtures win. FD4 reader integration
+> and the FD5 measured admission gate remain in progress (§6).
 
 This document defines how the daemon reports what changed in functions'
 inputs and outputs over a stretch of captured work. It is the design for the
@@ -393,7 +393,7 @@ invented.
   "range": { "before_seq": "10", "after_seq": "20" },
   "status": "ready",                      // ready | partial | skipped (page level)
   // "fallback_reason": "…"               // required iff status == skipped
-  "inventory": {
+  "inventory": {                         // null if range resolution never finished
     "scope": "observed",                  // F2-A
     "baseline_completed_seq": "10",       // null if the baseline was not complete by A
     "unknown_scopes": [],                 // from capture.baseline.completed.v1
@@ -405,8 +405,8 @@ invented.
     "effects": "notAnalyzed",
     "behavior": "notAnalyzed"
   },
-  "gaps": [ { "seq": "14", "reason": "restart", "scope": "…" } ],
-  "gaps_complete": true,                  // false when capped; the full list is on the event stream
+  "gaps": [ { "seq": "14", "reason": "restart", "scope": "…" } ], // null before resolution
+  "gaps_complete": true,                  // false when capped or not evaluated
   "files": [ /* §4.4 */ ],
   "page": { "complete": true, "next_after_path": null }
 }
@@ -443,6 +443,16 @@ has completed, a skipped or partial page retains the resolved metadata. The
 - The page ends there, with `page.complete: false`. `next_after_path` is that
   file's path, so the next request moves past it.
 - A client can retry one file on its own with `path_prefix`.
+
+**Interruption during look-ahead.** After one or more files have finished and
+no file comparison is in progress, the reader may be checking whether another
+path remains. A timeout or cancellation then returns the finished files with
+their normal aggregate status: `ready` if all returned files are `ready` or
+`identical`, otherwise `partial`. There is no page `fallback_reason`. The page
+has `complete: false` and `next_after_path` is the last returned file's path;
+it never advances past an unchecked candidate. `complete: false` says the scan
+is unfinished, not that another visible row is guaranteed. A continuation may
+return `files: []`, `status: "ready"`, and `complete: true`.
 
 **Filtering.** By default, `files` omits results whose status is `identical`.
 A missing blob is never `identical` (§4.4), so it is always listed. With
@@ -889,7 +899,7 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
 - page boundary with `next_after_path`;
 - cache hit followed by blob loss.
 
-**Committed case index** (`contracts/interface/v2/cases/`, 69 cases):
+**Committed case index** (`contracts/interface/v2/cases/`, 71 cases):
 
 - **TypeScript (20):** `ts-` + `parameter-change`, `return-change`,
   `added-function`, `added-file`, `removed-function`, `removed-file`,
@@ -902,7 +912,7 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
   `labels-defaults-effects`, `init-failable`, `generics-where`, `variadic`,
   `guard-move` and `extension-member`.
 - **Python (2):** `py-unsupported-language`, `py-missing-blob-unsupported`.
-- **Range and page (24):** `range-` + `gap-unchanged-hashes`,
+- **Range and page (26):** `range-` + `gap-unchanged-hashes`,
   `restart-reconciliation`, `gap-before-b`, `add-then-remove-ts`,
   `add-then-remove-py`, `reverted-hidden` (default filter, `files: []`),
   `reverted-listed`, `all-failed-page`, `deadline-mid-page`,
@@ -910,7 +920,8 @@ boundary cases as `range-<case>`. The full index is at the end of this section.
   `admission-skipped`, `page-boundary-first`, `page-boundary-second`,
   `huge-seq`, `rename`, `durable-ahead-409`,
   `corrupt-chain-500`, `invalid-request-400`, `scan-limit-before-file`,
-  `deadline-before-file` and `cancelled-before-file`.
+  `deadline-before-file`, `cancelled-before-file`, `lookahead-timeout`,
+  and `lookahead-empty-continuation`.
 
 Two listed conditions are **not** static fixtures, because they need a race
 between requests: "cache hit followed by blob loss" and the `410` deletion race.
@@ -966,6 +977,13 @@ accepts: write them as the session's log, put `blobs` in the CAS, and leave
     `after_path` cursor. The record scan's deadline starts at admission.
   - `interrupt: { at_path, reason: "timeout" | "cancelled" }`: the deadline or
     cancellation hits while that file is being compared.
+  - `interrupt: { phase: "lookahead", after_path, reason: "timeout" | "cancelled" }`:
+    interruption occurs while checking the next path after a completed file.
+    `after_path` names the last returned path, not an unchecked path. The next
+    recorded candidate needs a retention check; the page retains its completed
+    file statuses and resolved metadata, ends incomplete at `after_path`, and
+    has no page `fallback_reason`. This condition cannot be combined with a
+    zero file-result budget. It does not change `interrupt.at_path` semantics.
   - `limits: { file_result_bytes: 0, metadata_bytes: 0 }`: zeroes a ceiling.
     `file_result_bytes: 0` ends the page after its first result, which is
     `skipped / too-large` if it would have been `ready` and otherwise its own
@@ -991,9 +1009,9 @@ on trust:
   including the first-change predecessor rule and unknown boundaries;
 - the page lists exactly the eligible paths in UTF-16 order (a record at or
   before `A`, inside `path_prefix` and past `after_path`, `identical` ones only
-  with `include_identical`), ended by `limit`, an interrupt, a zero
-  file-result budget, or a pre-work skip; `page.complete`, the cursor and the
-  page `status` follow;
+  with `include_identical`), ended by `limit`, an interrupt during comparison or
+  look-ahead, a zero file-result budget, or a pre-work skip; `page.complete`,
+  the cursor and page `status` follow;
 - each file's `status` and `fallback_reason` follow the §4.4 precedence from
   its endpoints, coverage, language and harness condition; each side's
   coverage matches what its endpoint forces (`absent`, `blob-missing`,
