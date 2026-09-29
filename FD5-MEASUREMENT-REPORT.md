@@ -45,10 +45,16 @@ cancellation churn, worker-retirement overlap, a large-log scan sample, or
 post-shutdown child cleanup. The raw report is diagnostic evidence, not a
 registered FD5 acceptance pass.
 
-The four-arm harness that produced this report is **uncommitted prototype
-code**, preserved locally as `.context/fd5-benchmark-wip.patch`. Its scorer and
-timeout-rate definition have not passed the repository review gates. The
-committed branch contains the deadline test seam and this failure record only.
+The four-arm benchmark that produced this report (`tools/fd5-bench.ts`), the
+bounded diagnostic driver (`tools/fd5-diag*.ts`), the scorer
+(`tools/fd5-score.ts`), the tracing observer (`tools/fd5-trace.ts`), and their
+configuration (`tools/fd5-diagnostic-config.json`,
+`tools/fd5-provisional-config.json`) are committed on this branch, each with
+its own test file. Committing the tooling is not the same as passing FD5's
+repository review gates: the scorer's timeout-rate definition and the
+deadline/`C`/`Q`/`W` values it measures against have not been reviewed or
+approved by Brian, and no run through this tooling is a registered FD5
+acceptance pass.
 
 Independent challenge review also identified unresolved risks: TypeScript
 worker cancellation can make subsequent requests cold; a long recorded-log

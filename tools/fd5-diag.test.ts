@@ -39,7 +39,7 @@ test('configuration pins bounded counts, separate modes and approval fields', ()
   assert.deepEqual(describeDiagnosticMode(config, 'queue'), { cells: 6, writes: 1200, maxRequests: 14400,
     perCellGuard: 5000,
     maxCellSecondsIncludingDrain: 30 });
-  assert.deepEqual(describeDiagnosticMode(config, 'w-pressure'), { groups: 40, maxRequests: 200,
+  assert.deepEqual(describeDiagnosticMode(config, 'w-pressure'), { groups: 40, maxRequests: 440,
     maxSecondsPerCap: 15 });
   assert.throws(() => validateDiagnosticConfig({ ...(proposal as object), repetitions: 3 }), /unknown/);
   assert.throws(() => validateDiagnosticConfig({ ...(proposal as object), overhead: {

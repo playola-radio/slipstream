@@ -21,7 +21,7 @@
     "maxRequestsIncludingConditional": 562, "maxSecondsPerCell": 60
   },
   "queue": { "queueWaiterCells": [[0, 0], [2, 2], [8, 8]], "repetitionsPerCell": 2, "clipSlots": 4, "interfaceSlots": 4, "scheduledWritesPerCell": 100, "scheduledIntervalMs": 120, "burstWritesPerCell": 100, "coldKeysPerWorkload": 1200, "maxAttemptsPerCell": 5000, "maxCellSecondsIncludingDrain": 30, "minRequestIntervalMs": 100 },
-  "wPressure": { "C": 1, "Q": 8, "waiterCaps": [2, 8], "groupsPerCap": 20, "sameKeyWaitersPerGroup": 4, "maxBarrierMs": 50, "maxSecondsPerCap": 15, "maxRequests": 200 },
+  "wPressure": { "C": 1, "Q": 8, "waiterCaps": [2, 8], "groupsPerCap": 20, "sameKeyWaitersPerGroup": 10, "maxBarrierMs": 50, "maxSecondsPerCap": 15, "maxRequests": 440 },
   "host": { "preflightQuietSeconds": 60, "maxFiveMinuteLoadFractionOfPhysicalCores": 0.5, "maxSwapGrowthBytes": 0, "requireAcPower": true, "requireNormalThermal": true, "requireNoMemoryPressureWarning": true, "sampleIntervalSeconds": 1 },
   "approvalRequired": { "measurementWindow": null, "tracingOverheadTolerance": null, "diagnosticDeadlinePoints": null, "wPressureRuntimeHook": null, "clipHistoricalComparison": null }
 }
