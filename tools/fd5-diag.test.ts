@@ -62,11 +62,11 @@ test('v1 and mismatched v2 prior chains cannot authorize the next mode', async (
   ].map(record => JSON.stringify(record)).join('\n') + '\n';
   try {
     await writeFile(path, prior('ready-only-v1'));
-    await assert.rejects(readPrior(path, 'overhead', 'same', 'same'), /another head\/config/);
+    await assert.rejects(readPrior(path, 'overhead', 'same', 'same', 'terminal200-first180-v2'), /another head\/config/);
     await writeFile(path, prior('terminal200-first180-v2', 'other'));
-    await assert.rejects(readPrior(path, 'overhead', 'same', 'same'), /another head\/config/);
+    await assert.rejects(readPrior(path, 'overhead', 'same', 'same', 'terminal200-first180-v2'), /another head\/config/);
     await writeFile(path, prior('terminal200-first180-v2'));
-    assert.deepEqual(await readPrior(path, 'overhead', 'same', 'same'), {});
+    assert.deepEqual(await readPrior(path, 'overhead', 'same', 'same', 'terminal200-first180-v2'), {});
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -135,12 +135,13 @@ function attempts(pages: CorpusPage[], duration = 100): InterfaceAttempt[] {
   return pages.map((page, i) => ({ requestId: `r${i}`, expected: page.expected,
     startedAtNs: BigInt(i) * 1_000_000_000n,
     completedAtNs: BigInt(i) * 1_000_000_000n + BigInt(duration) * 1_000_000n,
-    httpStatus: 200, body: { status: 'ready', files: [{ status: 'ready' }] } }));
+    httpStatus: 200, body: { status: 'ready', page: { complete: true, next_after_path: null },
+      files: [{ status: 'ready' }] } }));
 }
 test('predeclared interface cohort contains ten of every language, size and page cell', () => {
   const plan = planInterfaceCohort(corpus());
   assert.equal(plan.length, 180);
-  assert.equal(new Set(plan.map(row => `${row.language}/${row.sizeClass}/${row.limit}`)).size, 18);
+  assert.equal(new Set(plan.map(row => row.cell)).size, 18);
   assert(plan.every(row => plan.filter(other => other.cell === row.cell).length === 10));
   assert.equal(plan.some(row => row.key === 'key-180'), false);
 });
@@ -168,12 +169,12 @@ test('all terminal 200s count, including slow partials and skipped; extras canno
   const a = scoreInterfaceCohort(plan, off), b = scoreInterfaceCohort(plan, on);
   assert.equal(a.httpLatency.n, 180);
   assert.equal(a.httpLatency.p99, 100);
-  assert.equal(a.httpLatency.p100, 900);
+  assert.equal(a.transitionsByKey[179]!.httpDurationMs, 900);
   assert.equal(b.httpLatency.p99, 100);
-  assert.equal(b.fullArm.httpLatency.p100, 10_000);
+  assert.equal(b.fullArm.count, 181);
   assert.equal(a.readyCount, 179);
   assert.equal(b.transitionsByKey.length, 180);
-  assert.equal(a.unfinishedCompletionCount, 1);
+  assert.equal(a.transitionsByKey[179]!.completion, 'unfinished');
 });
 test('interface ready loss fails despite faster HTTP, zero reference invalid, clip capture gate stays', () => {
   const plan = planInterfaceCohort(corpus());
@@ -197,5 +198,24 @@ test('interface ready loss fails despite faster HTTP, zero reference invalid, cl
   assert.equal(scoreDiagnosticOverhead(rows, tolerance)[0]!.passed, false);
   const zero = attempts(corpus()); for (const item of zero) item.body = { status: 'skipped', fallback_reason: 'overloaded', files: [] };
   rows[1] = report(100, off); rows[4] = report(100, scoreInterfaceCohort(plan, zero));
-  assert.equal(scoreDiagnosticOverhead(rows, tolerance)[2]!.passed, false);
+  assert.equal(scoreDiagnosticOverhead(rows, tolerance)[2]!.valid, false);
+  assert.match(scoreDiagnosticOverhead(rows, tolerance)[2]!.invalidReasons.join(' '), /zero-ready reference/);
+});
+
+test('real incomplete-ready and file-level timeout pages never count as ready or completed work', () => {
+  const plan = planInterfaceCohort(corpus());
+  const observed = attempts(corpus());
+  observed[0]!.body = { status: 'ready', page: { complete: false, next_after_path: 'first.ts' },
+    files: [{ status: 'ready' }] };
+  observed[1]!.body = { status: 'partial', page: { complete: false, next_after_path: 'first.ts' },
+    files: [{ status: 'ready' }, { status: 'skipped', fallback_reason: 'timeout' }] };
+  observed[2]!.body = { status: 'partial', page: { complete: true, next_after_path: null },
+    files: [{ status: 'unavailable', fallback_reason: 'after-blob-missing' }] };
+  const report = scoreInterfaceCohort(plan, observed);
+  assert.equal(report.readyCount, 177);
+  assert.equal(report.httpLatency.n, 180);
+  assert.equal(report.transitionsByKey[0]!.outcome, 'partial');
+  assert.equal(report.transitionsByKey[0]!.completion, 'unfinished');
+  assert.equal(report.transitionsByKey[1]!.completion, 'unfinished');
+  assert.equal(report.transitionsByKey[2]!.completion, 'failed');
 });

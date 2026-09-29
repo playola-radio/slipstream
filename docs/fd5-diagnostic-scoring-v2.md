@@ -26,8 +26,9 @@ shortfall. Limits and arm duration do not expand to make up a shortfall.
 
 The gate compares nearest-rank p50, p95, and p99 of elapsed client HTTP response
 duration for all 180 terminal HTTP 200 responses, including ready, partial, and
-skipped pages. Limits remain 1.05, 1.10, and 1.20. The ready count uses the
-same fixed population and retains the 0.95 on/off minimum. An off arm with zero
+skipped pages. Limits remain 1.05, 1.10, and 1.20. The ready count requires a
+complete page with a ready file, uses the same fixed population, and retains the
+0.95 on/off minimum. An off arm with zero
 ready results is invalid; an on arm with zero ready results against a positive
 off count fails normally. Capture latency, throughput, clip request scoring,
 host controls, request caps, corpus caps, and worker behavior remain unchanged.
@@ -42,7 +43,8 @@ between arms and never affect cohort membership; equal additional load is not
 assumed.
 
 HTTP response duration is measured for a completed HTTP 200 response even when
-the page reports timeout or cancellation. Completion time for interrupted
+the page or a file row reports timeout or cancellation. A `ready` page with an
+incomplete pagination marker does not count as ready work. Completion time for interrupted
 useful work is unknown and is reported as unfinished. Parse, unsupported, and
 unavailable outcomes are explicit failures, not censored successful timings.
 No completion-time percentile or censored percentile estimator is used.
