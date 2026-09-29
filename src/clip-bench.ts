@@ -252,13 +252,20 @@ export async function createHistoricalCorpus(storeDir: string, count: number): P
 }
 
 export interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
-export function runWriter(root: string, repetition: number, config: BenchmarkConfig): Promise<WorkerWrite[]> {
+export function runWriter(root: string, repetition: number, config: BenchmarkConfig,
+  options?: { signal?: AbortSignal; onWrite?: (write: WorkerWrite) => void }): Promise<WorkerWrite[]> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), { workerData: { root, repetition, ...config } });
+    if (options?.signal?.aborted) { reject(new Error('clip benchmark writer aborted')); return; }
+    const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), {
+      workerData: { root, repetition, ...config, streamWrites: Boolean(options?.signal || options?.onWrite) },
+    });
     let settled = false;
+    const onAbort = () => finish(new Error('clip benchmark writer aborted'));
+    options?.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: WorkerWrite[] | Error): void => {
       if (settled) return;
       settled = true;
+      options?.signal?.removeEventListener('abort', onAbort);
       if (result instanceof Error) {
         void worker.terminate();
         reject(result);
@@ -266,8 +273,11 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
     };
     worker.once('error', (err) => finish(err));
     worker.once('exit', (code) => { if (!settled) finish(new Error(`clip benchmark writer exited unexpectedly (${code})`)); });
-    worker.on('message', (message: { type: string; written?: WorkerWrite[]; error?: string }) => {
+    worker.on('message', (message: { type: string; write?: WorkerWrite; written?: WorkerWrite[]; error?: string }) => {
       if (message.type === 'error') finish(new Error(message.error));
+      if (message.type === 'written' && message.write && !settled) {
+        try { options?.onWrite?.(message.write); } catch (error) { finish(error as Error); }
+      }
       if (message.type === 'complete') finish(message.written ?? []);
     });
   });

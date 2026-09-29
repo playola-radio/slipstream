@@ -10,6 +10,7 @@ interface WriterData {
   scheduledWrites: number;
   scheduledIntervalMs: number;
   burstWrites: number;
+  streamWrites?: boolean;
 }
 
 interface WrittenFile {
@@ -34,7 +35,9 @@ async function writeOne(phase: 'scheduled' | 'burst', index: number): Promise<Wr
   const contents = body(phase, index);
   const startedAtNs = process.hrtime.bigint().toString();
   await writeFile(join(data.root, path), contents);
-  return { path, body: contents, startedAtNs, phase };
+  const written = { path, body: contents, startedAtNs, phase };
+  if (data.streamWrites) port.postMessage({ type: 'written', write: written });
+  return written;
 }
 
 async function run(): Promise<void> {
