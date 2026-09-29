@@ -1,8 +1,8 @@
 /** Offline FD5 collector isolation. Never starts a daemon or changes reader limits. */
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { readFile, mkdir, link, unlink, writeFile } from 'node:fs/promises';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFile, mkdir, link, unlink, open, realpath, lstat, stat } from 'node:fs/promises';
 import { resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProjectionTraceCollector, type PhaseSummary } from './fd5-trace.ts';
@@ -22,6 +22,9 @@ const ITERATIONS_PER_ORDER = 10;
 const MAX_ARM_NS = 10_000_000_000n;
 const MAX_CHILD_MS = 25_000;
 const TOOL_PATH = fileURLToPath(import.meta.url);
+const COLLECTOR_PATH = fileURLToPath(new URL('./fd5-trace.ts', import.meta.url));
+const TRACE_SOURCE_PATH = fileURLToPath(new URL('../src/projection-trace.ts', import.meta.url));
+const CHILD_TOKEN_ENV = 'FD5_COLLECTOR_PROFILE_CHILD_TOKEN';
 
 interface StoredTrace { type: 'trace'; cell: string; events: unknown[];
   phases: Record<string, PhaseSummary>; faults: unknown[] }
@@ -34,12 +37,30 @@ const sha256 = (bytes: Buffer | string): string => createHash('sha256').update(b
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-export function parseProfileArgs(argv: string[]): { source: string; out: string; toolSha256: string } {
-  if (argv.length !== 7 || argv[0] !== '--source' || argv[2] !== '--out'
-    || argv[4] !== '--tool-sha256' || argv[6] !== '--execute'
-    || !argv[1] || !argv[3] || !/^[a-f0-9]{64}$/.test(argv[5] ?? ''))
-    throw new Error('usage: node tools/fd5-collector-profile.ts --source PATH --out PATH --tool-sha256 SHA256 --execute');
-  return { source: argv[1], out: argv[3], toolSha256: argv[5]! };
+export function parseProfileArgs(argv: string[]): { source: string; out: string; toolSha256: string; head: string } {
+  if (argv.length !== 9 || argv[0] !== '--source' || argv[2] !== '--out'
+    || argv[4] !== '--tool-sha256' || argv[6] !== '--head' || argv[8] !== '--execute'
+    || !argv[1] || !argv[3] || !/^[a-f0-9]{64}$/.test(argv[5] ?? '')
+    || !/^[a-f0-9]{40}$/.test(argv[7] ?? ''))
+    throw new Error('usage: node tools/fd5-collector-profile.ts --source PATH --out PATH --tool-sha256 SHA256 --head COMMIT --execute');
+  return { source: argv[1], out: argv[3], toolSha256: argv[5]!, head: argv[7]! };
+}
+
+export async function codeHashes() {
+  const [tool, collector, traceSource] = await Promise.all([
+    readFile(TOOL_PATH), readFile(COLLECTOR_PATH), readFile(TRACE_SOURCE_PATH),
+  ]);
+  return { toolSha256: sha256(tool), collectorSha256: sha256(collector),
+    traceSourceSha256: sha256(traceSource) };
+}
+
+function gitOutput(args: string[]): string {
+  return execFileSync('git', args, { encoding: 'utf8' }).trim();
+}
+
+function assertCleanHead(expectedHead: string): void {
+  if (gitOutput(['rev-parse', 'HEAD']) !== expectedHead) throw new Error('git HEAD changed');
+  if (gitOutput(['status', '--porcelain']) !== '') throw new Error('working tree is dirty');
 }
 
 export function validateOutputSize(bytes: Buffer): number {
@@ -160,12 +181,16 @@ function runArm(input: ClipInput) {
     userMicros: number; systemMicros: number; heapUsedBytes: number; checksum?: number }> = [];
   const modes: Mode[] = ['iteration-only', 'noop-observer', 'collector'];
   const noop: ProjectionTraceObserver = () => {};
-  for (const order of ['phase-grouped', 'request-grouped'] as const) {
-    const events = buildInterleaving(input, order);
-    assert.equal(events.length, 8895);
-    for (let iteration = 0; iteration < ITERATIONS_PER_ORDER; iteration++) {
+  const sequences = { 'phase-grouped': buildInterleaving(input, 'phase-grouped'),
+    'request-grouped': buildInterleaving(input, 'request-grouped') };
+  for (const events of Object.values(sequences)) assert.equal(events.length, 8895);
+  for (let iteration = 0; iteration < ITERATIONS_PER_ORDER; iteration++) {
+    const orders: Order[] = iteration % 2 === 0
+      ? ['phase-grouped', 'request-grouped'] : ['request-grouped', 'phase-grouped'];
+    for (const [orderIndex, order] of orders.entries()) {
+      const events = sequences[order];
       for (let offset = 0; offset < modes.length; offset++) {
-        const mode = modes[(iteration + offset) % modes.length]!;
+        const mode = modes[(iteration + orderIndex + offset) % modes.length]!;
         const collector = mode === 'collector' ? createProjectionTraceCollector(100_000) : undefined;
         let checksum = 0;
         const started = process.hrtime.bigint();
@@ -196,12 +221,16 @@ function runArm(input: ClipInput) {
 }
 
 async function child(source: string, expectedToolSha: string): Promise<void> {
-  const toolSha256 = sha256(await readFile(TOOL_PATH));
-  if (toolSha256 !== expectedToolSha) throw new Error('tool SHA-256 changed');
+  const hashes = await codeHashes();
+  if (hashes.toolSha256 !== expectedToolSha) throw new Error('tool SHA-256 changed');
+  const sourceStat = await stat(source);
+  if (!sourceStat.isFile() || sourceStat.size > MAX_SOURCE_BYTES) throw new Error('source exceeds 32 MiB or is not regular');
   const input = parseSource(await readFile(source));
   const arms = input.map(runArm);
   const result = { type: 'fd5-collector-only-profile.v1', sourceSha256: SOURCE_SHA256,
-    toolSha256, syntheticPhaseEvents: true,
+    ...hashes, gitHead: gitOutput(['rev-parse', 'HEAD']), nodeVersion: process.version,
+    nodeOptionsPresent: Boolean(process.env.NODE_OPTIONS), hostVetoesApplied: false,
+    syntheticPhaseEvents: true,
     reconstruction: 'Histogram lower bounds; phase order and associations are synthetic.',
     measuredScope: 'Direct collector.observe(event) only; events were built before timing.',
     bounds: { arms: 2, iterationsPerArm: 20, iterationsPerOrder: 10,
@@ -212,40 +241,86 @@ async function child(source: string, expectedToolSha: string): Promise<void> {
   process.stdout.write(bytes);
 }
 
-async function publishExclusive(path: string, bytes: Buffer): Promise<void> {
-  const temp = `${path}.tmp-${process.pid}`;
+export async function publishExclusive(path: string, bytes: Buffer): Promise<void> {
+  const temp = `${path}.tmp-${randomBytes(8).toString('hex')}`;
+  let created = false;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 });
+    handle = await open(temp, 'wx', 0o600);
+    created = true;
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
     await link(temp, path);
-  } finally { await unlink(temp).catch(() => {}); }
+    const directory = await open(dirname(path), 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  } finally {
+    await handle?.close().catch(() => {});
+    if (created) await unlink(temp).catch(() => {});
+  }
+}
+
+async function requireAbsent(path: string): Promise<void> {
+  try { await lstat(path); throw new Error(`profile artifact already exists: ${path}`); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 
 async function parent(argv: string[]): Promise<void> {
-  const { source, out, toolSha256 } = parseProfileArgs(argv);
+  const { source, out, toolSha256, head } = parseProfileArgs(argv);
   const sourcePath = resolve(source), outputPath = resolve(out);
-  const contextRoot = resolve('.context') + sep;
+  const root = gitOutput(['rev-parse', '--show-toplevel']);
+  if (await realpath(process.cwd()) !== await realpath(root))
+    throw new Error('run from the workspace root');
+  const contextDir = resolve(root, '.context');
+  if ((await lstat(contextDir)).isSymbolicLink()) throw new Error('.context must not be a symlink');
+  const contextRoot = contextDir + sep;
   if (!outputPath.startsWith(contextRoot) || sourcePath === outputPath)
     throw new Error('result must be a distinct path under this workspace .context/');
-  if (sha256(await readFile(TOOL_PATH)) !== toolSha256) throw new Error('tool SHA-256 mismatch');
+  if (process.env.NODE_OPTIONS || process.execArgv.length) throw new Error('Node flags are not permitted');
+  assertCleanHead(head);
+  const hashes = await codeHashes();
+  if (hashes.toolSha256 !== toolSha256) throw new Error('tool SHA-256 mismatch');
+  const sourceStat = await stat(sourcePath);
+  if (!sourceStat.isFile() || sourceStat.size > MAX_SOURCE_BYTES)
+    throw new Error('source exceeds 32 MiB or is not regular');
   const sourceBytes = await readFile(sourcePath);
-  if (sourceBytes.byteLength > MAX_SOURCE_BYTES || sha256(sourceBytes) !== SOURCE_SHA256)
+  if (sha256(sourceBytes) !== SOURCE_SHA256)
     throw new Error('failed overhead evidence SHA-256 mismatch');
   const ignored = spawnSync('git', ['check-ignore', '-q', outputPath]);
   if (ignored.status !== 0) throw new Error('result path is not gitignored');
-  const run = spawnSync(process.execPath, [TOOL_PATH, '--child', sourcePath, toolSha256],
-    { encoding: 'utf8', timeout: MAX_CHILD_MS, maxBuffer: MAX_RESULT_BYTES, killSignal: 'SIGKILL' });
+  await requireAbsent(outputPath);
+  await requireAbsent(`${outputPath}.sha256`);
+  await mkdir(dirname(outputPath), { recursive: true });
+  const realOutputDir = await realpath(dirname(outputPath));
+  const realContextDir = await realpath(contextDir);
+  if (realOutputDir !== realContextDir && !realOutputDir.startsWith(realContextDir + sep))
+    throw new Error('result directory escapes .context');
+  const childToken = randomBytes(16).toString('hex');
+  const run = spawnSync(process.execPath, [TOOL_PATH, '--child', sourcePath, toolSha256, head, childToken],
+    { encoding: 'utf8', timeout: MAX_CHILD_MS, maxBuffer: MAX_RESULT_BYTES, killSignal: 'SIGKILL',
+      env: { ...process.env, [CHILD_TOKEN_ENV]: childToken } });
   if (run.error || run.status !== 0) throw new Error(`profile child failed: ${run.error?.message ?? run.stderr}`);
   const bytes = Buffer.from(run.stdout);
   validateOutputSize(bytes);
   if (sha256(await readFile(sourcePath)) !== SOURCE_SHA256) throw new Error('source changed during profile');
-  await mkdir(dirname(outputPath), { recursive: true });
+  assertCleanHead(head);
+  assert.deepEqual(await codeHashes(), hashes, 'profile code changed during run');
   await publishExclusive(outputPath, bytes);
-  await publishExclusive(`${outputPath}.sha256`, Buffer.from(`${sha256(bytes)}  ${outputPath}\n`));
+  try {
+    await publishExclusive(`${outputPath}.sha256`, Buffer.from(`${sha256(bytes)}  ${outputPath.split(sep).at(-1)}\n`));
+  } catch (error) {
+    await unlink(outputPath).catch(() => {});
+    throw error;
+  }
   process.stdout.write(`result=${outputPath}\nsha256=${sha256(bytes)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === TOOL_PATH) {
   const run = process.argv[2] === '--child'
-    ? child(process.argv[3]!, process.argv[4]!) : parent(process.argv.slice(2));
+    ? process.argv[6] && process.env[CHILD_TOKEN_ENV] === process.argv[6]
+      ? (assertCleanHead(process.argv[5]!), child(process.argv[3]!, process.argv[4]!))
+      : Promise.reject(new Error('private profile child requires parent token'))
+    : parent(process.argv.slice(2));
   run.catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });
 }
