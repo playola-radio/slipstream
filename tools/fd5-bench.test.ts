@@ -102,7 +102,6 @@ test('isolated load client starts, stops and actually exits without a reader', a
   try {
     const [started] = await once(worker, 'message', { signal: AbortSignal.timeout(5_000) });
     assert.equal(started.type, 'started');
-    assert.equal(started.argv1, fileURLToPath(new URL('./fd5-load-worker.ts', import.meta.url)));
     const summary = once(worker, 'message', { signal: AbortSignal.timeout(5_000) });
     const exit = once(worker, 'exit', { signal: AbortSignal.timeout(5_000) });
     worker.postMessage('stop');

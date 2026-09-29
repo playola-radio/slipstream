@@ -263,7 +263,7 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
   return new Promise((resolve, reject) => {
     if (options?.signal?.aborted) { reject(new Error('clip benchmark writer aborted')); return; }
     const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), {
-      workerData: { root, repetition, ...config, streamWrites: Boolean(options?.signal || options?.onWrite) },
+      workerData: { root, repetition, ...config, streamWrites: Boolean(options?.onWrite) },
     });
     let settled = false;
     let completed: WorkerWrite[] | undefined;

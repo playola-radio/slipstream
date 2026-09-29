@@ -8,12 +8,11 @@ if (!parentPort) throw new Error('diagnostic HTTP client needs a parent');
 const port = parentPort;
 const active = new Map<number, AbortController>();
 let stopping = false;
-function finishIfStopped(): void { if (stopping && active.size === 0) { port.postMessage({ type: 'stopped' }); port.close(); } }
+function finishIfStopped(): void { if (stopping && active.size === 0) port.close(); }
 port.on('message', (message: string | { type: string; id?: number; url?: string; token?: string;
   timeoutMs?: number; kind?: 'clip' | 'interface'; change?: HistoricalChange; page?: CorpusPage }) => {
   if (message === 'stop') { stopping = true; finishIfStopped(); return; }
   if (typeof message === 'string') return;
-  if (message.type === 'stop') { stopping = true; finishIfStopped(); return; }
   if (message.type === 'cancel') { if (message.id !== undefined) active.get(message.id)?.abort(); return; }
   if (message.type !== 'request' || stopping || message.id === undefined || active.has(message.id)
     || !message.url || !message.token || !message.timeoutMs) return;
