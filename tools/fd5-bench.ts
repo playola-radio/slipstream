@@ -71,15 +71,18 @@ async function fixture(name: string): Promise<Fixture> {
 }
 
 /** Each page has immutable before/after cutoffs; a trailing comment makes every content key unique. */
-export async function createInterfaceCorpus(storeDir: string, pageCount: number, seed = 'fd5-recovery-v1'): Promise<CorpusPage[]> {
+export async function createInterfaceCorpus(storeDir: string, pageCount: number, seed = 'fd5-recovery-v1',
+  selection?: { language: 'typescript' | 'tsx' | 'swift'; sizeClass: 'tiny' | 'representative'; files: 1 | 4 | 16 },
+  signal?: AbortSignal): Promise<CorpusPage[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
   const ts = await fixture('ts-return-change');
   const swift = await fixture('swift-labels-defaults-effects');
   const pages: CorpusPage[] = [];
   for (let index = 0; index < pageCount; index++) {
-    const limit = [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16;
-    const pageLanguage = LANGUAGES[index % LANGUAGES.length]!;
-    const sizeClass = Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative';
+    signal?.throwIfAborted();
+    const limit = selection?.files ?? [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16;
+    const pageLanguage = selection?.language ?? LANGUAGES[index % LANGUAGES.length]!;
+    const sizeClass = selection?.sizeClass ?? (Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative');
     const idHex = createHash('sha256').update(`${seed}:session:${index}`).digest('hex');
     const sessionId = `${idHex.slice(0, 8)}-${idHex.slice(8, 12)}-4${idHex.slice(13, 16)}-8${idHex.slice(17, 20)}-${idHex.slice(20, 32)}`;
     await mkdir(join(storeDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
@@ -89,6 +92,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
         data: { root: '/synthetic-fd5-corpus', max_bytes: 1024 * 1024 } });
       const baselines: Array<Omit<ExpectedFile, 'afterRecordSeq'> & { beforeSize: number; afterSize: number }> = [];
       for (let j = 0; j < limit; j++) {
+        signal?.throwIfAborted();
         const language = pageLanguage;
         const source = language === 'swift' ? swift : ts;
         const filler = sizeClass === 'representative' ? Array.from({ length: 96 }, (_, n) => language === 'swift'

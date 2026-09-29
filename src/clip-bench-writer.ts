@@ -52,6 +52,7 @@ async function run(): Promise<void> {
   );
   written.push(...burst);
   port.postMessage({ type: 'complete', written });
+  port.close();
 }
 
-void run().catch((err) => port.postMessage({ type: 'error', error: String(err) }));
+void run().catch((err) => { port.postMessage({ type: 'error', error: String(err) }); port.close(); });

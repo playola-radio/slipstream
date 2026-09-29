@@ -44,7 +44,7 @@ export interface CaptureArmInput {
   drainTimedOut?: boolean;
 }
 
-interface LatencyStats { n: number; p50: number | null; p99: number | null }
+interface LatencyStats { n: number; p50: number | null; p95: number | null; p99: number | null }
 export interface CaptureArmReport {
   host?: { before: ReturnType<typeof hostSample>; after: ReturnType<typeof hostSample> };
   name: string;
@@ -65,7 +65,8 @@ interface ChangedLike { type?: unknown; seq?: unknown; data?: { path?: unknown; 
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const stats = (samples: number[]): LatencyStats => {
   const sorted = [...samples].sort((a, b) => a - b);
-  return { n: sorted.length, p50: sorted.length ? percentile(sorted, 50) : null, p99: sorted.length ? percentile(sorted, 99) : null };
+  return { n: sorted.length, p50: sorted.length ? percentile(sorted, 50) : null,
+    p95: sorted.length ? percentile(sorted, 95) : null, p99: sorted.length ? percentile(sorted, 99) : null };
 };
 const increment = (target: Record<string, number>, key: string): void => { target[key] = (target[key] ?? 0) + 1; };
 
@@ -221,7 +222,7 @@ function corpusBody(index: number, changed: boolean): string {
   return `export function corpus(value: number): number {\n  let total = value;\n${lines.join('\n')}\n  return total;\n}\n`;
 }
 
-export async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
+export async function createHistoricalCorpus(storeDir: string, count: number, signal?: AbortSignal): Promise<HistoricalChange[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
   let sessionId = '';
   let log: Awaited<ReturnType<typeof createLog>> | undefined;
@@ -231,6 +232,7 @@ export async function createHistoricalCorpus(storeDir: string, count: number): P
     const before = await cas.put(Buffer.from(corpusBody(0, false)));
     const changes: HistoricalChange[] = [];
     for (let index = 0; index < count; index++) {
+      signal?.throwIfAborted();
       if (index % CHANGES_PER_HISTORICAL_SESSION === 0) {
         await log?.close();
         sessionId = randomUUID();
@@ -253,13 +255,14 @@ export async function createHistoricalCorpus(storeDir: string, count: number): P
 
 export interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
 export function runWriter(root: string, repetition: number, config: BenchmarkConfig,
-  options?: { signal?: AbortSignal; onWrite?: (write: WorkerWrite) => void }): Promise<WorkerWrite[]> {
+  options?: { signal?: AbortSignal; onWrite?: (write: WorkerWrite) => void; requireExit?: boolean }): Promise<WorkerWrite[]> {
   return new Promise((resolve, reject) => {
     if (options?.signal?.aborted) { reject(new Error('clip benchmark writer aborted')); return; }
     const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), {
       workerData: { root, repetition, ...config, streamWrites: Boolean(options?.signal || options?.onWrite) },
     });
     let settled = false;
+    let completed: WorkerWrite[] | undefined;
     const onAbort = () => finish(new Error('clip benchmark writer aborted'));
     options?.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: WorkerWrite[] | Error): void => {
@@ -272,13 +275,20 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
       } else resolve(result);
     };
     worker.once('error', (err) => finish(err));
-    worker.once('exit', (code) => { if (!settled) finish(new Error(`clip benchmark writer exited unexpectedly (${code})`)); });
+    worker.once('exit', (code) => {
+      if (settled) return;
+      if (code === 0 && options?.requireExit && completed) finish(completed);
+      else finish(new Error(`clip benchmark writer exited unexpectedly (${code})`));
+    });
     worker.on('message', (message: { type: string; write?: WorkerWrite; written?: WorkerWrite[]; error?: string }) => {
       if (message.type === 'error') finish(new Error(message.error));
       if (message.type === 'written' && message.write && !settled) {
         try { options?.onWrite?.(message.write); } catch (error) { finish(error as Error); }
       }
-      if (message.type === 'complete') finish(message.written ?? []);
+      if (message.type === 'complete') {
+        if (options?.requireExit) completed = message.written ?? [];
+        else finish(message.written ?? []);
+      }
     });
   });
 }

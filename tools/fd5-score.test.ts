@@ -153,7 +153,7 @@ test('rejects illegal retry and an interval gap despite peak concurrency', () =>
 test('capture comparison checks all six latency cells and throughput independently', () => {
   const base = { written: 200, missing: 0, latency: { n: 200, p50: 10, p99: 10 }, scheduledLatency: { n: 100, p50: 10, p99: 10 },
     burstLatency: { n: 100, p50: 10, p99: 10 }, throughputPerSecond: 100 } as Parameters<typeof compareCaptureToBaseline>[0];
-  const loaded = { ...base, burstLatency: { n: 100, p50: 10, p99: 13 }, throughputPerSecond: 90 };
+  const loaded = { ...base, burstLatency: { n: 100, p50: 10, p95: 10, p99: 13 }, throughputPerSecond: 90 };
   const result = compareCaptureToBaseline(base, loaded, 'combined', 2, true);
   assert.equal(result.passed, false);
   assert.equal(result.latencyCells.length, 6);

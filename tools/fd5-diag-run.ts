@@ -1,0 +1,669 @@
+/** Deliberately separate from the registered 12-arm FD5 campaign. Raw diagnostic evidence only. */
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
+import { arch, availableParallelism, cpus, loadavg, release, tmpdir } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { startCapture, type CaptureSession } from '../src/session.ts';
+import { startReaderServer } from '../src/http-reader.ts';
+import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
+  type BenchmarkConfig, type HistoricalChange, type WorkerWrite, type CaptureArmReport } from '../src/clip-bench.ts';
+import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
+import { SWIFT_V1 } from '../src/swift-interface.ts';
+import { createInterfaceCorpus, type CorpusPage } from './fd5-bench.ts';
+import { assembleProjectionTrace, scoreClipTrace, scoreProcessStartupTiming, validateInterfacePage,
+  type InterfaceAttempt } from './fd5-score.ts';
+import { createProjectionTraceCollector } from './fd5-trace.ts';
+import { startDiagnosticLoad, type DiagnosticLoad, type DiagnosticAttempt } from './fd5-diag-load.ts';
+import type { DiagnosticConfig, DiagnosticMode } from './fd5-diag.ts';
+
+const encode = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) =>
+  typeof item === 'bigint' ? item.toString() : item);
+const sha = (body: string | Uint8Array): string => createHash('sha256').update(body).digest('hex');
+
+/** Every record is appended in order. Result/failure records are durably synced. */
+class Journal {
+  private pending = Promise.resolve();
+  private readonly file: Awaited<ReturnType<typeof open>>;
+  constructor(file: Awaited<ReturnType<typeof open>>) { this.file = file; }
+  record(value: unknown, durable = false): Promise<void> {
+    const next = this.pending.then(async () => {
+      await this.file.appendFile(encode(value) + '\n');
+      if (durable) await this.file.sync();
+    });
+    this.pending = next;
+    return next;
+  }
+  async close(): Promise<void> { await this.pending; await this.file.close(); }
+}
+
+function startCap(seconds: number): { signal: AbortSignal; expired: () => boolean; close: () => void } {
+  const controller = new AbortController();
+  let hit = false;
+  const timer = setTimeout(() => { hit = true; controller.abort(new Error('diagnostic wall-time cap')); }, seconds * 1000);
+  return { signal: controller.signal, expired: () => hit, close: () => clearTimeout(timer) };
+}
+async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return Promise.race([work, new Promise<never>((_, reject) =>
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true }))]);
+}
+async function cleanupWithin<T>(work: Promise<T>): Promise<T> {
+  return bounded(work, AbortSignal.timeout(5_000));
+}
+async function quietDrain(session: CaptureSession, signal: AbortSignal): Promise<boolean> {
+  return new Promise(resolve => {
+    let done = false;
+    let quietTimer: ReturnType<typeof setTimeout>;
+    const finish = (quiet: boolean): void => {
+      if (done) return;
+      done = true; clearTimeout(quietTimer); off(); signal.removeEventListener('abort', onAbort); resolve(quiet);
+    };
+    const onAbort = (): void => finish(false);
+    const off = session.health.subscribe(() => { clearTimeout(quietTimer); quietTimer = setTimeout(() => finish(true), 500); });
+    quietTimer = setTimeout(() => finish(true), 500);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) finish(false);
+  });
+}
+
+function command(binary: string, args: string[]): string | null {
+  try { return execFileSync(binary, args, { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+  catch { return null; }
+}
+function hostEvidence(config: DiagnosticConfig): { at: string; load5: number; physicalCores: number;
+  acPower: boolean | null; normalThermal: boolean | null; noMemoryWarning: boolean | null;
+  swapUsedBytes: number | null; faults: string[] } {
+  const batt = command('pmset', ['-g', 'batt']);
+  const therm = command('pmset', ['-g', 'therm']);
+  const memory = command('memory_pressure', ['-Q']);
+  const swap = command('sysctl', ['vm.swapusage']);
+  const used = swap?.match(/used\s*=\s*([\d.]+)([KMG])/i);
+  const scale = used?.[2]?.toUpperCase() === 'G' ? 2 ** 30 : used?.[2]?.toUpperCase() === 'M' ? 2 ** 20 : 2 ** 10;
+  const swapUsedBytes = used ? Math.round(Number(used[1]) * scale) : null;
+  const load5 = loadavg()[1]!;
+  const physicalCores = Number(command('sysctl', ['-n', 'hw.physicalcpu'])) || availableParallelism();
+  const acPower = batt === null ? null : batt.includes('AC Power');
+  const normalThermal = therm === null ? null : !/thermal level\s*:\s*[1-9]|CPU_Speed_Limit\s*=\s*(?!100\b)/i.test(therm);
+  const noMemoryWarning = memory === null ? null : !/critical|warning/i.test(memory);
+  const faults = [
+    ...(load5 >= config.host.maxFiveMinuteLoadFractionOfPhysicalCores * physicalCores ? ['host load veto'] : []),
+    ...(config.host.requireAcPower && acPower !== true ? ['AC power unverified or absent'] : []),
+    ...(config.host.requireNormalThermal && normalThermal !== true ? ['normal thermal state unverified'] : []),
+    ...(config.host.requireNoMemoryPressureWarning && noMemoryWarning !== true ? ['memory pressure unverified or warned'] : []),
+    ...(swapUsedBytes === null ? ['swap usage unverified'] : []),
+  ];
+  return { at: new Date().toISOString(), load5, physicalCores, acPower, normalThermal,
+    noMemoryWarning, swapUsedBytes, faults };
+}
+async function preflight(config: DiagnosticConfig, journal: Journal): Promise<void> {
+  let first: ReturnType<typeof hostEvidence> | undefined;
+  for (let i = 0; i <= config.host.preflightQuietSeconds; i++) {
+    const sample = hostEvidence(config);
+    if (!first) first = sample;
+    const swapGrowth = first.swapUsedBytes !== null && sample.swapUsedBytes !== null
+      ? sample.swapUsedBytes - first.swapUsedBytes : null;
+    await journal.record({ type: 'preflight-sample', sample, swapGrowthBytes: swapGrowth });
+    if (sample.faults.length || swapGrowth === null || swapGrowth > config.host.maxSwapGrowthBytes)
+      throw new Error(`host preflight veto: ${[...sample.faults, ...(swapGrowth === null ? ['swap growth unknown'] :
+        swapGrowth > config.host.maxSwapGrowthBytes ? ['swap growth'] : [])].join(', ')}`);
+    if (i < config.host.preflightQuietSeconds) await delay(1000);
+  }
+}
+function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => Promise<string[]> } {
+  const faults: string[] = [];
+  let previousSwap: number | null = null;
+  const sample = (): void => {
+    const item = hostEvidence(config);
+    const hadPrevious = previousSwap !== null;
+    const growth = hadPrevious && item.swapUsedBytes !== null ? item.swapUsedBytes - previousSwap! : null;
+    previousSwap = item.swapUsedBytes;
+    faults.push(...item.faults);
+    if (hadPrevious && (growth === null || growth > config.host.maxSwapGrowthBytes))
+      faults.push('host swap growth unknown or positive');
+    void journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
+  };
+  sample();
+  const timer = setInterval(sample, config.host.sampleIntervalSeconds * 1000);
+  return { stop: async () => { clearInterval(timer); await journal.record({ type: 'host-monitor-ended' });
+    return [...new Set(faults)]; } };
+}
+
+async function requestInterface(server: Awaited<ReturnType<typeof startReaderServer>>, page: CorpusPage,
+  timeoutMs: number, signal: AbortSignal): Promise<InterfaceAttempt> {
+  const startedAtNs = process.hrtime.bigint();
+  const requestId = sha(`${startedAtNs}:${page.expected.key}`).slice(0, 32);
+  try {
+    const response = await fetch(server.url + page.expected.routeKey, { headers: { authorization: `Bearer ${server.token}` },
+      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
+    const body: unknown = await response.json().catch(() => null);
+    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(),
+      httpStatus: response.status, body };
+  } catch (error) {
+    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(), error: String(error) };
+  }
+}
+
+async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeDir: string,
+  clipCorpus: HistoricalChange[], interfaceCorpus: CorpusPage[], spec: {
+    name: string; clip: boolean; interfaces: boolean; trace: boolean; C: number; Q: number; W: number;
+    interfaceDeadlineMs: number; scheduled: number; burst: number; intervalMs: number;
+    clipSlots: number; interfaceSlots: number; maxAttempts: number; maxSeconds: number; minRequestIntervalMs: number;
+  }): Promise<{ valid: boolean; faults: string[]; capture: CaptureArmReport }> {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-wt-'));
+  const cap = startCap(spec.maxSeconds);
+  const collector = createProjectionTraceCollector();
+  const written: WorkerWrite[] = [];
+  const durableAtNsBySeq = new Map<string, bigint>();
+  let session: CaptureSession | undefined, server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+  let clipLoad: DiagnosticLoad | undefined, interfaceLoad: DiagnosticLoad | undefined;
+  let off: (() => void) | undefined;
+  let drained = false, captureStopped = false, readerClosed = false, worktreeRemoved = false;
+  const faults: string[] = [];
+  const host = monitorHost(config, journal);
+  const sharedCount = new SharedArrayBuffer(4);
+  let clipSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
+  let interfaceSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
+  try {
+    session = await bounded(startCapture({ root, storeDir }), cap.signal);
+    let highWater = BigInt(session.health.snapshot().durable_seq);
+    off = session.health.subscribe(() => {
+      const next = BigInt(session!.health.snapshot().durable_seq);
+      const at = process.hrtime.bigint();
+      for (let seq = highWater + 1n; seq <= next; seq++) durableAtNsBySeq.set(seq.toString(), at);
+      highWater = next;
+    });
+    server = await bounded(startReaderServer({ storeDir,
+      active: { id: session.sessionId, health: session.health, logPath: session.logPath },
+      projectionAdmissionConfig: { C: spec.C, Q: spec.Q, W: spec.W, D: config.admission.clipDeadlineMs },
+      interfaceDeadlineMs: spec.interfaceDeadlineMs, ...(spec.trace ? { projectionTrace: collector.observe } : {}) }), cap.signal);
+    const loadOptions = { url: server.url, token: server.token, maxAttempts: spec.maxAttempts, sharedCount,
+      minRequestIntervalMs: spec.minRequestIntervalMs, requestTimeoutMs: spec.interfaceDeadlineMs + 2000,
+      onEvidence: (event: unknown) => { void journal.record({ type: 'load-evidence', cell: spec.name, event }); } };
+    if (spec.clip) clipLoad = startDiagnosticLoad({ ...loadOptions, kind: 'clip', corpus: clipCorpus, slots: spec.clipSlots });
+    if (spec.interfaces) interfaceLoad = startDiagnosticLoad({ ...loadOptions, kind: 'interface', corpus: interfaceCorpus,
+      slots: spec.interfaceSlots });
+    await bounded(Promise.all([clipLoad?.ready, interfaceLoad?.ready]), cap.signal);
+    const writerConfig: BenchmarkConfig = { repetitions: 1, scheduledWrites: spec.scheduled,
+      scheduledIntervalMs: spec.intervalMs, burstWrites: spec.burst, concurrentClipRequests: spec.clipSlots,
+      corpusChanges: clipCorpus.length };
+    await bounded(runWriter(root, 0, writerConfig, { signal: cap.signal, requireExit: true,
+      onWrite: write => { written.push(write); void journal.record({ type: 'write', cell: spec.name, write }); } }), cap.signal);
+    drained = await quietDrain(session, cap.signal);
+    if (!drained) faults.push('capture quiet drain missing before cap');
+  } catch (error) { faults.push(String(error)); }
+  finally {
+    off?.();
+    const results = await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
+    if (results[0]?.status === 'fulfilled') clipSummary = results[0].value;
+    else if (results[0]?.status === 'rejected') faults.push(`clip client exit: ${results[0].reason}`);
+    if (results[1]?.status === 'fulfilled') interfaceSummary = results[1].value;
+    else if (results[1]?.status === 'rejected') faults.push(`interface client exit: ${results[1].reason}`);
+    try { if (session) await cleanupWithin(session.stop()); captureStopped = true; }
+    catch (error) { faults.push(`capture stop: ${error}`); }
+    try { if (server) await cleanupWithin(server.close()); readerClosed = true; }
+    catch (error) { faults.push(`reader close: ${error}`); }
+    try { await cleanupWithin(rm(root, { recursive: true, force: true })); worktreeRemoved = true; }
+    catch (error) { faults.push(`worktree cleanup: ${error}`); }
+    cap.close();
+  }
+  const hostFaults = await host.stop();
+  faults.push(...hostFaults);
+  if (cap.expired()) faults.push('wall-time cap hit');
+  if (Atomics.load(new Int32Array(sharedCount), 0) >= spec.maxAttempts) faults.push('request cap hit');
+  if (clipSummary?.corpusExhausted || interfaceSummary?.corpusExhausted) faults.push('cold corpus exhausted');
+  if (clipSummary?.incompleteRequestIds.length || interfaceSummary?.incompleteRequestIds.length)
+    faults.push('client request lacks final outcome');
+  if (!captureStopped || !readerClosed || !worktreeRemoved) faults.push('incomplete cleanup');
+  const records = session ? await readRecords(session.logPath) : [];
+  const expectedWrites = written.map(write => ({ path: write.path, sha256: sha(write.body),
+    startedAtNs: BigInt(write.startedAtNs), phase: write.phase }));
+  const capture = scoreCaptureArm({ name: spec.name, writes: expectedWrites, records, durableAtNsBySeq,
+    clipResponses: clipLoad?.attempts.filter(item => item.kind === 'clip').map(item => item.attempt) ?? [],
+    requestedClipKeys: clipLoad?.attempts.filter(item => item.kind === 'clip').map(item => item.attempt.key ?? '') ?? [],
+    concurrentClipRequests: spec.clip ? spec.clipSlots : 0, maxConcurrentRequests: clipSummary?.maxConcurrentRequests,
+    coldCacheServerFresh: Boolean(spec.clip), loadStartedAtNs: clipSummary?.startedAtNs,
+    loadStoppedAtNs: clipSummary?.stoppedAtNs, corpusExhausted: clipSummary?.corpusExhausted,
+    attemptLimitReached: clipSummary?.attemptLimitReached, drainTimedOut: !drained });
+  if (capture.missing > 0 || capture.written !== spec.scheduled + spec.burst)
+    faults.push('expected capture writes are missing or incomplete');
+  if (spec.trace) {
+    const observed = collector.snapshot();
+    const interfaces = interfaceLoad?.attempts.filter(item => item.kind === 'interface').map(item => item.attempt) ?? [];
+    const assembly = assembleProjectionTrace(observed.events, interfaces);
+    faults.push(...observed.faults, ...assembly.faults);
+    if (!assembly.processExitsVerified) faults.push('actual parser process exit missing');
+    const startup = scoreProcessStartupTiming(assembly.processUses, observed.events,
+      observed.processPhases, assembly.traces);
+    faults.push(...startup.faults);
+    if (spec.clip) faults.push(...scoreClipTrace(clipLoad?.attempts.filter(item => item.kind === 'clip')
+      .map(item => item.attempt) ?? [], assembly.traces, assembly.clipCacheBypasses));
+    for (const attempt of assembly.attempts) {
+      if (attempt.httpStatus === 200) faults.push(...validateInterfacePage(attempt.body, attempt.expected));
+      else faults.push('interface HTTP outcome is not 200');
+      const traces = assembly.traces.filter(trace => trace.workload === 'interface'
+        && trace.routeKey === attempt.expected.routeKey && trace.submittedAtNs >= attempt.startedAtNs
+        && trace.settledAtNs <= (attempt.completedAtNs ?? -1n));
+      if (traces.length !== 1) { faults.push('interface HTTP request lacks unique admission join'); continue; }
+      const trace = traces[0]!;
+      const readyFiles = (attempt.body as { files?: Array<{ path?: string; status?: string }> } | null)
+        ?.files?.filter(file => file.status === 'ready') ?? [];
+      for (const file of readyFiles) {
+        if (attempt.freshnessByPath?.[String(file.path)] !== 'fresh')
+          faults.push(`cold interface file ${String(file.path)} lacks fresh extraction`);
+        const phases = observed.unitPhases.get(trace.unitId);
+        const scope = attempt.expected.language === 'swift' ? 'swift' : 'typescript';
+        for (const phase of ['interface:range-scan', 'interface:cas-read', 'interface:cas-hash',
+          `${scope}:${scope === 'swift' ? 'child-lifecycle' : 'worker-roundtrip'}`,
+          `${scope}:grammar-load`, `${scope}:parse-compare`])
+          if (!phases?.has(phase)) faults.push(`ready interface unit lacks ${phase}`);
+      }
+    }
+    const successfulRoutes = new Map<string, number>();
+    for (const attempt of assembly.attempts) if (attempt.httpStatus === 200)
+      successfulRoutes.set(attempt.expected.routeKey, (successfulRoutes.get(attempt.expected.routeKey) ?? 0) + 1);
+    for (const response of clipLoad?.attempts.filter(item => item.kind === 'clip').map(item => item.attempt) ?? [])
+      if (response.httpStatus === 200 && response.routeKey)
+        successfulRoutes.set(response.routeKey, (successfulRoutes.get(response.routeKey) ?? 0) + 1);
+    for (const [route, count] of successfulRoutes) {
+      const phases = observed.routePhases.get(route);
+      if (phases?.serialization !== count || phases.completion !== count)
+        faults.push(`HTTP route ${route} lacks completion timing`);
+    }
+    for (const route of observed.routePhases.keys()) if (!successfulRoutes.has(route))
+      faults.push(`orphan HTTP timing ${route}`);
+    await journal.record({ type: 'trace', cell: spec.name, assembly, phases: observed.phases,
+      events: observed.events, faults: observed.faults, startupCensored: startup.censored });
+  } else if (spec.clip || spec.interfaces) {
+    await journal.record({ type: 'unverified-trace-off', cell: spec.name,
+      reason: 'admission, freshness, parser exits and interface load sufficiency unknown' });
+  }
+  await journal.record({ type: 'cell', cell: spec.name, diagnosticValid: faults.length === 0,
+    faults: [...new Set(faults)], capture, cleanup: { captureStopped, readerClosed, worktreeRemoved,
+      clipClientExit: clipSummary?.actualWorkerExit ?? !spec.clip,
+      interfaceClientExit: interfaceSummary?.actualWorkerExit ?? !spec.interfaces },
+    bounds: { requests: Atomics.load(new Int32Array(sharedCount), 0), seconds: spec.maxSeconds,
+      capHit: cap.expired() }, host: { before: hostSample(), faults: hostFaults } }, true);
+  return { valid: faults.length === 0, faults, capture };
+}
+
+async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: DiagnosticConfig,
+  journal: Journal, storeDir: string, selectedDeadlineMs = config.admission.interfaceDeadlineMs): Promise<void> {
+  const clipCount = mode === 'smoke' ? config.smoke.coldKeysPerWorkload :
+    mode === 'overhead' ? config.overhead.coldKeysPerWorkload : config.queue.coldKeysPerWorkload;
+  const interfaceCount = clipCount;
+  const preparation = startCap(config.maxPreparationSeconds);
+  let clipCorpus: HistoricalChange[], interfaceCorpus: CorpusPage[];
+  try {
+    clipCorpus = await createHistoricalCorpus(storeDir, clipCount, preparation.signal);
+    interfaceCorpus = await createInterfaceCorpus(storeDir, interfaceCount, `${config.seed}-${mode}`,
+      undefined, preparation.signal);
+    preparation.signal.throwIfAborted();
+  } finally { preparation.close(); }
+  const base = { C: config.admission.C, Q: config.admission.Q, W: config.admission.W,
+    interfaceDeadlineMs: selectedDeadlineMs, clipSlots: 0, interfaceSlots: 0 };
+  const cells = mode === 'smoke' ? [
+    { name: 'smoke-baseline', clip: false, interfaces: false, trace: true, ...base,
+      scheduled: config.smoke.scheduledWrites, burst: config.smoke.burstWrites, intervalMs: 120,
+      maxAttempts: 1, maxSeconds: config.smoke.maxArmSeconds,
+      minRequestIntervalMs: config.smoke.minRequestIntervalMs },
+    { name: 'smoke-combined', clip: true, interfaces: true, trace: true, ...base,
+      clipSlots: config.smoke.clipSlots, interfaceSlots: config.smoke.interfaceSlots,
+      scheduled: config.smoke.scheduledWrites, burst: config.smoke.burstWrites, intervalMs: 120,
+      maxAttempts: config.smoke.coldKeysPerWorkload * 2, maxSeconds: config.smoke.maxArmSeconds,
+      minRequestIntervalMs: config.smoke.minRequestIntervalMs },
+  ] : mode === 'overhead' ? config.overhead.workloads.flatMap(workload =>
+    config.overhead.traceOrder.map((trace, index) => ({ name: `overhead-${workload}-${index + 1}-${trace}`,
+      clip: workload === 'clip', interfaces: workload === 'interface', trace: trace === 'on', ...base,
+      clipSlots: workload === 'clip' ? config.overhead.slotsPerWorkload : 0,
+      interfaceSlots: workload === 'interface' ? config.overhead.slotsPerWorkload : 0,
+      scheduled: config.overhead.scheduledWritesPerArm, burst: config.overhead.burstWritesPerArm,
+      intervalMs: config.overhead.scheduledIntervalMs, maxAttempts: config.overhead.maxAttemptsPerArm,
+      maxSeconds: config.overhead.maxArmSeconds, minRequestIntervalMs: config.overhead.minRequestIntervalMs }))) :
+    config.queue.queueWaiterCells.flatMap(([Q, W]) => Array.from({ length: config.queue.repetitionsPerCell }, (_, i) => ({
+      name: `queue-q${Q}-w${W}-${i + 1}`, clip: true, interfaces: true, trace: true, ...base,
+      Q, W, clipSlots: config.queue.clipSlots, interfaceSlots: config.queue.interfaceSlots,
+      scheduled: config.queue.scheduledWritesPerCell, burst: config.queue.burstWritesPerCell,
+      intervalMs: config.queue.scheduledIntervalMs, maxAttempts: config.queue.maxAttemptsPerCell,
+      maxSeconds: config.queue.maxCellSecondsIncludingDrain, minRequestIntervalMs: config.queue.minRequestIntervalMs,
+    })));
+  const reports: CaptureArmReport[] = [];
+  for (const cell of cells) {
+    const report = await runCaptureCell(config, journal, storeDir, clipCorpus, interfaceCorpus, cell);
+    if (!report.valid) throw new Error(`diagnostic cell ${cell.name} invalid: ${report.faults.join('; ')}`);
+    reports.push(report.capture);
+  }
+  if (mode === 'overhead') {
+    const tolerance = config.approvalRequired.tracingOverheadTolerance as OverheadTolerance;
+    const comparisons = scoreDiagnosticOverhead(reports, tolerance);
+    await journal.record({ type: 'overhead-comparison', comparisons }, true);
+    if (comparisons.some(item => !item.passed)) throw new Error('tracing overhead exceeded approved tolerance');
+  }
+}
+
+export interface OverheadTolerance { maxLatencyRatio: { p50: number; p95: number; p99: number };
+  minThroughputRatio: number }
+export function scoreDiagnosticOverhead(reports: CaptureArmReport[], tolerance: OverheadTolerance):
+  Array<{ workload: string; pair: number; ratios: { p50: number; p95: number; p99: number;
+    throughput: number }; passed: boolean }> {
+  if (reports.length !== 8) throw new Error('overhead comparison requires eight fixed arms');
+  const output = [];
+  for (let workloadIndex = 0; workloadIndex < 2; workloadIndex++) for (let pair = 0; pair < 2; pair++) {
+    const index = workloadIndex * 4;
+    const off = reports[index + (pair === 0 ? 0 : 3)]!;
+    const on = reports[index + (pair === 0 ? 1 : 2)]!;
+    const divide = (a: number | null, b: number | null): number => a !== null && b !== null && b > 0 ? a / b : Infinity;
+    const ratios = { p50: divide(on.latency.p50, off.latency.p50),
+      p95: divide(on.latency.p95, off.latency.p95), p99: divide(on.latency.p99, off.latency.p99),
+      throughput: divide(on.throughputPerSecond, off.throughputPerSecond) };
+    output.push({ workload: workloadIndex === 0 ? 'clip' : 'interface', pair: pair + 1, ratios,
+      passed: ratios.p50 <= tolerance.maxLatencyRatio.p50 && ratios.p95 <= tolerance.maxLatencyRatio.p95
+        && ratios.p99 <= tolerance.maxLatencyRatio.p99
+        && ratios.throughput >= tolerance.minThroughputRatio });
+  }
+  return output;
+}
+
+async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
+  let requested = 0;
+  const cacheDone = new Set<string>();
+  const usefulSwift: number[] = [];
+  const cells = config.unqueued.cells;
+  const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<number> => {
+    const cap = startCap(config.unqueued.maxSecondsPerCell);
+    let pages: CorpusPage[];
+    try {
+      pages = await createInterfaceCorpus(storeDir,
+        config.unqueued.observationsPerCell + (cell.warmth === 'initialized-worker-new-content' ? 1 : 0),
+        `${config.seed}-${label}`, { language: cell.language, sizeClass: cell.size, files: cell.files }, cap.signal);
+    } catch (error) { cap.close(); throw error; }
+    let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+    let collector = createProjectionTraceCollector();
+    let attempts: InterfaceAttempt[] = [];
+    const purposeById = new Map<string, string>();
+    let useful = 0;
+    const faults: string[] = [];
+    const host = monitorHost(config, journal);
+    const finishServer = async (): Promise<void> => {
+      if (!server) return;
+      const current = server;
+      server = undefined;
+      try { await cleanupWithin(current.close()); } catch (error) { faults.push(`reader close: ${error}`); }
+      const snapshot = collector.snapshot();
+      const assembly = assembleProjectionTrace(snapshot.events, attempts);
+      faults.push(...snapshot.faults, ...assembly.faults);
+      if (!assembly.processExitsVerified) faults.push('actual parser process exit missing');
+      for (const attempt of assembly.attempts) {
+        if (attempt.httpStatus === 200) faults.push(...validateInterfacePage(attempt.body, attempt.expected));
+        const body = attempt.body as { files?: Array<{ path?: string; status?: string }> } | null;
+        if (purposeById.get(attempt.requestId) === 'measured' && body?.files?.some(row => row.status === 'ready' &&
+          attempt.freshnessByPath?.[String(row.path)] === 'fresh')) useful++;
+        if (purposeById.get(attempt.requestId) === 'response-cache-control' &&
+          !body?.files?.some(row => row.status === 'ready' &&
+            attempt.freshnessByPath?.[String(row.path)] === 'cache-hit'))
+          faults.push('cache control lacks observed cache-hit file');
+      }
+      await journal.record({ type: 'unqueued-trace', cell: label, attempts: assembly.attempts,
+        traces: assembly.traces, phases: snapshot.phases, events: snapshot.events, faults: snapshot.faults });
+      attempts = [];
+      collector = createProjectionTraceCollector();
+    };
+    const openServer = async (): Promise<void> => {
+      server = await bounded(startReaderServer({ storeDir,
+        projectionAdmissionConfig: { C: config.unqueued.C,
+          Q: config.unqueued.Q, W: config.unqueued.W, D: config.admission.clipDeadlineMs },
+        interfaceDeadlineMs: deadlineMs, projectionTrace: collector.observe }), cap.signal);
+    };
+    const request = async (page: CorpusPage, purpose: string): Promise<InterfaceAttempt> => {
+      if (++requested > config.unqueued.maxRequestsIncludingConditional)
+        throw new Error('unqueued global request cap reached');
+      const attempt = await bounded(requestInterface(server!, page, deadlineMs + 2000, cap.signal), cap.signal);
+      attempts.push(attempt);
+      purposeById.set(attempt.requestId, purpose);
+      await journal.record({ type: 'unqueued-attempt', cell: label, purpose, attempt });
+      return attempt;
+    };
+    try {
+      if (cell.warmth !== 'fresh-worker') await openServer();
+      let start = 0;
+      if (cell.warmth === 'initialized-worker-new-content') { await request(pages[0]!, 'warmup'); start = 1; }
+      for (let index = 0; index < config.unqueued.observationsPerCell; index++) {
+        if (cap.signal.aborted) throw cap.signal.reason;
+        if (cell.warmth === 'fresh-worker') await openServer();
+        const page = pages[start + index]!;
+        const attempt = await request(page, 'measured');
+        const body = attempt.body as { status?: string; files?: Array<{ status?: string }> } | null;
+        if (!cacheDone.has(cell.language) && body?.status === 'ready' && body.files?.some(row => row.status === 'ready')) {
+          cacheDone.add(cell.language);
+          for (let hit = 0; hit < config.unqueued.cacheControlRequestsPerVariant; hit++)
+            await request(page, 'response-cache-control');
+        }
+        if (cell.warmth === 'fresh-worker') await finishServer();
+      }
+    } catch (error) { faults.push(String(error)); }
+    finally { await finishServer(); cap.close(); }
+    faults.push(...await host.stop());
+    if (cap.expired()) faults.push('cell wall-time cap hit');
+    await journal.record({ type: 'unqueued-cell', cell: label, deadlineMs, observations: config.unqueued.observationsPerCell,
+      usefulFresh: useful, cacheControlAvailable: cacheDone.has(cell.language), requested,
+      faults: [...new Set(faults)], diagnosticValid: faults.length === 0 }, true);
+    if (faults.length) throw new Error(`unqueued cell ${label} invalid: ${faults.join('; ')}`);
+    return useful;
+  };
+  for (const [index, cell] of cells.entries()) {
+    const useful = await runCell(cell, config.admission.interfaceDeadlineMs, `400-${index}-${cell.language}-${cell.files}-${cell.warmth}`);
+    if (cell.language === 'swift') usefulSwift.push(useful);
+  }
+  for (const language of ['typescript', 'tsx', 'swift']) if (!cacheDone.has(language))
+    await journal.record({ type: 'cache-control-unavailable', language,
+      reason: 'no cacheable ready result; zero cache-control requests' }, true);
+  if (usefulSwift.length === 3 && usefulSwift.every(count => count === 0)) {
+    await journal.record({ type: 'conditional-800-trigger', basis: usefulSwift }, true);
+    let total = 0;
+    for (const [index, cell] of cells.filter(cell => cell.language === 'swift').entries())
+      total += await runCell(cell, config.admission.conditionalInterfaceDeadlineMs, `800-${index}-swift-${cell.files}`);
+    if (total === 0) throw new Error('conditional 800ms Swift cells yielded zero useful fresh work');
+  }
+  if (requested > config.unqueued.maxRequestsIncludingConditional) throw new Error('unqueued request cap exceeded');
+}
+
+async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
+  const spec = config.wPressure;
+  const preparation = startCap(config.maxPreparationSeconds);
+  let corpus: HistoricalChange[];
+  try { corpus = await createHistoricalCorpus(storeDir, spec.waiterCaps.length * spec.groupsPerCap,
+    preparation.signal); preparation.signal.throwIfAborted(); }
+  finally { preparation.close(); }
+  let totalRequests = 0;
+  for (const [capIndex, W] of spec.waiterCaps.entries()) {
+    const timer = startCap(spec.maxSecondsPerCap);
+    const collector = createProjectionTraceCollector();
+    const host = monitorHost(config, journal);
+    let release: (() => void) | undefined;
+    let entered: (() => void) | undefined;
+    let enteredPromise: Promise<void> = Promise.resolve();
+    let barrierEnteredAt = 0;
+    let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+    const faults: string[] = [];
+    const responses: Array<{ group: number; status: number; body: unknown; error?: string;
+      startedAtNs: bigint; completedAtNs: bigint }> = [];
+    try {
+      server = await bounded(startReaderServer({ storeDir,
+        projectionAdmissionConfig: { C: spec.C, Q: spec.Q, W, D: config.admission.clipDeadlineMs },
+        projectionTrace: collector.observe,
+        clipDispatchBarrier: () => new Promise<void>(resolve => {
+          barrierEnteredAt = Date.now(); release = resolve; entered?.();
+        }) }), timer.signal);
+      for (let group = 0; group < spec.groupsPerCap; group++) {
+        if (timer.signal.aborted) throw timer.signal.reason;
+        const change = corpus[capIndex * spec.groupsPerCap + group]!;
+        enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+        release = undefined;
+        const route = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
+        const send = async (): Promise<void> => {
+          if (++totalRequests > spec.maxRequests) throw new Error('W request cap exceeded');
+          const startedAtNs = process.hrtime.bigint();
+          try {
+            const response = await fetch(server!.url + route,
+              { headers: { authorization: `Bearer ${server!.token}` },
+                signal: AbortSignal.any([timer.signal, AbortSignal.timeout(config.admission.clipDeadlineMs + 2000)]) });
+            const body: unknown = await response.json().catch(() => null);
+            const item = { group, status: response.status, body, startedAtNs, completedAtNs: process.hrtime.bigint() };
+            responses.push(item);
+            await journal.record({ type: 'w-http', W, item });
+          } catch (error) {
+            const item = { group, status: 0, body: null, error: String(error), startedAtNs,
+              completedAtNs: process.hrtime.bigint() };
+            responses.push(item);
+            await journal.record({ type: 'w-http', W, item });
+          }
+        };
+        const leader = send();
+        await bounded(enteredPromise, timer.signal);
+        const waiters = Array.from({ length: spec.sameKeyWaitersPerGroup }, () => send());
+        const admitted = async (): Promise<void> => {
+          while (Date.now() - barrierEnteredAt < spec.maxBarrierMs && !timer.signal.aborted) {
+            const count = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route).length;
+            if (count >= 1 + spec.sameKeyWaitersPerGroup) return;
+            await delay(1);
+          }
+        };
+        await admitted();
+        const beforeRelease = collector.snapshot().events.filter(event => event.kind === 'admission' && event.routeKey === route);
+        const barrierMs = Date.now() - barrierEnteredAt;
+        if (barrierMs > spec.maxBarrierMs) faults.push(`group ${group} exceeded barrier cap`);
+        (release as (() => void) | undefined)?.();
+        await journal.record({ type: 'w-before-release', W, group, route, barrierMs, admissions: beforeRelease }, true);
+        await bounded(Promise.all([leader, ...waiters]), timer.signal);
+        const admissions = collector.snapshot().events.filter((event): event is Extract<typeof event, { kind: 'admission' }> =>
+          event.kind === 'admission' && event.routeKey === route);
+        await journal.record({ type: 'w-group', W, group, route, admissions }, true);
+        if (admissions.length !== 1 + spec.sameKeyWaitersPerGroup) faults.push(`group ${group} missing admissions`);
+        if (admissions.filter(item => item.disposition === 'running').length !== 1)
+          faults.push(`group ${group} lacks exactly one leader`);
+        const expectedWaiters = Math.min(W, spec.sameKeyWaitersPerGroup);
+        if (admissions.filter(item => item.disposition === 'waiting').length !== expectedWaiters)
+          faults.push(`group ${group} waiter count differs from W`);
+        if (admissions.filter(item => item.disposition === 'overloaded').length !==
+          spec.sameKeyWaitersPerGroup - expectedWaiters) faults.push(`group ${group} overload count differs from W`);
+        const groupResponses = responses.filter(item => item.group === group);
+        if (groupResponses.length !== 1 + spec.sameKeyWaitersPerGroup ||
+          groupResponses.some(item => item.status !== 200)) faults.push(`group ${group} HTTP responses incomplete`);
+        const overloaded = groupResponses.filter(item => {
+          const body = item.body as { status?: string; fallback_reason?: string } | null;
+          return body?.status === 'skipped' && body.fallback_reason === 'overloaded';
+        }).length;
+        if (overloaded !== spec.sameKeyWaitersPerGroup - expectedWaiters)
+          faults.push(`group ${group} HTTP overload disagrees with admission`);
+      }
+    } catch (error) { faults.push(String(error)); }
+    finally {
+      release?.();
+      try { if (server) await cleanupWithin(server.close()); } catch (error) { faults.push(`reader close: ${error}`); }
+      timer.close();
+    }
+    faults.push(...await host.stop());
+    if (timer.expired()) faults.push('W cell wall-time cap hit');
+    const snapshot = collector.snapshot();
+    const assembly = assembleProjectionTrace(snapshot.events, []);
+    faults.push(...snapshot.faults, ...assembly.faults);
+    if (!assembly.processExitsVerified) faults.push('actual clip worker exit unverified');
+    const byRoute = new Map<string, number>();
+    const admissionRoutes = new Map(snapshot.events.filter(event => event.kind === 'admission')
+      .map(event => [event.unitId, event.routeKey] as const));
+    for (const event of snapshot.events) if (event.kind === 'parser-request') {
+      const route = admissionRoutes.get(event.unitId);
+      if (route) byRoute.set(route, (byRoute.get(route) ?? 0) + 1);
+    }
+    for (const change of corpus.slice(capIndex * spec.groupsPerCap, (capIndex + 1) * spec.groupsPerCap)) {
+      const route = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
+      if (byRoute.get(route) !== 1) faults.push(`W group ${route} lacks exactly one parser request`);
+    }
+    if (responses.length !== spec.groupsPerCap * (1 + spec.sameKeyWaitersPerGroup))
+      faults.push('W HTTP response count incomplete');
+    await journal.record({ type: 'w-cell', W, diagnosticValid: faults.length === 0,
+      faults: [...new Set(faults)], requests: responses.length, traces: assembly.traces,
+      lifecycle: snapshot.events, processExitsVerified: assembly.processExitsVerified }, true);
+    if (faults.length) throw new Error(`W=${W} invalid: ${faults.join('; ')}`);
+  }
+  if (totalRequests !== spec.maxRequests) throw new Error('W request count differs from frozen bound');
+}
+
+function approvalsComplete(config: DiagnosticConfig): boolean {
+  const approvals = config.approvalRequired;
+  const tolerance = approvals.tracingOverheadTolerance as Partial<OverheadTolerance> | null;
+  const numeric = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
+  return Object.entries(approvals).every(([key, value]) => key === 'tracingOverheadTolerance'
+    ? tolerance !== null && typeof tolerance === 'object'
+      && numeric(tolerance.maxLatencyRatio?.p50) && numeric(tolerance.maxLatencyRatio?.p95)
+      && numeric(tolerance.maxLatencyRatio?.p99) && numeric(tolerance.minThroughputRatio)
+    : typeof value === 'string' && value.trim().length > 0);
+}
+const previousMode: Partial<Record<DiagnosticMode, DiagnosticMode>> = {
+  overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued', 'w-pressure': 'queue',
+};
+async function readPrior(path: string | undefined, mode: DiagnosticMode, revision: string, configSha256: string):
+  Promise<{ selectedDeadlineMs?: number }> {
+  const expected = previousMode[mode];
+  if (!expected) { if (path) throw new Error('smoke has no prior diagnostic'); return {}; }
+  if (!path) throw new Error(`${mode} requires the preceding ${expected} report`);
+  const lines = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>);
+  const started = lines.find(line => line.type === 'started');
+  const final = lines.at(-1);
+  if (started?.mode !== expected || started.revision !== revision || started.configSha256 !== configSha256
+    || final?.type !== 'final' || final.diagnosticValid !== true)
+    throw new Error(`preceding ${expected} report is incomplete, invalid or from another head/config`);
+  if (mode !== 'queue') return {};
+  const useful = lines.filter(line => line.type === 'unqueued-cell' && Number(line.usefulFresh) > 0
+    && String(line.cell).includes('swift'));
+  const deadlines = useful.map(line => Number(line.deadlineMs));
+  const swiftUseful = useful.length > 0;
+  if (!swiftUseful) throw new Error('queue requires useful unqueued Swift completion');
+  const selectedDeadlineMs = Math.min(...deadlines.filter(Number.isFinite));
+  if (!Number.isFinite(selectedDeadlineMs)) throw new Error('queue diagnostic deadline lacks useful evidence');
+  return { selectedDeadlineMs };
+}
+export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: DiagnosticMode,
+  outputPath: string, priorPath?: string): Promise<void> {
+  if (!approvalsComplete(config)) throw new Error('owner execution decisions are incomplete in approvalRequired');
+  const repository = await realpath(fileURLToPath(new URL('..', import.meta.url)));
+  const output = resolve(outputPath);
+  const parent = await realpath(dirname(output));
+  const target = join(parent, basename(output));
+  const excluded = [repository, resolve(repository, '../..')];
+  if (excluded.some(root => target === root || target.startsWith(root + sep)))
+    throw new Error('diagnostic report must be outside both worktrees');
+  if (execFileSync('git', ['status', '--porcelain'], { cwd: repository, encoding: 'utf8' }).trim())
+    throw new Error('diagnostics require a clean committed harness');
+  const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim();
+  const configSha256 = sha(JSON.stringify(config));
+  const prior = await readPrior(priorPath, mode, revision, configSha256);
+  const file = await open(target, 'ax', 0o600);
+  const journal = new Journal(file);
+  let storeDir: string | undefined;
+  try {
+    await journal.record({ type: 'started', mode, diagnostic: true, d7Decision: 'pending', revision,
+      config, configSha256, at: new Date().toISOString(), startedAtNs: process.hrtime.bigint(),
+      node: process.version, platform: process.platform, osRelease: release(), arch: arch(),
+      cpu: cpus()[0]?.model, physicalCores: availableParallelism(),
+      parserArtifacts: { typescript: sha(verifyTypeScriptGrammarArtifact('typescript')),
+        tsx: sha(verifyTypeScriptGrammarArtifact('tsx')), swift: SWIFT_V1 } }, true);
+    await preflight(config, journal);
+    storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-store-'));
+    if (mode === 'smoke' || mode === 'overhead' || mode === 'queue')
+      await runCaptureMode(mode, config, journal, storeDir, prior.selectedDeadlineMs);
+    else if (mode === 'unqueued') await runUnqueued(config, journal, storeDir);
+    else await runWPressure(config, journal, storeDir);
+    await journal.record({ type: 'final', diagnosticValid: true, d7Decision: 'pending',
+      fullCampaignSufficiency: 'not evaluated', at: new Date().toISOString() }, true);
+  } catch (error) {
+    await journal.record({ type: 'failed', error: String(error), diagnosticValid: false,
+      d7Decision: 'pending', at: new Date().toISOString() }, true);
+    throw error;
+  } finally {
+    if (storeDir) await rm(storeDir, { recursive: true, force: true });
+    await journal.close();
+  }
+}

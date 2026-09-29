@@ -9,23 +9,24 @@ export type DiagnosticMode = typeof DIAGNOSTIC_MODES[number];
 type ApprovalFields = { measurementWindow: unknown; tracingOverheadTolerance: unknown;
   diagnosticDeadlinePoints: unknown; wPressureRuntimeHook: unknown; clipHistoricalComparison: unknown };
 export interface DiagnosticConfig {
-  protocol: string; seed: string;
+  protocol: string; seed: string; maxPreparationSeconds: number;
   admission: { C: number; Q: number; W: number; clipDeadlineMs: number;
     interfaceDeadlineMs: number; conditionalInterfaceDeadlineMs: number };
   smoke: { repetitions: number; arms: string[]; scheduledWrites: number; burstWrites: number;
-    clipSlots: number; interfaceSlots: number; coldKeysPerWorkload: number };
+    clipSlots: number; interfaceSlots: number; coldKeysPerWorkload: number; maxArmSeconds: number;
+    minRequestIntervalMs: number };
   overhead: { workloads: string[]; traceOrder: string[]; scheduledWritesPerArm: number;
     scheduledIntervalMs: number; burstWritesPerArm: number; slotsPerWorkload: number;
-    maxAttemptsPerArm: number; maxArmSeconds: number };
+    coldKeysPerWorkload: number; maxAttemptsPerArm: number; maxArmSeconds: number; minRequestIntervalMs: number };
   unqueued: { C: number; Q: number; W: number; observationsPerCell: number;
     cells: Array<{ language: 'typescript' | 'tsx' | 'swift'; size: 'tiny' | 'representative';
       files: 1 | 4 | 16; warmth: 'fresh-worker' | 'initialized-worker-new-content' | 'fresh-child' }>;
     warmupRequests: number; cacheControlRequestsPerVariant: number; cacheControlPrerequisite: string;
-    conditionalSwiftRepeatTrigger: string; maxRequestsIncludingConditional: number };
+    conditionalSwiftRepeatTrigger: string; maxRequestsIncludingConditional: number; maxSecondsPerCell: number };
   queue: { C: number; queueWaiterCells: Array<[number, number]>; repetitionsPerCell: number;
     clipSlots: number; interfaceSlots: number; scheduledWritesPerCell: number;
-    scheduledIntervalMs: number; burstWritesPerCell: number; maxAttemptsPerCell: number;
-    maxCellSecondsIncludingDrain: number };
+    scheduledIntervalMs: number; burstWritesPerCell: number; coldKeysPerWorkload: number; maxAttemptsPerCell: number;
+    maxCellSecondsIncludingDrain: number; minRequestIntervalMs: number };
   wPressure: { C: number; Q: number; waiterCaps: number[]; groupsPerCap: number;
     leadersPerGroup: number; sameKeyWaitersPerGroup: number; maxBarrierMs: number;
     maxSecondsPerCap: number; maxRequests: number; retries: number };
@@ -66,7 +67,7 @@ export function validateDiagnosticConfig(raw: unknown): DiagnosticConfig {
 }
 
 export function parseDiagnosticArgs(argv: string[]): { configPath: string; mode: DiagnosticMode;
-  outputPath?: string; describe: boolean } {
+  outputPath?: string; priorPath?: string; describe: boolean } {
   const values = new Map<string, string>();
   const switches = new Set<string>();
   for (let index = 0; index < argv.length; index++) {
@@ -75,7 +76,7 @@ export function parseDiagnosticArgs(argv: string[]): { configPath: string; mode:
       if (switches.has(flag)) throw new Error(`duplicate ${flag}`);
       switches.add(flag); continue;
     }
-    if (!['--config', '--mode', '--out'].includes(flag)) throw new Error(`unknown diagnostic argument ${flag}`);
+    if (!['--config', '--mode', '--out', '--prior'].includes(flag)) throw new Error(`unknown diagnostic argument ${flag}`);
     if (values.has(flag) || !argv[index + 1] || argv[index + 1]!.startsWith('--'))
       throw new Error(`missing or duplicate ${flag}`);
     values.set(flag, argv[++index]!);
@@ -87,7 +88,11 @@ export function parseDiagnosticArgs(argv: string[]): { configPath: string; mode:
   if (describe === switches.has('--execute')) throw new Error('choose exactly one of --describe or --execute');
   const outputPath = values.get('--out');
   if (!describe && !outputPath || describe && outputPath) throw new Error('--out is required only with --execute');
-  return { configPath, mode: mode as DiagnosticMode, ...(outputPath ? { outputPath } : {}), describe };
+  const priorPath = values.get('--prior');
+  if (describe && priorPath || !describe && mode !== 'smoke' && !priorPath || !describe && mode === 'smoke' && priorPath)
+    throw new Error('each diagnostic mode after smoke requires its preceding report via --prior');
+  return { configPath, mode: mode as DiagnosticMode, ...(outputPath ? { outputPath } : {}),
+    ...(priorPath ? { priorPath } : {}), describe };
 }
 
 export function describeDiagnosticMode(config: DiagnosticConfig, mode: DiagnosticMode): Record<string, number> {
@@ -123,6 +128,7 @@ async function main(): Promise<void> {
   const config = validateDiagnosticConfig(JSON.parse(await readFile(args.configPath, 'utf8')));
   if (args.describe) { process.stdout.write(JSON.stringify({ mode: args.mode,
     bounds: describeDiagnosticMode(config, args.mode), d7Decision: 'pending' }) + '\n'); return; }
-  throw new Error('bounded diagnostic execution is not implemented');
+  const { runBoundedDiagnostic } = await import('./fd5-diag-run.ts');
+  await runBoundedDiagnostic(config, args.mode, args.outputPath!, args.priorPath);
 }
 if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) await main();
