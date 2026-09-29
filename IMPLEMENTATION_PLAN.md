@@ -702,7 +702,9 @@ admission deadline times out cold Swift extraction in the standalone live check,
 so FD4 acceptance remains open. A preliminary FD5 four-arm run at a test-only
 400 ms interface deadline failed the paired capture and load-sufficiency gates
 (`FD5-MEASUREMENT-REPORT.md`); D7 production values remain unapproved. The
-Swift fixture-backed view remains FS2's work, and FS3
+bounded FD5 diagnostic driver and optional W barrier are implemented on FD4's
+draft branch, but no bounded diagnostics have been executed or approved yet.
+The Swift fixture-backed view remains FS2's work, and FS3
 live wiring waits for this API. No success criterion or ratified decision changes.
 
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
