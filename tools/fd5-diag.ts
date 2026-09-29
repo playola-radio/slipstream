@@ -9,7 +9,7 @@ export type DiagnosticMode = typeof DIAGNOSTIC_MODES[number];
 type ApprovalFields = { measurementWindow: unknown; tracingOverheadTolerance: unknown;
   diagnosticDeadlinePoints: unknown; wPressureRuntimeHook: unknown; clipHistoricalComparison: unknown };
 export interface DiagnosticConfig {
-  protocol: string; seed: string; maxPreparationSeconds: number;
+  protocol: string; interfaceScorer: string; seed: string; maxPreparationSeconds: number;
   admission: { C: number; Q: number; W: number; clipDeadlineMs: number;
     interfaceDeadlineMs: number; conditionalInterfaceDeadlineMs: number };
   smoke: { scheduledWrites: number; burstWrites: number;

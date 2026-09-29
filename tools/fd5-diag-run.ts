@@ -8,6 +8,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface as createLineReader } from 'node:readline';
 import { promisify } from 'node:util';
+import { isDeepStrictEqual } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startCapture, type CaptureSession } from '../src/session.ts';
 import { startReaderServer } from '../src/http-reader.ts';
@@ -33,6 +34,128 @@ function latency(samples: number[]): DiagnosticLatency {
   const at = (percent: number): number | null => sorted.length
     ? sorted[Math.max(0, Math.ceil(sorted.length * percent / 100) - 1)]! : null;
   return { n: sorted.length, p50: at(50), p95: at(95), p99: at(99) };
+}
+
+type InterfaceCell = `${string}/${string}/${number}`;
+export type PlannedInterface = { key: string; routeKey: string; language: string; sizeClass: string;
+  limit: number; cell: InterfaceCell; expected: InterfaceAttempt['expected'] };
+type Outcome = 'ready' | 'partial' | 'skipped' | 'invalid';
+type CohortRow = { key: string; cell: InterfaceCell; outcome: Outcome; reason: string | null;
+  httpDurationMs: number | null; completion: 'observed' | 'unfinished' | 'failed' };
+export type InterfaceCohortReport = { valid: boolean; faults: string[]; plannedCount: number;
+  observedCount: number; shortfall: number; readyCount: number;
+  httpLatency: DiagnosticLatency & { p100: number | null }; legacyReadyOnlyLatency: DiagnosticLatency;
+  unfinishedCompletionCount: number; transitionsByKey: CohortRow[];
+  byCell: Record<string, { count: number; ready: number; outcomes: Record<Outcome, number>;
+    httpLatency: DiagnosticLatency }>;
+  fullArm: { count: number; outcomes: Record<Outcome, number>; httpLatency: DiagnosticLatency & { p100: number | null };
+    byCell: Record<string, { count: number; outcomes: Record<Outcome, number>; httpLatency: DiagnosticLatency }> } };
+
+function cellOf(page: CorpusPage): InterfaceCell {
+  return `${page.expected.language}/${page.expected.sizeClass}/${page.limit}`;
+}
+export function planInterfaceCohort(corpus: CorpusPage[]): PlannedInterface[] {
+  const first = corpus.slice(0, 180);
+  if (first.length !== 180) throw new Error(`interface cohort needs 180 source identities; corpus has ${first.length}`);
+  const counts = new Map<string, number>();
+  const keys = new Set<string>();
+  const planned = first.map(page => {
+    const cell = cellOf(page);
+    counts.set(cell, (counts.get(cell) ?? 0) + 1);
+    if (keys.has(page.expected.key)) throw new Error(`interface cohort duplicate source key ${page.expected.key}`);
+    keys.add(page.expected.key);
+    return { key: page.expected.key, routeKey: page.expected.routeKey,
+      language: page.expected.language, sizeClass: page.expected.sizeClass, limit: page.limit,
+      cell, expected: page.expected };
+  });
+  const cells = ['typescript', 'tsx', 'swift'].flatMap(language =>
+    ['tiny', 'representative'].flatMap(size => [1, 4, 16].map(limit => `${language}/${size}/${limit}`)));
+  if (cells.some(cell => counts.get(cell) !== 10) || counts.size !== cells.length)
+    throw new Error('interface cohort is not ten examples in each of 18 language/size/page cells');
+  return planned;
+}
+function outcomeOf(attempt: InterfaceAttempt): Outcome {
+  if (attempt.httpStatus !== 200 || attempt.error) return 'invalid';
+  const status = (attempt.body as { status?: unknown } | null)?.status;
+  return status === 'ready' || status === 'partial' || status === 'skipped' ? status : 'invalid';
+}
+function durationOf(attempt: InterfaceAttempt): number | null {
+  if (attempt.completedAtNs === undefined || attempt.completedAtNs < attempt.startedAtNs) return null;
+  const duration = Number(attempt.completedAtNs - attempt.startedAtNs) / 1e6;
+  return Number.isFinite(duration) ? duration : null;
+}
+function extendedLatency(samples: number[]): DiagnosticLatency & { p100: number | null } {
+  return { ...latency(samples), p100: samples.length ? Math.max(...samples) : null };
+}
+const emptyOutcomes = (): Record<Outcome, number> => ({ ready: 0, partial: 0, skipped: 0, invalid: 0 });
+export function scoreInterfaceCohort(planned: PlannedInterface[], attempts: InterfaceAttempt[]): InterfaceCohortReport {
+  const faults: string[] = [];
+  const observed = new Map<string, InterfaceAttempt[]>();
+  for (const attempt of attempts) {
+    const list = observed.get(attempt.expected.key) ?? [];
+    list.push(attempt);
+    observed.set(attempt.expected.key, list);
+  }
+  const shortfall = planned.filter(row => !observed.has(row.key)).length;
+  if (shortfall) faults.push(`interface cohort shortfall: ${shortfall} of ${planned.length} planned identities`);
+  const rows: CohortRow[] = [];
+  const byCell: InterfaceCohortReport['byCell'] = {};
+  const allOutcomes = emptyOutcomes();
+  const allDurations: number[] = [];
+  const fullByCell: InterfaceCohortReport['fullArm']['byCell'] = {};
+  for (const attempt of attempts) {
+    const outcome = outcomeOf(attempt);
+    allOutcomes[outcome]++;
+    const cellName = `${attempt.expected.language}/${attempt.expected.sizeClass}/${attempt.expected.files.length}`;
+    const fullCell = fullByCell[cellName] ??= { count: 0, outcomes: emptyOutcomes(), httpLatency: latency([]) };
+    fullCell.count++; fullCell.outcomes[outcome]++;
+    if (attempt.httpStatus === 200 && !attempt.error) {
+      const duration = durationOf(attempt);
+      if (duration !== null) allDurations.push(duration);
+    }
+  }
+  for (const [cellName, cell] of Object.entries(fullByCell))
+    cell.httpLatency = latency(attempts.filter(attempt =>
+      `${attempt.expected.language}/${attempt.expected.sizeClass}/${attempt.expected.files.length}` === cellName
+      && attempt.httpStatus === 200 && !attempt.error).map(durationOf).filter((value): value is number => value !== null));
+  for (const plannedRow of planned) {
+    const matches = observed.get(plannedRow.key) ?? [];
+    if (!matches.length) { faults.push(`missing interface identity ${plannedRow.key}`); continue; }
+    if (matches.length !== 1) faults.push(`duplicate interface identity ${plannedRow.key}: ${matches.length} terminal observations`);
+    const attempt = matches[0]!;
+    if (!isDeepStrictEqual(attempt.expected, plannedRow.expected))
+      faults.push(`interface identity mismatch ${plannedRow.key}`);
+    if (attempt.httpStatus !== 200 || attempt.error) faults.push(`interface HTTP outcome invalid ${plannedRow.key}`);
+    const duration = durationOf(attempt);
+    if (duration === null) faults.push(`interface terminal HTTP duration missing ${plannedRow.key}`);
+    const outcome = outcomeOf(attempt);
+    if (outcome === 'invalid') faults.push(`interface outcome ambiguous ${plannedRow.key}`);
+    const body = attempt.body as { fallback_reason?: unknown; files?: Array<{ status?: unknown }> } | null;
+    const reason = typeof body?.fallback_reason === 'string' ? body.fallback_reason : null;
+    const unfinished = reason === 'timeout' || reason === 'cancelled';
+    const completion = unfinished ? 'unfinished' : outcome === 'ready' ? 'observed' : 'failed';
+    rows.push({ key: plannedRow.key, cell: plannedRow.cell, outcome, reason,
+      httpDurationMs: duration, completion });
+    const cell = byCell[plannedRow.cell] ??= { count: 0, ready: 0, outcomes: emptyOutcomes(),
+      httpLatency: latency([]) };
+    cell.count++; cell.outcomes[outcome]++;
+    if (outcome === 'ready' && body?.files?.some(file => file.status === 'ready')) cell.ready++;
+  }
+  for (const [cellName, cell] of Object.entries(byCell))
+    cell.httpLatency = latency(rows.filter(row => row.cell === cellName && row.httpDurationMs !== null)
+      .map(row => row.httpDurationMs!));
+  const cohortDurations = rows.filter(row => row.httpDurationMs !== null).map(row => row.httpDurationMs!);
+  const legacyReadyOnly = attempts.filter(attempt => attempt.httpStatus === 200 && !attempt.error
+    && outcomeOf(attempt) === 'ready'
+    && (attempt.body as { files?: Array<{ status?: string }> } | null)?.files?.some(file => file.status === 'ready'))
+    .map(durationOf).filter((value): value is number => value !== null);
+  return { valid: faults.length === 0, faults, plannedCount: planned.length, observedCount: rows.length,
+    shortfall, readyCount: Object.values(byCell).reduce((sum, cell) => sum + cell.ready, 0),
+    httpLatency: extendedLatency(cohortDurations), legacyReadyOnlyLatency: latency(legacyReadyOnly),
+    unfinishedCompletionCount: rows.filter(row => row.completion === 'unfinished').length,
+    transitionsByKey: rows, byCell,
+    fullArm: { count: attempts.length, outcomes: allOutcomes, httpLatency: extendedLatency(allDurations),
+      byCell: fullByCell } };
 }
 
 /** Every record is appended in order. Result/failure records are durably synced. */
@@ -177,8 +300,8 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
     name: string; clip: boolean; interfaces: boolean; trace: boolean; C: number; Q: number; W: number;
     interfaceDeadlineMs: number; scheduled: number; burst: number; intervalMs: number;
     clipSlots: number; interfaceSlots: number; maxAttempts: number; maxSeconds: number; minRequestIntervalMs: number;
-  }): Promise<{ valid: boolean; faults: string[]; capture: CaptureArmReport;
-    requestLatency: DiagnosticLatency }> {
+  }, plannedInterface?: PlannedInterface[]): Promise<{ valid: boolean; faults: string[]; capture: CaptureArmReport;
+    requestLatency: DiagnosticLatency; interfaceCohort?: InterfaceCohortReport }> {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-wt-'));
   const cap = startCap(spec.maxSeconds);
   const collector = createProjectionTraceCollector(100_000);
@@ -266,9 +389,12 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
       && (item.attempt.body as { files?: Array<{ status?: string }> } | null)?.files?.some(file => file.status === 'ready')
       ? [Number(item.attempt.completedAtNs - item.attempt.startedAtNs) / 1e6] : []) ?? []),
   ]);
+  const interfaceCohort = plannedInterface ? scoreInterfaceCohort(plannedInterface,
+    interfaceLoad?.attempts.filter(item => item.kind === 'interface').map(item => item.attempt) ?? []) : undefined;
+  if (interfaceCohort) faults.push(...interfaceCohort.faults);
   if (capture.missing > 0 || capture.written !== spec.scheduled + spec.burst)
     faults.push('expected capture writes are missing or incomplete');
-  if ((spec.clip || spec.interfaces) && requestLatency.n === 0)
+  if ((spec.clip || spec.interfaces) && requestLatency.n === 0 && !interfaceCohort)
     faults.push('loaded arm has no ready HTTP latency evidence');
   for (const item of clipLoad?.attempts ?? []) if (item.kind === 'clip') {
     const response = item.attempt;
@@ -334,9 +460,11 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
     faults: [...new Set(faults)], capture, requestLatency, cleanup: { captureStopped, readerClosed, worktreeRemoved,
       clipClientExit: clipSummary?.actualWorkerExit ?? !spec.clip,
       interfaceClientExit: interfaceSummary?.actualWorkerExit ?? !spec.interfaces },
+    ...(interfaceCohort ? { interfaceCohort } : {}),
     bounds: { requests: Atomics.load(new Int32Array(sharedCount), 0), maxSeconds: spec.maxSeconds,
       capHit: cap.expired() }, hostFaults }, true);
-  return { valid: faults.length === 0, faults, capture, requestLatency };
+  return { valid: faults.length === 0, faults, capture, requestLatency,
+    ...(interfaceCohort ? { interfaceCohort } : {}) };
 }
 
 async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: DiagnosticConfig,
@@ -379,11 +507,17 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
       intervalMs: config.queue.scheduledIntervalMs, maxAttempts: config.queue.maxAttemptsPerCell,
       maxSeconds: config.queue.maxCellSecondsIncludingDrain, minRequestIntervalMs: config.queue.minRequestIntervalMs,
     })));
-  const reports: Array<{ capture: CaptureArmReport; requestLatency: DiagnosticLatency }> = [];
+  const plannedInterface = mode === 'overhead' ? planInterfaceCohort(interfaceCorpus) : undefined;
+  if (plannedInterface) await journal.record({ type: 'interface-cohort-planned', scorer: 'interface-terminal200-v2',
+    identities: plannedInterface }, true);
+  const reports: Array<{ capture: CaptureArmReport; requestLatency: DiagnosticLatency;
+    interfaceCohort?: InterfaceCohortReport }> = [];
   for (const cell of cells) {
-    const report = await runCaptureCell(config, journal, storeDir, clipCorpus, interfaceCorpus, cell);
+    const report = await runCaptureCell(config, journal, storeDir, clipCorpus, interfaceCorpus, cell,
+      cell.interfaces && mode === 'overhead' ? plannedInterface : undefined);
     if (!report.valid) throw new Error(`diagnostic cell ${cell.name} invalid: ${report.faults.join('; ')}`);
-    reports.push({ capture: report.capture, requestLatency: report.requestLatency });
+    reports.push({ capture: report.capture, requestLatency: report.requestLatency,
+      ...(report.interfaceCohort ? { interfaceCohort: report.interfaceCohort } : {}) });
   }
   if (mode === 'overhead') {
     const tolerance = config.approvalRequired.tracingOverheadTolerance as OverheadTolerance;
@@ -398,10 +532,17 @@ export interface OverheadTolerance { approved: true;
   maxRequestLatencyRatio: { p50: number; p95: number; p99: number };
   minCaptureThroughputRatio: number; minReadyRatio: number }
 export function scoreDiagnosticOverhead(reports: Array<{ capture: CaptureArmReport;
-  requestLatency: DiagnosticLatency }>, tolerance: OverheadTolerance):
+  requestLatency: DiagnosticLatency; interfaceCohort?: InterfaceCohortReport }>, tolerance: OverheadTolerance):
   Array<{ workload: string; pair: number; captureRatios: { p50: number; p95: number; p99: number;
     throughput: number }; requestRatios: { p50: number; p95: number; p99: number;
-    readyCount: number }; passed: boolean }> {
+    readyCount: number }; interfaceDetails?: { transitions: Record<string, number>;
+      transitionsByCell: Record<string, Record<string, number>>;
+      pairedTimings: Array<{ key: string; cell: string; offOutcome: Outcome; onOutcome: Outcome;
+        offHttpMs: number | null; onHttpMs: number | null; httpRatio: number }>;
+      byCell: Record<string, { off: InterfaceCohortReport['byCell'][string];
+        on: InterfaceCohortReport['byCell'][string]; p50Ratio: number; p95Ratio: number; p99Ratio: number }>;
+      offFullArm: InterfaceCohortReport['fullArm']; onFullArm: InterfaceCohortReport['fullArm'];
+      offLegacyReadyOnly: DiagnosticLatency; onLegacyReadyOnly: DiagnosticLatency }; passed: boolean }> {
   if (reports.length !== 8) throw new Error('overhead comparison requires eight fixed arms');
   const output = [];
   for (let workloadIndex = 0; workloadIndex < 2; workloadIndex++) for (let pair = 0; pair < 2; pair++) {
@@ -413,13 +554,55 @@ export function scoreDiagnosticOverhead(reports: Array<{ capture: CaptureArmRepo
       p95: divide(on.capture.latency.p95, off.capture.latency.p95),
       p99: divide(on.capture.latency.p99, off.capture.latency.p99),
       throughput: divide(on.capture.throughputPerSecond, off.capture.throughputPerSecond) };
-    const requestRatios = { p50: divide(on.requestLatency.p50, off.requestLatency.p50),
-      p95: divide(on.requestLatency.p95, off.requestLatency.p95),
-      p99: divide(on.requestLatency.p99, off.requestLatency.p99),
-      readyCount: divide(on.requestLatency.n, off.requestLatency.n) };
+    const interfacePair = workloadIndex === 1;
+    const offCohort = off.interfaceCohort, onCohort = on.interfaceCohort;
+    const identicalCohort = Boolean(offCohort && onCohort
+      && isDeepStrictEqual(offCohort.transitionsByKey.map(row => row.key),
+        onCohort.transitionsByKey.map(row => row.key)));
+    const offLatency = interfacePair ? offCohort?.httpLatency : off.requestLatency;
+    const onLatency = interfacePair ? onCohort?.httpLatency : on.requestLatency;
+    const requestRatios = { p50: divide(onLatency?.p50 ?? null, offLatency?.p50 ?? null),
+      p95: divide(onLatency?.p95 ?? null, offLatency?.p95 ?? null),
+      p99: divide(onLatency?.p99 ?? null, offLatency?.p99 ?? null),
+      readyCount: divide(interfacePair ? onCohort?.readyCount ?? null : on.requestLatency.n,
+        interfacePair ? offCohort?.readyCount ?? null : off.requestLatency.n) };
+    const interfaceDetails = interfacePair && offCohort && onCohort ? (() => {
+      const transitions: Record<string, number> = {};
+      const transitionsByCell: Record<string, Record<string, number>> = {};
+      const pairedTimings: Array<{ key: string; cell: string; offOutcome: Outcome; onOutcome: Outcome;
+        offHttpMs: number | null; onHttpMs: number | null; httpRatio: number }> = [];
+      const offByKey = new Map(offCohort.transitionsByKey.map(row => [row.key, row]));
+      for (const row of onCohort.transitionsByKey) {
+        const prior = offByKey.get(row.key);
+        const label = `${prior?.outcome ?? 'missing'}:${prior?.reason ?? 'none'} -> ${row.outcome}:${row.reason ?? 'none'}`;
+        transitions[label] = (transitions[label] ?? 0) + 1;
+        const cell = transitionsByCell[row.cell] ??= {};
+        cell[label] = (cell[label] ?? 0) + 1;
+        pairedTimings.push({ key: row.key, cell: row.cell, offOutcome: prior?.outcome ?? 'invalid',
+          onOutcome: row.outcome, offHttpMs: prior?.httpDurationMs ?? null, onHttpMs: row.httpDurationMs,
+          httpRatio: divide(row.httpDurationMs, prior?.httpDurationMs ?? null) });
+      }
+      const byCell: Record<string, { off: InterfaceCohortReport['byCell'][string];
+        on: InterfaceCohortReport['byCell'][string]; p50Ratio: number; p95Ratio: number; p99Ratio: number }> = {};
+      for (const cell of Object.keys(offCohort.byCell)) {
+        const before = offCohort.byCell[cell]!, after = onCohort.byCell[cell]!;
+        if (!after) continue;
+        byCell[cell] = { off: before, on: after,
+          p50Ratio: divide(after.httpLatency.p50, before.httpLatency.p50),
+          p95Ratio: divide(after.httpLatency.p95, before.httpLatency.p95),
+          p99Ratio: divide(after.httpLatency.p99, before.httpLatency.p99) };
+      }
+      return { transitions, transitionsByCell, pairedTimings, byCell,
+        offFullArm: offCohort.fullArm, onFullArm: onCohort.fullArm,
+        offLegacyReadyOnly: offCohort.legacyReadyOnlyLatency,
+        onLegacyReadyOnly: onCohort.legacyReadyOnlyLatency };
+    })() : undefined;
     output.push({ workload: workloadIndex === 0 ? 'clip' : 'interface', pair: pair + 1,
-      captureRatios, requestRatios,
+      captureRatios, requestRatios, ...(interfaceDetails ? { interfaceDetails } : {}),
       passed: Number.isFinite(captureRatios.throughput)
+        && (!interfacePair || Boolean(offCohort?.valid && onCohort?.valid && identicalCohort
+          && offCohort.readyCount > 0
+          && offCohort.plannedCount === 180 && onCohort.plannedCount === 180))
         && captureRatios.p50 <= tolerance.maxCaptureLatencyRatio.p50
         && captureRatios.p95 <= tolerance.maxCaptureLatencyRatio.p95
         && captureRatios.p99 <= tolerance.maxCaptureLatencyRatio.p99
@@ -715,7 +898,8 @@ export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now
 const previousMode: Partial<Record<DiagnosticMode, DiagnosticMode>> = {
   overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued', 'w-pressure': 'queue',
 };
-async function readPrior(path: string | undefined, mode: DiagnosticMode, revision: string, configSha256: string):
+export async function readPrior(path: string | undefined, mode: DiagnosticMode, revision: string,
+  configSha256: string, scorerVersion = 'terminal200-first180-v2'):
   Promise<{ selectedDeadlineMs?: number }> {
   const expected = previousMode[mode];
   if (!expected) { if (path) throw new Error('smoke has no prior diagnostic'); return {}; }
@@ -732,6 +916,7 @@ async function readPrior(path: string | undefined, mode: DiagnosticMode, revisio
     final = record;
   }
   if (started?.mode !== expected || started.revision !== revision || started.configSha256 !== configSha256
+    || started.scorerVersion !== scorerVersion
     || final?.type !== 'final' || final.diagnosticValid !== true)
     throw new Error(`preceding ${expected} report is incomplete, invalid or from another head/config`);
   if (mode !== 'queue') return {};
@@ -764,12 +949,13 @@ export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: Diagn
     throw new Error('diagnostics require a clean committed harness');
   const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim();
   const configSha256 = sha(JSON.stringify(config));
-  const prior = await readPrior(priorPath, mode, revision, configSha256);
+  const prior = await readPrior(priorPath, mode, revision, configSha256, config.interfaceScorer);
   const file = await open(target, 'ax', 0o600);
   const journal = new Journal(file);
   let storeDir: string | undefined;
   try {
     await journal.record({ type: 'started', mode, diagnostic: true, d7Decision: 'pending', revision,
+      scorerVersion: config.interfaceScorer,
       config, configSha256, at: new Date().toISOString(), startedAtNs: process.hrtime.bigint(),
       node: process.version, platform: process.platform, osRelease: release(), arch: arch(),
       cpu: cpus()[0]?.model, availableCpuThreads: availableParallelism(),

@@ -1,5 +1,6 @@
 {
-  "protocol": "fd5-bounded-diagnostic.v1-proposal",
+  "protocol": "fd5-bounded-diagnostic.v2-proposal",
+  "interfaceScorer": "terminal200-first180-v2",
   "seed": "fd5-bounded-v1",
   "maxPreparationSeconds": 300,
   "admission": { "C": 2, "Q": 8, "W": 8, "clipDeadlineMs": 100, "interfaceDeadlineMs": 400, "conditionalInterfaceDeadlineMs": 800 },
