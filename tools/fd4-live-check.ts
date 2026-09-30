@@ -1,7 +1,7 @@
 /** Independent authenticated consumer of a disposable daemon; no bundled UI. */
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startQaDaemon } from './qa/harness-proc.ts';
@@ -49,7 +49,8 @@ try {
   assert.ok(tsStart < beforeSeq && beforeSeq < tsEnd && tsEnd < afterSeq);
 
   const endpoint = `${env.url}/v1/sessions/${env.session_id}/interfaces?before_seq=${beforeSeq}&after_seq=${afterSeq}&limit=16`;
-  assert.equal((await fetch(endpoint)).status, 401);
+  const unauthenticated = await fetch(endpoint);
+  assert.equal(unauthenticated.status, 401);
   const headers = { authorization: `Bearer ${env.token}` };
   const schema = await fetch(`${env.url}/v1/schemas/projections/interface.v2`, { headers });
   assert.equal(schema.status, 200);
@@ -66,7 +67,8 @@ try {
   const response = await pending;
   assert.equal(response.status, 200);
   const page = await response.json() as { status: string; inventory: unknown; gaps: unknown;
-    files: { path: string; status: string; fallback_reason?: string; changes: Array<{
+    files: { path: string; status: string; fallback_reason?: string;
+      before: { snapshot?: { sha256?: string } }; changes: Array<{
       kind: string; parameters?: Array<{ before?: { type?: { text?: string } } | null;
         after?: { type?: { text?: string } } | null }> }> }[] };
   assert.ok(page.inventory);
@@ -84,10 +86,42 @@ try {
       correct: file?.status === 'ready' && row?.kind === 'signatureChanged'
         && parameter?.before?.type?.text === beforeType && parameter?.after?.type?.text === afterType };
   });
+  const durableSeq = (await reader.finite(env.session_id, 0n)).durableSeq;
+  const aheadUrl = new URL(endpoint);
+  aheadUrl.searchParams.set('after_seq', (durableSeq + 1n).toString());
+  const ahead = await fetch(aheadUrl, { headers });
+  assert.equal(ahead.status, 409);
+  assert.equal(ahead.headers.get('slipstream-durable-seq'), durableSeq.toString());
+  assert.ok(!(ahead.headers.get('content-type') ?? '').includes('application/json'));
+  assert.equal(await ahead.text(), 'cursor beyond durable high-water');
+
+  // Fault injection touches only this harness-owned disposable store. The
+  // response is still obtained exclusively through the authenticated reader.
+  const beforeSha = page.files.find(file => file.path === tsPath)?.before.snapshot?.sha256;
+  assert.ok(beforeSha);
+  assert.match(beforeSha, /^[0-9a-f]{64}$/);
+  await unlink(join(env.store, 'blobs', 'sha256', beforeSha.slice(0, 2), beforeSha));
+  const missingResponse = await fetch(endpoint, { headers });
+  assert.equal(missingResponse.status, 200);
+  const missingPage = await missingResponse.json() as { status: string;
+    files: { path: string; status: string; fallback_reason?: string }[] };
+  const missingFile = missingPage.files.find(file => file.path === tsPath);
+  assert.equal(missingPage.status, 'partial');
+  assert.equal(missingFile?.status, 'unavailable');
+  assert.equal(missingFile?.fallback_reason, 'before-blob-missing');
+
+  await writeFile(join(env.store, 'sessions', env.session_id, 'removed.json'), '{"version":1}');
+  const gone = await fetch(endpoint, { headers });
+  assert.equal(gone.status, 410);
+  assert.equal(await gone.text(), 'gone');
   const passed = page.status === 'ready' && comparisons.every(item => item.correct) && captureDuringAnalysis;
   console.log(JSON.stringify({ gate: passed ? 'passed' : 'failed', before_seq: beforeSeq.toString(),
     after_seq: afterSeq.toString(), page_status: page.status,
     comparisons, probe_seq: probeSeq.toString(), capture_during_analysis: captureDuringAnalysis,
+    schema_status: schema.status, unauthenticated_status: unauthenticated.status,
+    ahead_status: ahead.status, ahead_durable_seq: ahead.headers.get('slipstream-durable-seq'),
+    missing_blob_page_status: missingPage.status, missing_blob_file_status: missingFile?.status,
+    missing_blob_reason: missingFile?.fallback_reason, tombstone_status: gone.status,
     assertion: 'standalone authenticated HTTP consumer, default budget, disposable daemon, no UI' }));
   if (!passed) process.exitCode = 1;
 } finally {

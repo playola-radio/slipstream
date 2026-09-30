@@ -1087,6 +1087,16 @@ Optional, only if approved (F3/F4):
 | **FD4** Service and public surface | admission overload / timeout; shutdown; deletion race (`410`); cache hit then blob loss; pagination freeze; `409` with header; schema route; text errors | GET route and schema served. It uses the reader-owned **shared** budget (wiring what T5b.1 deferred) with both languages, disposable caching and bounded output | Authenticated requests against a disposable daemon cover: ready TS and Swift, a `partial` page, a missing blob, `409` / `410`, and a schema fetch. Stop every UI and repeat from a standalone script. |
 | **FD5** Measurement gate | combined starvation; cold Swift; worker-retirement overlap; cancellation churn | All four D7 arms (ADMISSION.md) measured with TS, TSX and Swift. **Brian approves** `C/Q/W/D` and timeout rates. No success criterion is relaxed | The registered combined-load check. Crashes and missing data count as failures. This may be a gate rather than a PR. |
 
+**FD4 closeout (Brian, 2026-09-30).** The independent public-reader check in
+`docs/FD4-READER-API.md` covers FD4's full acceptance row. Brian approved
+merging the FD4 implementation separately from FD5 measurement acceptance.
+An interrupted no-row page with an unchanged cursor stops automatic pagination
+and permits explicit retry; it is not complete. A Swift host failure remains a
+text HTTP `500` with manual retry, and a reproducible file failure can block
+later files pending per-file recovery work. FD5's failed tracing-overhead gate
+and provisional admission values remain open. FS3 live wiring may start after
+FD4 merges and proceed alongside FD5; overall feature completion waits for FD5.
+
 ### 6.2 Swift slices
 
 | Slice | Failing cases written first | Done when | Independent live acceptance |

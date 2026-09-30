@@ -1,10 +1,11 @@
 # FD4 reader API handoff
 
-**Status: in progress; keep the PR draft.** Brian approved a 10,000 ms default
-interface-page safety budget for completeness on 2026-09-30. The earlier 100 ms
-cold Swift timeout remains historical evidence. Clip keeps its 100 ms deadline;
-the shared `C/Q/W`, capture impact and timeout rates still require FD5 evidence
-and approval.
+**Status: FD4 implementation accepted for merge by Brian on 2026-09-30; PR #44
+awaits Brian's merge.** Brian approved a 10,000 ms default interface-page safety
+budget for completeness. The earlier 100 ms cold Swift timeout remains historical
+evidence. Clip keeps its 100 ms deadline; shared `C/Q/W`, capture impact and
+timeout rates still require separate FD5 evidence and approval. This does not
+complete the overall function-change feature.
 
 ## Public contract trace
 
@@ -41,7 +42,7 @@ and approval.
   past unchecked files. An interruption during a file comparison has its own
   partial-page outcome and preserves any established per-file failure status.
 
-## Evidence and open gates
+## FD4 acceptance evidence
 
 `src/interface-http.test.ts` replays every applicable contract history against
 the real HTTP route, including both languages, missing blobs, status precedence,
@@ -63,7 +64,29 @@ were cleaned up; this is functional capture-continuity evidence, not a D7 load
 or latency result. The local gitignored response summary is
 `.context/fd4-completeness-live-clean.json` (SHA-256
 `c9a51db27c8a1ffed60937a70441a0ec732d411dcfcbc9ed6e93b80512ab0e45`);
-the committed `tools/fd4-live-check.ts` reproduces the check.
+the committed `tools/fd4-live-check.ts` reproduces the check. A closeout run of
+that same independent consumer also fetched the authenticated schema (`200`),
+observed unauthenticated `401`, requested beyond durable high-water and received
+text `409` with `slipstream-durable-seq: 22`, removed a recorded blob from the
+harness-owned disposable store and received a `partial` page with explicit
+`unavailable / before-blob-missing` coverage, then tombstoned the disposable
+session and received text `410`. Its local summary is
+`.context/fd4-closeout-live.json` (SHA-256
+`a82ae949825f96faaec098f4b547d2631322febc60c272d11cd7acea5e1dcd91`).
+This completes FD4's independent public-reader acceptance row in
+`FUNCTION-CHANGES.md` §6.1; the test does not measure shared-load safety.
+
+## Accepted MVP behavior and follow-ups
+
+Brian accepted the current pagination and host-error behavior for FD4 merge.
+When an interrupted page has no rows and its cursor does not advance, a client
+stops automatic pagination and offers explicit retry; the page is not complete.
+A Swift host failure remains an honest text HTTP `500`, displayed as analysis
+failure with manual retry. A reproducibly failing file can block later files in
+the range. Per-file recovery requires a later contract and implementation
+decision; no status was fabricated in this PR.
+
+## FD5 and FS3 handoff
 
 - **FD5:** Measure baseline, clip-only, interface-only, and combined load with
   TS, TSX, Swift, malformed and Unicode inputs, cold and warm paths, worker
@@ -76,7 +99,7 @@ the committed `tools/fd4-live-check.ts` reproduces the check.
   cannot identify it. No FD5 gate is waived by this pagination decision.
   Also measure shared-queue saturation by multiple 10-second interface pages:
   clip's own deadline stays 100 ms, but a full queue can reject its admission.
-- **FS3:** Once FD4/FD5 admission is settled, consume only the authenticated
+- **FS3:** After FD4 merges, live wiring may proceed alongside FD5. Consume only the authenticated
   public route, schema, event stream and blob route. Freeze session, B/A,
   filters, and version across `next_after_path`; handle partial/skipped pages,
   explicit unavailable sides, unknown scopes, gaps, 409, 410, and stale replies.
@@ -91,8 +114,8 @@ the committed `tools/fd4-live-check.ts` reproduces the check.
   pre-resolution outcome.
 - **Swift host crash:** The current v2 schema has no dedicated per-file status.
   An abnormal host exit is an internal text `500`; a reproducible crash on one
-  file can block later paths on a page. A per-file recovery status would need a
-  separate contract decision.
+  file can block later paths on a page. This accepted MVP limitation needs a
+  separate contract decision for per-file recovery.
 - **FD5 measurement risk:** A page may inspect many identical paths while seeking
   the next visible row. The admission deadline includes that retention scan, so
   large recorded inventories can return a skipped or partial timeout even when
@@ -102,12 +125,31 @@ the committed `tools/fd4-live-check.ts` reproduces the check.
   per-file status for these failures. A repeated failure can block the same page
   until the underlying store or worker problem is resolved.
 
-## Remaining merge and measurement gates
+## Remaining feature-completion gates
 
 The original FD5 tracing-overhead failure remains failed under its frozen
-configuration. The native/WASM diagnostic timeout remains unresolved. Two
-previous tools-suite failures (clip cache-bypass admission count under load and
-the Swift cancellation demo) passed in the 2026-09-30 run but remain tracked as
-intermittent until diagnosed; one green run does not erase them. The no-row,
-unchanged-cursor progress decision also remains open. None is silently waived
-by the 10-second interface-completeness policy or the functional live check.
+configuration, so the existing measurement cannot establish D7 acceptance.
+Prepare a bounded acceptance protocol for the current 10-second policy and
+queue/clip pressure, including how the failed instrumentation-overhead gate
+affects result validity. Execution needs separate approval; no diagnostic rerun
+or campaign is authorized by FD4 closeout. The archived native/WASM diagnostic
+timeout remains unresolved, but the deferred Rust spike is not a prerequisite
+for the existing Node path.
+
+Two historical intermittent tools tests remain tracked follow-ups, despite
+passing in the 2026-09-30 tools run (557/557):
+
+- `tools/fd5-bench.test.ts:168`, “real clip cache bypass is separate from
+  admission and blob loss forces a new compute”: a prior full tools run counted
+  3 clip admissions where 2 were expected; it also failed once in isolation.
+  FD5 must retain shared-admission and cache-bypass coverage.
+- `tools/swift-parse.test.ts:72`, “cancel-demo reports
+  inProgressAtCancel:false when the parse finished first”: that prior full run
+  reported `true` where `false` was expected. FD5 must retain real cancellation
+  and actual child-exit coverage.
+
+The prior failures are recorded in
+`.context/fd5-collector-profile-tools-after-review.txt`; the passing run is
+`.context/fd4-completeness-tools-test.log`. Neither failure is claimed fixed.
+The accepted no-row/unchanged-cursor and Swift host-error limitations remain
+follow-ups. Overall feature completion and release remain gated on FD5.
