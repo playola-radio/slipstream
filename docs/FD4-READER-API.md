@@ -101,3 +101,13 @@ the committed `tools/fd4-live-check.ts` reproduces the check.
   TypeScript worker failure also returns text `500`; the schema has no truthful
   per-file status for these failures. A repeated failure can block the same page
   until the underlying store or worker problem is resolved.
+
+## Remaining merge and measurement gates
+
+The original FD5 tracing-overhead failure remains failed under its frozen
+configuration. The native/WASM diagnostic timeout remains unresolved. Two
+previous tools-suite failures (clip cache-bypass admission count under load and
+the Swift cancellation demo) passed in the 2026-09-30 run but remain tracked as
+intermittent until diagnosed; one green run does not erase them. The no-row,
+unchanged-cursor progress decision also remains open. None is silently waived
+by the 10-second interface-completeness policy or the functional live check.
