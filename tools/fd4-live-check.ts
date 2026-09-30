@@ -24,6 +24,9 @@ try {
     }
   };
   const tsPath = 'fd4-live.ts';
+  // Several distinct cold Swift files keep the default-budget page pending long
+  // enough to observe a separate durable capture event through the public feed.
+  // This is a functional overlap check, not a latency measurement.
   const swiftPaths = Array.from({ length: 8 }, (_, i) => `zFD4Live${i}.swift`);
   const tsBefore = 'export function sample(x: number): number { return x; }\n';
   const tsAfter = 'export function sample(x: string): string { return x; }\n';

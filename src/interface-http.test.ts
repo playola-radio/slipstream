@@ -190,6 +190,19 @@ test('reader test seam extends only the interface deadline for an isolated Swift
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
+test('reader default interface budget serves cold Swift with a shorter shared clip deadline', async () => {
+  const { storeDir, request, expected } = await fixture('swift-parameter-change');
+  const reader = await startReaderServer({ storeDir,
+    projectionAdmissionConfig: { C: 2, Q: 8, W: 8, D: 1 } });
+  try {
+    const response = await fetch(reader.url + request.slice(4), {
+      headers: { authorization: `Bearer ${reader.token}` },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), expected);
+  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
 test('default interface budget completes a comparison after 100 ms of admitted work', async t => {
   const { storeDir, req, expected } = await serviceRequest('swift-parameter-change');
   const admission = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 100 });

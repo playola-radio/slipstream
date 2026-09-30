@@ -139,6 +139,12 @@ only the combined-load measurement can, because it observes capture under real t
   look-ahead. Clip continues to use 100 ms. Neither the shared limits nor the
   longer page budget proves capture safety; D7 measurement remains open.
 
+An interface page can now occupy a shared running or queued slot for up to
+10 seconds. Eight queued interface pages can fill `Q` and cause new clip
+requests to return `overloaded` during that interval, even though an admitted
+clip still has its own 100 ms deadline. FD5 must measure this cross-client
+pressure; this policy adds no priority or reserved clip capacity.
+
 The shared starting limits are named in `src/projection-admission.ts`; the
 interface page default is in `src/interface-service.ts`. The internal diagnostic
 seam may override the page budget without changing clip or the shared `C/Q/W`.

@@ -60,17 +60,22 @@ eight exact `Int`→`String` cold Swift parameter changes. A separate file-chang
 event at seq 22 became durable while the analysis HTTP request was still
 pending (frozen range ended at seq 21). The disposable daemon and worktree
 were cleaned up; this is functional capture-continuity evidence, not a D7 load
-or latency result. Raw response summary and hash are in
-`.context/fd4-completeness-live.json`.
+or latency result. The local gitignored response summary is
+`.context/fd4-completeness-live-clean.json` (SHA-256
+`c9a51db27c8a1ffed60937a70441a0ec732d411dcfcbc9ed6e93b80512ab0e45`);
+the committed `tools/fd4-live-check.ts` reproduces the check.
 
 - **FD5:** Measure baseline, clip-only, interface-only, and combined load with
   TS, TSX, Swift, malformed and Unicode inputs, cold and warm paths, worker
-  retirement and cancellation churn. Obtain Brian's D7 approval for `C/Q/W/D`
-  and timeout rates. Preserve clip's existing deadline while deciding how an
-  interface deadline can accommodate Swift. Do not infer approval from FD4's
-  test-only longer deadline. Count a look-ahead admission timeout as a timeout
+  retirement and cancellation churn. Obtain Brian's D7 approval for shared
+  `C/Q/W`, production timeout rates and any revision of the approved
+  interface-completeness budget. Preserve clip's existing 100 ms deadline;
+  the 10,000 ms interface default does not itself pass D7. Count a look-ahead
+  admission timeout as a timeout
   even when its returned page and files are `ready`; the JSON response alone
   cannot identify it. No FD5 gate is waived by this pagination decision.
+  Also measure shared-queue saturation by multiple 10-second interface pages:
+  clip's own deadline stays 100 ms, but a full queue can reject its admission.
 - **FS3:** Once FD4/FD5 admission is settled, consume only the authenticated
   public route, schema, event stream and blob route. Freeze session, B/A,
   filters, and version across `next_after_path`; handle partial/skipped pages,

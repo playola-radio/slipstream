@@ -719,6 +719,10 @@ deadline; `C/Q/W` are unchanged. A page can still be partial at a real deadline
 or resource limit. The longer interface budget is not a D7 capture-safety or
 timeout-rate acceptance result. The earlier cold Swift ~210 ms observation and
 failed 100 ms response remain historical evidence, not rescored results.
+Several clients can fill the shared `Q = 8` queue with interface pages lasting
+up to 10 seconds; a clip request may then be rejected as `overloaded` despite
+keeping its own 100 ms deadline. FD5 must measure that pressure before any
+capture-safety or timeout-rate claim.
 
 **Scan cost.** Endpoint resolution scans the log prefix for every page. For a
 large baseline (for example one that includes `node_modules`) this is
