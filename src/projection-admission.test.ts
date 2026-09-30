@@ -5,6 +5,7 @@ import {
   type AdmitOutcome,
   type ComputeHandle,
 } from './projection-admission.ts';
+import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 // A test-only synthetic workload: a fake compute with a controllable resolution
 // and a cancel spy. It stands in for the future interface-projection service so
@@ -25,6 +26,131 @@ function later(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+test('trace records distinct overload, dispatch, queue expiry and one terminal transition', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 40 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const first = budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/same', run });
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/queued', run });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1, traceRouteKey: '/same', run }),
+    { kind: 'overloaded' });
+  t.mock.timers.tick(41);
+  assert.deepEqual(await first, { kind: 'timeout' });
+  assert.deepEqual(await queued, { kind: 'timeout' });
+  held.resolve('late');
+  await Promise.resolve();
+  const admissions = events.filter(e => e.kind === 'admission');
+  assert.deepEqual(events.filter(e => e.kind === 'task-finished').map(e => e.unitId), [admissions[0]!.unitId]);
+  assert.deepEqual(admissions.map(e => e.disposition), ['running', 'queued', 'overloaded']);
+  assert.equal(new Set(admissions.map(e => e.unitId)).size, 3);
+  const dispatches = events.filter(e => e.kind === 'dispatch');
+  assert.deepEqual(dispatches.map(e => e.unitId), [admissions[0]!.unitId]);
+  const settles = events.filter(e => e.kind === 'settle');
+  assert.equal(settles.length, 3);
+  assert.deepEqual(settles.map(e => [e.priorState, e.outcome]),
+    [['overloaded', 'overloaded'], ['running', 'timeout'], ['queued', 'timeout']]);
+  for (const admission of admissions) {
+    const terminal = settles.find(e => e.unitId === admission.unitId)!;
+    assert.ok(terminal.atNs >= admission.atNs);
+  }
+  await budget.close();
+});
+
+test('trace records waiter cancellation and close without changing admission results', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 1, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const leader = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'K', traceRouteKey: '/leader', run });
+  const controller = new AbortController();
+  const waiter = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'K',
+    traceRouteKey: '/waiter', signal: controller.signal, run });
+  controller.abort();
+  assert.deepEqual(await waiter, { kind: 'cancelled' });
+  await budget.close();
+  assert.deepEqual(await leader, { kind: 'closed' });
+  assert.deepEqual(events.filter(e => e.kind === 'settle').map(e => [e.priorState, e.outcome]),
+    [['waiting', 'cancelled'], ['running', 'closed']]);
+  held.resolve('late');
+  await Promise.resolve();
+  assert.equal(events.filter(e => e.kind === 'settle').length, 2);
+});
+
+test('throwing trace observer cannot change admission outcome or release', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 }, () => { throw new Error('collector'); });
+  const outcome = await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/x', run: () => ({ promise: Promise.resolve('ok'), cancel: () => {} }) });
+  assert.deepEqual(outcome, { kind: 'ok', value: 'ok' });
+  assert.deepEqual(budget.snapshot(), { running: 0, queued: 0, waiters: 0 });
+  await budget.close();
+});
+
+test('pre-aborted and post-close calls remain unclassified by the frozen trace union', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 }, event => events.push(event));
+  const controller = new AbortController();
+  controller.abort();
+  const run = () => ({ promise: Promise.resolve('never'), cancel: () => {} });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/aborted', signal: controller.signal, run }), { kind: 'cancelled' });
+  await budget.close();
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/closed', run }), { kind: 'closed' });
+  assert.deepEqual(events, []);
+});
+
+test('leader settle is traced before a released waiter can dispatch queued work', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 1, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const run = () => ({ promise: held.promise, cancel: () => {} });
+  const leader = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'same',
+    traceRouteKey: '/leader', run });
+  const waiter = budget.admit({ workload: 'interface', localConcurrency: 1, key: 'same',
+    traceRouteKey: '/waiter', run });
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/queued', run: () => ({ promise: Promise.resolve('queued'), cancel: () => {} }) });
+  held.resolve('done');
+  await Promise.all([leader, waiter, queued]);
+  const leaderId = events.find(e => e.kind === 'admission' && e.routeKey === '/leader')!;
+  const queuedId = events.find(e => e.kind === 'admission' && e.routeKey === '/queued')!;
+  assert.ok(leaderId.kind === 'admission' && queuedId.kind === 'admission');
+  const leaderSettle = events.findIndex(e => e.kind === 'settle' && e.unitId === leaderId.unitId);
+  const queuedDispatch = events.findIndex(e => e.kind === 'dispatch' && e.unitId === queuedId.unitId);
+  assert.ok(leaderSettle >= 0 && queuedDispatch > leaderSettle);
+  await budget.close();
+});
+
+test('a rejected async trace observer cannot produce an unhandled rejection', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 },
+    async () => { throw new Error('async collector'); });
+  assert.deepEqual(await budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/async', run: () => ({ promise: Promise.resolve('ok'), cancel: () => {} }) }),
+  { kind: 'ok', value: 'ok' });
+  await new Promise(resolve => setImmediate(resolve));
+  await budget.close();
+});
+
+test('trace dispatches a promoted leader once before its compute starts', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 1000 }, event => events.push(event));
+  const held = gate();
+  const first = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/first', run: () => ({ promise: held.promise, cancel: () => {} }) });
+  const second = budget.admit({ workload: 'interface', localConcurrency: 1,
+    traceRouteKey: '/second', run: () => ({ promise: Promise.resolve('second'), cancel: () => {} }) });
+  held.resolve('first');
+  assert.deepEqual(await Promise.all([first, second]), [{ kind: 'ok', value: 'first' }, { kind: 'ok', value: 'second' }]);
+  const queued = events.find((e): e is Extract<ProjectionTraceEvent, { kind: 'admission' }> =>
+    e.kind === 'admission' && e.routeKey === '/second')!;
+  const sequence = events.filter(e => 'unitId' in e && e.unitId === queued.unitId);
+  assert.deepEqual(sequence.map(e => e.kind), ['admission', 'dispatch', 'task-finished', 'settle']);
+  assert.ok(sequence[0]!.atNs <= sequence[1]!.atNs && sequence[1]!.atNs <= sequence[2]!.atNs);
+  await budget.close();
+});
+
 test('an immediately runnable leader is admitted even when Q is 0', async () => {
   // Regression: a design that reserves a queue slot first would reject the very
   // first request despite an idle worker.
@@ -36,6 +162,38 @@ test('an immediately runnable leader is admitted even when Q is 0', async () => 
   });
   assert.equal(ran, true);
   assert.deepEqual(outcome, { kind: 'ok', value: 'v' });
+  await budget.close();
+});
+
+test('a disconnected queued request releases its admission slot immediately', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 1000 });
+  const held = gate();
+  const first = budget.admit({ workload: 'clip', localConcurrency: 1,
+    run: () => ({ promise: held.promise, cancel: () => {} }) });
+  const controller = new AbortController();
+  let ran = false;
+  const queued = budget.admit({ workload: 'interface', localConcurrency: 1, signal: controller.signal,
+    run: () => { ran = true; return { promise: Promise.resolve('queued'), cancel: () => {} }; } });
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 1, waiters: 0 });
+  controller.abort();
+  assert.deepEqual(await queued, { kind: 'cancelled' });
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 0, waiters: 0 });
+  assert.equal(ran, false);
+  held.resolve('done');
+  await first;
+  await budget.close();
+});
+
+test('a disconnected running request cancels compute and frees capacity', async () => {
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 1000 });
+  const controller = new AbortController();
+  let cancelled = 0;
+  const pending = budget.admit({ workload: 'interface', localConcurrency: 1, signal: controller.signal,
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => { cancelled++; } }) });
+  controller.abort();
+  assert.deepEqual(await pending, { kind: 'cancelled' });
+  assert.equal(cancelled, 1);
+  assert.deepEqual(budget.snapshot(), { running: 0, queued: 0, waiters: 0 });
   await budget.close();
 });
 
@@ -138,6 +296,45 @@ test('a request that expires while running is cancelled and settles timeout', as
   });
   assert.deepEqual(outcome, { kind: 'timeout' });
   assert.equal(cancelled, true);
+  await budget.close();
+});
+
+test('the deadline timer grants the full duration when the wall clock ticks during admission', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let clockReads = 0;
+  t.mock.method(Date, 'now', () => (++clockReads === 1 ? 1000 : 1001));
+  const budget = createProjectionAdmission({ C: 1, Q: 0, W: 0, D: 100 });
+  let settled = false;
+  const outcome = budget.admit<string>({
+    workload: 'clip', localConcurrency: 1,
+    run: () => ({ promise: new Promise<string>(() => {}), cancel: () => {} }),
+  }).then((value) => { settled = true; return value; });
+  t.mock.timers.tick(99);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await outcome, { kind: 'timeout' });
+  await budget.close();
+});
+
+test('an internal interface deadline does not extend clip running or queue wait', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const budget = createProjectionAdmission({ C: 1, Q: 2, W: 0, D: 100 });
+  const interfaceGate = gate();
+  let interfaceCancelled = false;
+  let queuedClipRan = false;
+  const interfaceWork = budget.admit<string>({ workload: 'interface', localConcurrency: 1,
+    deadlineMs: 250,
+    run: () => ({ promise: interfaceGate.promise, cancel: () => { interfaceCancelled = true; } }) });
+  const queuedClip = budget.admit<string>({ workload: 'clip', localConcurrency: 1,
+    run: () => { queuedClipRan = true; return { promise: Promise.resolve('clip'), cancel: () => {} }; } });
+  t.mock.timers.tick(101);
+  assert.deepEqual(await queuedClip, { kind: 'timeout' });
+  assert.equal(queuedClipRan, false);
+  assert.equal(interfaceCancelled, false);
+  assert.deepEqual(budget.snapshot(), { running: 1, queued: 0, waiters: 0 });
+  interfaceGate.resolve('interface');
+  assert.deepEqual(await interfaceWork, { kind: 'ok', value: 'interface' });
   await budget.close();
 });
 

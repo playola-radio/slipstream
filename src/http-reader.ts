@@ -10,15 +10,32 @@ import {
 import { checkAuth, checkHostOrigin, generateToken, publishDescriptor } from './http-security.ts';
 import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './log-reader.ts';
 import { parseClipSnapshot } from './clip-blob-reader.ts';
-import { createClipProjectionService } from './clip-projection-service.ts';
+import { createClipProjectionService, type ClipServiceOptions } from './clip-projection-service.ts';
 import { languageForPath } from './clip-language.ts';
 import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
 import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
+import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
+import { createInterfaceService, type InterfaceServiceOptions } from './interface-service.ts';
+import { emitProjectionPhase, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
 export interface ReaderServerOptions {
   storeDir: string;
+  /** Test seam only; the daemon uses the provisional D7 values. */
+  projectionAdmissionConfig?: AdmissionConfig;
+  /** Test-only, synchronous and nonreentrant observer; unset by the daemon. */
+  projectionTrace?: ProjectionTraceObserver;
+  /** Test seam for measuring interface deadlines without relaxing clip's D. */
+  interfaceDeadlineMs?: number;
+  /** Test seam for deterministic contract budget fixtures. */
+  interfaceLimits?: Pick<InterfaceServiceOptions, 'fileResultBytes' | 'metadataBytes'>;
+  /** Test seam for an isolated Swift host failure. */
+  interfaceExtractSwift?: InterfaceServiceOptions['extractSwift'];
+  /** Test seam for interruption after a recorded content-retention probe. */
+  interfaceOnRetentionCheck?: InterfaceServiceOptions['onRetentionCheck'];
+  /** Test-only delay after clip admission; unset in normal daemon operation. */
+  clipDispatchBarrier?: ClipServiceOptions['dispatchBarrier'];
   /** Standalone single-session view (`serve`). Ignored when {@link registry} is
    * given; internally it becomes a one-entry registry. */
   active?: ActiveSession;
@@ -39,12 +56,21 @@ const FOLD_CONTRACT_HEADER = 'slipstream-fold-contract';
 const SSE_HEARTBEAT_MS = 15000;
 const DRAIN_DEADLINE_MS = 10000;
 
-function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {}) {
+function send(res: ServerResponse, status: number, body: string | Buffer, headers: Record<string,string> = {},
+  onFinish?: () => void) {
   res.writeHead(status, { 'cache-control': 'no-store', ...headers });
-  res.end(body);
+  if (onFinish) res.end(body, onFinish); else res.end(body);
 }
-function sendJson(res: ServerResponse, status: number, value: unknown) {
-  send(res, status, JSON.stringify(value), { 'content-type': 'application/json; charset=utf-8' });
+function sendJson(res: ServerResponse, status: number, value: unknown,
+  trace?: { observer: ProjectionTraceObserver; routeKey: string; scope: 'clip' | 'interface' }) {
+  const startedAtNs = trace ? process.hrtime.bigint() : undefined;
+  const body = JSON.stringify(value);
+  if (trace) emitProjectionPhase(trace.observer, 'serialization', startedAtNs,
+    { scope: trace.scope, routeKey: trace.routeKey });
+  const writeStartedAtNs = trace ? process.hrtime.bigint() : undefined;
+  send(res, status, body, { 'content-type': 'application/json; charset=utf-8' }, trace
+    ? () => emitProjectionPhase(trace.observer, 'http-completion', writeStartedAtNs,
+      { scope: trace.scope, routeKey: trace.routeKey }) : undefined);
 }
 
 function isFollow(params: URLSearchParams): boolean {
@@ -81,7 +107,14 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   // disposably (no log, no persistence). The service owns the worker pool + bounded
   // admission so a burst of cold-cache requests cannot starve capture; the server
   // closes it on shutdown.
-  const clipService = createClipProjectionService({ storeDir: opts.storeDir });
+  const admission = createProjectionAdmission(opts.projectionAdmissionConfig ?? PROVISIONAL_SHARED_ADMISSION,
+    opts.projectionTrace);
+  const clipService = createClipProjectionService({ storeDir: opts.storeDir, admission,
+    projectionTrace: opts.projectionTrace, dispatchBarrier: opts.clipDispatchBarrier });
+  const interfaceService = createInterfaceService({ storeDir: opts.storeDir, admission,
+    ...opts.interfaceLimits, extractSwift: opts.interfaceExtractSwift,
+    onRetentionCheck: opts.interfaceOnRetentionCheck,
+    admissionDeadlineMs: opts.interfaceDeadlineMs, projectionTrace: opts.projectionTrace });
 
   const server = createServer((req, res) => { void handle(req, res).catch((err) => {
     console.error('slipstream reader: request failed', err);
@@ -98,7 +131,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     });
   } catch (err) {
     // Do not leak the clip worker if the listener never bound.
-    await clipService.close();
+    await admission.close();
+    await Promise.all([clipService.close(), interfaceService.close()]);
     throw err;
   }
   const port = (server.address() as AddressInfo).port;
@@ -110,7 +144,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   } catch (err) {
     // Do not leak the listener or the clip worker if we cannot publish.
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await clipService.close();
+    await admission.close();
+    await Promise.all([clipService.close(), interfaceService.close()]);
     throw err;
   }
 
@@ -150,7 +185,16 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     }
     const clipsMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/changes\/([0-9]+)\/clips$/);
     if (clipsMatch) {
-      await handleClips(res, decodeURIComponent(clipsMatch[1]!), clipsMatch[2]!);
+      await handleClips(res, decodeURIComponent(clipsMatch[1]!), clipsMatch[2]!,
+        opts.projectionTrace ? req.url : undefined);
+      return;
+    }
+    const interfacesMatch = pathname.match(/^\/v1\/sessions\/([^/]+)\/interfaces$/);
+    if (interfacesMatch) {
+      let id: string;
+      try { id = decodeURIComponent(interfacesMatch[1]!); }
+      catch { send(res, 400, 'invalid session id'); return; }
+      await handleInterfaces(req, res, id, searchParams);
       return;
     }
     const blobMatch = pathname.match(/^\/v1\/blobs\/sha256\/([^/]+)$/);
@@ -221,7 +265,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     return staticBoundary(await onDiskHighWater(sessionLogPath(opts.storeDir, id)));
   }
 
-  async function handleClips(res: ServerResponse, id: string, seqStr: string): Promise<void> {
+  async function handleClips(res: ServerResponse, id: string, seqStr: string,
+    traceRouteKey?: string): Promise<void> {
     if (!isValidSessionId(id)) { send(res, 404, 'not found'); return; }
     if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
     const logPath = sessionLogPath(opts.storeDir, id);
@@ -277,8 +322,65 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     // status with a reason, served as a normal 200. The HTTP status reports whether
     // the request succeeded, not whether the content is still retained.
     const projection = await clipService.get({ changeSeq: seqStr, before, after,
-      language: languageForPath(path) });
-    sendJson(res, 200, projection);
+      language: languageForPath(path), traceRouteKey });
+    sendJson(res, 200, projection, opts.projectionTrace && traceRouteKey
+      ? { observer: opts.projectionTrace, routeKey: traceRouteKey, scope: 'clip' } : undefined);
+  }
+
+  async function handleInterfaces(req: IncomingMessage, res: ServerResponse, id: string,
+    params: URLSearchParams): Promise<void> {
+    if (!isValidSessionId(id)) { send(res, 404, 'not found'); return; }
+    if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+    const logPath = sessionLogPath(opts.storeDir, id);
+    try { await access(logPath); } catch {
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      send(res, 404, 'not found'); return;
+    }
+    const allowed = new Set(['before_seq', 'after_seq', 'limit', 'path_prefix', 'after_path', 'include_identical']);
+    const values = new Map<string, string>();
+    for (const [key, value] of params) {
+      if (!allowed.has(key) || values.has(key)) { send(res, 400, 'invalid request'); return; }
+      values.set(key, value);
+    }
+    const beforeText = values.get('before_seq');
+    const afterText = values.get('after_seq');
+    if (beforeText === undefined || afterText === undefined || !/^(0|[1-9][0-9]*)$/.test(beforeText)
+      || !/^(0|[1-9][0-9]*)$/.test(afterText)) { send(res, 400, 'invalid cutoffs'); return; }
+    const beforeSeq = BigInt(beforeText), afterSeq = BigInt(afterText);
+    const limitText = values.get('limit') ?? '16';
+    const limit = Number(limitText);
+    const prefix = values.get('path_prefix') ?? '';
+    const identical = values.get('include_identical');
+    if (beforeSeq > afterSeq || !/^[1-9][0-9]*$/.test(limitText) || !Number.isSafeInteger(limit)
+      || limit < 1 || limit > 16 || prefix.startsWith('/') || prefix.includes('\0')
+      || prefix.split('/').includes('..') || (identical !== undefined && identical !== 'true')) {
+      send(res, 400, 'invalid request'); return;
+    }
+    const H = (await boundaryFor(id)).current();
+    if (afterSeq > H) {
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      send(res, 409, 'cursor beyond durable high-water', { [DURABLE_SEQ_HEADER]: H.toString() });
+      return;
+    }
+    const abort = new AbortController();
+    const onDisconnect = () => abort.abort();
+    res.on('close', onDisconnect);
+    res.on('error', onDisconnect);
+    try {
+      const page = await interfaceService.get({ sessionId: id, logPath, durableSeq: H,
+        beforeSeq, afterSeq, pathPrefix: prefix, afterPath: values.get('after_path') ?? null,
+        includeIdentical: identical === 'true', limit, signal: abort.signal,
+        traceRouteKey: opts.projectionTrace ? req.url : undefined });
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      if (!res.destroyed) sendJson(res, 200, page, opts.projectionTrace && req.url
+        ? { observer: opts.projectionTrace, routeKey: req.url, scope: 'interface' } : undefined);
+    } catch (error) {
+      if (await readTombstone(opts.storeDir, id)) { send(res, 410, 'gone'); return; }
+      throw error;
+    } finally {
+      res.off('close', onDisconnect);
+      res.off('error', onDisconnect);
+    }
   }
 
   async function handleEvents(
@@ -459,7 +561,8 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     close: async () => {
       closing = true;
       for (const ac of followers) ac.abort();
-      await clipService.close();
+      await admission.close();
+      await Promise.all([clipService.close(), interfaceService.close()]);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // Remove the descriptor this server published; a dead reader must not leave
       // a stale pointer behind. ENOENT (already gone) is fine.

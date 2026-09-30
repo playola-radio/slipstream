@@ -11,6 +11,7 @@ import type { ClipCompute } from './clip-worker-pool.ts';
 import type { ClipSnapshot } from './clip-blob-reader.ts';
 import { withFakeSession, changesFor } from './test/helpers.ts';
 import { computeClipProjection } from './clip-blob-reader.ts';
+import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 const sha = (i: number): string => String(i).padStart(64, '0');
 const contentReq = (seq: string, id: number): ClipRequest => ({
@@ -142,6 +143,65 @@ test('identical concurrent requests coalesce onto one compute', async () => {
   assert.equal(r1.change_seq, '1');
   assert.equal(r2.change_seq, '2'); // coalesced waiter still gets its own change_seq
   await svc.close();
+});
+
+test('coalesced clip waiters consume W and trace separately from their running leader', async () => {
+  const events: ProjectionTraceEvent[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    queueLimit: 1, projectionTrace: event => events.push(event),
+    compute: job => ({ promise: gate.then(() => fallback(job.opts.changeSeq)), cancel: () => {} }) });
+  const req = { ...contentReq('1', 1), traceRouteKey: '/same-clips' };
+  try {
+    const leader = svc.get(req);
+    const waiter = svc.get({ ...req, changeSeq: '2' });
+    const rejected = await svc.get({ ...req, changeSeq: '3' });
+    assert.equal(rejected.fallback_reason, 'overloaded');
+    release();
+    await Promise.all([leader, waiter]);
+    assert.deepEqual(events.filter(e => e.kind === 'admission').map(e => e.disposition),
+      ['running', 'waiting', 'overloaded']);
+    assert.equal(events.filter(e => e.kind === 'dispatch').length, 1);
+    assert.equal(events.filter(e => e.kind === 'task-finished').length, 1);
+  } finally { release(); await svc.close(); }
+});
+
+test('optional dispatch barrier holds one admitted clip leader while same-key waiters consume W', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    queueLimit: 2, deadlineMs: 1_000, dispatchBarrier: () => held,
+    compute: job => { computes++; return { promise: Promise.resolve(fallback(job.opts.changeSeq)), cancel: () => {} }; } });
+  const req = contentReq('1', 1);
+  try {
+    const leader = svc.get(req);
+    const waiterA = svc.get({ ...req, changeSeq: '2' });
+    const waiterB = svc.get({ ...req, changeSeq: '3' });
+    const rejected = await svc.get({ ...req, changeSeq: '4' });
+    assert.equal(rejected.fallback_reason, 'overloaded');
+    assert.equal(computes, 0, 'barrier must hold the actual worker dispatch');
+    release();
+    assert.deepEqual((await Promise.all([leader, waiterA, waiterB])).map(v => v.change_seq), ['1', '2', '3']);
+    assert.equal(computes, 1);
+  } finally { release(); await svc.close(); }
+});
+
+test('clip deadline includes the optional barrier and prevents late compute', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let computes = 0;
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent,
+    deadlineMs: 10, dispatchBarrier: () => held,
+    compute: job => { computes++; return { promise: Promise.resolve(fallback(job.opts.changeSeq)), cancel: () => {} }; } });
+  try {
+    const result = await svc.get(contentReq('1', 1));
+    assert.equal(result.fallback_reason, 'timeout');
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(computes, 0);
+  } finally { release(); await svc.close(); }
 });
 
 test('a coalesced waiter does not redundantly re-write the leader\'s cache entry', async (t) => {
@@ -384,7 +444,9 @@ test('close awaits the busy worker terminated by admission cancellation, not jus
   });
 
   const storeDir = await mkdtemp(join(tmpdir(), 'slip-clipsvc-close-'));
-  const svc = createClipProjectionService({ storeDir, deadlineMs: 60_000 });
+  const events: ProjectionTraceEvent[] = [];
+  const svc = createClipProjectionService({ storeDir, deadlineMs: 60_000,
+    projectionTrace: event => events.push(event) });
   const cas = await createCas(join(storeDir, 'blobs'));
   const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
   const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
@@ -393,7 +455,7 @@ test('close awaits the busy worker terminated by admission cancellation, not jus
 
   let closePromise: Promise<void> | undefined;
   try {
-    const pending = svc.get({ changeSeq: '1', before, after }); // admitted, running
+    const pending = svc.get({ changeSeq: '1', before, after, traceRouteKey: '/closed-clips' }); // admitted, running
     // Give the job a tick to actually reach the worker before closing.
     await new Promise((r) => setTimeout(r, 0));
 
@@ -404,11 +466,16 @@ test('close awaits the busy worker terminated by admission cancellation, not jus
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(closed, false, 'close() resolved before the busy worker actually terminated');
     assert.equal(terminated.length, 1);
+    const retired = events.find(event => event.kind === 'process-retire');
+    assert.ok(retired);
+    assert.equal(events.some(event => event.kind === 'process-exit' && event.processId === retired.processId), false);
 
     terminated[0]!(); // let the original worker's termination complete
     await closePromise;
     assert.equal(closed, true);
     await pending;
+    assert.ok(events.some(event => event.kind === 'process-exit' && event.processId === retired.processId));
+    assert.equal(events.filter(event => event.kind === 'task-finished').length, 1);
   } finally {
     terminated[0]?.(); // always release the held termination so the real worker actually exits
     await closePromise?.catch(() => {});

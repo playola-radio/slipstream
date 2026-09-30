@@ -19,6 +19,7 @@
     "live-feed": "node tools/live-feed/cli.ts",
     "identity-probe": "node tools/identity-probe/server.ts",
     "bench:clips": "node src/clip-bench.ts",
+    "bench:fd5": "node tools/fd5-bench.ts",
     "qa:daemon": "node tools/qa-daemon.ts",
     "qa:check": "node tools/projection-check.ts acceptance",
     "check:fold-release": "node tools/projection-check.ts fold-release"

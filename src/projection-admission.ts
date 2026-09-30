@@ -22,6 +22,8 @@
  * responsibility; the budget bounds admitted running work as a proxy.
  */
 
+import { emitProjectionTrace, type ProjectionTraceEvent, type ProjectionTraceObserver } from './projection-trace.ts';
+
 export interface ComputeHandle<T> {
   promise: Promise<T>;
   /** Stop the running compute. Fire-and-forget; the budget never awaits it. */
@@ -33,10 +35,16 @@ export interface AdmitRequest<T> {
   workload: string;
   /** Max computes this workload may run at once (clip: 1 single worker). */
   localConcurrency: number;
+  /** Internal workload deadline; defaults to the shared D. Includes queue wait. */
+  deadlineMs?: number;
   /** Coalescing key; identical concurrent keys share one compute. Undefined never coalesces. */
   key?: string;
+  /** Test-only HTTP route identity. Unset for ordinary daemon/clip work. */
+  traceRouteKey?: string;
+  /** Cancels this request when its HTTP consumer disconnects. */
+  signal?: AbortSignal;
   /** Starts the compute; called once, when a running slot is granted. */
-  run: () => ComputeHandle<T>;
+  run: (traceUnitId?: number) => ComputeHandle<T>;
 }
 
 export type AdmitOutcome<T> =
@@ -44,6 +52,7 @@ export type AdmitOutcome<T> =
   | { kind: 'timeout' }
   | { kind: 'overloaded' }
   | { kind: 'closed' }
+  | { kind: 'cancelled' }
   | { kind: 'error' };
 
 export interface AdmissionConfig {
@@ -78,15 +87,18 @@ export const PROVISIONAL_SHARED_ADMISSION: AdmissionConfig = { C: 2, Q: 8, W: 8,
 type UnitState = 'running' | 'queued' | 'waiting' | 'settled';
 
 interface Unit {
+  traceId?: number;
   workload: string;
   localConcurrency: number;
   key?: string;
-  run: () => ComputeHandle<unknown>;
+  run: (traceUnitId?: number) => ComputeHandle<unknown>;
   resolve: (outcome: AdmitOutcome<unknown>) => void;
   state: UnitState;
   deadlineAt: number;
   timer: ReturnType<typeof setTimeout> | undefined;
   handle: ComputeHandle<unknown> | undefined;
+  signal?: AbortSignal;
+  onAbort?: () => void;
 }
 
 interface Flight {
@@ -94,7 +106,7 @@ interface Flight {
   waiters: Set<Unit>;
 }
 
-export function createProjectionAdmission(config: AdmissionConfig): ProjectionAdmission {
+export function createProjectionAdmission(config: AdmissionConfig, trace?: ProjectionTraceObserver): ProjectionAdmission {
   const { C, Q, W, D } = config;
 
   let running = 0;
@@ -111,6 +123,14 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   const live = new Set<Unit>();
   let closed = false;
   let pumping = false;
+  let nextTraceId = 0;
+  const emit = (event: ProjectionTraceEvent): void => emitProjectionTrace(trace, event);
+  const admissionEvent = (unitId: number | undefined, routeKey: string | undefined,
+    workload: string, disposition: Extract<ProjectionTraceEvent, { kind: 'admission' }>['disposition']): void => {
+    if (unitId === undefined || routeKey === undefined || (workload !== 'interface' && workload !== 'clip')) return;
+    emit({ kind: 'admission', unitId, routeKey, workload,
+      atNs: process.hrtime.bigint(), disposition });
+  };
 
   const runningOf = (w: string): number => runningByWorkload.get(w) ?? 0;
   const incRunning = (w: string): void => { running++; runningByWorkload.set(w, runningOf(w) + 1); };
@@ -121,8 +141,8 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   };
   const pending = (): number => queue.length + waiters;
 
-  const arm = (unit: Unit): void => {
-    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }), D);
+  const arm = (unit: Unit, deadlineMs: number): void => {
+    unit.timer = setTimeout(() => settle(unit, { kind: 'timeout' }), deadlineMs);
     unit.timer.unref(); // a pending deadline must never hold the process open
   };
 
@@ -140,13 +160,18 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     const prev = unit.state;
     unit.state = 'settled';
     if (unit.timer !== undefined) clearTimeout(unit.timer);
+    if (unit.signal && unit.onAbort) unit.signal.removeEventListener('abort', unit.onAbort);
     live.delete(unit);
+    // Record the leader before releasing its waiters: a waiter can pump queued
+    // work, so delayed emission would make the trace briefly exceed C.
+    if (unit.traceId !== undefined) emit({ kind: 'settle', unitId: unit.traceId,
+      atNs: process.hrtime.bigint(), priorState: prev, outcome: outcome.kind });
 
     if (prev === 'running') {
       decRunning(unit.workload);
       // Cancel only when forcibly ending unfinished work; ok/error already settled.
       // Fire-and-forget: a throwing cancel must not skip flight release or resolution.
-      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed')) {
+      if (unit.handle && (outcome.kind === 'timeout' || outcome.kind === 'closed' || outcome.kind === 'cancelled')) {
         try { unit.handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
       }
       releaseFlight(unit, outcome);
@@ -164,10 +189,15 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
   };
 
   const startCompute = (unit: Unit): void => {
+    if (unit.traceId !== undefined) emit({ kind: 'dispatch', unitId: unit.traceId, atNs: process.hrtime.bigint() });
+    const finished = (): void => {
+      if (unit.traceId !== undefined) emit({ kind: 'task-finished', unitId: unit.traceId, atNs: process.hrtime.bigint() });
+    };
     let handle: ComputeHandle<unknown>;
     try {
-      handle = unit.run();
+      handle = unit.run(unit.traceId);
     } catch {
+      finished();
       if (unit.state === 'settled') return; // reentrant settle already resolved it
       // A synchronous throw after the deadline is a timeout, mirroring the async path.
       if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
@@ -180,12 +210,13 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
     // rejection now that no handler is attached.
     if (unit.state === 'settled') {
       try { handle.cancel(); } catch { /* ignore: teardown is the pool's job */ }
-      handle.promise.catch(() => {});
+      handle.promise.then(finished, finished);
       return;
     }
     unit.handle = handle;
     handle.promise.then(
       (value) => {
+        finished();
         if (unit.state === 'settled') return; // late completion ignored
         // A finished result is never discarded for lateness: the deadline bounds
         // WAITING (its timer already fired 'timeout' if it elapsed), not completed
@@ -193,6 +224,7 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         settle(unit, { kind: 'ok', value });
       },
       () => {
+        finished();
         if (unit.state === 'settled') return;
         // A rejection after the deadline is a timeout, not a worker error.
         if (Date.now() >= unit.deadlineAt) { settle(unit, { kind: 'timeout' }); return; }
@@ -227,18 +259,31 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
 
   const admit = <T>(req: AdmitRequest<T>): Promise<AdmitOutcome<T>> => {
     if (closed) return Promise.resolve({ kind: 'closed' });
+    if (req.signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
+    const traceId = trace && req.traceRouteKey !== undefined &&
+      (req.workload === 'interface' || req.workload === 'clip') ? ++nextTraceId : undefined;
+    const overload = (resolve: (outcome: AdmitOutcome<T>) => void): void => {
+      admissionEvent(traceId, req.traceRouteKey, req.workload, 'overloaded');
+      if (traceId !== undefined) emit({ kind: 'settle', unitId: traceId, atNs: process.hrtime.bigint(),
+        priorState: 'overloaded', outcome: 'overloaded' });
+      resolve({ kind: 'overloaded' });
+    };
     return new Promise<AdmitOutcome<T>>((resolve) => {
+      const deadlineMs = req.deadlineMs ?? D;
       const unit: Unit = {
+        traceId,
         workload: req.workload,
         localConcurrency: req.localConcurrency,
         key: req.key,
-        run: req.run as () => ComputeHandle<unknown>,
+        run: req.run as (traceUnitId?: number) => ComputeHandle<unknown>,
         resolve: resolve as (outcome: AdmitOutcome<unknown>) => void,
         state: 'queued',
-        deadlineAt: Date.now() + D,
+        deadlineAt: Date.now() + deadlineMs,
         timer: undefined,
         handle: undefined,
+        signal: req.signal,
       };
+      unit.onAbort = () => settle(unit, { kind: 'cancelled' });
 
       const fk = req.key !== undefined ? flightKey(req.workload, req.key) : undefined;
 
@@ -247,12 +292,14 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
       if (fk !== undefined) {
         const flight = inFlight.get(fk);
         if (flight) {
-          if (pending() >= Q || waiters >= W) { resolve({ kind: 'overloaded' }); return; }
+          if (pending() >= Q || waiters >= W) { overload(resolve); return; }
           waiters++;
           unit.state = 'waiting';
           flight.waiters.add(unit);
-          arm(unit);
+          arm(unit, deadlineMs);
           live.add(unit);
+          req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+          admissionEvent(traceId, req.traceRouteKey, req.workload, 'waiting');
           return;
         }
       }
@@ -262,8 +309,10 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         unit.state = 'running';
         incRunning(req.workload);
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
-        arm(unit);
+        arm(unit, deadlineMs);
         live.add(unit);
+        req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+        admissionEvent(traceId, req.traceRouteKey, req.workload, 'running');
         startCompute(unit);
         return;
       }
@@ -271,11 +320,13 @@ export function createProjectionAdmission(config: AdmissionConfig): ProjectionAd
         unit.state = 'queued';
         queue.push(unit);
         if (fk !== undefined) inFlight.set(fk, { leader: unit, waiters: new Set() });
-        arm(unit);
+        arm(unit, deadlineMs);
         live.add(unit);
+        req.signal?.addEventListener('abort', unit.onAbort, { once: true });
+        admissionEvent(traceId, req.traceRouteKey, req.workload, 'queued');
         return;
       }
-      resolve({ kind: 'overloaded' });
+      overload(resolve);
     });
   };
 

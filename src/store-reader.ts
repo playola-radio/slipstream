@@ -14,6 +14,7 @@ const HEX_RE = /^[0-9a-f]{64}$/;
 const SEQ_RE = /^[1-9][0-9]*$/;
 const SCHEMAS_DIR = fileURLToPath(new URL('../schemas/', import.meta.url));
 const PROJECTIONS_DIR = fileURLToPath(new URL('../schemas/projections/', import.meta.url));
+const INTERFACE_SCHEMA = fileURLToPath(new URL('../contracts/interface/v2/schema.json', import.meta.url));
 
 /** The published projection schemas, by projection_version. Not gated to
  *  EVENT_TYPES: a projection is a reader-derived view, not a log event. */
@@ -116,6 +117,7 @@ export async function schemaBytes(type: string): Promise<Buffer | null> {
 }
 
 export async function projectionSchemaBytes(version: string): Promise<Buffer | null> {
+  if (version === 'interface.v2') return readFile(INTERFACE_SCHEMA);
   if (!PROJECTION_SCHEMAS.has(version)) return null;
   return readFile(join(PROJECTIONS_DIR, `${version}.json`));
 }

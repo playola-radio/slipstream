@@ -1,15 +1,24 @@
 # Shared projection admission budget (T5b.1)
 
+**FD4 status (2026-09-30):** the reader shares one provisional `C/Q/W` budget
+across clip and interface work. Brian approved a 10,000 ms default for each
+interface-analysis page as a completeness policy. Clip still uses the 100 ms
+shared deadline. These are safety budgets, not expected waits or D7 performance
+acceptance; `C/Q/W` and acceptable timeout rates remain **UNAPPROVED**. See
+`docs/FD4-READER-API.md` for functional evidence and the FD5 handoff.
+Consumer abort is used only by unkeyed interface requests; a keyed leader's abort
+would also cancel its coalesced waiters, so keyed callers must not pass a signal.
+
 Clip projection and the upcoming interface projection (T5b.2) both turn a change's
 before/after blobs into a derived view on demand, in terminable workers. Two
 independently-bounded pools can still **jointly** starve capture, so both draw from
 one small shared admission budget (spec `STAGE-T-PREREQS.md` Part 3.4, decision D7).
 
 This file records the Architect-phase decisions (a Codex `gpt-6-astra` consult against
-the spec + the existing clip service) and the measurement method that must run before
-the numbers are approved. **The numbers here are PROVISIONAL.** Brian approves them
-later, from measurements taken after the TypeScript (T5a.2) and Swift (T5a.4) language
-modules exist (D7, D11). Nothing in this repo may claim they are approved or measured.
+the spec + the existing clip service) and the measurement method for D7. Shared
+`C/Q/W` and clip's `D` remain provisional; Brian separately approved the 10,000 ms
+interface-page default for completeness. No number here is a measured capture-safety
+or timeout-rate acceptance result.
 
 ## What the budget is (and is not)
 
@@ -20,7 +29,7 @@ The budget owns four bounds, shared across every workload:
 | `C` | Max computes **executing** at once, across all workloads. |
 | `Q` | Max admitted-but-not-running units: queued leaders **plus** coalesced waiters. |
 | `W` | Sub-cap on how many of the `Q` units may be coalesced waiters (`W <= Q`). |
-| `D` | Per-request deadline, measured **from admission** — queue wait included. |
+| `D` | Per-request deadline, measured **from admission** — queue wait included. The interface page supplies its 10,000 ms default override; clip uses the shared 100 ms default. |
 
 It admits a unit to one of: **running**, **queued**, or **rejected (`overloaded`)**.
 A unit whose `D` elapses while queued or running settles **`timeout`** (running work is
@@ -118,16 +127,27 @@ the workload's pool responsibility (`close()` awaits it). This is precisely why 
 synthetic checker and unit tests **cannot** approve the numbers or claim capture safety —
 only the combined-load measurement can, because it observes capture under real teardown.
 
-## Provisional numbers (NOT approved, NOT measured)
+## Shared starting limits and interface completeness policy
 
-- **Clip's own budget** (unchanged from today): `C = 1`, `Q = 8`, `W = 8`, `D = 100 ms`.
-  These reproduce the existing clip ceiling `maxPending = C + Q = 9` exactly.
-- **Future shared budget** (clip + interface, used by the synthetic checker): provisional
-  `C = 2`, `Q = 8`, `W = 8`, `D = 100 ms`. `C = 2` lets one clip and one interface compute
-  run at once; it is a starting point for measurement, not a decision.
+- **Clip workload** (unchanged): local concurrency `1`, with the shared `Q = 8`,
+  `W = 8` and default `D = 100 ms`. The single clip worker cannot run two jobs
+  at once.
+- **Reader-owned shared budget:** provisional `C = 2`, `Q = 8`, `W = 8`,
+  `D = 100 ms`. `C = 2` lets one clip and one interface compute run at once.
+  Brian approved an **interface-only** `deadlineMs = 10,000 ms` override on each
+  page, including queue wait, range scan, blob reads, parsing, comparison and
+  look-ahead. Clip continues to use 100 ms. Neither the shared limits nor the
+  longer page budget proves capture safety; D7 measurement remains open.
 
-Both are named constants in `src/projection-admission.ts`, commented as provisional
-pending D7 approval.
+An interface page can now occupy a shared running or queued slot for up to
+10 seconds. Eight queued interface pages can fill `Q` and cause new clip
+requests to return `overloaded` during that interval, even though an admitted
+clip still has its own 100 ms deadline. FD5 must measure this cross-client
+pressure; this policy adds no priority or reserved clip capacity.
+
+The shared starting limits are named in `src/projection-admission.ts`; the
+interface page default is in `src/interface-service.ts`. The internal diagnostic
+seam may override the page budget without changing clip or the shared `C/Q/W`.
 
 ## Measurement method (the D7 four-arm plan)
 
@@ -138,8 +158,8 @@ thresholds. Crashes and missing data are **failures**, never discarded.
 |---|---|---|
 | **Baseline** | Capture only, no projection load. | Runnable now. |
 | **Clip-only** | Capture + a saturating clip request burst. | Runnable now. |
-| **Interface-only** | Capture + a saturating interface request burst. | **NOT YET RUNNABLE** — needs the TypeScript module (T5a.2) and Swift module (T5a.4). |
-| **Combined** | Capture + clip + interface bursts together, over the shared bound. | **NOT YET RUNNABLE** — needs T5a.2 + T5a.4. |
+| **Interface-only** | Capture + a saturating interface request burst. | Preliminary run failed the D7 decision gate; see `FD5-MEASUREMENT-REPORT.md`. |
+| **Combined** | Capture + clip + interface bursts together, over the shared bound. | Preliminary run failed the D7 decision gate; see `FD5-MEASUREMENT-REPORT.md`. |
 
 Inputs, once the interface arms are runnable: representative **TS / TSX / Swift** sizes,
 plus **malformed** and **Unicode** inputs; **cold** (first parse, grammar load) and

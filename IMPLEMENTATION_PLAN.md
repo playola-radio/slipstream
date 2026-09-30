@@ -696,10 +696,37 @@ per-change `interface.v1` endpoint (the v1 core and corpus stay). Decisions F1�
 were settled as A on 2026-09-27 (delegated by Brian). The contract
 (`contracts/interface/v2/`: schema, hand-written fixtures, and the
 `projection-check interface-v2-contract` validator) is written. Its slices
-(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked; FD2 has passed branch
-acceptance and is awaiting PR review on this branch, while the parallel slices
-retain their own status. No
-success criterion or ratified decision changes.
+(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2 and FD3 are merged;
+FD4's implementation is accepted for merge on reader-API PR #44; Brian merges.
+This is separate from FD5's measured feature-completion gate. Brian approved a 10,000 ms
+interface-only default page budget on 2026-09-30 for completeness; clip retains
+100 ms and the shared `C/Q/W` remain provisional. The earlier 100 ms cold Swift
+timeout remains historical evidence. A standalone authenticated consumer of a
+new disposable daemon returned `ready` TypeScript and cold Swift signature
+changes under the new default, while a separate capture event became durable
+before the analysis response completed. The independent public-reader closeout
+also verified a partial page and explicit missing-blob coverage, `409` with
+durable high-water, `410` after tombstoning, and schema fetch. This is FD4
+functional acceptance, not FD5 capture-safety acceptance. The accepted MVP
+limitations are an interrupted no-row/unchanged-cursor page that stops automatic
+pagination and permits manual retry, and Swift host failure as text `500` with
+manual retry; a reproducibly failing file can block later files pending a
+per-file recovery decision. A preliminary FD5 four-arm run at a test-only
+400 ms interface deadline failed the paired capture and load-sufficiency gates
+(`FD5-MEASUREMENT-REPORT.md`); D7 production values remain unapproved. The
+bounded FD5 diagnostic driver and optional W barrier are implemented on PR #44's
+branch. A bounded smoke passed on 2026-09-29, but its v1 tracing-overhead
+mode exceeded the approved latency tolerance and stopped the sequence; the raw
+failure remains preserved. The revised v2 interface scorer is integrated for
+future diagnostics, with no v2 execution authorized. Observer cost and D7 values
+remain open. FD5 needs a separately approved bounded acceptance protocol for
+the current 10-second policy and shared queue/clip pressure; the failed tracing
+overhead gate still affects validity. The archived native/WASM diagnostic
+timeout does not require completing the deferred Rust spike for this Node path.
+The Swift fixture-backed view remains FS2's work, and FS3
+live wiring may proceed after FD4 merges, alongside FD5. Overall feature
+completion still waits for FD5 approval. No success criterion or ratified
+decision changes.
 
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
 

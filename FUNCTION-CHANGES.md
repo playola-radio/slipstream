@@ -711,11 +711,18 @@ numbers**:
 | Prefix scan for endpoint resolution | 100,000 records / 16 MiB, then `skipped / scan-limit` |
 | Disposable cache | 128 entries / 16 MiB |
 
-**Risk on record.** A cold Swift invocation measured about 210 ms end to end
-(SWIFT-GRAMMAR.md), and the provisional shared deadline is `D = 100 ms`. Cold
-Swift pages will time out under the provisional numbers. If measurement
-justifies a longer interface deadline, clip's 100 ms ceiling must stay enforced
-separately. Raising the shared `D` would quietly relax clip behaviour.
+**Interface completeness policy (Brian, 2026-09-30).** Each interface page now
+uses a 10,000 ms default safety budget, measured from admission through queue
+wait, record resolution, blob reads, cold startup, parsing, comparison and
+look-ahead. This applies to TS/TSX and Swift. Clip keeps its shared 100 ms
+deadline; `C/Q/W` are unchanged. A page can still be partial at a real deadline
+or resource limit. The longer interface budget is not a D7 capture-safety or
+timeout-rate acceptance result. The earlier cold Swift ~210 ms observation and
+failed 100 ms response remain historical evidence, not rescored results.
+Several clients can fill the shared `Q = 8` queue with interface pages lasting
+up to 10 seconds; a clip request may then be rejected as `overloaded` despite
+keeping its own 100 ms deadline. FD5 must measure that pressure before any
+capture-safety or timeout-rate claim.
 
 **Scan cost.** Endpoint resolution scans the log prefix for every page. For a
 large baseline (for example one that includes `node_modules`) this is
@@ -738,6 +745,10 @@ The daemon owns analysis. The client owns:
   - `ready` with `changes: []` ("no detected interface change");
   - `incomplete`, `unavailable`, `unsupported` and `skipped` (each with its
     reason).
+- **Request pacing (FS3).** Keep at most one outstanding page request for each
+  view/range. Do not immediately retry `timeout` or an unchanged cursor; wait
+  for an explicit user action or a later state change. Another client may still
+  occupy the shared queue while this view waits.
 
 ---
 
@@ -1075,6 +1086,16 @@ Optional, only if approved (F3/F4):
 | **FD3** Range resolver | first-change predecessor; incomplete baseline; unknown scopes; gap; reconciliation; revert; add-then-remove; huge `seq`; corrupt chain; scan limit | Endpoint selection, provenance and inventory match every boundary fixture. The scan is bounded. There is no language code | Capture edits in a disposable session, resolve B/A, and cross-check hashes and provenance against the public events from an independent script. Needs no interface route. |
 | **FD4** Service and public surface | admission overload / timeout; shutdown; deletion race (`410`); cache hit then blob loss; pagination freeze; `409` with header; schema route; text errors | GET route and schema served. It uses the reader-owned **shared** budget (wiring what T5b.1 deferred) with both languages, disposable caching and bounded output | Authenticated requests against a disposable daemon cover: ready TS and Swift, a `partial` page, a missing blob, `409` / `410`, and a schema fetch. Stop every UI and repeat from a standalone script. |
 | **FD5** Measurement gate | combined starvation; cold Swift; worker-retirement overlap; cancellation churn | All four D7 arms (ADMISSION.md) measured with TS, TSX and Swift. **Brian approves** `C/Q/W/D` and timeout rates. No success criterion is relaxed | The registered combined-load check. Crashes and missing data count as failures. This may be a gate rather than a PR. |
+
+**FD4 closeout (Brian, 2026-09-30).** The independent public-reader check in
+`docs/FD4-READER-API.md` covers FD4's full acceptance row. Brian approved
+merging the FD4 implementation separately from FD5 measurement acceptance.
+An interrupted no-row page with an unchanged cursor stops automatic pagination
+and permits explicit retry; it is not complete. A Swift host failure remains a
+text HTTP `500` with manual retry, and a reproducible file failure can block
+later files pending per-file recovery work. FD5's failed tracing-overhead gate
+and provisional admission values remain open. FS3 live wiring may start after
+FD4 merges and proceed alongside FD5; overall feature completion waits for FD5.
 
 ### 6.2 Swift slices
 

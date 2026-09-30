@@ -1,0 +1,17 @@
+{
+  "repetitions": 3,
+  "scheduledWrites": 100,
+  "scheduledIntervalMs": 120,
+  "burstWrites": 100,
+  "requestSlots": 16,
+  "clipCorpusChanges": 8192,
+  "interfaceCorpusPages": 8192,
+  "admission": {
+    "C": 2,
+    "Q": 8,
+    "W": 8,
+    "clipDeadlineMs": 100,
+    "interfaceDeadlineMs": 400
+  },
+  "seed": "fd5-recovery-v1"
+}

@@ -1,0 +1,27 @@
+{
+  "protocol": "fd5-bounded-diagnostic.v2-proposal",
+  "interfaceScorer": "terminal200-first180-v2",
+  "seed": "fd5-bounded-v1",
+  "maxPreparationSeconds": 300,
+  "admission": { "C": 2, "Q": 8, "W": 8, "clipDeadlineMs": 100, "interfaceDeadlineMs": 400, "conditionalInterfaceDeadlineMs": 800 },
+  "smoke": { "scheduledWrites": 4, "burstWrites": 10, "clipSlots": 4, "interfaceSlots": 4, "coldKeysPerWorkload": 64, "maxArmSeconds": 15, "minRequestIntervalMs": 100 },
+  "overhead": { "workloads": ["clip", "interface"], "traceOrder": ["off", "on", "on", "off"], "scheduledWritesPerArm": 100, "scheduledIntervalMs": 120, "burstWritesPerArm": 100, "slotsPerWorkload": 4, "coldKeysPerWorkload": 1200, "maxAttemptsPerArm": 5000, "maxArmSeconds": 30, "minRequestIntervalMs": 100 },
+  "unqueued": {
+    "C": 2, "Q": 0, "W": 0, "observationsPerCell": 50,
+    "cells": [
+      { "language": "typescript", "size": "tiny", "files": 1, "warmth": "fresh-worker" },
+      { "language": "typescript", "size": "tiny", "files": 1, "warmth": "initialized-worker-new-content" },
+      { "language": "tsx", "size": "representative", "files": 1, "warmth": "fresh-worker" },
+      { "language": "tsx", "size": "representative", "files": 1, "warmth": "initialized-worker-new-content" },
+      { "language": "swift", "size": "tiny", "files": 1, "warmth": "fresh-child" },
+      { "language": "swift", "size": "tiny", "files": 4, "warmth": "fresh-child" },
+      { "language": "swift", "size": "tiny", "files": 16, "warmth": "fresh-child" }
+    ],
+    "cacheControlRequestsPerVariant": 20,
+    "maxRequestsIncludingConditional": 562, "maxSecondsPerCell": 60
+  },
+  "queue": { "queueWaiterCells": [[0, 0], [2, 2], [8, 8]], "repetitionsPerCell": 2, "clipSlots": 4, "interfaceSlots": 4, "scheduledWritesPerCell": 100, "scheduledIntervalMs": 120, "burstWritesPerCell": 100, "coldKeysPerWorkload": 1200, "maxAttemptsPerCell": 5000, "maxCellSecondsIncludingDrain": 30, "minRequestIntervalMs": 100 },
+  "wPressure": { "C": 1, "Q": 8, "waiterCaps": [2, 8], "groupsPerCap": 20, "sameKeyWaitersPerGroup": 10, "maxBarrierMs": 50, "maxSecondsPerCap": 15, "maxRequests": 440 },
+  "host": { "preflightQuietSeconds": 60, "maxFiveMinuteLoadFractionOfPhysicalCores": 0.5, "maxSwapGrowthBytes": 0, "requireAcPower": true, "requireNormalThermal": true, "requireNoMemoryPressureWarning": true, "sampleIntervalSeconds": 1 },
+  "approvalRequired": { "measurementWindow": null, "tracingOverheadTolerance": null, "diagnosticDeadlinePoints": null, "wPressureRuntimeHook": null, "clipHistoricalComparison": null }
+}

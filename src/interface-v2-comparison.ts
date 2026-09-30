@@ -50,6 +50,34 @@ export type Comparison =
   | { status: 'ready'; changes: StructuredChange[]; fallback_reason?: never }
   | { status: 'incomplete'; fallback_reason: string; changes: [] };
 
+/** v2 D8 excludes the private signature key used by the v1 matcher. */
+function compareV2Rows(a: StructuredChange, b: StructuredChange): number {
+  const rank = { removed: 0, signatureChanged: 1, added: 2 } as const;
+  const byKind = rank[a.kind] - rank[b.kind];
+  if (byKind) return byKind;
+  const cmp = (x: string | number, y: string | number): number => x < y ? -1 : x > y ? 1 : 0;
+  const cmpArray = (x: string[], y: string[]): number => {
+    for (let i = 0; i < Math.min(x.length, y.length); i++) {
+      const c = cmp(x[i]!, y[i]!);
+      if (c) return c;
+    }
+    return cmp(x.length, y.length);
+  };
+  const compareSide = (x: StructuredChange, y: StructuredChange, side: 'before' | 'after'): number => {
+    const left = x[side], right = y[side];
+    if (!left || !right) return left ? 1 : right ? -1 : 0;
+    return cmp(left.display_name, right.display_name)
+      || cmp(x.identity.kind, y.identity.kind)
+      || cmpArray(x.identity.scope.flatMap(scope => [scope.kind, scope.name]),
+        y.identity.scope.flatMap(scope => [scope.kind, scope.name]))
+      || cmp(x.identity.name, y.identity.name)
+      || cmpArray(x.identity.guards, y.identity.guards)
+      || cmp(left.span.byte_start, right.span.byte_start)
+      || cmp(left.span.byte_end, right.span.byte_end);
+  };
+  return compareSide(a, b, a.kind === 'added' ? 'after' : 'before') || compareSide(a, b, 'after');
+}
+
 function signature(d: StructuredDeclaration): string {
   return JSON.stringify([d.role ?? null, d.parameters.map(p => [p.name, p.label, p.binding,
     p.type, p.optional, p.variadic, p.default, p.modifiers]), d.result, d.throws, d.header]);
@@ -153,5 +181,6 @@ export function compareStructuredExtractions(before: StructuredExtraction,
       && change.throws.op === 'equal' && change.header.op === 'equal') continue;
     changes.push(change);
   }
+  changes.sort(compareV2Rows);
   return { status: 'ready', changes };
 }

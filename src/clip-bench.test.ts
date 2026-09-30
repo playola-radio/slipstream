@@ -1,9 +1,38 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { scoreCaptureArm } from './clip-bench.ts';
+import { runWriter, scoreCaptureArm, waitForQuietCapture } from './clip-bench.ts';
+import type { CaptureSession } from './session.ts';
 import type { ClipResponse } from './clip-bench.ts';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const ns = (ms: number) => BigInt(ms) * 1_000_000n;
+
+test('diagnostic quiet drain aborts without leaving a health subscriber', async () => {
+  const controller = new AbortController();
+  let active = 0;
+  const session = { health: { subscribe: () => { active++; return () => { active--; }; } } } as unknown as CaptureSession;
+  const waiting = waitForQuietCapture(session, controller.signal);
+  controller.abort();
+  assert.equal(await waiting, false);
+  assert.equal(active, 0);
+});
+
+test('writer streams each completed write and abort retains its partial evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-writer-abort-'));
+  const controller = new AbortController();
+  const observed: string[] = [];
+  try {
+    await assert.rejects(runWriter(root, 0, { repetitions: 1, scheduledWrites: 5,
+      scheduledIntervalMs: 100, burstWrites: 0, concurrentClipRequests: 0, corpusChanges: 1 },
+    { signal: controller.signal, onWrite: write => {
+      observed.push(write.path);
+      if (observed.length === 1) controller.abort();
+    } }), /aborted/);
+    assert.deepEqual(observed, ['scheduled-0-0.ts']);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 function loadScenario(responses: ClipResponse[], durableMs = 3_000) {
   const keyed = responses.map((r, i) => ({ ...r, key: r.key ?? `key-${i}` }));
   return scoreCaptureArm({

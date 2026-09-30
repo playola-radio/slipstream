@@ -16,7 +16,7 @@ import { createLog } from './log.ts';
 import { startCapture, type CaptureSession } from './session.ts';
 import { CLIP_PROJECTION_VERSION } from './clip-projection.ts';
 
-interface BenchmarkConfig { repetitions: number; scheduledWrites: number; scheduledIntervalMs: number; burstWrites: number; concurrentClipRequests: number; corpusChanges: number }
+export interface BenchmarkConfig { repetitions: number; scheduledWrites: number; scheduledIntervalMs: number; burstWrites: number; concurrentClipRequests: number; corpusChanges: number }
 const DEFAULTS: Readonly<BenchmarkConfig> = Object.freeze({ repetitions: 3, scheduledWrites: 100, scheduledIntervalMs: 120, burstWrites: 100, concurrentClipRequests: 16, corpusChanges: 8192 });
 const CHANGES_PER_HISTORICAL_SESSION = 64;
 const MAX_REQUEST_ATTEMPTS = 100_000;
@@ -25,7 +25,8 @@ const DRAIN_TIMEOUT_MS = 15_000;
 const NS_PER_MS = 1_000_000n;
 
 export interface ExpectedWrite { path: string; sha256: string; startedAtNs: bigint; phase: 'scheduled' | 'burst' }
-export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string; key?: string; startedAtNs?: bigint; completedAtNs?: bigint }
+export interface ClipResponse { httpStatus: number; status: string; reason?: string; latencyMs: number; error?: string;
+  key?: string; routeKey?: string; startedAtNs?: bigint; completedAtNs?: bigint }
 export interface CaptureArmInput {
   name: string;
   writes: ExpectedWrite[];
@@ -43,7 +44,7 @@ export interface CaptureArmInput {
   drainTimedOut?: boolean;
 }
 
-interface LatencyStats { n: number; p50: number | null; p99: number | null }
+interface LatencyStats { n: number; p50: number | null; p95: number | null; p99: number | null }
 export interface CaptureArmReport {
   host?: { before: ReturnType<typeof hostSample>; after: ReturnType<typeof hostSample> };
   name: string;
@@ -64,7 +65,8 @@ interface ChangedLike { type?: unknown; seq?: unknown; data?: { path?: unknown; 
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const stats = (samples: number[]): LatencyStats => {
   const sorted = [...samples].sort((a, b) => a - b);
-  return { n: sorted.length, p50: sorted.length ? percentile(sorted, 50) : null, p99: sorted.length ? percentile(sorted, 99) : null };
+  return { n: sorted.length, p50: sorted.length ? percentile(sorted, 50) : null,
+    p95: sorted.length ? percentile(sorted, 95) : null, p99: sorted.length ? percentile(sorted, 99) : null };
 };
 const increment = (target: Record<string, number>, key: string): void => { target[key] = (target[key] ?? 0) + 1; };
 
@@ -191,36 +193,40 @@ export function scoreCaptureArm(input: CaptureArmInput): CaptureArmReport {
   };
 }
 
-async function readRecords(path: string): Promise<AnyEvent[]> {
+export async function readRecords(path: string): Promise<AnyEvent[]> {
   const text = await readFile(path, 'utf8').catch(() => '');
   const complete = text.endsWith('\n') ? text : text.slice(0, text.lastIndexOf('\n') + 1);
   return complete.split('\n').filter(Boolean).map((line) => JSON.parse(line) as AnyEvent);
 }
 
-async function waitForQuietCapture(session: CaptureSession): Promise<boolean> {
+export async function waitForQuietCapture(session: CaptureSession, signal?: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     let quietTimer = setTimeout(() => done(true), QUIET_MS);
     const deadline = setTimeout(() => done(false), DRAIN_TIMEOUT_MS);
     const off = session.health.subscribe(() => { clearTimeout(quietTimer); quietTimer = setTimeout(() => done(true), QUIET_MS); });
+    const onAbort = (): void => done(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
     function done(quiet: boolean): void {
       if (settled) return;
       settled = true;
       clearTimeout(quietTimer);
       clearTimeout(deadline);
+      signal?.removeEventListener('abort', onAbort);
       off();
       resolve(quiet);
     }
+    if (signal?.aborted) done(false);
   });
 }
 
-interface HistoricalChange { sessionId: string; seq: string; key: string }
+export interface HistoricalChange { sessionId: string; seq: string; key: string }
 function corpusBody(index: number, changed: boolean): string {
   const lines = Array.from({ length: 296 }, (_, line) => `  total += ${line === 147 && changed ? index + 2 : 1};`);
   return `export function corpus(value: number): number {\n  let total = value;\n${lines.join('\n')}\n  return total;\n}\n`;
 }
 
-async function createHistoricalCorpus(storeDir: string, count: number): Promise<HistoricalChange[]> {
+export async function createHistoricalCorpus(storeDir: string, count: number, signal?: AbortSignal): Promise<HistoricalChange[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
   let sessionId = '';
   let log: Awaited<ReturnType<typeof createLog>> | undefined;
@@ -230,6 +236,7 @@ async function createHistoricalCorpus(storeDir: string, count: number): Promise<
     const before = await cas.put(Buffer.from(corpusBody(0, false)));
     const changes: HistoricalChange[] = [];
     for (let index = 0; index < count; index++) {
+      signal?.throwIfAborted();
       if (index % CHANGES_PER_HISTORICAL_SESSION === 0) {
         await log?.close();
         sessionId = randomUUID();
@@ -250,43 +257,62 @@ async function createHistoricalCorpus(storeDir: string, count: number): Promise<
   } finally { await log?.close(); }
 }
 
-interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
-function runWriter(root: string, repetition: number, config: BenchmarkConfig): Promise<WorkerWrite[]> {
+export interface WorkerWrite { path: string; body: string; startedAtNs: string; phase: 'scheduled' | 'burst' }
+export function runWriter(root: string, repetition: number, config: BenchmarkConfig,
+  options?: { signal?: AbortSignal; onWrite?: (write: WorkerWrite) => void; requireExit?: boolean }): Promise<WorkerWrite[]> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), { workerData: { root, repetition, ...config } });
+    if (options?.signal?.aborted) { reject(new Error('clip benchmark writer aborted')); return; }
+    const worker = new Worker(new URL('./clip-bench-writer.ts', import.meta.url), {
+      workerData: { root, repetition, ...config, streamWrites: Boolean(options?.onWrite) },
+    });
     let settled = false;
+    let completed: WorkerWrite[] | undefined;
+    const onAbort = () => finish(new Error('clip benchmark writer aborted'));
+    options?.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: WorkerWrite[] | Error): void => {
       if (settled) return;
       settled = true;
+      options?.signal?.removeEventListener('abort', onAbort);
       if (result instanceof Error) {
         void worker.terminate();
         reject(result);
       } else resolve(result);
     };
     worker.once('error', (err) => finish(err));
-    worker.once('exit', (code) => { if (!settled) finish(new Error(`clip benchmark writer exited unexpectedly (${code})`)); });
-    worker.on('message', (message: { type: string; written?: WorkerWrite[]; error?: string }) => {
+    worker.once('exit', (code) => {
+      if (settled) return;
+      if (code === 0 && options?.requireExit && completed) finish(completed);
+      else finish(new Error(`clip benchmark writer exited unexpectedly (${code})`));
+    });
+    worker.on('message', (message: { type: string; write?: WorkerWrite; written?: WorkerWrite[]; error?: string }) => {
       if (message.type === 'error') finish(new Error(message.error));
-      if (message.type === 'complete') finish(message.written ?? []);
+      if (message.type === 'written' && message.write && !settled) {
+        try { options?.onWrite?.(message.write); } catch (error) { finish(error as Error); }
+      }
+      if (message.type === 'complete') {
+        if (options?.requireExit) completed = message.written ?? [];
+        else finish(message.written ?? []);
+      }
     });
   });
 }
 
 async function requestClip(url: string, token: string, change: HistoricalChange): Promise<ClipResponse> {
   const started = process.hrtime.bigint();
+  const routeKey = `/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`;
   try {
-    const response = await fetch(`${url}/v1/sessions/${change.sessionId}/changes/${change.seq}/clips`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
+    const response = await fetch(`${url}${routeKey}`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
     const body = await response.json().catch(() => ({})) as { status?: unknown; fallback_reason?: unknown };
     const completed = process.hrtime.bigint();
-    return { httpStatus: response.status, status: typeof body.status === 'string' ? body.status : 'invalid-response', ...(typeof body.fallback_reason === 'string' ? { reason: body.fallback_reason } : {}), latencyMs: Number(completed - started) / 1e6, startedAtNs: started, completedAtNs: completed };
+    return { httpStatus: response.status, status: typeof body.status === 'string' ? body.status : 'invalid-response', ...(typeof body.fallback_reason === 'string' ? { reason: body.fallback_reason } : {}), latencyMs: Number(completed - started) / 1e6, routeKey, startedAtNs: started, completedAtNs: completed };
   } catch (err) {
     const completed = process.hrtime.bigint();
-    return { httpStatus: 0, status: 'request-error', error: String(err), latencyMs: Number(completed - started) / 1e6, startedAtNs: started, completedAtNs: completed };
+    return { httpStatus: 0, status: 'request-error', error: String(err), latencyMs: Number(completed - started) / 1e6, routeKey, startedAtNs: started, completedAtNs: completed };
   }
 }
 
-interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
-function startContinuousLoad(url: string, token: string, corpus: HistoricalChange[], concurrent: number): { stop: () => Promise<LoadSummary> } {
+export interface LoadSummary { responses: ClipResponse[]; requested: string[]; maxConcurrentRequests: number; startedAtNs: bigint; stoppedAtNs: bigint; corpusExhausted: boolean; attemptLimitReached: boolean }
+export function startContinuousLoad(url: string, token: string, corpus: HistoricalChange[], concurrent: number): { stop: () => Promise<LoadSummary> } {
   const startedAtNs = process.hrtime.bigint();
   const responses: ClipResponse[] = [];
   const requested: string[] = [];
@@ -325,7 +351,7 @@ function startContinuousLoad(url: string, token: string, corpus: HistoricalChang
   };
 }
 
-function hostSample() { return { at: new Date().toISOString(), loadavg: loadavg(), freeMemoryGiB: freemem() / 2 ** 30 }; }
+export function hostSample() { return { at: new Date().toISOString(), loadavg: loadavg(), freeMemoryGiB: freemem() / 2 ** 30 }; }
 
 async function runReplication(arm: 'baseline' | 'saturation', repetition: number, storeDir: string, corpus: HistoricalChange[], config: BenchmarkConfig): Promise<CaptureArmReport> {
   const hostBefore = hostSample();

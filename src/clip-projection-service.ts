@@ -30,14 +30,17 @@ import {
 } from './clip-projection.ts';
 import { type ClipSnapshot } from './clip-blob-reader.ts';
 import { createClipWorkerPool, type ClipCompute } from './clip-worker-pool.ts';
-import { createProjectionAdmission } from './projection-admission.ts';
+import { createProjectionAdmission, type ProjectionAdmission } from './projection-admission.ts';
 import type { ClipLanguage } from './clip-language.ts';
+import { emitProjectionPhase, emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ClipRequest {
   changeSeq: string;
   language?: ClipLanguage;
   before: ClipSnapshot;
   after: ClipSnapshot;
+  /** Test-only raw HTTP target used for admission correlation. */
+  traceRouteKey?: string;
 }
 
 export interface ClipProjectionService {
@@ -47,6 +50,8 @@ export interface ClipProjectionService {
 
 export interface ClipServiceOptions {
   storeDir: string;
+  /** The reader owns this when clip and interface projections share admission. */
+  admission?: ProjectionAdmission;
   /** Compute seam. Defaults to a single clip-projection worker thread. */
   compute?: ClipCompute;
   /** Blob-presence probe for revalidate-on-hit. Defaults to a filesystem check. */
@@ -55,6 +60,9 @@ export interface ClipServiceOptions {
   cacheEntries?: number;
   cacheBytes?: number;
   deadlineMs?: number;
+  projectionTrace?: ProjectionTraceObserver;
+  /** Test-only delay after admission, before the clip worker starts. */
+  dispatchBarrier?: () => Promise<void>;
 }
 
 // B1 runs exactly one clip worker (CPU stays off the capture path); concurrency
@@ -153,9 +161,12 @@ class LruCache {
 }
 
 export function createClipProjectionService(opts: ClipServiceOptions): ClipProjectionService {
+  if (opts.admission && (opts.queueLimit !== undefined || opts.deadlineMs !== undefined)) {
+    throw new Error('shared clip admission cannot also set private queue or deadline');
+  }
   const queueLimit = opts.queueLimit ?? DEFAULTS.queueLimit;
   const deadlineMs = opts.deadlineMs ?? DEFAULTS.deadlineMs;
-  const pool = opts.compute ? null : createClipWorkerPool();
+  const pool = opts.compute ? null : createClipWorkerPool(opts.projectionTrace);
   const compute: ClipCompute = opts.compute ?? pool!.run;
   const hasBlob = opts.hasBlob ?? ((sha256: string) =>
     access(blobPath(opts.storeDir, sha256), constants.F_OK).then(() => true, () => false));
@@ -169,12 +180,12 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
   // (coalesced waiters counted), reproducing the prior `maxPending` bound. The
   // budget is workload-agnostic so a future interface service can share one
   // instance; wiring that shared instance is a later step (see ADMISSION.md).
-  const budget = createProjectionAdmission({
+  const budget = opts.admission ?? createProjectionAdmission({
     C: CONCURRENCY,
     Q: queueLimit,
     W: queueLimit,
     D: deadlineMs,
-  });
+  }, opts.projectionTrace);
   let closed = false;
 
   const stamp = (value: ClipProjection, changeSeq: string): ClipProjection =>
@@ -191,7 +202,11 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
 
     const hit = cache.get(key);
     if (hit) {
-      if (await blobsPresent(req)) return stamp(hit, req.changeSeq);
+      if (await blobsPresent(req)) {
+        if (req.traceRouteKey !== undefined) emitProjectionTrace(opts.projectionTrace,
+          { kind: 'clip-cache-bypass', routeKey: req.traceRouteKey, atNs: process.hrtime.bigint() });
+        return stamp(hit, req.changeSeq);
+      }
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
@@ -204,14 +219,37 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       workload: 'clip',
       localConcurrency: CONCURRENCY,
       key,
-      run: () => {
+      traceRouteKey: req.traceRouteKey,
+      run: traceUnitId => {
         isLeader = true;
-        return compute({
+        const start = () => {
+          if (traceUnitId !== undefined) emitProjectionTrace(opts.projectionTrace,
+            { kind: 'parser-request', unitId: traceUnitId, atNs: process.hrtime.bigint() });
+          return compute({
           storeDir: opts.storeDir,
           before: req.before,
           after: req.after,
           opts: { changeSeq: req.changeSeq, language: req.language },
+          }, traceUnitId);
+        };
+        if (!opts.dispatchBarrier) return start();
+        const beganAtNs = opts.projectionTrace ? process.hrtime.bigint() : undefined;
+        let cancelBarrier!: (reason: Error) => void;
+        const cancelled = new Promise<never>((_resolve, reject) => { cancelBarrier = reject; });
+        let inner: ReturnType<ClipCompute> | undefined;
+        let wasCancelled = false;
+        const promise = Promise.race([Promise.resolve().then(opts.dispatchBarrier), cancelled]).then(() => {
+          if (wasCancelled) throw new Error('clip dispatch cancelled');
+          emitProjectionPhase(opts.projectionTrace, 'dispatch-barrier', beganAtNs,
+            { scope: 'clip', unitId: traceUnitId });
+          inner = start();
+          return inner.promise;
         });
+        return { promise, cancel: () => {
+          wasCancelled = true;
+          cancelBarrier(new Error('clip dispatch cancelled'));
+          inner?.cancel();
+        } };
       },
     });
 
@@ -236,7 +274,7 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
     // Settle everything admitted to this service's budget, then terminate the
     // worker. (The budget here is private to this service; closing it never
     // affects another workload.)
-    await budget.close();
+    if (!opts.admission) await budget.close();
     await pool?.close();
   };
 

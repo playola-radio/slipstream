@@ -17,13 +17,15 @@ const GRAMMAR_SHA256 = {
 const RUNTIME_VERSION = '0.25.10';
 const RUNTIME_WASM_SHA256 = 'f38dcc4b43b818f9a0785bc1c6d5611a75ac4cdd428ff3f02757c34ca4e46d7f';
 
-function verifyParserRuntime(): void {
+function verifyParserRuntime(): Uint8Array {
   const root = dirname(require.resolve('web-tree-sitter'));
   const version = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }).version;
-  const actual = createHash('sha256').update(readFileSync(join(root, 'tree-sitter.wasm'))).digest('hex');
+  const bytes = readFileSync(join(root, 'tree-sitter.wasm'));
+  const actual = createHash('sha256').update(bytes).digest('hex');
   if (version !== RUNTIME_VERSION || actual !== RUNTIME_WASM_SHA256) {
     throw new Error('typescript.v2 parser runtime version or WASM hash mismatch');
   }
+  return bytes;
 }
 
 /** A language_version must never silently select different grammar bytes. */
@@ -36,22 +38,34 @@ export function verifyTypeScriptGrammarArtifact(language: 'typescript' | 'tsx',
   return bytes;
 }
 
+export interface TypeScriptLimits { inputBytes?: number; declarations?: number; syntaxVisits?: number }
+export class TypeScriptLimitError extends Error {
+  constructor(limit: keyof TypeScriptLimits) { super(`${limit} limit exceeded`); }
+}
 export async function createTypeScriptInterfaceExtractor(language: 'typescript' | 'tsx'):
-  Promise<(bytes: Uint8Array) => StructuredExtraction> {
+  Promise<(bytes: Uint8Array, limits?: TypeScriptLimits) => StructuredExtraction> {
   let pending = grammars.get(language);
   if (!pending) {
     pending = (async () => {
       initialization ??= Promise.resolve().then(() => {
-        verifyParserRuntime();
-        return Parser.init();
+        const runtime = verifyParserRuntime();
+        return Parser.init({ wasmBinary: runtime } as Parameters<typeof Parser.init>[0]);
+      }).catch(error => {
+        initialization = undefined;
+        throw error;
       });
       await initialization;
       return Language.load(verifyTypeScriptGrammarArtifact(language));
     })();
     grammars.set(language, pending);
   }
-  const grammar = await pending;
-  return bytes => extract(bytes, grammar);
+  try {
+    const grammar = await pending;
+    return (bytes, limits) => extract(bytes, grammar, limits);
+  } catch (error) {
+    if (grammars.get(language) === pending) grammars.delete(language);
+    throw error;
+  }
 }
 
 function child(node: Node, type: string): Node | undefined {
@@ -309,7 +323,8 @@ function parseDeclaration(node: Node, spanNode: Node, scope: StructuredDeclarati
   };
 }
 
-function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
+function extract(bytes: Uint8Array, grammar: Language, limits?: TypeScriptLimits): StructuredExtraction {
+  if (limits?.inputBytes !== undefined && bytes.byteLength > limits.inputBytes) throw new TypeScriptLimitError('inputBytes');
   let source: string;
   try {
     source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
@@ -322,6 +337,18 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
     parser.setLanguage(grammar);
     tree = parser.parse(source);
     if (!tree || tree.rootNode.hasError) return { status: 'incomplete', reason: 'parse-error' };
+    if (limits?.syntaxVisits !== undefined) {
+      let visits = 0;
+      const pending = [tree.rootNode];
+      while (pending.length) {
+        const node = pending.pop()!;
+        if (++visits > limits.syntaxVisits) throw new TypeScriptLimitError('syntaxVisits');
+        for (let i = node.childCount - 1; i >= 0; i--) {
+          const next = node.child(i);
+          if (next) pending.push(next);
+        }
+      }
+    }
     const table = buildUtf16ToByteTable(source);
     const declarations: StructuredDeclaration[] = [];
     const add = (n: Node, span: Node, scope: StructuredDeclaration['identity']['scope'],
@@ -329,6 +356,7 @@ function extract(bytes: Uint8Array, grammar: Language): StructuredExtraction {
       const parsed = parseDeclaration(n, span, scope, mods, table, binding, bindingType);
       if (!parsed) return false;
       declarations.push(parsed);
+      if (limits?.declarations !== undefined && declarations.length > limits.declarations) throw new TypeScriptLimitError('declarations');
       return true;
     };
     const scan = (node: Node, span = node, mods: string[] = []): boolean => {

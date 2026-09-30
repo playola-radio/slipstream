@@ -11,6 +11,7 @@ import { createCas } from './cas.ts';
 import { createHealth } from './health.ts';
 import { createBoundaryRegistry } from './boundary-registry.ts';
 import { liveBoundary, staticBoundary } from './reader-runtime.ts';
+import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
 
@@ -263,6 +264,36 @@ async function storeWithChange(path = 'x.txt', beforeText = 'a\nb\nc\n', afterTe
 }
 
 describe('http-reader clip projection', () => {
+  it('optional HTTP clip barrier exposes real coalesced W pressure', { timeout: 15_000 }, async () => {
+    const { dir } = await storeWithChange('x.ts', 'function f() { return 1; }\n', 'function f() { return 2; }\n');
+    const events: ProjectionTraceEvent[] = [];
+    let entered!: () => void, release!: () => void;
+    const barrierEntered = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const srv = await startReaderServer({ storeDir: dir,
+      projectionAdmissionConfig: { C: 1, Q: 8, W: 2, D: 500 },
+      projectionTrace: event => events.push(event),
+      clipDispatchBarrier: () => { entered(); return barrier; } });
+    try {
+      const path = `/v1/sessions/${UUID}/changes/2/clips`;
+      const leader = GET(srv, path);
+      await barrierEntered;
+      const waiters = Array.from({ length: 4 }, () => GET(srv, path));
+      const admitted = async () => {
+        const until = Date.now() + 200;
+        while (events.filter(event => event.kind === 'admission').length < 5 && Date.now() < until)
+          await new Promise(resolve => setTimeout(resolve, 1));
+      };
+      await admitted();
+      assert.deepEqual(events.filter(event => event.kind === 'admission').map(event => event.disposition),
+        ['running', 'waiting', 'waiting', 'overloaded', 'overloaded']);
+      release();
+      const responses = await Promise.all([leader, ...waiters]);
+      assert.ok(responses.every(response => response.status === 200));
+      assert.equal(events.filter(event => event.kind === 'parser-request').length, 1);
+    } finally { release(); await srv.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+
   it('serves the same function projection as a direct-disk client without appending to the log', { timeout: 15_000 }, async t => {
     // Contract shape before deadline; real clocks are covered by service tests
     // and the cold-load benchmark. Each server belongs only to this test.
