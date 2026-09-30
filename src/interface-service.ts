@@ -12,6 +12,7 @@ import type { ProjectionAdmission } from './projection-admission.ts';
 import { emitProjectionPhase, emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 const FILES_PER_PAGE = 16;
+const INTERFACE_PAGE_DEADLINE_MS = 10_000;
 const SIDE_BYTES = 1024 * 1024;
 const PAGE_BLOB_BYTES = 8 * 1024 * 1024;
 const FILE_RESULT_BYTES = 512 * 1024;
@@ -54,7 +55,7 @@ export interface InterfaceServiceOptions {
   storeDir: string;
   admission: ProjectionAdmission;
   projectionTrace?: ProjectionTraceObserver;
-  /** Internal benchmark seam; absent uses shared admission D. */
+  /** Internal benchmark seam; absent uses the interface page safety budget. */
   admissionDeadlineMs?: number;
   scanBudget?: typeof SCAN;
   fileResultBytes?: number;
@@ -448,7 +449,8 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
     // The runner begins only after admission grants the local interface slot.
     // Progress remains outside admission's value, so a timeout retains finished rows.
     const outcome = await options.admission.admit<InterfacePage>({ workload: 'interface', localConcurrency: 1,
-      deadlineMs: options.admissionDeadlineMs, signal: req.signal, traceRouteKey: req.traceRouteKey,
+      deadlineMs: options.admissionDeadlineMs ?? INTERFACE_PAGE_DEADLINE_MS,
+      signal: req.signal, traceRouteKey: req.traceRouteKey,
       run: traceUnitId => {
         const task = run(traceUnitId).catch(error => { failure = error; throw error; });
         active.add(task);

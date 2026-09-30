@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { blobPath } from './store-reader.ts';
 import { startReaderServer } from './http-reader.ts';
 import { createInterfaceService } from './interface-service.ts';
-import type { SwiftSide } from './swift-interface.ts';
+import { extractSwiftSides, type SwiftSide } from './swift-interface.ts';
 import { createProjectionAdmission, type ProjectionAdmission, type AdmitRequest, type AdmitOutcome } from './projection-admission.ts';
 import type { ProjectionTraceEvent } from './projection-trace.ts';
 
@@ -188,6 +188,89 @@ test('reader test seam extends only the interface deadline for an isolated Swift
     assert.equal(page.files[0]?.status, 'ready');
     assert.ok(page.files[0]?.changes.length);
   } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+});
+
+test('default interface budget completes a comparison after 100 ms of admitted work', async t => {
+  const { storeDir, req, expected } = await serviceRequest('swift-parameter-change');
+  const admission = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 100 });
+  let started!: () => void;
+  const parsingStarted = new Promise<void>(resolve => { started = resolve; });
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const service = createInterfaceService({ storeDir, admission,
+    extractSwift: async (sides, options) => {
+      started();
+      await hold;
+      return extractSwiftSides(sides, options);
+    } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    let settled = false;
+    const pending = service.get(req).then(page => { settled = true; return page; });
+    await parsingStarted;
+    t.mock.timers.tick(101);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(settled, false, 'the shared 100 ms deadline cut off interface work');
+    release();
+    const page = await pending;
+    assert.equal(page.status, 'ready');
+    assert.deepEqual(page.files[0]?.changes,
+      (expected as { files: { changes: unknown[] }[] }).files[0]?.changes);
+  } finally {
+    release();
+    t.mock.timers.reset();
+    await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test('default interface deadline includes queue wait and never starts expired work', async t => {
+  const { storeDir, req } = await serviceRequest('swift-parameter-change');
+  const admission = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 100 });
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  let started = false;
+  const service = createInterfaceService({ storeDir, admission,
+    onFileStart: () => { started = true; } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    const blocker = admission.admit({ workload: 'clip', localConcurrency: 1, deadlineMs: 20_000,
+      run: () => ({ promise: hold, cancel: () => {} }) });
+    let settled = false;
+    const pending = service.get(req).then(page => { settled = true; return page; });
+    assert.deepEqual(admission.snapshot(), { running: 1, queued: 1, waiters: 0 });
+    t.mock.timers.tick(9_999);
+    await Promise.resolve();
+    assert.deepEqual(admission.snapshot(), { running: 1, queued: 1, waiters: 0 });
+    assert.equal(settled, false);
+    assert.equal(started, false);
+    t.mock.timers.tick(1);
+    const page = await pending;
+    assert.equal(page.status, 'skipped');
+    assert.equal(page.fallback_reason, 'timeout');
+    assert.deepEqual(page.files, []);
+    assert.equal(started, false);
+    release();
+    await blocker;
+  } finally {
+    release();
+    t.mock.timers.reset();
+    await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test('explicit short interface deadline keeps completed rows on timeout', async t => {
+  const { storeDir, req, expected } = await serviceRequest('range-deadline-mid-page');
+  const admission = createProjectionAdmission({ C: 1, Q: 1, W: 0, D: 100 });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = createInterfaceService({ storeDir, admission, admissionDeadlineMs: 50,
+    onFileStart: path => { if (path === 'src/b.ts') t.mock.timers.tick(50); } });
+  try {
+    assert.deepEqual(await service.get(req), expected);
+  } finally {
+    t.mock.timers.reset();
+    await admission.close(); await service.close(); await rm(storeDir, { recursive: true, force: true });
+  }
 });
 
 const HARNESS_ONLY = new Set(['range-admission-skipped', 'range-cancelled-mid-page',

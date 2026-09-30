@@ -697,9 +697,14 @@ were settled as A on 2026-09-27 (delegated by Brian). The contract
 (`contracts/interface/v2/`: schema, hand-written fixtures, and the
 `projection-check interface-v2-contract` validator) is written. Its slices
 (FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2 and FD3 are merged;
-FD4 is in progress on the reader-API branch. Its production 100 ms provisional
-admission deadline times out cold Swift extraction in the standalone live check,
-so FD4 acceptance remains open. A preliminary FD5 four-arm run at a test-only
+FD4 is in progress on the reader-API branch. Brian approved a 10,000 ms
+interface-only default page budget on 2026-09-30 for completeness; clip retains
+100 ms and the shared `C/Q/W` remain provisional. The earlier 100 ms cold Swift
+timeout remains historical evidence. A standalone authenticated consumer of a
+new disposable daemon returned `ready` TypeScript and cold Swift signature
+changes under the new default, while a separate capture event became durable
+before the analysis response completed. This is functional evidence, not FD5
+capture-safety acceptance. A preliminary FD5 four-arm run at a test-only
 400 ms interface deadline failed the paired capture and load-sufficiency gates
 (`FD5-MEASUREMENT-REPORT.md`); D7 production values remain unapproved. The
 bounded FD5 diagnostic driver and optional W barrier are implemented on FD4's

@@ -1,9 +1,10 @@
 # FD4 reader API handoff
 
-**Status: in progress; keep the PR draft.** The reader serves `interface.v2`, but
-the provisional D7 deadline is shorter than cold isolated Swift extraction in
-the standalone live check. FD5 must measure and obtain Brian's approval before
-the production admission values or the Swift ready gate can be claimed.
+**Status: in progress; keep the PR draft.** Brian approved a 10,000 ms default
+interface-page safety budget for completeness on 2026-09-30. The earlier 100 ms
+cold Swift timeout remains historical evidence. Clip keeps its 100 ms deadline;
+the shared `C/Q/W`, capture impact and timeout rates still require FD5 evidence
+and approval.
 
 ## Public contract trace
 
@@ -51,8 +52,16 @@ empty final continuation, a remaining visible file, and a hidden file exposed
 by later blob loss. A warmed cache followed by blob loss is tested.
 The independent `tools/fd4-live-check.ts` starts a disposable daemon with no
 UI, captures TypeScript and Swift edits, and makes authenticated HTTP requests.
-Its production-budget result on 2026-09-27 was TypeScript `ready` with one
-change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
+Its 2026-09-27 result under the old 100 ms default was TypeScript `ready` with
+one change and Swift `skipped/timeout`; that failed result is preserved. Under
+Brian's new default, the 2026-09-30 standalone authenticated run returned a
+`ready` page with the exact `number`→`string` TypeScript parameter change and
+eight exact `Int`→`String` cold Swift parameter changes. A separate file-change
+event at seq 22 became durable while the analysis HTTP request was still
+pending (frozen range ended at seq 21). The disposable daemon and worktree
+were cleaned up; this is functional capture-continuity evidence, not a D7 load
+or latency result. Raw response summary and hash are in
+`.context/fd4-completeness-live.json`.
 
 - **FD5:** Measure baseline, clip-only, interface-only, and combined load with
   TS, TSX, Swift, malformed and Unicode inputs, cold and warm paths, worker
@@ -66,10 +75,12 @@ change and Swift `skipped/timeout`; the script reports a failed ready-both gate.
   public route, schema, event stream and blob route. Freeze session, B/A,
   filters, and version across `next_after_path`; handle partial/skipped pages,
   explicit unavailable sides, unknown scopes, gaps, 409, 410, and stale replies.
-  FS2 owns the fixture-backed Swift screen. This PR changes no Swift client.
+  Keep one outstanding page request per view/range, and do not immediately
+  retry a timeout or unchanged cursor. FS2 owns the fixture-backed Swift screen.
+  This PR changes no Swift client.
 - **Contract owner:** Brian approved the narrow pre-first-file harness extension.
   Three additional goldens cover scan-limit, deadline and cancellation during
-  resolution; the validator now checks 69 cases with its negative control.
+  resolution; the validator now checks 71 cases with its negative control.
   A later interruption with no file row can also be `skipped`, retaining the
   inventory and gaps already resolved; these goldens specify only the
   pre-resolution outcome.
