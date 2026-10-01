@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assembleProjectionTrace, compareCaptureToBaseline, scoreInterfaceLoad, scoreProcessStartupTiming, validateInterfacePage,
-  type AdmissionTrace, type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
+import { assembleProjectionTrace, compareCaptureToBaseline, PLANNED_ABORT, scoreInterfaceLoad, scoreProcessStartupTiming,
+  validateInterfacePage, witnessCoverageFaults, type AdmissionTrace, type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { scoreCaptureArm } from '../src/clip-bench.ts';
 
 const ns = (ms: number): bigint => BigInt(ms) * 1_000_000n;
@@ -108,11 +108,11 @@ test('cold comparison cannot hide one cached or unobserved ready row among usefu
 
 test('counts look-ahead timeout once even with ready file; separates queue and running timeouts', () => {
   const input = passing();
-  const running = input.traces[0]!;
+  const running = input.traces![0]!;
   running.outcome = 'timeout'; running.exitedAtNs = running.settledAtNs + ns(1);
   input.attempts[0]!.body = { ...page(input.attempts[0]!.expected) as object,
     status: 'partial', fallback_reason: 'timeout', page: { complete: false, next_after_path: null } };
-  const queued = input.traces[2]!;
+  const queued = input.traces![2]!;
   queued.outcome = 'timeout'; delete queued.startedAtNs;
   input.attempts[2]!.body = { ...page(input.attempts[2]!.expected) as object,
     status: 'skipped', fallback_reason: 'timeout', files: [], page: { complete: false, next_after_path: null } };
@@ -125,9 +125,9 @@ test('counts look-ahead timeout once even with ready file; separates queue and r
 
 test('rejects absent correlation, missing responses, child leaks, corpus and attempt exhaustion', () => {
   const cases: Array<[(x: InterfaceLoadInput) => void, RegExp]> = [
-    [x => { x.traces.pop(); }, /admission trace count/],
+    [x => { x.traces!.pop(); }, /admission trace count/],
     [x => { delete x.attempts[0]!.completedAtNs; }, /correlated admission/],
-    [x => { x.traces[0]!.outcome = 'cancelled'; }, /actual exit/],
+    [x => { x.traces![0]!.outcome = 'cancelled'; }, /actual exit/],
     [x => { x.corpusExhausted = true; }, /corpus exhausted/],
     [x => { x.attemptLimitReached = true; }, /attempt guard/],
     [x => { x.cleanupComplete = false; }, /cleanup unproven/],
@@ -146,7 +146,7 @@ test('rejects illegal retry and an interval gap despite peak concurrency', () =>
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /repeated/);
   const y = passing();
   y.attempts = y.attempts.filter((_, i) => i !== 12);
-  y.traces = y.traces.filter(t => t.unitId !== 12);
+  y.traces = y.traces!.filter(t => t.unitId !== 12);
   assert.match(scoreInterfaceLoad(y).reasons.join(' '), /continuously|window/);
 });
 
@@ -178,19 +178,19 @@ test('joins legal same-key overload retry by route and disjoint monotonic interv
   x.attempts[0]!.body = { ...page(x.attempts[0]!.expected) as object,
     status: 'skipped', fallback_reason: 'overloaded', files: [] };
   x.attempts[0]!.freshnessByPath = {};
-  x.traces[0]!.outcome = 'overloaded';
-  delete x.traces[0]!.admittedAtNs;
-  delete x.traces[0]!.startedAtNs;
+  x.traces![0]!.outcome = 'overloaded';
+  delete x.traces![0]!.admittedAtNs;
+  delete x.traces![0]!.startedAtNs;
   x.attempts[1]!.expected = x.attempts[0]!.expected;
   x.attempts[1]!.body = page(x.attempts[1]!.expected);
   x.attempts[1]!.freshnessByPath = { [x.attempts[1]!.expected.files[0]!.path]: 'fresh' };
-  x.traces[1]!.routeKey = x.traces[0]!.routeKey;
-  x.traces[1]!.outcome = 'ok';
-  x.traces[1]!.admittedAtNs = x.traces[1]!.submittedAtNs;
-  x.traces[1]!.startedAtNs = x.traces[1]!.submittedAtNs;
+  x.traces![1]!.routeKey = x.traces![0]!.routeKey;
+  x.traces![1]!.outcome = 'ok';
+  x.traces![1]!.admittedAtNs = x.traces![1]!.submittedAtNs;
+  x.traces![1]!.startedAtNs = x.traces![1]!.submittedAtNs;
   assert.equal(scoreInterfaceLoad(x).sufficient, true);
   // An ambiguous runtime unit for one interval must not be guessed by order.
-  x.traces.push({ ...x.traces[1]!, unitId: 999 });
+  x.traces!.push({ ...x.traces![1]!, unitId: 999 });
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /correlated admission/);
 });
 
@@ -283,8 +283,8 @@ test('ready continuation and timed-out look-ahead remain distinct from complete 
   first.expected.files.push({ ...expected(99).files[0]!, path: 'later.ts' });
   first.body = { ...page(expected(0)) as object, page: { complete: false, next_after_path: first.expected.files[0]!.path } };
   assert.deepEqual(validateInterfacePage(first.body, first.expected), []);
-  x.traces[0]!.outcome = 'timeout';
-  x.traces[0]!.exitedAtNs = x.traces[0]!.settledAtNs + ns(1);
+  x.traces![0]!.outcome = 'timeout';
+  x.traces![0]!.exitedAtNs = x.traces![0]!.settledAtNs + ns(1);
   const report = scoreInterfaceLoad(x);
   assert.equal(report.total.runningTimeout, 1);
   assert.equal(report.timeoutWithoutHttpReason, 1);
@@ -293,10 +293,10 @@ test('ready continuation and timed-out look-ahead remain distinct from complete 
 
 test('contradictory and unclassified admission evidence invalidates denominators', () => {
   const x = passing();
-  x.traces[1]!.admittedAtNs = x.traces[1]!.submittedAtNs;
+  x.traces![1]!.admittedAtNs = x.traces![1]!.submittedAtNs;
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /contradicts outcome/);
   const y = passing();
-  y.traces[0]!.settledAtNs = y.traces[0]!.submittedAtNs - 1n;
+  y.traces![0]!.settledAtNs = y.traces![0]!.submittedAtNs - 1n;
   assert.match(scoreInterfaceLoad(y).reasons.join(' '), /timestamps are contradictory/);
 });
 
@@ -309,4 +309,160 @@ test('FD5 capture still treats a missing durable timestamp as a missing write', 
   assert.equal(report.missing, 1);
   assert.equal(report.latency.n, 0);
   assert.equal(report.latency.p99, null);
+});
+
+function httpOnly(): InterfaceLoadInput {
+  const x = passing();
+  for (const a of x.attempts) delete a.freshnessByPath;
+  return { ...x, traces: null };
+}
+const timedOut = (e: ExpectedInterfaceRequest): unknown => ({ ...page(e) as object, status: 'skipped',
+  fallback_reason: 'timeout', files: [], page: { complete: false, next_after_path: null } });
+const lookAhead = (e: ExpectedInterfaceRequest): unknown => ({ ...page(e) as object,
+  page: { complete: false, next_after_path: e.files[0]!.path } });
+function malformed(i: number): ExpectedInterfaceRequest {
+  const e = expected(i);
+  e.variant = 'malformed';
+  e.files[0]!.changes = [];
+  e.files[0]!.incompleteReason = 'before-parse-error';
+  return e;
+}
+const incompleteRow = (e: ExpectedInterfaceRequest, reason = 'before-parse-error'): unknown => {
+  const body = page(e) as { status: string; files: Array<Record<string, unknown>> };
+  body.status = 'partial';
+  Object.assign(body.files[0]!, { status: 'incomplete', fallback_reason: reason });
+  return body;
+};
+
+test('HTTP-only scoring classifies overload, work and windows without admission traces', () => {
+  const report = scoreInterfaceLoad(httpOnly());
+  assert.deepEqual(report.reasons, []);
+  assert.equal(report.classification, 'http');
+  assert.equal(report.total.rejected, 15);
+  assert.equal(report.total.admitted, 15);
+  assert.equal(report.total.usefulComparisons, 15);
+  assert.equal(report.total.unclassified, 0);
+});
+
+test('HTTP-only scoring still rejects failures, illegal cold-key reuse and overload-free windows', () => {
+  const cases: Array<[(x: InterfaceLoadInput) => void, RegExp]> = [
+    [x => { x.attempts[0]!.httpStatus = 500; }, /HTTP or host failure/],
+    [x => { delete x.attempts[0]!.httpStatus; x.attempts[0]!.error = 'reset'; }, /HTTP or host failure/],
+    [x => { x.attempts[2]!.expected = x.attempts[0]!.expected; }, /repeated/],
+    [x => { for (const a of x.attempts) a.body = page(a.expected); }, /window lacked/],
+  ];
+  for (const [mutate, reason] of cases) {
+    const x = httpOnly(); mutate(x);
+    const report = scoreInterfaceLoad(x);
+    assert.equal(report.sufficient, false);
+    assert.match(report.reasons.join(' '), reason);
+  }
+  const retry = httpOnly();
+  retry.attempts[2]!.expected = retry.attempts[1]!.expected;
+  retry.attempts[2]!.body = page(retry.attempts[1]!.expected);
+  assert.deepEqual(scoreInterfaceLoad(retry).reasons, []);
+});
+
+test('timeout fraction is bounded by explicit timeouts and unexplained incomplete pages', () => {
+  const x = httpOnly();
+  x.attempts[0]!.body = timedOut(x.attempts[0]!.expected);
+  x.attempts[6]!.body = lookAhead(x.attempts[6]!.expected);
+  const report = scoreInterfaceLoad(x);
+  const typescript = report.byLanguage.typescript;
+  assert.equal(typescript.validResponses, 5);
+  assert.equal(typescript.explicitTimeouts, 1);
+  assert.equal(typescript.unexplainedIncomplete, 1);
+  assert.deepEqual(typescript.timeoutFractionBounds, { lower: 1 / 5, upper: 2 / 5 });
+  assert.equal(typescript.usefulComparisons, 3);
+  assert.equal(report.byLanguage.swift.timeoutFractionBounds?.upper, 0);
+});
+
+test('traced witnesses prove the HTTP timeout evidence agrees with admission', () => {
+  const explicit = passing();
+  explicit.attempts[0]!.body = timedOut(explicit.attempts[0]!.expected);
+  assert.match(scoreInterfaceLoad(explicit).reasons.join(' '), /timeout disagrees with admission/);
+  const silent = passing();
+  silent.attempts[0]!.body = lookAhead(silent.attempts[0]!.expected);
+  assert.match(scoreInterfaceLoad(silent).reasons.join(' '), /incomplete page lacks timeout/);
+  silent.traces![0]!.outcome = 'timeout';
+  silent.traces![0]!.exitedAtNs = silent.traces![0]!.settledAtNs;
+  assert.deepEqual(scoreInterfaceLoad(silent).reasons, []);
+});
+
+function withPlanned(x: InterfaceLoadInput, language: 'typescript' | 'swift'): InterfaceAttempt {
+  const e = expected(500, language);
+  const attempt: InterfaceAttempt = { requestId: 'planned', expected: e, startedAtNs: ns(150),
+    completedAtNs: ns(250), error: PLANNED_ABORT, plannedAbortMs: 100 };
+  x.attempts.push(attempt);
+  x.corpusKeys.push(e.key);
+  return attempt;
+}
+
+test('planned client aborts are excluded from load denominators but counted separately', () => {
+  const x = httpOnly();
+  withPlanned(x, 'typescript');
+  const report = scoreInterfaceLoad(x);
+  assert.deepEqual(report.reasons, []);
+  assert.equal(report.total.submitted, 30);
+  assert.deepEqual(report.plannedCancels, { planned: 1, abortedBeforeResponse: 1, respondedBeforeAbort: 0,
+    cancelledRunning: { typescript: 0, swift: 0 } });
+  const failed = httpOnly();
+  withPlanned(failed, 'typescript').error = 'socket hang up';
+  assert.match(scoreInterfaceLoad(failed).reasons.join(' '), /HTTP or host failure/);
+});
+
+test('traced planned aborts must settle cancelled running work with an actual exit', () => {
+  const x = passing();
+  const attempt = withPlanned(x, 'swift');
+  const cancelled: AdmissionTrace = { unitId: 900, routeKey: attempt.expected.routeKey, workload: 'interface',
+    submittedAtNs: ns(151), admittedAtNs: ns(151), startedAtNs: ns(152), settledAtNs: ns(260),
+    outcome: 'cancelled', exitedAtNs: ns(270) };
+  x.traces!.push(cancelled);
+  const report = scoreInterfaceLoad(x);
+  assert.deepEqual(report.reasons, []);
+  assert.equal(report.plannedCancels.cancelledRunning.swift, 1);
+  delete cancelled.exitedAtNs;
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /actual exit/);
+  cancelled.exitedAtNs = ns(270);
+  x.traces!.push({ ...cancelled, unitId: 901 });
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /planned abort.*admission/);
+  x.traces!.pop();
+  x.traces!.pop();
+  assert.deepEqual(scoreInterfaceLoad(x).reasons, []);
+});
+
+test('expected parse failures must stay incomplete with their stated reason', () => {
+  const e = malformed(0);
+  assert.deepEqual(validateInterfacePage(incompleteRow(e), e), []);
+  assert.match(validateInterfacePage(page(e), e).join(' '), /expected incomplete/);
+  assert.match(validateInterfacePage(incompleteRow(e, 'after-parse-error'), e).join(' '), /incomplete reason/);
+  const interrupted = incompleteRow(e) as { files: Array<Record<string, unknown>> };
+  Object.assign(interrupted.files[0]!, { status: 'skipped', fallback_reason: 'cancelled' });
+  assert.deepEqual(validateInterfacePage(interrupted, e), []);
+});
+
+test('each requested input variant needs one correctly handled response', () => {
+  const x = httpOnly();
+  const e = malformed(600);
+  x.attempts.push({ requestId: 'variant', expected: e, startedAtNs: ns(2900), completedAtNs: ns(2950),
+    httpStatus: 200, body: incompleteRow(e) });
+  x.corpusKeys.push(e.key);
+  const report = scoreInterfaceLoad(x);
+  assert.deepEqual(report.reasons, []);
+  assert.deepEqual(report.variants, { 'malformed:typescript': { requested: 1, handled: 1 } });
+  x.attempts.at(-1)!.body = timedOut(e);
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
+});
+
+test('witness coverage needs cancelled running work per parser family and a retired TypeScript worker', () => {
+  const report = scoreInterfaceLoad(passing());
+  const retired = [
+    { kind: 'process-start', processId: 3, process: 'ts-worker', atNs: 1n },
+    { kind: 'process-retire', processId: 3, unitId: 1, atNs: 2n },
+    { kind: 'process-exit', processId: 3, code: 1, atNs: 3n },
+  ] as const;
+  assert.match(witnessCoverageFaults(report, [...retired]).join(' '), /typescript.*cancel/);
+  report.plannedCancels.cancelledRunning = { typescript: 1, swift: 1 };
+  assert.deepEqual(witnessCoverageFaults(report, [...retired]), []);
+  assert.match(witnessCoverageFaults(report, [retired[0], retired[1]]).join(' '), /retired TypeScript worker/);
 });
