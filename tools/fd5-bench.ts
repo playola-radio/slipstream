@@ -16,13 +16,14 @@ import { INTERFACE_PAGE_DEADLINE_MS } from '../src/interface-service.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
   waitForQuietCapture, type BenchmarkConfig, type HistoricalChange, type LoadSummary } from '../src/clip-bench.ts';
-import { assembleProjectionTrace, compareCaptureToBaseline, scoreClipTrace, scoreInterfaceLoad,
+import { assembleProjectionTrace, compareCaptureToBaseline, PLANNED_ABORT, scoreClipTrace, scoreInterfaceLoad,
   scoreProcessStartupTiming, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 
 const MAX_ATTEMPTS = 100_000;
 const DRAIN_TIMEOUT_MS = 15_000;
+const OVERLOAD_RETRY_MS = 100;
 const LANGUAGES = ['typescript', 'tsx', 'swift'] as const;
 type Arm = 'baseline' | 'clip-only' | 'interface-only' | 'combined';
 export interface FD5Config {
@@ -60,30 +61,54 @@ export function validateConfig(raw: unknown): FD5Config {
   return raw as FD5Config;
 }
 
-export interface CorpusPage { expected: ExpectedInterfaceRequest; limit: 1 | 4 | 16 }
-interface Fixture { before: string; after: string; changes: unknown[]; extension: string; languageVersion: string }
+export interface CorpusPage { expected: ExpectedInterfaceRequest; limit: 1 | 4 | 16; plannedAbortMs?: number }
+type Language = typeof LANGUAGES[number];
+type Variant = 'unicode' | 'malformed';
+interface PagePlan { limit: 1 | 4 | 16; language: Language; sizeClass: 'tiny' | 'representative'; variant?: Variant;
+  plannedAbortMs?: number }
+const PLANNED_ABORT_MS = [100, 500, 2000, 5000];
+/** Registered page schedule: one Unicode and one parse-failure page per 20, one client disconnect per 25. */
+export function corpusPlan(index: number): PagePlan {
+  const language = LANGUAGES[index % LANGUAGES.length]!;
+  const variant: Variant | undefined = index % 20 === 18 ? 'malformed'
+    : index % 20 === 17 && language !== 'swift' ? 'unicode' : undefined;
+  if (variant) return { limit: 1, language, sizeClass: 'tiny', variant };
+  return { limit: [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16, language,
+    sizeClass: Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative',
+    ...index % 25 === 11 ? { plannedAbortMs: PLANNED_ABORT_MS[Math.floor(index / 25) % PLANNED_ABORT_MS.length]! } : {} };
+}
+interface Fixture { before: string; after: string; changes: unknown[]; extension: string; languageVersion: string;
+  incompleteReason?: string }
 async function fixture(name: string): Promise<Fixture> {
   const root = new URL(`../contracts/interface/v2/cases/${name}/`, import.meta.url);
   const history = JSON.parse(await readFile(new URL('history.json', root), 'utf8')) as { blobs: Record<string, string> };
-  const expected = JSON.parse(await readFile(new URL('expected.json', root), 'utf8')) as { files: Array<{ before: { snapshot: { sha256: string } }; after: { snapshot: { sha256: string } }; changes: unknown[]; language_version: string }> };
+  const expected = JSON.parse(await readFile(new URL('expected.json', root), 'utf8')) as { files: Array<{ before: { snapshot: { sha256: string } }; after: { snapshot: { sha256: string } }; changes: unknown[]; language_version: string; status: string; fallback_reason?: string }> };
   const file = expected.files[0]!;
   return { before: history.blobs[file.before.snapshot.sha256]!, after: history.blobs[file.after.snapshot.sha256]!,
-    changes: file.changes, extension: name.startsWith('swift') ? 'swift' : 'ts', languageVersion: file.language_version };
+    changes: file.changes, extension: name.startsWith('swift') ? 'swift' : 'ts', languageVersion: file.language_version,
+    ...file.status === 'incomplete' ? { incompleteReason: file.fallback_reason! } : {} };
 }
 
 /** Each page has immutable before/after cutoffs; a trailing comment makes every content key unique. */
 export async function createInterfaceCorpus(storeDir: string, pageCount: number, seed = 'fd5-recovery-v1',
-  selection?: { language: 'typescript' | 'tsx' | 'swift'; sizeClass: 'tiny' | 'representative'; files: 1 | 4 | 16 },
+  selection?: { language: Language; sizeClass: 'tiny' | 'representative'; files: 1 | 4 | 16; variant?: Variant },
   signal?: AbortSignal): Promise<CorpusPage[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
-  const ts = await fixture('ts-return-change');
-  const swift = await fixture('swift-labels-defaults-effects');
+  const fixtures = {
+    normal: { ts: await fixture('ts-return-change'), swift: await fixture('swift-labels-defaults-effects') },
+    unicode: { ts: await fixture('ts-unicode-span') },
+    malformed: { ts: await fixture('ts-parse-failure'), swift: await fixture('swift-parse-failure') },
+  };
   const pages: CorpusPage[] = [];
   for (let index = 0; index < pageCount; index++) {
     signal?.throwIfAborted();
-    const limit = selection?.files ?? [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16;
-    const pageLanguage = selection?.language ?? LANGUAGES[index % LANGUAGES.length]!;
-    const sizeClass = selection?.sizeClass ?? (Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative');
+    const plan: PagePlan = selection ? { limit: selection.files, language: selection.language, sizeClass: selection.sizeClass,
+      ...selection.variant ? { variant: selection.variant } : {} } : corpusPlan(index);
+    const { limit, language: pageLanguage, sizeClass, variant } = plan;
+    const family = fixtures[variant ?? 'normal'] as { ts: Fixture; swift?: Fixture };
+    const ts = family.ts;
+    const swift = family.swift;
+    if (pageLanguage === 'swift' && !swift) throw new Error(`FD5 corpus has no Swift ${variant} fixture`);
     const idHex = createHash('sha256').update(`${seed}:session:${index}`).digest('hex');
     const sessionId = `${idHex.slice(0, 8)}-${idHex.slice(8, 12)}-4${idHex.slice(13, 16)}-8${idHex.slice(17, 20)}-${idHex.slice(20, 32)}`;
     await mkdir(join(storeDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
@@ -95,7 +120,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
       for (let j = 0; j < limit; j++) {
         signal?.throwIfAborted();
         const language = pageLanguage;
-        const source = language === 'swift' ? swift : ts;
+        const source = language === 'swift' ? swift! : ts;
         const filler = sizeClass === 'representative' ? Array.from({ length: 96 }, (_, n) => language === 'swift'
           ? `func fd5Filler${n}(x: Int) -> Int { x }\n`
           : `function fd5Filler${n}(x: number): number { return x; }\n`).join('') : '';
@@ -106,6 +131,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
           data: { path, snapshot: { kind: 'content', sha256: before.sha256, size: before.size } } });
         baselines.push({ path, language: language === 'swift' ? 'swift' : 'typescript', languageVersion: source.languageVersion,
           beforeSha256: before.sha256, afterSha256: after.sha256, changes: source.changes,
+          ...source.incompleteReason ? { incompleteReason: source.incompleteReason } : {},
           beforeRecordSeq: baselineEvent.seq,
           beforeSize: before.size, afterSize: after.size });
       }
@@ -125,9 +151,10 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
       const key = createHash('sha256').update(JSON.stringify(files.map(f => [f.beforeSha256, f.afterSha256, f.language, f.languageVersion]))).digest('hex');
       const routeKey = `/v1/sessions/${sessionId}/interfaces?${new URLSearchParams({ before_seq: baseline.seq,
         after_seq: lastSeq, limit: String(limit) })}`;
-      pages.push({ limit, expected: { key, routeKey, language: pageLanguage, sizeClass, sessionId,
-        beforeSeq: baseline.seq, afterSeq: lastSeq,
-        files: files.map(({ beforeSize: _a, afterSize: _b, ...file }) => file) } });
+      pages.push({ limit, ...plan.plannedAbortMs === undefined ? {} : { plannedAbortMs: plan.plannedAbortMs },
+        expected: { key, routeKey, language: pageLanguage, sizeClass, sessionId,
+          beforeSeq: baseline.seq, afterSeq: lastSeq, ...variant ? { variant } : {},
+          files: files.map(({ beforeSize: _a, afterSize: _b, ...file }) => file) } });
     } finally { await log.close(); }
   }
   if (new Set(pages.map(p => p.expected.key)).size !== pages.length) throw new Error('FD5 corpus repeats a cold content key');
@@ -137,15 +164,20 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
 async function requestInterface(url: string, token: string, page: CorpusPage): Promise<InterfaceAttempt> {
   const startedAtNs = process.hrtime.bigint();
   const requestId = randomUUID();
+  const planned = page.plannedAbortMs === undefined ? {} : { plannedAbortMs: page.plannedAbortMs };
+  const disconnect = new AbortController();
+  const timer = page.plannedAbortMs === undefined ? undefined : setTimeout(() => disconnect.abort(), page.plannedAbortMs);
   try {
-    const response = await fetch(`${url}${page.expected.routeKey}`, {
-      headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRAIN_TIMEOUT_MS) });
+    const response = await fetch(`${url}${page.expected.routeKey}`, { headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.any([disconnect.signal, AbortSignal.timeout(DRAIN_TIMEOUT_MS)]) });
     const body: unknown = await response.json().catch(() => null);
+    if (disconnect.signal.aborted) throw new Error('planned disconnect interrupted the response body');
     return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(),
-      httpStatus: response.status, body };
+      httpStatus: response.status, body, ...planned };
   } catch (error) {
-    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(), error: String(error) };
-  }
+    return { requestId, expected: page.expected, startedAtNs, completedAtNs: process.hrtime.bigint(),
+      error: disconnect.signal.aborted ? PLANNED_ABORT : String(error), ...planned };
+  } finally { clearTimeout(timer); }
 }
 
 export interface InterfaceLoadSummary { attempts: InterfaceAttempt[]; maxConcurrentRequests: number;
@@ -168,8 +200,9 @@ export function startInterfaceLoad(url: string, token: string, corpus: CorpusPag
         const attempt = await requestInterface(url, token, page);
         attempts.push(attempt);
         const body = attempt.body as { status?: unknown; fallback_reason?: unknown } | null;
-        if (body?.status !== 'skipped' || body.fallback_reason !== 'overloaded') page = undefined;
+        if (page.plannedAbortMs !== undefined || body?.status !== 'skipped' || body.fallback_reason !== 'overloaded') page = undefined;
       } finally { active--; }
+      if (page) await new Promise(resolve => setTimeout(resolve, OVERLOAD_RETRY_MS));
     }
   };
   const workers = Array.from({ length: slots }, () => slot());

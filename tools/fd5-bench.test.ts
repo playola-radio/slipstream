@@ -4,7 +4,8 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createInterfaceCorpus, validateConfig } from './fd5-bench.ts';
+import { corpusPlan, createInterfaceCorpus, startInterfaceLoad, validateConfig } from './fd5-bench.ts';
+import { createServer } from 'node:http';
 import { createHistoricalCorpus, type ClipResponse } from '../src/clip-bench.ts';
 import { createTypeScriptInterfaceExtractor } from '../src/interface-v2-typescript.ts';
 import { compareStructuredExtractions } from '../src/interface-v2-comparison.ts';
@@ -18,7 +19,7 @@ import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { startReaderServer } from '../src/http-reader.ts';
 import { INTERFACE_PAGE_DEADLINE_MS } from '../src/interface-service.ts';
-import { assembleProjectionTrace, scoreClipTrace, type InterfaceAttempt } from './fd5-score.ts';
+import { assembleProjectionTrace, PLANNED_ABORT, scoreClipTrace, validateInterfacePage, type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 
 test('registered config preserves fixed B2 limits and requires an explicit finite cold corpus', async () => {
@@ -92,6 +93,83 @@ test('TS, TSX and Swift corpus variants retain pinned changes at tiny and repres
       }
     }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('registered corpus schedule mixes Unicode and parse-failure pages with planned disconnects', () => {
+  const plans = Array.from({ length: 300 }, (_, index) => corpusPlan(index));
+  const variants = new Set(plans.flatMap(plan => plan.variant ? [`${plan.variant}:${plan.language}`] : []));
+  assert.deepEqual(variants, new Set(['unicode:typescript', 'unicode:tsx',
+    'malformed:typescript', 'malformed:tsx', 'malformed:swift']));
+  for (const plan of plans.filter(plan => plan.variant)) assert.deepEqual([plan.limit, plan.sizeClass], [1, 'tiny']);
+  const planned = plans.flatMap((plan, index) => plan.plannedAbortMs === undefined ? [] : [{ index, ...plan }]);
+  assert.equal(planned.length, 12);
+  assert.ok(planned.every(plan => plan.index % 25 === 11 && plan.variant === undefined));
+  assert.deepEqual(new Set(planned.map(plan => `${plan.language}:${plan.plannedAbortMs}`)).size, 12);
+  assert.deepEqual(plans.slice(0, 9).map(plan => plan.limit), [1, 1, 1, 4, 4, 4, 16, 16, 16]);
+});
+
+test('real reader handles Unicode and parse-failure variant pages exactly as the fixtures state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-variant-test-'));
+  let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+  try {
+    const pages = [];
+    for (const [language, variant] of [['typescript', 'unicode'], ['tsx', 'unicode'], ['typescript', 'malformed'],
+      ['tsx', 'malformed'], ['swift', 'malformed']] as const)
+      pages.push(...await createInterfaceCorpus(root, 1, `variant-${language}-${variant}`,
+        { language, sizeClass: 'tiny', files: 1, variant }));
+    reader = await startReaderServer({ storeDir: root });
+    for (const page of pages) {
+      const response = await fetch(reader.url + page.expected.routeKey,
+        { headers: { authorization: `Bearer ${reader.token}` } });
+      const body = await response.json() as { files: Array<{ status: string }> };
+      assert.equal(response.status, 200);
+      assert.deepEqual(validateInterfacePage(body, page.expected), []);
+      assert.equal(body.files[0]!.status, page.expected.variant === 'unicode' ? 'ready' : 'incomplete');
+    }
+  } finally {
+    await reader?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function fakeReader(handler: Parameters<typeof createServer>[1]):
+  Promise<{ url: string; requests: () => number; close: () => Promise<void> }> {
+  let count = 0;
+  const server = createServer((req, res) => { count++; handler!(req, res); });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const { port } = server.address() as { port: number };
+  return { url: `http://127.0.0.1:${port}`, requests: () => count,
+    close: async () => { server.closeAllConnections(); server.close(); await once(server, 'close'); } };
+}
+
+test('interface load disconnects a planned page once and never retries its key', async () => {
+  const fake = await fakeReader(() => {});
+  try {
+    const [page] = await createInterfaceCorpus(await mkdtemp(join(tmpdir(), 'slip-fd5-planned-')), 1);
+    const load = startInterfaceLoad(fake.url, 'token', [{ ...page!, plannedAbortMs: 50 }], 1);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const summary = await load.stop();
+    assert.equal(summary.attempts.length, 1);
+    assert.equal(summary.attempts[0]!.error, PLANNED_ABORT);
+    assert.equal(summary.attempts[0]!.plannedAbortMs, 50);
+    assert.equal(summary.corpusExhausted, true);
+  } finally { await fake.close(); }
+});
+
+test('interface load backs off before retrying an overloaded page', async () => {
+  const fake = await fakeReader((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ status: 'skipped', fallback_reason: 'overloaded' }));
+  });
+  try {
+    const [page] = await createInterfaceCorpus(await mkdtemp(join(tmpdir(), 'slip-fd5-backoff-')), 1);
+    const load = startInterfaceLoad(fake.url, 'token', [page!], 1);
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const summary = await load.stop();
+    assert.ok(summary.attempts.length >= 2 && summary.attempts.length <= 6, `${summary.attempts.length} attempts`);
+    assert.equal(new Set(summary.attempts.map(attempt => attempt.expected.key)).size, 1);
+  } finally { await fake.close(); }
 });
 
 test('isolated load client starts, stops and actually exits without a reader', async () => {
