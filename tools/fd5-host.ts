@@ -120,6 +120,7 @@ export async function preflight(host: HostLimits, windowEndUtc: string, journal:
     const swapGrowth = first.swapUsedBytes !== null && sample.swapUsedBytes !== null
       ? sample.swapUsedBytes - first.swapUsedBytes : null;
     await journal.record({ type: 'preflight-sample', sample, swapGrowthBytes: swapGrowth });
+    await journal.assertHealthy();
     if (sample.faults.length || swapGrowth === null || swapGrowth > host.maxSwapGrowthBytes)
       throw new Error(`host preflight veto: ${[...sample.faults, ...(swapGrowth === null ? ['swap growth unknown'] :
         swapGrowth > host.maxSwapGrowthBytes ? ['swap growth'] : [])].join(', ')}`);
@@ -148,6 +149,7 @@ export function monitorHost(host: HostLimits, windowEndUtc: string, journal: Jou
     if (hadPrevious && (growth === null || growth > host.maxSwapGrowthBytes))
       fault('host swap growth unknown or positive');
     await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
+    await journal.assertHealthy().catch(error => fault(`journal cannot record evidence: ${error}`));
   };
   const schedule = (): void => {
     if (sampling) { fault('host sample missed its interval'); return; }

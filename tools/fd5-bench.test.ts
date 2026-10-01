@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { campaignApprovalFaults, childProcessesExit, corpusPlan, createInterfaceCorpus, createLargeLogProbe,
+  diagnosticCorpusPlan,
   LARGE_LOG_RESTORED_PATHS, largeLogOutcome, runFD5, startInterfaceLoad, validateConfig,
   type CorpusPage } from './fd5-bench.ts';
 import { createServer } from 'node:http';
@@ -134,6 +135,19 @@ test('registered corpus schedule mixes Unicode and parse-failure pages with plan
   assert.deepEqual(plans.slice(0, 9).map(plan => plan.limit), [1, 1, 1, 4, 4, 4, 16, 16, 16]);
 });
 
+test('diagnostic corpus keeps ten plain pages in every language, size and page cell', () => {
+  const cells = new Map<string, number>();
+  for (let index = 0; index < 180; index++) {
+    const plan = diagnosticCorpusPlan(index);
+    assert.equal(plan.variant, undefined);
+    assert.equal(plan.plannedAbortMs, undefined);
+    const cell = `${plan.language}/${plan.sizeClass}/${plan.limit}`;
+    cells.set(cell, (cells.get(cell) ?? 0) + 1);
+  }
+  assert.equal(cells.size, 18);
+  assert.ok([...cells.values()].every(count => count === 10));
+});
+
 test('real reader handles Unicode and parse-failure variant pages exactly as the fixtures state', async () => {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-variant-test-'));
   let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
@@ -142,7 +156,7 @@ test('real reader handles Unicode and parse-failure variant pages exactly as the
     for (const [language, variant] of [['typescript', 'unicode'], ['tsx', 'unicode'], ['typescript', 'malformed'],
       ['tsx', 'malformed'], ['swift', 'malformed']] as const)
       pages.push(...await createInterfaceCorpus(root, 1, `variant-${language}-${variant}`,
-        { language, sizeClass: 'tiny', files: 1, variant }));
+        () => ({ language, sizeClass: 'tiny', limit: 1, variant })));
     reader = await startReaderServer({ storeDir: root });
     for (const page of pages) {
       const response = await fetch(reader.url + page.expected.routeKey,

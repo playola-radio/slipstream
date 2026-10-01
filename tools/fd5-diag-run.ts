@@ -16,7 +16,7 @@ import { createHistoricalCorpus, readRecords, runWriter, scoreCaptureArm, waitFo
 import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
 import type { ProjectionTraceEvent } from '../src/projection-trace.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
-import { createInterfaceCorpus, type CorpusPage } from './fd5-bench.ts';
+import { createInterfaceCorpus, diagnosticCorpusPlan, type CorpusPage } from './fd5-bench.ts';
 import { assembleProjectionTrace, scoreClipTrace, scoreProcessStartupTiming, validateInterfacePage,
   type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
@@ -327,7 +327,7 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
   try {
     clipCorpus = await createHistoricalCorpus(storeDir, clipCount, preparation.signal);
     interfaceCorpus = await createInterfaceCorpus(storeDir, interfaceCount, `${config.seed}-${mode}`,
-      undefined, preparation.signal);
+      diagnosticCorpusPlan, preparation.signal);
     preparation.signal.throwIfAborted();
   } finally { preparation.close(); }
   const base = { C: config.admission.C, Q: config.admission.Q, W: config.admission.W,
@@ -478,7 +478,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
     try {
       pages = await createInterfaceCorpus(storeDir,
         config.unqueued.observationsPerCell + (cell.warmth === 'initialized-worker-new-content' ? 1 : 0),
-        `${config.seed}-${label}`, { language: cell.language, sizeClass: cell.size, files: cell.files }, cap.signal);
+        `${config.seed}-${label}`, () => ({ language: cell.language, sizeClass: cell.size, limit: cell.files }), cap.signal);
     } catch (error) { cap.close(); throw error; }
     let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
     const client = startDiagnosticHttpClient();

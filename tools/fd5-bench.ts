@@ -24,7 +24,7 @@ import { assembleProjectionTrace, compareCaptureToBaseline, PLANNED_ABORT, score
   scoreProcessStartupTiming, validateInterfacePage, witnessCoverageFaults, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
-import { bounded, encode, Journal, monitorHost, preflight, runCapped, startCap, type HostLimits } from './fd5-host.ts';
+import { encode, Journal, monitorHost, preflight, runCapped, type HostLimits } from './fd5-host.ts';
 
 const MAX_ATTEMPTS = 100_000;
 const DRAIN_TIMEOUT_MS = 15_000;
@@ -98,17 +98,21 @@ export function campaignApprovalFaults(config: FD5Config, now = Date.now()): str
 export interface CorpusPage { expected: ExpectedInterfaceRequest; limit: 1 | 4 | 16; plannedAbortMs?: number }
 type Language = typeof LANGUAGES[number];
 type Variant = 'unicode' | 'malformed';
-interface PagePlan { limit: 1 | 4 | 16; language: Language; sizeClass: 'tiny' | 'representative'; variant?: Variant;
+export interface PagePlan { limit: 1 | 4 | 16; language: Language; sizeClass: 'tiny' | 'representative'; variant?: Variant;
   plannedAbortMs?: number }
 const PLANNED_ABORT_MS = [100, 500, 2000, 5000];
+/** Plain pages cycling language, page size and source size; the bounded diagnostics' cohorts depend on this layout. */
+export function diagnosticCorpusPlan(index: number): PagePlan {
+  return { limit: [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16, language: LANGUAGES[index % LANGUAGES.length]!,
+    sizeClass: Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative' };
+}
 /** Registered page schedule: one Unicode and one parse-failure page per 20, one client disconnect per 25. */
 export function corpusPlan(index: number): PagePlan {
-  const language = LANGUAGES[index % LANGUAGES.length]!;
+  const plain = diagnosticCorpusPlan(index);
   const variant: Variant | undefined = index % 20 === 18 ? 'malformed'
-    : index % 20 === 17 && language !== 'swift' ? 'unicode' : undefined;
-  if (variant) return { limit: 1, language, sizeClass: 'tiny', variant };
-  return { limit: [1, 4, 16][Math.floor(index / 3) % 3]! as 1 | 4 | 16, language,
-    sizeClass: Math.floor(index / 9) % 2 === 0 ? 'tiny' : 'representative',
+    : index % 20 === 17 && plain.language !== 'swift' ? 'unicode' : undefined;
+  if (variant) return { limit: 1, language: plain.language, sizeClass: 'tiny', variant };
+  return { ...plain,
     ...index % 25 === 11 ? { plannedAbortMs: PLANNED_ABORT_MS[Math.floor(index / 25) % PLANNED_ABORT_MS.length]! } : {} };
 }
 interface Fixture { before: string; after: string; changes: unknown[]; extension: string; languageVersion: string;
@@ -132,8 +136,7 @@ const contentKey = (files: ExpectedFile[]): string => createHash('sha256')
 
 /** Each page has immutable before/after cutoffs; a trailing comment makes every content key unique. */
 export async function createInterfaceCorpus(storeDir: string, pageCount: number, seed = 'fd5-recovery-v1',
-  selection?: { language: Language; sizeClass: 'tiny' | 'representative'; files: 1 | 4 | 16; variant?: Variant },
-  signal?: AbortSignal): Promise<CorpusPage[]> {
+  planFor: (index: number) => PagePlan = corpusPlan, signal?: AbortSignal): Promise<CorpusPage[]> {
   const cas = await createCas(join(storeDir, 'blobs'));
   const fixtures = {
     normal: { ts: await fixture('ts-return-change'), swift: await fixture('swift-labels-defaults-effects') },
@@ -143,9 +146,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
   const pages: CorpusPage[] = [];
   for (let index = 0; index < pageCount; index++) {
     signal?.throwIfAborted();
-    const plan: PagePlan = selection ? { limit: selection.files, language: selection.language, sizeClass: selection.sizeClass,
-      ...selection.variant ? { variant: selection.variant } : {} } : corpusPlan(index);
-    const { limit, language: pageLanguage, sizeClass, variant } = plan;
+    const { limit, language: pageLanguage, sizeClass, variant, plannedAbortMs } = planFor(index);
     const family = fixtures[variant ?? 'normal'] as { ts: Fixture; swift?: Fixture };
     const ts = family.ts;
     const swift = family.swift;
@@ -191,7 +192,7 @@ export async function createInterfaceCorpus(storeDir: string, pageCount: number,
       const key = contentKey(files);
       const routeKey = `/v1/sessions/${sessionId}/interfaces?${new URLSearchParams({ before_seq: baseline.seq,
         after_seq: lastSeq, limit: String(limit) })}`;
-      pages.push({ limit, ...plan.plannedAbortMs === undefined ? {} : { plannedAbortMs: plan.plannedAbortMs },
+      pages.push({ limit, ...plannedAbortMs === undefined ? {} : { plannedAbortMs },
         expected: { key, routeKey, language: pageLanguage, sizeClass, sessionId,
           beforeSeq: baseline.seq, afterSeq: lastSeq, ...variant ? { variant } : {},
           files: files.map(({ beforeSize: _a, afterSize: _b, ...file }) => file) } });
@@ -588,9 +589,10 @@ export function largeLogOutcome(attempt: InterfaceAttempt): { outcome: 'ready-co
 }
 
 /** Each request uses a fresh untraced reader, so every page is a cold retention scan of the large log. */
-async function runLargeLogProbe(storeDir: string, page: CorpusPage, config: FD5Config) {
+async function runLargeLogProbe(storeDir: string, page: CorpusPage, config: FD5Config, signal: AbortSignal) {
   const results = [];
   for (let i = 0; i < LARGE_LOG_REQUESTS; i++) {
+    signal.throwIfAborted();
     const server = await startReaderServer({ storeDir, interfaceDeadlineMs: config.admission.interfaceDeadlineMs,
       projectionAdmissionConfig: { C: config.admission.C, Q: config.admission.Q, W: config.admission.W, D: config.admission.clipDeadlineMs } });
     let attempt: InterfaceAttempt;
@@ -628,14 +630,15 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
     await journal.record({ type: 'started', revision, config, configSha256,
       node: process.version, platform: process.platform, osRelease: release(), arch: arch(), cpu: cpus()[0]?.model,
       parserArtifacts }, true);
+    await journal.assertHealthy();
     await preflight(config.host, windowEndUtc(config), journal);
     storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-store-'));
-    const preparation = startCap(config.maxPreparationSeconds);
     const corpusDir = storeDir;
-    const [clipCorpus, interfaceCorpus] = await bounded((async () => [
-      await createHistoricalCorpus(corpusDir, config.clipCorpusChanges),
-      await createInterfaceCorpus(corpusDir, config.interfaceCorpusPages, config.seed, undefined, preparation.signal),
-    ] as const)(), preparation.signal).finally(() => preparation.close());
+    // Both builders stop on the cap and settle before the store can be removed.
+    const [clipCorpus, interfaceCorpus] = await runCapped(config.maxPreparationSeconds, ARM_SETTLE_MS, async signal => [
+      await createHistoricalCorpus(corpusDir, config.clipCorpusChanges, signal),
+      await createInterfaceCorpus(corpusDir, config.interfaceCorpusPages, config.seed, corpusPlan, signal),
+    ] as const);
     const schedule = [
       ...[0, 1, 2].flatMap(repetition => rotations[repetition]!.map(arm => ({ arm, repetition, traced: false }))),
       ...WITNESS_ARMS.map(arm => ({ arm, repetition: 3, traced: true })),
@@ -667,7 +670,7 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
         try {
           const page = await createLargeLogProbe(largeLogDir);
           signal.throwIfAborted();
-          return await runLargeLogProbe(largeLogDir, page, config);
+          return await runLargeLogProbe(largeLogDir, page, config, signal);
         } finally { await host.stop(); }
       });
     await journal.record({ type: 'large-log', largeLog }, true);

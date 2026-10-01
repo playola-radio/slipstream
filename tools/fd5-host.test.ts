@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, open, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Journal, monitorHost, runCapped, type HostLimits } from './fd5-host.ts';
+import { Journal, monitorHost, preflight, runCapped, type HostLimits } from './fd5-host.ts';
 
 const host: HostLimits = { preflightQuietSeconds: 0, maxFiveMinuteLoadFractionOfPhysicalCores: 0.5,
   maxSwapGrowthBytes: 0, requireAcPower: true, requireNormalThermal: true, requireNoMemoryPressureWarning: true,
@@ -48,4 +48,23 @@ test('a veto stops a capped run, and cleanup that never settles is abandoned aft
 
 test('a capped run that finishes in time returns its result', async () => {
   assert.equal(await runCapped(60, 50, async () => 'done'), 'done');
+});
+
+const brokenJournal = (): Journal => new Journal({ appendFile: async () => { throw new Error('ENOSPC'); },
+  sync: async () => {}, close: async () => {} } as unknown as ConstructorParameters<typeof Journal>[0]);
+
+test('a journal that cannot record host evidence is a host fault while the run is active', async () => {
+  const observed: string[] = [];
+  const monitor = monitorHost(host, '2999-01-01T00:00:00Z', brokenJournal(), fault => observed.push(fault));
+  const deadline = Date.now() + 5_000;
+  while (!observed.some(fault => /journal/.test(fault)) && Date.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  await monitor.stop().catch(() => {});
+  assert.ok(observed.some(fault => /journal.*ENOSPC/.test(fault)), observed.join(', '));
+});
+
+test('preflight stops at the first sample the journal cannot record', async () => {
+  await assert.rejects(preflight({ ...host, preflightQuietSeconds: 5, requireAcPower: false, requireNormalThermal: false,
+    requireNoMemoryPressureWarning: false, maxFiveMinuteLoadFractionOfPhysicalCores: 1e6 },
+  '2999-01-01T00:00:00Z', brokenJournal()), /ENOSPC/);
 });

@@ -139,9 +139,9 @@ timeout remains unresolved, but the deferred Rust spike is not a prerequisite
 for the existing Node path.
 
 Two historical intermittent tools tests remain tracked follow-ups, despite
-passing in the 2026-09-30 (557/557) and 2026-10-01 (576/576, 584/584) tools runs:
+passing in the 2026-09-30 (557/557) and 2026-10-01 (576/576, 587/587) tools runs:
 
-- `tools/fd5-bench.test.ts:317`, “real clip cache bypass is separate from
+- `tools/fd5-bench.test.ts:331`, “real clip cache bypass is separate from
   admission and blob loss forces a new compute”: a prior full tools run counted
   3 clip admissions where 2 were expected; it also failed once in isolation.
   FD5 must retain shared-admission and cache-bypass coverage.
