@@ -46,6 +46,16 @@ export async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise
     });
   });
 }
+
+export class CappedWorkDidNotSettleError extends Error {
+  override cause: unknown;
+  constructor(cause: unknown) {
+    super(`capped work did not settle within its cleanup bound after abort: ${String(cause)}`);
+    this.name = 'CappedWorkDidNotSettleError';
+    this.cause = cause;
+  }
+}
+
 /** Runs work under a wall cap. A cap hit or veto aborts the work's signal, then waits up to
  * settleMs for the work's own cleanup before failing, so nothing is removed underneath it. */
 export async function runCapped<T>(seconds: number, settleMs: number,
@@ -56,7 +66,10 @@ export async function runCapped<T>(seconds: number, settleMs: number,
   const running = work(signal, reason => vetoed.abort(reason));
   try { return await bounded(running, signal); }
   catch (error) {
-    if (signal.aborted) await bounded(running.then(() => {}, () => {}), AbortSignal.timeout(settleMs)).catch(() => {});
+    if (signal.aborted) {
+      try { await bounded(running.then(() => {}, () => {}), AbortSignal.timeout(settleMs)); }
+      catch { throw new CappedWorkDidNotSettleError(error); }
+    }
     throw error;
   } finally { cap.close(); }
 }
@@ -163,4 +176,3 @@ export function monitorHost(host: HostLimits, windowEndUtc: string, journal: Jou
     await journal.record({ type: 'host-monitor-ended' });
     return [...new Set(faults)]; } };
 }
-

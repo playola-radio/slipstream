@@ -500,9 +500,15 @@ test('expected parse failures must stay incomplete with their stated reason', ()
   assert.deepEqual(validateInterfacePage(incompleteRow(e), e), []);
   assert.match(validateInterfacePage(page(e), e).join(' '), /expected incomplete/);
   assert.match(validateInterfacePage(incompleteRow(e, 'after-parse-error'), e).join(' '), /incomplete reason/);
-  const interrupted = incompleteRow(e) as { files: Array<Record<string, unknown>> };
-  Object.assign(interrupted.files[0]!, { status: 'skipped', fallback_reason: 'cancelled' });
-  assert.deepEqual(validateInterfacePage(interrupted, e), []);
+  const wrongStatuses = ['identical', 'skipped', 'unavailable', 'unsupported'] as const;
+  for (const status of wrongStatuses) {
+    const body = incompleteRow(e) as { files: Array<Record<string, unknown>> };
+    Object.assign(body.files[0]!, { status, fallback_reason: status === 'skipped' ? 'cancelled' : undefined });
+    assert.match(validateInterfacePage(body, e).join(' '), /expected incomplete/, status);
+  }
+  assert.deepEqual(validateInterfacePage(timedOut(e), e), []);
+  assert.deepEqual(validateInterfacePage({ ...page(e) as object, status: 'skipped',
+    fallback_reason: 'overloaded', files: [], page: { complete: false, next_after_path: null } }, e), []);
 });
 
 test('each requested input variant needs one correctly handled response', () => {
@@ -514,6 +520,8 @@ test('each requested input variant needs one correctly handled response', () => 
   const report = scoreInterfaceLoad(x);
   assert.deepEqual(report.reasons, []);
   assert.deepEqual(report.variants, { 'malformed:typescript': { requested: 1, handled: 1 } });
+  x.attempts.at(-1)!.body = incompleteRow(e, 'after-parse-error');
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
   x.attempts.at(-1)!.body = timedOut(e);
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
 });

@@ -17,7 +17,7 @@ const SIDE_BYTES = 1024 * 1024;
 const PAGE_BLOB_BYTES = 8 * 1024 * 1024;
 const FILE_RESULT_BYTES = 512 * 1024;
 const METADATA_BYTES = 64 * 1024;
-const SCAN = { records: 100_000, bytes: 16 * 1024 * 1024 };
+export const INTERFACE_SCAN_BUDGET = { records: 100_000, bytes: 16 * 1024 * 1024 };
 const ANALYSIS = { shared_types: 'notAnalyzed', effects: 'notAnalyzed', behavior: 'notAnalyzed' } as const;
 
 type Coverage = { state: 'complete' | 'absent' | 'incomplete' | 'unavailable' | 'unsupported' | 'notEvaluated'; reason?: string };
@@ -57,7 +57,7 @@ export interface InterfaceServiceOptions {
   projectionTrace?: ProjectionTraceObserver;
   /** Internal benchmark seam; absent uses the interface page safety budget. */
   admissionDeadlineMs?: number;
-  scanBudget?: typeof SCAN;
+  scanBudget?: typeof INTERFACE_SCAN_BUDGET;
   fileResultBytes?: number;
   metadataBytes?: number;
   pageBlobBytes?: number;
@@ -354,7 +354,7 @@ export function createInterfaceService(options: InterfaceServiceOptions) {
       const result = await resolveRecordedRange({ logPath: req.logPath, sessionId: req.sessionId,
         durableSeq: req.durableSeq, beforeSeq: req.beforeSeq, afterSeq: req.afterSeq,
         pathPrefix: req.pathPrefix, afterPath: req.afterPath,
-        scanBudget: options.scanBudget ?? SCAN, signal: abort.signal }).finally(() =>
+        scanBudget: options.scanBudget ?? INTERFACE_SCAN_BUDGET, signal: abort.signal }).finally(() =>
         emitProjectionPhase(options.projectionTrace, 'range-scan', scanStartedAtNs,
           { scope: 'interface', unitId: traceUnitId, routeKey: req.traceRouteKey }));
       if (sealed) return page;

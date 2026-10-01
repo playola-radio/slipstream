@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { runWriter, scoreCaptureArm, waitForQuietCapture } from './clip-bench.ts';
 import type { CaptureSession } from './session.ts';
 import type { ClipResponse } from './clip-bench.ts';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -31,6 +31,23 @@ test('writer streams each completed write and abort retains its partial evidence
       if (observed.length === 1) controller.abort();
     } }), /aborted/);
     assert.deepEqual(observed, ['scheduled-0-0.ts']);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('writer abort waits for the worker to exit and stops scheduled writes promptly', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-writer-exit-'));
+  const controller = new AbortController();
+  const observed: string[] = [];
+  const abortAt = Date.now();
+  try {
+    await assert.rejects(runWriter(root, 0, { repetitions: 1, scheduledWrites: 20,
+      scheduledIntervalMs: 50, burstWrites: 0, concurrentClipRequests: 0, corpusChanges: 1 },
+    { signal: controller.signal, requireExit: true, onWrite: write => {
+      observed.push(write.path);
+      if (observed.length === 1) controller.abort();
+    } }), /aborted/);
+    assert.ok(Date.now() - abortAt < 1_000);
+    assert.deepEqual(await readdir(root), ['scheduled-0-0.ts']);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 function loadScenario(responses: ClipResponse[], durableMs = 3_000) {

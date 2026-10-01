@@ -384,10 +384,10 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
       || after?.kind !== 'recorded' || after.record_seq !== want.afterRecordSeq || after.field !== 'after'
       || after.observation !== 'watcher') faults.push(`source provenance mismatch ${file.path}`);
     if (file.language !== want.language || file.language_version !== want.languageVersion) faults.push(`language/version mismatch ${file.path}`);
-    if (want.incompleteReason !== undefined && file.status === 'ready') faults.push(`expected incomplete file reported ready ${file.path}`);
-    else if (want.incompleteReason !== undefined && file.status === 'incomplete' && file.fallback_reason !== want.incompleteReason)
-      faults.push(`incomplete reason mismatch ${file.path}`);
-    else if (file.status === 'ready') {
+    if (want.incompleteReason !== undefined) {
+      if (file.status !== 'incomplete') faults.push(`expected incomplete file reported ${String(file.status)} ${file.path}`);
+      else if (file.fallback_reason !== want.incompleteReason) faults.push(`incomplete reason mismatch ${file.path}`);
+    } else if (file.status === 'ready') {
       if (!Array.isArray(file.changes) || !same(file.changes, want.changes)) faults.push(`change mismatch ${file.path}`);
     } else if (!['identical', 'incomplete', 'unavailable', 'unsupported', 'skipped'].includes(String(file.status))) {
       faults.push(`invalid file status ${file.path}`);
@@ -565,7 +565,9 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
     if (explicitTimeout) { counts.explicitTimeouts++; total.explicitTimeouts++; }
     else if (!complete) { counts.unexplainedIncomplete++; total.unexplainedIncomplete++; }
     if (variant && !explicitTimeout && complete && attempt.expected.files.every(file => rows.some(row =>
-      row.path === file.path && row.status === (file.incompleteReason === undefined ? 'ready' : 'incomplete'))))
+      row.path === file.path && (file.incompleteReason === undefined
+        ? row.status === 'ready'
+        : row.status === 'incomplete' && row.fallback_reason === file.incompleteReason))))
       variants[variant]!.handled++;
     for (const row of rows) {
       const freshness = attempt.freshnessByPath?.[String(row.path)];

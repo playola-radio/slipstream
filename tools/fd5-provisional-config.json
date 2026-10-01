@@ -15,7 +15,7 @@
   },
   "seed": "fd5-recovery-v1",
   "maxArmSeconds": 180,
-  "maxPreparationSeconds": 300,
+  "maxPreparationSeconds": 2300,
   "host": { "preflightQuietSeconds": 60, "maxFiveMinuteLoadFractionOfPhysicalCores": 0.5, "maxSwapGrowthBytes": 0, "requireAcPower": true, "requireNormalThermal": true, "requireNoMemoryPressureWarning": true, "sampleIntervalSeconds": 1 },
   "approvalRequired": { "measurementWindow": null, "packetDecisions": null }
 }

@@ -24,7 +24,7 @@ import { assembleProjectionTrace, compareCaptureToBaseline, PLANNED_ABORT, score
   scoreProcessStartupTiming, validateInterfacePage, witnessCoverageFaults, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
-import { encode, Journal, monitorHost, preflight, runCapped, type HostLimits } from './fd5-host.ts';
+import { CappedWorkDidNotSettleError, encode, Journal, monitorHost, preflight, runCapped, type HostLimits } from './fd5-host.ts';
 
 const MAX_ATTEMPTS = 100_000;
 const DRAIN_TIMEOUT_MS = 15_000;
@@ -53,6 +53,8 @@ const rotations: Arm[][] = [
   ['interface-only', 'combined', 'baseline', 'clip-only'],
   ['combined', 'baseline', 'clip-only', 'interface-only'],
 ];
+const FD5_MAX_ARM_SECONDS = 180;
+const FD5_MAX_PREPARATION_SECONDS = 2300;
 
 export function validateConfig(raw: unknown): FD5Config {
   if (raw === null || typeof raw !== 'object') throw new Error('FD5 config must be a JSON object');
@@ -69,8 +71,8 @@ export function validateConfig(raw: unknown): FD5Config {
     throw new Error('FD5 cold corpus must contain at least 8192 keys per workload');
   if ((a!.W as number) > (a!.Q as number)) throw new Error('W exceeds Q');
   if (typeof c.seed !== 'string' || !c.seed) throw new Error('FD5 config needs a fixed seed');
-  for (const value of [c.maxArmSeconds, c.maxPreparationSeconds])
-    if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error('FD5 config needs positive wall caps');
+  if (c.maxArmSeconds !== FD5_MAX_ARM_SECONDS || c.maxPreparationSeconds !== FD5_MAX_PREPARATION_SECONDS)
+    throw new Error(`FD5 config wall caps must be exactly ${FD5_MAX_ARM_SECONDS}s per arm and ${FD5_MAX_PREPARATION_SECONDS}s for preparation`);
   if (!isDeepStrictEqual(c.host, DIAGNOSTIC_HOST)) throw new Error('FD5 host vetoes must match the diagnostic quiet-host definition');
   const approvals = c.approvalRequired as Record<string, unknown> | undefined;
   if (!approvals || !('measurementWindow' in approvals) || !('packetDecisions' in approvals))
@@ -492,7 +494,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     const writerConfig: BenchmarkConfig = { repetitions: config.repetitions, scheduledWrites: config.scheduledWrites,
       scheduledIntervalMs: config.scheduledIntervalMs, burstWrites: config.burstWrites,
       concurrentClipRequests: config.requestSlots, corpusChanges: config.clipCorpusChanges };
-    const written = await runWriter(root, repetition, writerConfig);
+    const written = await runWriter(root, repetition, writerConfig, { signal, requireExit: true });
     signal.throwIfAborted();
     const drained = await waitForQuietCapture(session);
     signal.throwIfAborted();
@@ -625,6 +627,7 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
     tsx: createHash('sha256').update(verifyTypeScriptGrammarArtifact('tsx')).digest('hex'), swift: SWIFT_V1 };
   const journal = new Journal(await open(output, 'ax', 0o600));
   let storeDir: string | undefined;
+  let failure: unknown;
   const reports: Array<Omit<Awaited<ReturnType<typeof runArm>>, 'raw'>> = [];
   try {
     await journal.record({ type: 'started', revision, config, configSha256,
@@ -709,10 +712,11 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
       measurementStatus: measuredGatesPass ? 'further evidence required' : 'invalid: missing or failed evidence' }, true);
     await journal.assertHealthy();
   } catch (error) {
+    failure = error;
     await journal.record({ type: 'failed', error: String(error), completedArms: reports.length }, true);
     throw error;
   } finally {
-    if (storeDir) await rm(storeDir, { recursive: true, force: true });
+    if (storeDir && !(failure instanceof CappedWorkDidNotSettleError)) await rm(storeDir, { recursive: true, force: true });
     await journal.close();
   }
 }

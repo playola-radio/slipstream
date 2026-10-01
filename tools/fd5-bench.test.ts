@@ -21,7 +21,7 @@ import { compareV2 } from '../src/interface-v2-core.ts';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { startReaderServer } from '../src/http-reader.ts';
-import { INTERFACE_PAGE_DEADLINE_MS } from '../src/interface-service.ts';
+import { INTERFACE_PAGE_DEADLINE_MS, INTERFACE_SCAN_BUDGET } from '../src/interface-service.ts';
 import { assembleProjectionTrace, PLANNED_ABORT, scoreClipTrace, validateInterfacePage, type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 
@@ -37,6 +37,18 @@ test('registered config preserves fixed B2 limits and requires an explicit finit
     { maxArmSeconds: 0 }, { maxPreparationSeconds: undefined }, { host: undefined },
     { host: { ...config.host, requireAcPower: false } }, { approvalRequired: undefined },
   ]) assert.throws(() => validateConfig({ ...config, ...change }));
+});
+
+test('registered config pins the owner-approved FD5 wall caps exactly', async () => {
+  const config = JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8'));
+  assert.equal(validateConfig(config).maxArmSeconds, 180);
+  assert.equal(validateConfig(config).maxPreparationSeconds, 2300);
+  assert.deepEqual(validateConfig({ ...config, maxArmSeconds: 180, maxPreparationSeconds: 2300 }),
+    validateConfig(config));
+  for (const maxArmSeconds of [0, 179, 181])
+    assert.throws(() => validateConfig({ ...config, maxArmSeconds }), /wall caps/);
+  for (const maxPreparationSeconds of [0, 300, 2299, 2301])
+    assert.throws(() => validateConfig({ ...config, maxPreparationSeconds }), /wall caps/);
 });
 
 test('campaign refuses to execute without an approved window, host vetoes and packet decisions', async () => {
@@ -211,20 +223,17 @@ test('interface load backs off before retrying an overloaded page', async () => 
   } finally { await fake.close(); }
 });
 
-test('large-log probe hides restored paths, serves the one real change and stays inside the scan budget', async () => {
+test('registered large-log probe hides restored paths, serves the one real change and stays inside the scan budget', async () => {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-large-log-test-'));
   let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
   try {
-    const small = await createLargeLogProbe(join(root, 'a'), 50);
-    const large = await createLargeLogProbe(join(root, 'b'), 100);
-    const size = async (page: typeof small) => (await readFile(join(root, page === small ? 'a' : 'b', 'sessions',
-      page.expected.sessionId, 'events.jsonl'))).length;
-    const bytesPerPath = (await size(large) - await size(small)) / 50;
-    const projectedBytes = await size(small) + bytesPerPath * (LARGE_LOG_RESTORED_PATHS - 50);
-    assert.ok(projectedBytes < 0.9 * 16 * 1024 * 1024, `${projectedBytes} projected log bytes`);
-    assert.ok(3 * LARGE_LOG_RESTORED_PATHS + 5 < 100_000);
-    assert.equal(BigInt(large.expected.afterSeq) - BigInt(large.expected.beforeSeq), 201n);
-    reader = await startReaderServer({ storeDir: join(root, 'b') });
+    const large = await createLargeLogProbe(root);
+    const logBytes = await readFile(join(root, 'sessions', large.expected.sessionId, 'events.jsonl'));
+    const recordCount = logBytes.toString('utf8').trimEnd().split('\n').length;
+    assert.equal(BigInt(large.expected.afterSeq) - BigInt(large.expected.beforeSeq), BigInt(2 * LARGE_LOG_RESTORED_PATHS + 1));
+    assert.ok(recordCount < INTERFACE_SCAN_BUDGET.records, `${recordCount} records`);
+    assert.ok(logBytes.byteLength < INTERFACE_SCAN_BUDGET.bytes, `${logBytes.byteLength} bytes`);
+    reader = await startReaderServer({ storeDir: root });
     const response = await fetch(reader.url + large.expected.routeKey, { headers: { authorization: `Bearer ${reader.token}` } });
     const body = await response.json() as { status: string; page: { complete: boolean };
       files: Array<{ path: string; status: string; changes: unknown[] }> };

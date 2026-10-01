@@ -267,7 +267,12 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
     });
     let settled = false;
     let completed: WorkerWrite[] | undefined;
-    const onAbort = () => finish(new Error('clip benchmark writer aborted'));
+    let abortError: Error | undefined;
+    const onAbort = () => {
+      if (settled) return;
+      abortError = new Error('clip benchmark writer aborted');
+      void worker.terminate();
+    };
     options?.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: WorkerWrite[] | Error): void => {
       if (settled) return;
@@ -281,7 +286,8 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
     worker.once('error', (err) => finish(err));
     worker.once('exit', (code) => {
       if (settled) return;
-      if (code === 0 && options?.requireExit && completed) finish(completed);
+      if (abortError) finish(abortError);
+      else if (code === 0 && options?.requireExit && completed) finish(completed);
       else finish(new Error(`clip benchmark writer exited unexpectedly (${code})`));
     });
     worker.on('message', (message: { type: string; write?: WorkerWrite; written?: WorkerWrite[]; error?: string }) => {
