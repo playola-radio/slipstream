@@ -12,6 +12,7 @@ import { createLog } from '../src/log.ts';
 import { startCapture, type CaptureSession } from '../src/session.ts';
 import { startReaderServer } from '../src/http-reader.ts';
 import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
+import { INTERFACE_PAGE_DEADLINE_MS } from '../src/interface-service.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
 import { createHistoricalCorpus, hostSample, readRecords, runWriter, scoreCaptureArm,
   waitForQuietCapture, type BenchmarkConfig, type HistoricalChange, type LoadSummary } from '../src/clip-bench.ts';
@@ -46,9 +47,9 @@ export function validateConfig(raw: unknown): FD5Config {
   const c = raw as Record<string, unknown>;
   const a = c.admission as Record<string, unknown> | undefined;
   if (c.repetitions !== 3 || c.scheduledWrites !== 100 || c.scheduledIntervalMs !== 120 || c.burstWrites !== 100
-    || c.requestSlots !== 16 || a?.clipDeadlineMs !== 100)
-    throw new Error('FD5 config cannot weaken the fixed B2 repetition, write, slot or clip deadline protocol');
-  for (const value of [c.clipCorpusChanges, c.interfaceCorpusPages, a?.C, a?.interfaceDeadlineMs])
+    || c.requestSlots !== 16 || a?.clipDeadlineMs !== 100 || a?.interfaceDeadlineMs !== INTERFACE_PAGE_DEADLINE_MS)
+    throw new Error('FD5 config cannot weaken the fixed B2 repetition, write, slot or clip/interface deadline protocol');
+  for (const value of [c.clipCorpusChanges, c.interfaceCorpusPages, a?.C])
     if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error('FD5 config has an invalid positive bound');
   for (const value of [a?.Q, a?.W])
     if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error('FD5 config has an invalid queue/waiter bound');

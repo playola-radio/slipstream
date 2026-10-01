@@ -17,6 +17,7 @@ import { compareV2 } from '../src/interface-v2-core.ts';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { startReaderServer } from '../src/http-reader.ts';
+import { INTERFACE_PAGE_DEADLINE_MS } from '../src/interface-service.ts';
 import { assembleProjectionTrace, scoreClipTrace, type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 
@@ -28,7 +29,15 @@ test('registered config preserves fixed B2 limits and requires an explicit finit
     { requestSlots: 15 }, { repetitions: 2 }, { scheduledWrites: 99 }, { burstWrites: 99 },
     { admission: { ...config.admission, clipDeadlineMs: 101 } },
     { interfaceCorpusPages: 100 }, { clipCorpusChanges: 100 },
+    { admission: { ...config.admission, interfaceDeadlineMs: 400 } },
   ]) assert.throws(() => validateConfig({ ...config, ...change }));
+});
+
+test('registered config follows the merged 10-second interface page budget', async () => {
+  const config = validateConfig(JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8')));
+  assert.equal(config.admission.interfaceDeadlineMs, INTERFACE_PAGE_DEADLINE_MS);
+  assert.equal(INTERFACE_PAGE_DEADLINE_MS, 10_000);
+  assert.deepEqual([config.admission.C, config.admission.Q, config.admission.W, config.admission.clipDeadlineMs], [2, 8, 8, 100]);
 });
 
 test('disposable interface corpus has unique cold keys and mixed 1/4/16-file ranges', async () => {

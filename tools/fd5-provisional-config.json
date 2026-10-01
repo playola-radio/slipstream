@@ -11,7 +11,7 @@
     "Q": 8,
     "W": 8,
     "clipDeadlineMs": 100,
-    "interfaceDeadlineMs": 400
+    "interfaceDeadlineMs": 10000
   },
   "seed": "fd5-recovery-v1"
 }

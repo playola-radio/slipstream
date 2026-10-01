@@ -607,9 +607,8 @@ export function scoreDiagnosticOverhead(reports: Array<{ capture: CaptureArmRepo
 async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
   let requested = 0;
   const cacheDone = new Set<string>();
-  const usefulSwift: number[] = [];
   const cells = config.unqueued.cells;
-  const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<number> => {
+  const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<void> => {
     const cap = startCap(config.unqueued.maxSecondsPerCell);
     let pages: CorpusPage[];
     let hostFaults: string[] = [];
@@ -659,7 +658,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       cap.signal, late => late.close());
     };
     const request = async (page: CorpusPage, purpose: string): Promise<InterfaceAttempt> => {
-      if (++requested > config.unqueued.maxRequestsIncludingConditional)
+      if (++requested > config.unqueued.maxRequests)
         throw new Error('unqueued global request cap reached');
       const attempt = await bounded(client.interface(server!.url, server!.token, page,
         deadlineMs + 2000, cap.signal), cap.signal);
@@ -697,23 +696,14 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       usefulFresh: useful, cacheControlAvailable: cacheDone.has(cell.language), requested,
       faults: [...new Set(faults)], diagnosticValid: faults.length === 0 }, true);
     if (faults.length) throw new Error(`unqueued cell ${label} invalid: ${faults.join('; ')}`);
-    return useful;
   };
-  for (const [index, cell] of cells.entries()) {
-    const useful = await runCell(cell, config.admission.interfaceDeadlineMs, `400-${index}-${cell.language}-${cell.files}-${cell.warmth}`);
-    if (cell.language === 'swift') usefulSwift.push(useful);
-  }
+  const deadlineMs = config.admission.interfaceDeadlineMs;
+  for (const [index, cell] of cells.entries())
+    await runCell(cell, deadlineMs, `${deadlineMs}-${index}-${cell.language}-${cell.files}-${cell.warmth}`);
   for (const language of ['typescript', 'tsx', 'swift']) if (!cacheDone.has(language))
     await journal.record({ type: 'cache-control-unavailable', language,
       reason: 'no cacheable ready result; zero cache-control requests' }, true);
-  if (usefulSwift.length === 3 && usefulSwift.every(count => count === 0)) {
-    await journal.record({ type: 'conditional-800-trigger', basis: usefulSwift }, true);
-    let total = 0;
-    for (const [index, cell] of cells.filter(cell => cell.language === 'swift').entries())
-      total += await runCell(cell, config.admission.conditionalInterfaceDeadlineMs, `800-${index}-swift-${cell.files}`);
-    if (total === 0) throw new Error('conditional 800ms Swift cells yielded zero useful fresh work');
-  }
-  if (requested > config.unqueued.maxRequestsIncludingConditional) throw new Error('unqueued request cap exceeded');
+  if (requested > config.unqueued.maxRequests) throw new Error('unqueued request cap exceeded');
 }
 
 async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
@@ -851,13 +841,15 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   if (totalRequests !== spec.maxRequests) throw new Error('W request count differs from frozen bound');
 }
 
-export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now()): string[] {
+/** W pressure checks coalescing counts, not latency, so it is gated only by the
+ * window and its own hook approval; every other mode needs every approval. */
+export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now(), mode?: DiagnosticMode): string[] {
   const approvals = config.approvalRequired;
   const tolerance = approvals.tracingOverheadTolerance as Partial<OverheadTolerance> | null;
   const window = approvals.measurementWindow as { approved?: unknown; startUtc?: unknown; endUtc?: unknown;
     hostVetoesApproved?: unknown } | null;
   const points = approvals.diagnosticDeadlinePoints as { approved?: unknown; interfaceMs?: unknown;
-    conditional800?: unknown; cellsAndCountsApproved?: unknown } | null;
+    cellsAndCountsApproved?: unknown } | null;
   const w = approvals.wPressureRuntimeHook as { approved?: unknown } | null;
   const clip = approvals.clipHistoricalComparison as { approved?: unknown; treatment?: unknown } | null;
   const numeric = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
@@ -867,31 +859,33 @@ export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now
   const end = typeof window?.endUtc === 'string' ? Date.parse(window.endUtc) : NaN;
   const utc = (value: unknown): boolean => typeof value === 'string'
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
+  const windowFaults = window?.approved === true && window.hostVetoesApproved === true
+    && utc(window.startUtc) && utc(window.endUtc) && Number.isFinite(start)
+    && Number.isFinite(end) && start <= now && now < end ? [] : ['measurement window or host veto approval missing'];
+  const wFaults = w?.approved === true ? [] : ['W runtime hook approval missing'];
+  if (mode === 'w-pressure') return [...windowFaults, ...wFaults];
   return [
-    ...(window?.approved === true && window.hostVetoesApproved === true
-      && utc(window.startUtc) && utc(window.endUtc) && Number.isFinite(start)
-      && Number.isFinite(end) && start <= now && now < end ? [] : ['measurement window or host veto approval missing']),
+    ...windowFaults,
     ...(tolerance?.approved === true && ratios(tolerance.maxCaptureLatencyRatio)
       && ratios(tolerance.maxRequestLatencyRatio) && numeric(tolerance.minCaptureThroughputRatio)
       && numeric(tolerance.minReadyRatio)
       ? [] : ['tracing overhead tolerance missing']),
     ...(points?.approved === true && JSON.stringify(points.interfaceMs) === JSON.stringify([
-      config.admission.interfaceDeadlineMs, config.admission.conditionalInterfaceDeadlineMs])
-      && points.conditional800 === true && points.cellsAndCountsApproved === true
+      config.admission.interfaceDeadlineMs]) && points.cellsAndCountsApproved === true
       ? [] : ['diagnostic deadline points or selected cells/counts approval missing']),
-    ...(w?.approved === true ? [] : ['W runtime hook approval missing']),
+    ...wFaults,
     ...(clip?.approved === true && clip.treatment === 'historical-only'
       ? [] : ['clip historical comparison disposition missing']),
   ];
 }
 const previousMode: Partial<Record<DiagnosticMode, DiagnosticMode>> = {
-  overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued', 'w-pressure': 'queue',
+  overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued',
 };
 export async function readPrior(path: string | undefined, mode: DiagnosticMode, revision: string,
   configSha256: string, scorerVersion: string):
   Promise<{ selectedDeadlineMs?: number }> {
   const expected = previousMode[mode];
-  if (!expected) { if (path) throw new Error('smoke has no prior diagnostic'); return {}; }
+  if (!expected) { if (path) throw new Error(`${mode} has no prior diagnostic`); return {}; }
   if (!path) throw new Error(`${mode} requires the preceding ${expected} report`);
   let started: Record<string, unknown> | undefined, final: Record<string, unknown> | undefined;
   const useful: Record<string, unknown>[] = [];
@@ -920,7 +914,7 @@ export async function readPrior(path: string | undefined, mode: DiagnosticMode, 
 }
 export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: DiagnosticMode,
   outputPath: string, priorPath?: string): Promise<void> {
-  const approvalFaults = executionApprovalFaults(config);
+  const approvalFaults = executionApprovalFaults(config, Date.now(), mode);
   if (approvalFaults.length) throw new Error(`owner execution decisions are incomplete in approvalRequired: ${approvalFaults.join('; ')}`);
   const repository = await realpath(fileURLToPath(new URL('..', import.meta.url)));
   const output = resolve(outputPath);

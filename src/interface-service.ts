@@ -12,7 +12,7 @@ import type { ProjectionAdmission } from './projection-admission.ts';
 import { emitProjectionPhase, emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 
 const FILES_PER_PAGE = 16;
-const INTERFACE_PAGE_DEADLINE_MS = 10_000;
+export const INTERFACE_PAGE_DEADLINE_MS = 10_000;
 const SIDE_BYTES = 1024 * 1024;
 const PAGE_BLOB_BYTES = 8 * 1024 * 1024;
 const FILE_RESULT_BYTES = 512 * 1024;
