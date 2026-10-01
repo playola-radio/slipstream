@@ -4,7 +4,8 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { corpusPlan, createInterfaceCorpus, startInterfaceLoad, validateConfig } from './fd5-bench.ts';
+import { campaignApprovalFaults, corpusPlan, createInterfaceCorpus, createLargeLogProbe, LARGE_LOG_RESTORED_PATHS,
+  runFD5, startInterfaceLoad, validateConfig } from './fd5-bench.ts';
 import { createServer } from 'node:http';
 import { createHistoricalCorpus, type ClipResponse } from '../src/clip-bench.ts';
 import { createTypeScriptInterfaceExtractor } from '../src/interface-v2-typescript.ts';
@@ -31,7 +32,31 @@ test('registered config preserves fixed B2 limits and requires an explicit finit
     { admission: { ...config.admission, clipDeadlineMs: 101 } },
     { interfaceCorpusPages: 100 }, { clipCorpusChanges: 100 },
     { admission: { ...config.admission, interfaceDeadlineMs: 400 } },
+    { maxArmSeconds: 0 }, { maxPreparationSeconds: undefined }, { host: undefined },
+    { host: { ...config.host, requireAcPower: false } }, { approvalRequired: undefined },
   ]) assert.throws(() => validateConfig({ ...config, ...change }));
+});
+
+test('campaign refuses to execute without an approved window, host vetoes and packet decisions', async () => {
+  const config = validateConfig(JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8')));
+  const now = Date.parse('2026-10-02T15:00:00Z');
+  assert.deepEqual(campaignApprovalFaults(config, now), ['measurement window or host veto approval missing',
+    'FD5 packet decisions approval missing']);
+  const approved = { ...config, approvalRequired: {
+    measurementWindow: { approved: true, hostVetoesApproved: true, startUtc: '2026-10-02T14:00:00Z', endUtc: '2026-10-02T16:00:00Z' },
+    packetDecisions: { approved: true } } };
+  assert.deepEqual(campaignApprovalFaults(approved, now), []);
+  assert.deepEqual(campaignApprovalFaults(approved, Date.parse('2026-10-02T16:00:00Z')),
+    ['measurement window or host veto approval missing']);
+});
+
+test('unapproved campaign stops before writing a report', async () => {
+  const config = validateConfig(JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8')));
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-unapproved-'));
+  try {
+    await assert.rejects(runFD5(config, join(root, 'report.jsonl')), /owner execution decisions are incomplete/);
+    await assert.rejects(readFile(join(root, 'report.jsonl')), { code: 'ENOENT' });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('registered config follows the merged 10-second interface page budget', async () => {
@@ -170,6 +195,31 @@ test('interface load backs off before retrying an overloaded page', async () => 
     assert.ok(summary.attempts.length >= 2 && summary.attempts.length <= 6, `${summary.attempts.length} attempts`);
     assert.equal(new Set(summary.attempts.map(attempt => attempt.expected.key)).size, 1);
   } finally { await fake.close(); }
+});
+
+test('large-log probe hides restored paths, serves the one real change and stays inside the scan budget', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-large-log-test-'));
+  let reader: Awaited<ReturnType<typeof startReaderServer>> | undefined;
+  try {
+    const small = await createLargeLogProbe(join(root, 'a'), 50);
+    const large = await createLargeLogProbe(join(root, 'b'), 100);
+    const size = async (page: typeof small) => (await readFile(join(root, page === small ? 'a' : 'b', 'sessions',
+      page.expected.sessionId, 'events.jsonl'))).length;
+    const bytesPerPath = (await size(large) - await size(small)) / 50;
+    const projectedBytes = await size(small) + bytesPerPath * (LARGE_LOG_RESTORED_PATHS - 50);
+    assert.ok(projectedBytes < 0.9 * 16 * 1024 * 1024, `${projectedBytes} projected log bytes`);
+    assert.ok(3 * LARGE_LOG_RESTORED_PATHS + 5 < 100_000);
+    assert.equal(BigInt(large.expected.afterSeq) - BigInt(large.expected.beforeSeq), 201n);
+    reader = await startReaderServer({ storeDir: join(root, 'b') });
+    const response = await fetch(reader.url + large.expected.routeKey, { headers: { authorization: `Bearer ${reader.token}` } });
+    const body = await response.json() as { status: string; page: { complete: boolean }; files: Array<{ path: string }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(validateInterfacePage(body, large.expected), []);
+    assert.deepEqual([body.status, body.page.complete, body.files.map(file => file.path)], ['ready', true, ['zz-large-log.ts']]);
+  } finally {
+    await reader?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('isolated load client starts, stops and actually exits without a reader', async () => {
