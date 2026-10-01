@@ -24,7 +24,7 @@ import { assembleProjectionTrace, compareCaptureToBaseline, PLANNED_ABORT, score
   scoreProcessStartupTiming, validateInterfacePage, witnessCoverageFaults, type ExpectedFile,
   type ExpectedInterfaceRequest, type InterfaceAttempt, type InterfaceLoadInput } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
-import { bounded, encode, Journal, monitorHost, preflight, startCap, type HostLimits } from './fd5-host.ts';
+import { bounded, encode, Journal, monitorHost, preflight, runCapped, startCap, type HostLimits } from './fd5-host.ts';
 
 const MAX_ATTEMPTS = 100_000;
 const DRAIN_TIMEOUT_MS = 15_000;
@@ -439,12 +439,14 @@ function traceEvidence(observed: ReturnType<ReturnType<typeof createProjectionTr
 }
 
 /** Swift children are this process's children; after cleanup none may remain. TS workers are threads,
- * so their exits are proven only by traced witnesses. */
-async function childProcessesExit(): Promise<boolean> {
+ * so their exits are proven only by traced witnesses. An inspection failure is not an observed exit. */
+export async function childProcessesExit(pgrep = 'pgrep'): Promise<boolean> {
   const deadline = Date.now() + 5_000;
   for (;;) {
-    const children = await new Promise<string>(resolve => execFile('pgrep', ['-P', String(process.pid)],
-      (_error, stdout) => resolve(stdout.trim())));
+    const children = await new Promise<string | null>(resolve => execFile(pgrep, ['-P', String(process.pid)],
+      { timeout: 2_000 }, (error, stdout) => resolve(!error ? stdout.trim()
+        : (error as { code?: unknown }).code === 1 ? '' : null)));
+    if (children === null) return false;
     if (!children) return true;
     if (Date.now() >= deadline) return false;
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -452,7 +454,8 @@ async function childProcessesExit(): Promise<boolean> {
 }
 
 async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus: Awaited<ReturnType<typeof createHistoricalCorpus>>,
-  interfaceCorpus: CorpusPage[], config: FD5Config, traced: boolean, journal: Journal) {
+  interfaceCorpus: CorpusPage[], config: FD5Config, traced: boolean, journal: Journal,
+  signal: AbortSignal, veto: (reason: Error) => void) {
   const root = await mkdtemp(join(tmpdir(), 'slip-fd5-wt-'));
   let session: CaptureSession | undefined;
   let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
@@ -463,8 +466,12 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
   const durableAtNsBySeq = new Map<string, bigint>();
   // Registered arms run untraced: the 2026-09-29 overhead failure means traced capture latency is not scoreable.
   const collector = traced ? createProjectionTraceCollector() : undefined;
-  const host = monitorHost(config.host, windowEndUtc(config), journal);
+  const host = monitorHost(config.host, windowEndUtc(config), journal,
+    fault => veto(new Error(`host veto during ${arm}: ${fault}`)));
   let hostStopped = false;
+  // A cap hit or veto ends load at once; the writer and drain are bounded on their own.
+  const stopLoad = (): void => { void clipLoad?.stop().catch(() => {}); void interfaceLoad?.stop().catch(() => {}); };
+  signal.addEventListener('abort', stopLoad, { once: true });
   try {
     session = await startCapture({ root, storeDir });
     let highWater = BigInt(session.health.snapshot().durable_seq);
@@ -480,11 +487,14 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
     if (arm === 'clip-only' || arm === 'combined') clipLoad = startLoadWorker('clip', server.url, server.token, clipCorpus, config.requestSlots);
     if (arm === 'interface-only' || arm === 'combined') interfaceLoad = startLoadWorker('interface', server.url, server.token, interfaceCorpus, config.requestSlots);
     await Promise.all([clipLoad?.ready, interfaceLoad?.ready]);
+    signal.throwIfAborted();
     const writerConfig: BenchmarkConfig = { repetitions: config.repetitions, scheduledWrites: config.scheduledWrites,
       scheduledIntervalMs: config.scheduledIntervalMs, burstWrites: config.burstWrites,
       concurrentClipRequests: config.requestSlots, corpusChanges: config.clipCorpusChanges };
     const written = await runWriter(root, repetition, writerConfig);
+    signal.throwIfAborted();
     const drained = await waitForQuietCapture(session);
+    signal.throwIfAborted();
     await session.stop();
     const [clips, interfaces] = await Promise.all([clipLoad?.stop(), interfaceLoad?.stop()]);
     off(); off = undefined;
@@ -547,6 +557,7 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
           lifecycleEvents: trace.observed.events.filter(event => ['task-finished', 'parser-request', 'process-start',
             'process-use', 'process-retire', 'process-exit', 'process-spawn-failed'].includes(event.kind)) } : {} } };
   } finally {
+    signal.removeEventListener('abort', stopLoad);
     if (!hostStopped) await host.stop().catch(() => {});
     await Promise.allSettled([clipLoad?.stop(), interfaceLoad?.stop()]);
     off?.();
@@ -558,10 +569,22 @@ async function runArm(arm: Arm, repetition: number, storeDir: string, clipCorpus
 
 const WITNESS_ARMS: Arm[] = ['clip-only', 'interface-only', 'combined'];
 const LARGE_LOG_REQUESTS = 3;
+/** Longest an aborted arm's own bounded steps take to finish: writer, drain, load stop and child check. */
+const ARM_SETTLE_MS = 60_000;
 
-async function runArmWithin(config: FD5Config, ...args: Parameters<typeof runArm>): ReturnType<typeof runArm> {
-  const cap = startCap(config.maxArmSeconds);
-  try { return await bounded(runArm(...args), cap.signal); } finally { cap.close(); }
+export function largeLogOutcome(attempt: InterfaceAttempt): { outcome: 'ready-complete' | 'explicit-timeout' | 'unexplained';
+  faults: string[] } {
+  const body = attempt.body as { status?: string; fallback_reason?: string; page?: { complete?: boolean };
+    files?: Array<{ status?: string }> } | null;
+  const faults = attempt.httpStatus === 200 ? validateInterfacePage(attempt.body, attempt.expected)
+    : [`large-log request failed: ${attempt.httpStatus ?? attempt.error}`];
+  // The probe's one row has a known change; an identical or partial answer is not a comparison.
+  const outcome = body?.status === 'ready' && body.page?.complete === true && body.files?.length === 1
+    && body.files[0]!.status === 'ready' ? 'ready-complete'
+    : body?.fallback_reason === 'timeout' ? 'explicit-timeout' : 'unexplained';
+  if (attempt.httpStatus === 200 && outcome === 'unexplained')
+    faults.push(`unexplained large-log outcome ${body?.status}/${body?.fallback_reason}`);
+  return { outcome, faults };
 }
 
 /** Each request uses a fresh untraced reader, so every page is a cold retention scan of the large log. */
@@ -572,14 +595,7 @@ async function runLargeLogProbe(storeDir: string, page: CorpusPage, config: FD5C
       projectionAdmissionConfig: { C: config.admission.C, Q: config.admission.Q, W: config.admission.W, D: config.admission.clipDeadlineMs } });
     let attempt: InterfaceAttempt;
     try { attempt = await requestInterface(server.url, server.token, page); } finally { await server.close(); }
-    const body = attempt.body as { status?: string; fallback_reason?: string; page?: { complete?: boolean } } | null;
-    const faults = attempt.httpStatus === 200 ? validateInterfacePage(attempt.body, page.expected)
-      : [`large-log request failed: ${attempt.httpStatus ?? attempt.error}`];
-    const outcome = body?.status === 'ready' && body.page?.complete === true ? 'ready-complete'
-      : body?.fallback_reason === 'timeout' ? 'explicit-timeout' : 'unexplained';
-    if (attempt.httpStatus === 200 && outcome === 'unexplained')
-      faults.push(`unexplained large-log outcome ${body?.status}/${body?.fallback_reason}`);
-    results.push({ outcome, faults, httpStatus: attempt.httpStatus, durationMs:
+    results.push({ ...largeLogOutcome(attempt), httpStatus: attempt.httpStatus, durationMs:
       attempt.completedAtNs === undefined ? null : Number(attempt.completedAtNs - attempt.startedAtNs) / 1e6, body: attempt.body });
   }
   return { restoredPaths: LARGE_LOG_RESTORED_PATHS, valid: results.every(result => result.faults.length === 0), results };
@@ -624,24 +640,38 @@ export async function runFD5(config: FD5Config, outputPath: string): Promise<voi
       ...[0, 1, 2].flatMap(repetition => rotations[repetition]!.map(arm => ({ arm, repetition, traced: false }))),
       ...WITNESS_ARMS.map(arm => ({ arm, repetition: 3, traced: true })),
     ];
+    const requireApproval = (): void => {
+      const faults = campaignApprovalFaults(config);
+      if (faults.length) throw new Error(`approval no longer holds: ${faults.join('; ')}`);
+    };
     for (const { arm, repetition, traced } of schedule) {
-      const report = await runArmWithin(config, arm, repetition, storeDir, clipCorpus, interfaceCorpus,
-        config, traced, journal);
+      requireApproval();
+      const report = await runCapped(config.maxArmSeconds, ARM_SETTLE_MS, (signal, veto) => runArm(arm, repetition,
+        storeDir!, clipCorpus, interfaceCorpus, config, traced, journal, signal, veto));
       const { raw: _raw, ...summary } = report;
       reports.push(summary);
       await journal.record({ type: 'arm', report }, true);
+      await journal.assertHealthy();
       process.stderr.write(encode({ completed: `${traced ? 'witness ' : ''}${arm} repetition ${repetition + 1}`,
         capture: report.capture, interface: report.interface }) + '\n');
       // A host veto or a leftover child changes the machine under every later arm: stop, never rerun.
       if (report.host.faults.length) throw new Error(`host veto during ${arm}: ${report.host.faults.join(', ')}`);
       if (!report.cleanup.childProcessesExited) throw new Error(`child processes remained after ${arm}`);
     }
-    const probeCap = startCap(config.maxPreparationSeconds);
-    const probePage = await bounded(createLargeLogProbe(join(storeDir, 'large-log')), probeCap.signal)
-      .finally(() => probeCap.close());
-    const largeLog = await bounded(runLargeLogProbe(join(storeDir, 'large-log'), probePage, config),
-      AbortSignal.timeout(LARGE_LOG_REQUESTS * (DRAIN_TIMEOUT_MS + 5_000)));
+    requireApproval();
+    const largeLogDir = join(storeDir, 'large-log');
+    const largeLog = await runCapped(config.maxPreparationSeconds + LARGE_LOG_REQUESTS * (DRAIN_TIMEOUT_MS + 5_000) / 1000,
+      ARM_SETTLE_MS, async (signal, veto) => {
+        const host = monitorHost(config.host, windowEndUtc(config), journal,
+          fault => veto(new Error(`host veto during large-log probe: ${fault}`)));
+        try {
+          const page = await createLargeLogProbe(largeLogDir);
+          signal.throwIfAborted();
+          return await runLargeLogProbe(largeLogDir, page, config);
+        } finally { await host.stop(); }
+      });
     await journal.record({ type: 'large-log', largeLog }, true);
+    await journal.assertHealthy();
     const registered = reports.filter(r => !r.traced);
     const comparisons = registered.filter(r => r.arm !== 'baseline').map(report => {
       const baseline = registered.find(r => r.arm === 'baseline' && r.repetition === report.repetition)!;

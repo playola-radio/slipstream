@@ -17,6 +17,8 @@ export interface AdmissionTrace {
   outcome: AdmissionOutcome;
   /** True only after the owned compute actually exited following cancellation. */
   exitedAtNs?: bigint;
+  /** A parser process linked to this unit was alive when it was cancelled and then actually exited. */
+  parserCancelled?: boolean;
 }
 
 function tracesWithin(group: AdmissionTrace[], start: bigint, end: bigint): AdmissionTrace[] {
@@ -153,6 +155,11 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
   const finished = new Map<number, bigint>();
   const parserRequests = new Set<number>();
   const processes = new Map<number, { startedAtNs: bigint; exitedAtNs?: bigint; unitIds: Set<number> }>();
+  // A process started for, or retired by, a unit belongs to that unit's parse rather than a shared pool.
+  const ownedByUnit = new Map<number, Set<number>>();
+  const own = (unitId: number, processId: number): void => {
+    ownedByUnit.set(unitId, (ownedByUnit.get(unitId) ?? new Set()).add(processId));
+  };
   const clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[] = [];
   const processUses: Array<{ unitId: number; processId: number }> = [];
   for (const event of events) {
@@ -189,13 +196,15 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
         else high = middle;
       }
       const target = group[low - 1];
-      if (!target || event.atNs > (target.completedAtNs ?? -1n)) {
+      // A planned disconnect has no response body; its completed rows remain lifecycle evidence.
+      const planned = target?.error === PLANNED_ABORT;
+      if (!target || !planned && event.atNs > (target.completedAtNs ?? -1n)) {
         faults.push('interface-file event has no unique HTTP attempt'); continue;
       }
       if (!target.expected.files.some(f => f.path === event.path)) { faults.push('interface-file event names unexpected path'); continue; }
       if (target.freshnessByPath?.[event.path] !== undefined) { faults.push('duplicate interface-file event'); continue; }
       const row = (object(target.body)?.files as unknown[] | undefined)?.find(raw => object(raw)?.path === event.path);
-      if (object(row)?.status !== event.resultStatus) { faults.push('interface-file status disagrees with HTTP row'); continue; }
+      if (!planned && object(row)?.status !== event.resultStatus) { faults.push('interface-file status disagrees with HTTP row'); continue; }
       target.freshnessByPath![event.path] = event.freshness;
     } else if (event.kind === 'task-finished') {
       if (!units.has(event.unitId) || finished.has(event.unitId)) faults.push('invalid task completion');
@@ -209,6 +218,7 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
         processes.set(event.processId, { startedAtNs: event.atNs,
           unitIds: new Set(event.unitId === undefined ? [] : [event.unitId]) });
         if (event.unitId !== undefined) {
+          own(event.unitId, event.processId);
           if (!parserRequests.has(event.unitId)) faults.push('process started without parser request');
           processUses.push({ unitId: event.unitId, processId: event.processId });
         }
@@ -223,7 +233,7 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
       const process = processes.get(event.processId);
       if (!process || !units.has(event.unitId) || process.exitedAtNs !== undefined)
         faults.push('invalid process retirement');
-      else process.unitIds.add(event.unitId);
+      else { process.unitIds.add(event.unitId); own(event.unitId, event.processId); }
     } else if (event.kind === 'process-exit') {
       const process = processes.get(event.processId);
       if (!process || process.exitedAtNs !== undefined || event.atNs < process.startedAtNs)
@@ -259,6 +269,11 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
       if (taskAt !== undefined && (!parserRequests.has(unit.trace.unitId!) || linked.length > 0)
         && linked.every(process => process.exitedAtNs !== undefined))
         unit.trace.exitedAtNs = linked.reduce((at, process) => process.exitedAtNs! > at ? process.exitedAtNs! : at, taskAt);
+      const settledAt = unit.trace.settledAtNs!;
+      const owned = [...ownedByUnit.get(unit.trace.unitId!) ?? []].map(id => processes.get(id)!);
+      if (unit.trace.outcome === 'cancelled' && parserRequests.has(unit.trace.unitId!) && owned.some(process =>
+        process.startedAtNs <= settledAt && process.exitedAtNs !== undefined && process.exitedAtNs >= settledAt))
+        unit.trace.parserCancelled = true;
     }
     traces.push(unit.trace as AdmissionTrace);
   }
@@ -488,7 +503,7 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
       plannedTraces++;
       usedUnits.add(trace.unitId);
       requireExit(trace);
-      if (trace.outcome === 'cancelled' && trace.startedAtNs !== undefined)
+      if (trace.outcome === 'cancelled' && trace.parserCancelled === true)
         plannedCancels.cancelledRunning[attempt.expected.language === 'swift' ? 'swift' : 'typescript']++;
       continue;
     }
@@ -603,7 +618,7 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   if (byLanguage.typescript.usefulComparisons === 0 || byLanguage.tsx.usefulComparisons === 0 || byLanguage.swift.usefulComparisons === 0)
     reasons.push('one or more languages had no useful fresh comparison');
   if (total.rejected === total.submitted) reasons.push('overload-only load did no work');
-  const intervals = ordered.filter(a => a.completedAtNs !== undefined);
+  const intervals = loadBearing.filter(a => a.completedAtNs !== undefined);
   let covered = input.firstWriteAtNs;
   for (const attempt of intervals) {
     if (attempt.startedAtNs > covered) break;
@@ -636,12 +651,15 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
     classification: traced ? 'trace' : 'http', plannedCancels, variants };
 }
 
-/** Evidence only a traced witness can supply: planned disconnects reached running work in each
- * parser family, and at least one retired TypeScript worker actually exited. */
+const REQUIRED_VARIANTS = ['malformed:typescript', 'malformed:tsx', 'malformed:swift', 'unicode:typescript', 'unicode:tsx'];
+/** Evidence only a traced witness can supply: planned disconnects cancelled a live parser in each family,
+ * every input variant was handled, and at least one retired TypeScript worker actually exited. */
 export function witnessCoverageFaults(report: InterfaceLoadReport, events: ProjectionTraceEvent[]): string[] {
   const faults: string[] = [];
   for (const family of ['typescript', 'swift'] as const)
     if (report.plannedCancels.cancelledRunning[family] < 1) faults.push(`no ${family} planned abort cancelled running work`);
+  for (const variant of REQUIRED_VARIANTS)
+    if (!report.variants[variant]?.handled) faults.push(`variant ${variant} was never handled`);
   const tsWorkers = new Set(events.flatMap(event => event.kind === 'process-start' && event.process === 'ts-worker' ? [event.processId] : []));
   const retired = new Set(events.flatMap(event => event.kind === 'process-retire' && tsWorkers.has(event.processId) ? [event.processId] : []));
   if (!events.some(event => event.kind === 'process-exit' && retired.has(event.processId)))

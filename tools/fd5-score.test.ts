@@ -218,6 +218,58 @@ test('frozen observer events assemble into distinct retries and per-file freshne
   assert.match(assembleProjectionTrace([...events, events[4]], attempts).faults.join(' '), /duplicate interface-file/);
 });
 
+test('a planned disconnect keeps its completed-row freshness without an HTTP row to match', () => {
+  const e = expected(0);
+  const attempts: InterfaceAttempt[] = [{ requestId: 'planned', expected: e, startedAtNs: ns(0), completedAtNs: ns(10),
+    error: PLANNED_ABORT, plannedAbortMs: 10 }];
+  const events = [
+    { kind: 'admission', unitId: 1, routeKey: e.routeKey, workload: 'interface', atNs: ns(1), disposition: 'running' },
+    { kind: 'dispatch', unitId: 1, atNs: ns(2) },
+    { kind: 'interface-file', routeKey: e.routeKey, path: e.files[0]!.path, atNs: ns(8), freshness: 'fresh', resultStatus: 'ready' },
+    { kind: 'settle', unitId: 1, atNs: ns(12), priorState: 'running', outcome: 'cancelled' },
+    { kind: 'task-finished', unitId: 1, atNs: ns(13) },
+  ] as const;
+  const assembled = assembleProjectionTrace([...events], attempts);
+  assert.deepEqual(assembled.faults, []);
+  assert.equal(assembled.attempts[0]!.freshnessByPath?.[e.files[0]!.path], 'fresh');
+});
+
+test('only a parser process alive at cancellation and then exited proves cancelled parser work', () => {
+  const e = expected(0);
+  const scanOnly = [
+    { kind: 'admission', unitId: 1, routeKey: e.routeKey, workload: 'interface', atNs: ns(1), disposition: 'running' },
+    { kind: 'dispatch', unitId: 1, atNs: ns(2) },
+    { kind: 'settle', unitId: 1, atNs: ns(4), priorState: 'running', outcome: 'cancelled' },
+    { kind: 'task-finished', unitId: 1, atNs: ns(6) },
+  ] as const;
+  assert.notEqual(assembleProjectionTrace([...scanOnly], []).traces[0]!.parserCancelled, true);
+  const parsing = [
+    ...scanOnly.slice(0, 2),
+    { kind: 'parser-request', unitId: 1, atNs: ns(2) },
+    { kind: 'process-start', processId: 9, process: 'swift-child', unitId: 1, atNs: ns(3) },
+    ...scanOnly.slice(2),
+    { kind: 'process-exit', processId: 9, atNs: ns(7), code: 1 },
+  ] as const;
+  const assembled = assembleProjectionTrace([...parsing], []);
+  assert.deepEqual(assembled.faults, []);
+  assert.equal(assembled.traces[0]!.parserCancelled, true);
+  const exitedFirst = parsing.map(event => event.kind === 'process-exit' ? { ...event, atNs: ns(3) } : event);
+  assert.notEqual(assembleProjectionTrace([...exitedFirst], []).traces[0]!.parserCancelled, true);
+  const pooled = [
+    ...scanOnly.slice(0, 2),
+    { kind: 'parser-request', unitId: 1, atNs: ns(2) },
+    { kind: 'process-start', processId: 9, process: 'ts-worker', atNs: ns(0) },
+    { kind: 'process-use', processId: 9, unitId: 1, atNs: ns(3) },
+    ...scanOnly.slice(2),
+    { kind: 'process-exit', processId: 9, atNs: ns(9), code: 0 },
+  ] as const;
+  assert.notEqual(assembleProjectionTrace([...pooled], []).traces[0]!.parserCancelled, true);
+  const retired = assembleProjectionTrace([...pooled.slice(0, -1),
+    { kind: 'process-retire', processId: 9, unitId: 1, atNs: ns(5) }, pooled.at(-1)!], []);
+  assert.deepEqual(retired.faults, []);
+  assert.equal(retired.traces[0]!.parserCancelled, true);
+});
+
 test('actual process exit and task completion are both required after a running timeout', () => {
   const e = expected(0);
   const events = [
@@ -363,6 +415,16 @@ test('HTTP-only scoring still rejects failures, illegal cold-key reuse and overl
   assert.deepEqual(scoreInterfaceLoad(retry).reasons, []);
 });
 
+test('a planned disconnect cannot bridge a gap in continuous request coverage', () => {
+  const x = httpOnly();
+  const [gap] = x.attempts.splice(4, 1);
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /continuously cover/);
+  x.attempts.push({ requestId: 'planned', expected: expected(700), startedAtNs: gap!.startedAtNs,
+    completedAtNs: gap!.completedAtNs, error: PLANNED_ABORT, plannedAbortMs: 100 });
+  x.corpusKeys.push(expected(700).key);
+  assert.match(scoreInterfaceLoad(x).reasons.join(' '), /continuously cover/);
+});
+
 test('timeout fraction is bounded by explicit timeouts and unexplained incomplete pages', () => {
   const x = httpOnly();
   x.attempts[0]!.body = timedOut(x.attempts[0]!.expected);
@@ -418,6 +480,8 @@ test('traced planned aborts must settle cancelled running work with an actual ex
     submittedAtNs: ns(151), admittedAtNs: ns(151), startedAtNs: ns(152), settledAtNs: ns(260),
     outcome: 'cancelled', exitedAtNs: ns(270) };
   x.traces!.push(cancelled);
+  assert.equal(scoreInterfaceLoad(x).plannedCancels.cancelledRunning.swift, 0);
+  cancelled.parserCancelled = true;
   const report = scoreInterfaceLoad(x);
   assert.deepEqual(report.reasons, []);
   assert.equal(report.plannedCancels.cancelledRunning.swift, 1);
@@ -454,7 +518,7 @@ test('each requested input variant needs one correctly handled response', () => 
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
 });
 
-test('witness coverage needs cancelled running work per parser family and a retired TypeScript worker', () => {
+test('witness coverage needs cancelled parser work per family, every input variant and a retired TypeScript worker', () => {
   const report = scoreInterfaceLoad(passing());
   const retired = [
     { kind: 'process-start', processId: 3, process: 'ts-worker', atNs: 1n },
@@ -463,6 +527,9 @@ test('witness coverage needs cancelled running work per parser family and a reti
   ] as const;
   assert.match(witnessCoverageFaults(report, [...retired]).join(' '), /typescript.*cancel/);
   report.plannedCancels.cancelledRunning = { typescript: 1, swift: 1 };
+  assert.match(witnessCoverageFaults(report, [...retired]).join(' '), /variant malformed:swift was never handled/);
+  for (const variant of ['malformed:typescript', 'malformed:tsx', 'malformed:swift', 'unicode:typescript', 'unicode:tsx'])
+    report.variants[variant] = { requested: 1, handled: 1 };
   assert.deepEqual(witnessCoverageFaults(report, [...retired]), []);
   assert.match(witnessCoverageFaults(report, [retired[0], retired[1]]).join(' '), /retired TypeScript worker/);
 });

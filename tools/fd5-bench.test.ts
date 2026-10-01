@@ -4,8 +4,9 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { campaignApprovalFaults, corpusPlan, createInterfaceCorpus, createLargeLogProbe, LARGE_LOG_RESTORED_PATHS,
-  runFD5, startInterfaceLoad, validateConfig } from './fd5-bench.ts';
+import { campaignApprovalFaults, childProcessesExit, corpusPlan, createInterfaceCorpus, createLargeLogProbe,
+  LARGE_LOG_RESTORED_PATHS, largeLogOutcome, runFD5, startInterfaceLoad, validateConfig,
+  type CorpusPage } from './fd5-bench.ts';
 import { createServer } from 'node:http';
 import { createHistoricalCorpus, type ClipResponse } from '../src/clip-bench.ts';
 import { createTypeScriptInterfaceExtractor } from '../src/interface-v2-typescript.ts';
@@ -158,21 +159,21 @@ test('real reader handles Unicode and parse-failure variant pages exactly as the
 });
 
 async function fakeReader(handler: Parameters<typeof createServer>[1]):
-  Promise<{ url: string; requests: () => number; close: () => Promise<void> }> {
-  let count = 0;
-  const server = createServer((req, res) => { count++; handler!(req, res); });
+  Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer(handler);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const { port } = server.address() as { port: number };
-  return { url: `http://127.0.0.1:${port}`, requests: () => count,
+  return { url: `http://127.0.0.1:${port}`,
     close: async () => { server.closeAllConnections(); server.close(); await once(server, 'close'); } };
 }
+const fakePage: CorpusPage = { limit: 1, expected: { key: 'fake', routeKey: '/v1/sessions/fake/interfaces?limit=1',
+  language: 'typescript', sizeClass: 'tiny', sessionId: 'fake', beforeSeq: '1', afterSeq: '2', files: [] } };
 
 test('interface load disconnects a planned page once and never retries its key', async () => {
   const fake = await fakeReader(() => {});
   try {
-    const [page] = await createInterfaceCorpus(await mkdtemp(join(tmpdir(), 'slip-fd5-planned-')), 1);
-    const load = startInterfaceLoad(fake.url, 'token', [{ ...page!, plannedAbortMs: 50 }], 1);
+    const load = startInterfaceLoad(fake.url, 'token', [{ ...fakePage, plannedAbortMs: 50 }], 1);
     await new Promise(resolve => setTimeout(resolve, 250));
     const summary = await load.stop();
     assert.equal(summary.attempts.length, 1);
@@ -188,8 +189,7 @@ test('interface load backs off before retrying an overloaded page', async () => 
     res.end(JSON.stringify({ status: 'skipped', fallback_reason: 'overloaded' }));
   });
   try {
-    const [page] = await createInterfaceCorpus(await mkdtemp(join(tmpdir(), 'slip-fd5-backoff-')), 1);
-    const load = startInterfaceLoad(fake.url, 'token', [page!], 1);
+    const load = startInterfaceLoad(fake.url, 'token', [fakePage], 1);
     await new Promise(resolve => setTimeout(resolve, 450));
     const summary = await load.stop();
     assert.ok(summary.attempts.length >= 2 && summary.attempts.length <= 6, `${summary.attempts.length} attempts`);
@@ -212,14 +212,26 @@ test('large-log probe hides restored paths, serves the one real change and stays
     assert.equal(BigInt(large.expected.afterSeq) - BigInt(large.expected.beforeSeq), 201n);
     reader = await startReaderServer({ storeDir: join(root, 'b') });
     const response = await fetch(reader.url + large.expected.routeKey, { headers: { authorization: `Bearer ${reader.token}` } });
-    const body = await response.json() as { status: string; page: { complete: boolean }; files: Array<{ path: string }> };
+    const body = await response.json() as { status: string; page: { complete: boolean };
+      files: Array<{ path: string; status: string; changes: unknown[] }> };
     assert.equal(response.status, 200);
     assert.deepEqual(validateInterfacePage(body, large.expected), []);
     assert.deepEqual([body.status, body.page.complete, body.files.map(file => file.path)], ['ready', true, ['zz-large-log.ts']]);
+    const attempt: InterfaceAttempt = { requestId: 'large', expected: large.expected, startedAtNs: 0n, completedAtNs: 1n,
+      httpStatus: 200, body };
+    assert.deepEqual(largeLogOutcome(attempt), { outcome: 'ready-complete', faults: [] });
+    Object.assign(body.files[0]!, { status: 'identical', changes: [] });
+    assert.equal(largeLogOutcome(attempt).outcome, 'unexplained');
+    assert.notDeepEqual(largeLogOutcome(attempt).faults, []);
   } finally {
     await reader?.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('an unobservable child-process check fails closed', async () => {
+  assert.equal(await childProcessesExit('/nonexistent/pgrep'), false);
+  assert.equal(await childProcessesExit(), true);
 });
 
 test('isolated load client starts, stops and actually exits without a reader', async () => {

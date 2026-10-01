@@ -46,6 +46,20 @@ export async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise
     });
   });
 }
+/** Runs work under a wall cap. A cap hit or veto aborts the work's signal, then waits up to
+ * settleMs for the work's own cleanup before failing, so nothing is removed underneath it. */
+export async function runCapped<T>(seconds: number, settleMs: number,
+  work: (signal: AbortSignal, veto: (reason: Error) => void) => Promise<T>): Promise<T> {
+  const cap = startCap(seconds);
+  const vetoed = new AbortController();
+  const signal = AbortSignal.any([cap.signal, vetoed.signal]);
+  const running = work(signal, reason => vetoed.abort(reason));
+  try { return await bounded(running, signal); }
+  catch (error) {
+    if (signal.aborted) await bounded(running.then(() => {}, () => {}), AbortSignal.timeout(settleMs)).catch(() => {});
+    throw error;
+  } finally { cap.close(); }
+}
 export async function cleanupWithin<T>(work: Promise<T>): Promise<T> {
   return bounded(work, AbortSignal.timeout(5_000));
 }
@@ -112,8 +126,10 @@ export async function preflight(host: HostLimits, windowEndUtc: string, journal:
     if (i < host.preflightQuietSeconds) await delay(1000);
   }
 }
-export function monitorHost(host: HostLimits, windowEndUtc: string, journal: Journal): { stop: () => Promise<string[]> } {
+export function monitorHost(host: HostLimits, windowEndUtc: string, journal: Journal,
+  onFault?: (fault: string) => void): { stop: () => Promise<string[]> } {
   const faults: string[] = [];
+  const fault = (reason: string): void => { faults.push(reason); onFault?.(reason); };
   let previousSwap: number | null = null;
   let previousSampleAt: bigint | undefined;
   let pending = Promise.resolve();
@@ -121,22 +137,22 @@ export function monitorHost(host: HostLimits, windowEndUtc: string, journal: Jou
   const sample = async (): Promise<void> => {
     const startedAt = process.hrtime.bigint();
     if (previousSampleAt !== undefined && Number(startedAt - previousSampleAt) / 1e9 >
-      host.sampleIntervalSeconds * 1.5) faults.push('host sample interval exceeded');
+      host.sampleIntervalSeconds * 1.5) fault('host sample interval exceeded');
     previousSampleAt = startedAt;
     const item = await hostEvidence(host);
-    if (Date.now() >= Date.parse(windowEndUtc)) faults.push('approved measurement window ended');
+    if (Date.now() >= Date.parse(windowEndUtc)) fault('approved measurement window ended');
     const hadPrevious = previousSwap !== null;
     const growth = hadPrevious && item.swapUsedBytes !== null ? item.swapUsedBytes - previousSwap! : null;
     previousSwap = item.swapUsedBytes;
-    faults.push(...item.faults);
+    item.faults.forEach(fault);
     if (hadPrevious && (growth === null || growth > host.maxSwapGrowthBytes))
-      faults.push('host swap growth unknown or positive');
+      fault('host swap growth unknown or positive');
     await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
   };
   const schedule = (): void => {
-    if (sampling) { faults.push('host sample missed its interval'); return; }
+    if (sampling) { fault('host sample missed its interval'); return; }
     sampling = true;
-    pending = sample().catch(error => { faults.push(`host sample: ${error}`); })
+    pending = sample().catch(error => { fault(`host sample: ${error}`); })
       .finally(() => { sampling = false; });
   };
   schedule();
