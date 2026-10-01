@@ -719,9 +719,12 @@ branch. A bounded smoke passed on 2026-09-29, but its v1 tracing-overhead
 mode exceeded the approved latency tolerance and stopped the sequence; the raw
 failure remains preserved. The revised v2 interface scorer is integrated for
 future diagnostics, with no v2 execution authorized. Observer cost and D7 values
-remain open. FD5 needs a separately approved bounded acceptance protocol for
-the current 10-second policy and shared queue/clip pressure; the failed tracing
-overhead gate still affects validity. The archived native/WASM diagnostic
+remain open. The bounded acceptance protocol for the current 10-second policy
+and shared queue/clip pressure is prepared in `FD5-PROTOCOL.md` and awaits
+Brian's approval of a window and its packet decisions; nothing has run. The
+failed tracing overhead gate stays failed: the 12 scored arms run untraced, and
+three traced witness arms supply trace-only evidence with diagnostic-only
+latency. The archived native/WASM diagnostic
 timeout does not require completing the deferred Rust spike for this Node path.
 The Swift fixture-backed view remains FS2's work, and FS3
 live wiring may proceed after FD4 merges, alongside FD5. Overall feature
