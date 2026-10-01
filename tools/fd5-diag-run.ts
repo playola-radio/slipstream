@@ -1,13 +1,12 @@
 /** Deliberately separate from the registered 12-arm FD5 campaign. Raw diagnostic evidence only. */
 import { createHash } from 'node:crypto';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, open, realpath, rm } from 'node:fs/promises';
-import { arch, availableParallelism, cpus, loadavg, release, tmpdir } from 'node:os';
+import { arch, availableParallelism, cpus, release, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface as createLineReader } from 'node:readline';
-import { promisify } from 'node:util';
 import { isDeepStrictEqual } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startCapture, type CaptureSession } from '../src/session.ts';
@@ -24,10 +23,11 @@ import { createProjectionTraceCollector } from './fd5-trace.ts';
 import { startDiagnosticLoad, type DiagnosticLoad } from './fd5-diag-load.ts';
 import { startDiagnosticHttpClient } from './fd5-diag-http-client.ts';
 import type { DiagnosticConfig, DiagnosticMode } from './fd5-diag.ts';
+import { acquireWithin, bounded, cleanupWithin, encode, Journal, monitorHost, preflight, startCap } from './fd5-host.ts';
 
-const encode = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) =>
-  typeof item === 'bigint' ? item.toString() : item);
 const sha = (body: string | Uint8Array): string => createHash('sha256').update(body).digest('hex');
+const windowEnd = (config: DiagnosticConfig): string =>
+  (config.approvalRequired.measurementWindow as { endUtc: string }).endUtc;
 interface DiagnosticLatency { n: number; p50: number | null; p95: number | null; p99: number | null }
 function latency(samples: number[]): DiagnosticLatency {
   const sorted = samples.filter(Number.isFinite).sort((a, b) => a - b);
@@ -145,143 +145,6 @@ export function scoreInterfaceCohort(planned: PlannedInterface[], attempts: Inte
     fullArm: { count: attempts.length, outcomes: allOutcomes, httpLatency: latency(allDurations) } };
 }
 
-/** Every record is appended in order. Result/failure records are durably synced. */
-class Journal {
-  private pending = Promise.resolve();
-  private fault: Error | undefined;
-  private readonly file: Awaited<ReturnType<typeof open>>;
-  constructor(file: Awaited<ReturnType<typeof open>>) { this.file = file; }
-  record(value: unknown, durable = false): Promise<void> {
-    const next = this.pending.then(async () => {
-      if (this.fault) return;
-      await this.file.appendFile(encode(value) + '\n');
-      if (durable) await this.file.sync();
-    }).catch(error => { this.fault = error instanceof Error ? error : new Error(String(error)); });
-    this.pending = next;
-    return next;
-  }
-  async assertHealthy(): Promise<void> { await this.pending; if (this.fault) throw this.fault; }
-  async close(): Promise<void> { await this.pending; await this.file.close(); if (this.fault) throw this.fault; }
-}
-
-function startCap(seconds: number): { signal: AbortSignal; expired: () => boolean; close: () => void } {
-  const controller = new AbortController();
-  let hit = false;
-  const timer = setTimeout(() => { hit = true; controller.abort(new Error('diagnostic wall-time cap')); }, seconds * 1000);
-  return { signal: controller.signal, expired: () => hit, close: () => clearTimeout(timer) };
-}
-async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw signal.reason;
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => { signal.removeEventListener('abort', onAbort); reject(signal.reason); };
-    signal.addEventListener('abort', onAbort, { once: true });
-    void work.then(value => { signal.removeEventListener('abort', onAbort); resolve(value); }, error => {
-      signal.removeEventListener('abort', onAbort); reject(error);
-    });
-  });
-}
-async function cleanupWithin<T>(work: Promise<T>): Promise<T> {
-  return bounded(work, AbortSignal.timeout(5_000));
-}
-export async function acquireWithin<T>(work: Promise<T>, signal: AbortSignal,
-  cleanup: (value: T) => Promise<void>): Promise<T> {
-  try { return await bounded(work, signal); }
-  catch (error) {
-    if (signal.aborted) {
-      const lateCleanup = work.then(cleanup);
-      void lateCleanup.catch(() => {});
-      await cleanupWithin(lateCleanup).catch(() => {});
-    }
-    throw error;
-  }
-}
-const execFileAsync = promisify(execFile);
-async function command(binary: string, args: string[]): Promise<string | null> {
-  try { return (await execFileAsync(binary, args, { encoding: 'utf8', timeout: 2000,
-    maxBuffer: 64 * 1024 })).stdout.trim(); }
-  catch { return null; }
-}
-async function hostEvidence(config: DiagnosticConfig): Promise<{ at: string; load5: number; physicalCores: number | null;
-  acPower: boolean | null; normalThermal: boolean | null; noMemoryWarning: boolean | null;
-  swapUsedBytes: number | null; faults: string[] }> {
-  const [batt, therm, memoryLevel, swap, cores] = await Promise.all([
-    command('pmset', ['-g', 'batt']), command('pmset', ['-g', 'therm']),
-    command('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
-    command('sysctl', ['vm.swapusage']), command('sysctl', ['-n', 'hw.physicalcpu']),
-  ]);
-  const used = swap?.match(/used\s*=\s*([\d.]+)([KMG])/i);
-  const scale = used?.[2]?.toUpperCase() === 'G' ? 2 ** 30 : used?.[2]?.toUpperCase() === 'M' ? 2 ** 20 : 2 ** 10;
-  const swapUsedBytes = used ? Math.round(Number(used[1]) * scale) : null;
-  const load5 = loadavg()[1]!;
-  const physicalCores = cores !== null && Number.isSafeInteger(Number(cores)) && Number(cores) > 0
-    ? Number(cores) : null;
-  const acPower = batt === null ? null : batt.includes('AC Power');
-  const normalThermal = therm === null ? null :
-    therm.includes('No thermal warning level has been recorded') &&
-    therm.includes('No performance warning level has been recorded');
-  const noMemoryWarning = memoryLevel === null ? null : memoryLevel === '1';
-  const faults = [
-    ...(physicalCores === null ? ['physical core count unverified'] :
-      load5 >= config.host.maxFiveMinuteLoadFractionOfPhysicalCores * physicalCores ? ['host load veto'] : []),
-    ...(config.host.requireAcPower && acPower !== true ? ['AC power unverified or absent'] : []),
-    ...(config.host.requireNormalThermal && normalThermal !== true ? ['normal thermal state unverified'] : []),
-    ...(config.host.requireNoMemoryPressureWarning && noMemoryWarning !== true ? ['memory pressure unverified or warned'] : []),
-    ...(swapUsedBytes === null ? ['swap usage unverified'] : []),
-  ];
-  return { at: new Date().toISOString(), load5, physicalCores, acPower, normalThermal,
-    noMemoryWarning, swapUsedBytes, faults };
-}
-async function preflight(config: DiagnosticConfig, journal: Journal): Promise<void> {
-  let first: Awaited<ReturnType<typeof hostEvidence>> | undefined;
-  for (let i = 0; i <= config.host.preflightQuietSeconds; i++) {
-    const sample = await hostEvidence(config);
-    const window = config.approvalRequired.measurementWindow as { endUtc: string };
-    if (Date.now() >= Date.parse(window.endUtc)) throw new Error('approved measurement window ended during preflight');
-    if (!first) first = sample;
-    const swapGrowth = first.swapUsedBytes !== null && sample.swapUsedBytes !== null
-      ? sample.swapUsedBytes - first.swapUsedBytes : null;
-    await journal.record({ type: 'preflight-sample', sample, swapGrowthBytes: swapGrowth });
-    if (sample.faults.length || swapGrowth === null || swapGrowth > config.host.maxSwapGrowthBytes)
-      throw new Error(`host preflight veto: ${[...sample.faults, ...(swapGrowth === null ? ['swap growth unknown'] :
-        swapGrowth > config.host.maxSwapGrowthBytes ? ['swap growth'] : [])].join(', ')}`);
-    if (i < config.host.preflightQuietSeconds) await delay(1000);
-  }
-}
-function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => Promise<string[]> } {
-  const faults: string[] = [];
-  let previousSwap: number | null = null;
-  let previousSampleAt: bigint | undefined;
-  let pending = Promise.resolve();
-  let sampling = false;
-  const sample = async (): Promise<void> => {
-    const startedAt = process.hrtime.bigint();
-    if (previousSampleAt !== undefined && Number(startedAt - previousSampleAt) / 1e9 >
-      config.host.sampleIntervalSeconds * 1.5) faults.push('host sample interval exceeded');
-    previousSampleAt = startedAt;
-    const item = await hostEvidence(config);
-    const window = config.approvalRequired.measurementWindow as { endUtc: string };
-    if (Date.now() >= Date.parse(window.endUtc)) faults.push('approved measurement window ended');
-    const hadPrevious = previousSwap !== null;
-    const growth = hadPrevious && item.swapUsedBytes !== null ? item.swapUsedBytes - previousSwap! : null;
-    previousSwap = item.swapUsedBytes;
-    faults.push(...item.faults);
-    if (hadPrevious && (growth === null || growth > config.host.maxSwapGrowthBytes))
-      faults.push('host swap growth unknown or positive');
-    await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
-  };
-  const schedule = (): void => {
-    if (sampling) { faults.push('host sample missed its interval'); return; }
-    sampling = true;
-    pending = sample().catch(error => { faults.push(`host sample: ${error}`); })
-      .finally(() => { sampling = false; });
-  };
-  schedule();
-  const timer = setInterval(schedule, config.host.sampleIntervalSeconds * 1000);
-  return { stop: async () => { clearInterval(timer); await pending;
-    await journal.record({ type: 'host-monitor-ended' });
-    return [...new Set(faults)]; } };
-}
-
 async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeDir: string,
   clipCorpus: HistoricalChange[], interfaceCorpus: CorpusPage[], spec: {
     name: string; clip: boolean; interfaces: boolean; trace: boolean; C: number; Q: number; W: number;
@@ -299,7 +162,7 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
   let off: (() => void) | undefined;
   let drained = false, captureStopped = false, readerClosed = false, worktreeRemoved = false;
   const faults: string[] = [];
-  const host = monitorHost(config, journal);
+  const host = monitorHost(config.host, windowEnd(config), journal);
   const sharedCount = new SharedArrayBuffer(4);
   let clipSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
   let interfaceSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
@@ -624,7 +487,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
     const purposeById = new Map<string, string>();
     let useful = 0;
     const faults: string[] = [];
-    const host = monitorHost(config, journal);
+    const host = monitorHost(config.host, windowEnd(config), journal);
     const finishServer = async (): Promise<void> => {
       if (!server) return;
       const current = server;
@@ -717,7 +580,7 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   for (const [capIndex, W] of spec.waiterCaps.entries()) {
     const timer = startCap(spec.maxSecondsPerCap);
     const collector = createProjectionTraceCollector(100_000);
-    const host = monitorHost(config, journal);
+    const host = monitorHost(config.host, windowEnd(config), journal);
     let release: (() => void) | undefined;
     let entered: (() => void) | undefined;
     let enteredPromise: Promise<void> = Promise.resolve();
@@ -944,7 +807,7 @@ export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: Diagn
       cpu: cpus()[0]?.model, availableCpuThreads: availableParallelism(),
       parserArtifacts: { typescript: sha(verifyTypeScriptGrammarArtifact('typescript')),
         tsx: sha(verifyTypeScriptGrammarArtifact('tsx')), swift: SWIFT_V1 } }, true);
-    await preflight(config, journal);
+    await preflight(config.host, windowEnd(config), journal);
     storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-store-'));
     if (mode === 'smoke' || mode === 'overhead' || mode === 'queue')
       await runCaptureMode(mode, config, journal, storeDir, prior.selectedDeadlineMs);

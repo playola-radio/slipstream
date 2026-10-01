@@ -4,7 +4,8 @@ import { test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describeDiagnosticMode, parseDiagnosticArgs, validateDiagnosticConfig } from './fd5-diag.ts';
-import { acquireWithin, executionApprovalFaults, planInterfaceCohort, scoreInterfaceCohort,
+import { acquireWithin } from './fd5-host.ts';
+import { executionApprovalFaults, planInterfaceCohort, scoreInterfaceCohort,
   readPrior, runBoundedDiagnostic, scoreDiagnosticOverhead } from './fd5-diag-run.ts';
 import type { CaptureArmReport } from '../src/clip-bench.ts';
 import type { CorpusPage } from './fd5-bench.ts';
