@@ -385,6 +385,12 @@ const incompleteRow = (e: ExpectedInterfaceRequest, reason = 'before-parse-error
   Object.assign(body.files[0]!, { status: 'incomplete', fallback_reason: reason });
   return body;
 };
+const interruptedRow = (e: ExpectedInterfaceRequest, reason: string): unknown => {
+  const body = incompleteRow(e) as { files: Array<Record<string, unknown>>; page: Record<string, unknown> };
+  Object.assign(body.files[0]!, { status: 'skipped', fallback_reason: reason });
+  body.page = { complete: false, next_after_path: e.files[0]!.path };
+  return body;
+};
 
 test('HTTP-only scoring classifies overload, work and windows without admission traces', () => {
   const report = scoreInterfaceLoad(httpOnly());
@@ -500,12 +506,16 @@ test('expected parse failures must stay incomplete with their stated reason', ()
   assert.deepEqual(validateInterfacePage(incompleteRow(e), e), []);
   assert.match(validateInterfacePage(page(e), e).join(' '), /expected incomplete/);
   assert.match(validateInterfacePage(incompleteRow(e, 'after-parse-error'), e).join(' '), /incomplete reason/);
-  const wrongStatuses = ['identical', 'skipped', 'unavailable', 'unsupported'] as const;
-  for (const status of wrongStatuses) {
+  for (const status of ['identical', 'skipped', 'unavailable', 'unsupported']) {
     const body = incompleteRow(e) as { files: Array<Record<string, unknown>> };
-    Object.assign(body.files[0]!, { status, fallback_reason: status === 'skipped' ? 'cancelled' : undefined });
+    Object.assign(body.files[0]!, { status, fallback_reason: status === 'skipped' ? 'too-large' : undefined });
     assert.match(validateInterfacePage(body, e).join(' '), /expected incomplete/, status);
   }
+  const cancelledOnCompletePage = incompleteRow(e) as { files: Array<Record<string, unknown>> };
+  Object.assign(cancelledOnCompletePage.files[0]!, { status: 'skipped', fallback_reason: 'cancelled' });
+  assert.match(validateInterfacePage(cancelledOnCompletePage, e).join(' '), /expected incomplete/);
+  for (const reason of ['timeout', 'cancelled'])
+    assert.deepEqual(validateInterfacePage(interruptedRow(e, reason), e), [], reason);
   assert.deepEqual(validateInterfacePage(timedOut(e), e), []);
   assert.deepEqual(validateInterfacePage({ ...page(e) as object, status: 'skipped',
     fallback_reason: 'overloaded', files: [], page: { complete: false, next_after_path: null } }, e), []);
@@ -524,6 +534,11 @@ test('each requested input variant needs one correctly handled response', () => 
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
   x.attempts.at(-1)!.body = timedOut(e);
   assert.match(scoreInterfaceLoad(x).reasons.join(' '), /variant malformed:typescript was never handled/);
+  x.attempts.at(-1)!.body = interruptedRow(e, 'timeout');
+  const interrupted = scoreInterfaceLoad(x);
+  assert.equal(interrupted.malformedResponses, 0);
+  assert.equal(interrupted.total.explicitTimeouts, 1);
+  assert.match(interrupted.reasons.join(' '), /variant malformed:typescript was never handled/);
 });
 
 test('witness coverage needs cancelled parser work per family, every input variant and a retired TypeScript worker', () => {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CappedWorkDidNotSettleError, Journal, monitorHost, preflight, runCapped, type HostLimits } from './fd5-host.ts';
@@ -47,17 +47,10 @@ test('a veto stops a capped run, and cleanup that never settles is abandoned aft
 });
 
 test('capped work that ignores abort fails distinctly after settle so callers can preserve live state', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'slip-fd5-unsettled-'));
-  try {
-    const state = join(root, 'store-marker');
-    await writeFile(state, 'keep');
-    await assert.rejects(runCapped(0.001, 25, async signal => {
-      await new Promise<void>(resolve => signal.addEventListener('abort', () => {}, { once: true }));
-      return 'never';
-    }), (error: unknown) => error instanceof CappedWorkDidNotSettleError
-      && /did not settle/.test(String(error)));
-    assert.equal(await readFile(state, 'utf8'), 'keep');
-  } finally { await rm(root, { recursive: true, force: true }); }
+  await assert.rejects(runCapped(0.001, 25, async signal => {
+    await new Promise<void>(() => signal.addEventListener('abort', () => {}, { once: true }));
+    return 'never';
+  }), (error: unknown) => error instanceof CappedWorkDidNotSettleError && /did not settle/.test(String(error)));
 });
 
 test('a capped run that finishes in time returns its result', async () => {

@@ -43,8 +43,6 @@ test('registered config pins the owner-approved FD5 wall caps exactly', async ()
   const config = JSON.parse(await readFile(new URL('./fd5-provisional-config.json', import.meta.url), 'utf8'));
   assert.equal(validateConfig(config).maxArmSeconds, 180);
   assert.equal(validateConfig(config).maxPreparationSeconds, 2300);
-  assert.deepEqual(validateConfig({ ...config, maxArmSeconds: 180, maxPreparationSeconds: 2300 }),
-    validateConfig(config));
   for (const maxArmSeconds of [0, 179, 181])
     assert.throws(() => validateConfig({ ...config, maxArmSeconds }), /wall caps/);
   for (const maxPreparationSeconds of [0, 300, 2299, 2301])

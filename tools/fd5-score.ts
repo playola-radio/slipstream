@@ -385,8 +385,12 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
       || after.observation !== 'watcher') faults.push(`source provenance mismatch ${file.path}`);
     if (file.language !== want.language || file.language_version !== want.languageVersion) faults.push(`language/version mismatch ${file.path}`);
     if (want.incompleteReason !== undefined) {
-      if (file.status !== 'incomplete') faults.push(`expected incomplete file reported ${String(file.status)} ${file.path}`);
-      else if (file.fallback_reason !== want.incompleteReason) faults.push(`incomplete reason mismatch ${file.path}`);
+      // The reader's interruptPage reports a file cut off mid-parse as skipped with the interrupt reason.
+      const interrupted = file.status === 'skipped' && ['timeout', 'cancelled'].includes(String(file.fallback_reason))
+        && object(page.page)?.complete !== true;
+      if (file.status === 'incomplete') {
+        if (file.fallback_reason !== want.incompleteReason) faults.push(`incomplete reason mismatch ${file.path}`);
+      } else if (!interrupted) faults.push(`expected incomplete file reported ${String(file.status)} ${file.path}`);
     } else if (file.status === 'ready') {
       if (!Array.isArray(file.changes) || !same(file.changes, want.changes)) faults.push(`change mismatch ${file.path}`);
     } else if (!['identical', 'incomplete', 'unavailable', 'unsupported', 'skipped'].includes(String(file.status))) {
