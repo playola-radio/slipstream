@@ -15,11 +15,32 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, rm, rename, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
-import { changesFor, withSession } from './test/helpers.ts';
+import { changesFor, withSession, readRecords } from './test/helpers.ts';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 describe('session (real OS)', () => {
+  it('captures source edits while ignored noise and unreadable ignored directories stay out', async () => {
+    await withSession(async (root) => {
+      await writeFile(join(root, '.slipstreamignore'), '.gstack/\n*.png\n');
+      await mkdir(join(root, '.gstack'));
+      await writeFile(join(root, '.gstack/run.log'), 'noise');
+      await chmod(join(root, '.gstack'), 0o000);
+      await writeFile(join(root, 'shot.png'), 'noise');
+      await writeFile(join(root, 'app.tsx'), 'before');
+    }, async ({ root, session, waitFor }) => {
+      try {
+        await writeFile(join(root, 'shot.png'), 'more noise');
+        await writeFile(join(root, 'app.tsx'), 'after');
+        await waitFor((r) => changesFor(r, 'app.tsx').length === 1);
+        await session.stop();
+        const records = await readRecords(session.logPath);
+        assert.ok(!records.some((r) => 'path' in r.data && (r.data.path === 'shot.png' || r.data.path === '.gstack/run.log')));
+        assert.ok(!records.some((r) => r.type === 'slipstream.capture.gap.v1' && r.data.reason === 'baseline-unreadable'));
+      } finally { await chmod(join(root, '.gstack'), 0o700); }
+    });
+  });
+
   it('emits absent -> content when a file is created (real FSEvents delivery)', async () => {
     await withSession(
       async () => {},

@@ -62,6 +62,82 @@
         "started_at_ms": {
           "type": "integer",
           "minimum": 0
+        },
+        "capture_ignores": {
+          "type": "object",
+          "description": "Immutable capture-start ignore policy. Absent means legacy built-in exclusions only. Rule edits and index changes apply only to a new capture.",
+          "required": [
+            "version",
+            "git",
+            "slipstreamignore"
+          ],
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "slipstreamignore": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "git": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "root_prefix",
+                    "ignore_case",
+                    "sources",
+                    "tracked_exceptions"
+                  ],
+                  "properties": {
+                    "root_prefix": {
+                      "type": "string"
+                    },
+                    "ignore_case": {
+                      "type": "boolean"
+                    },
+                    "sources": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "dir",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "gitignore",
+                              "info/exclude",
+                              "core.excludesFile"
+                            ]
+                          },
+                          "dir": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "tracked_exceptions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
         }
       }
     }

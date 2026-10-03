@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
@@ -56,6 +58,74 @@ async function waitForHealth(health: Health, predicate: (s: ReturnType<Health['s
 }
 
 describe('session', () => {
+  it('resumes legacy captures without adopting current ignore rules and rejects corrupt saved rules', async () => {
+    await withTempPair(async (root, store) => {
+      await writeFile(join(root, 'debug.log'), 'before');
+      const first = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+      await first.stop();
+      const records = await readRecords(first.logPath);
+      const start = records[0]!;
+      assert.equal(start.type, 'slipstream.session.started.v1');
+      if (start.type !== 'slipstream.session.started.v1') return;
+      start.data.capture_ignores = { version: 1, git: null, slipstreamignore: null };
+      (start.data.capture_ignores as { version: number }).version = 2;
+      await writeFile(first.logPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      await assert.rejects(startCapture({ root, storeDir: store, resumeSessionId: first.sessionId }), CorruptLogError);
+      delete start.data.capture_ignores;
+      await writeFile(first.logPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      await writeFile(join(root, '.slipstreamignore'), '*.log\n');
+      await writeFile(join(root, 'debug.log'), 'after');
+      const resumed = await startCapture({ root, storeDir: store, resumeSessionId: first.sessionId }, { platform: createFakePlatform() });
+      await resumed.stop();
+      assert.equal(changesFor(await readRecords(first.logPath), 'debug.log').length, 1);
+    });
+  });
+
+  it('keeps frozen ignores on resume and picks up edits only in a new capture', async () => {
+    await withTempPair(async (root, store) => {
+      await writeFile(join(root, '.slipstreamignore'), '*.log\n');
+      await writeFile(join(root, 'debug.log'), 'before');
+      const first = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+      await first.stop();
+      const started = (await readRecords(first.logPath))[0]!;
+      assert.equal((started.data as { capture_ignores?: { version: number } }).capture_ignores?.version, 1);
+      await writeFile(join(root, '.slipstreamignore'), '');
+      await writeFile(join(root, 'debug.log'), 'after');
+      const resumed = await startCapture({ root, storeDir: store, resumeSessionId: first.sessionId }, { platform: createFakePlatform() });
+      await resumed.stop();
+      assert.ok(!(await readRecords(first.logPath)).some((r) => pathOf(r) === 'debug.log'));
+      const fresh = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+      await fresh.stop();
+      assert.ok((await readRecords(fresh.logPath)).some((r) => pathOf(r) === 'debug.log'));
+    });
+  });
+
+  it('excludes gitignored and Slipstream-only files from baseline and live capture', async () => {
+    await withTempPair(async (root, store) => {
+      await promisify(execFile)('git', ['init', '-q', root]);
+      await mkdir(join(root, '.gstack'));
+      await writeFile(join(root, '.gitignore'), '.gstack/\n*.log\n');
+      await writeFile(join(root, '.slipstreamignore'), 'screenshots/\n');
+      await mkdir(join(root, 'screenshots'));
+      const hidden = ['.gstack/run.ts', 'debug.log', 'screenshots/test.png'];
+      for (const path of [...hidden, 'app.tsx']) await writeFile(join(root, path), 'before');
+      const platform = createFakePlatform();
+      const session = await startCapture({ root, storeDir: store }, { platform });
+      try {
+        const baseline = await readRecords(session.logPath);
+        for (const path of hidden) assert.ok(!baseline.some((r) => pathOf(r) === path), path);
+        assert.ok(baseline.some((r) => pathOf(r) === 'app.tsx'));
+        for (const path of [...hidden, 'app.tsx']) {
+          await writeFile(join(root, path), 'after');
+          platform.observe(path);
+        }
+      } finally { await session.stop(); }
+      const records = await readRecords(session.logPath);
+      for (const path of hidden) assert.ok(!records.some((r) => pathOf(r) === path), path);
+      assert.equal(changesFor(records, 'app.tsx').length, 1);
+    });
+  });
+
   it('releases the session lock when opening the log fails', async () => {
     await withTempPair(async (root, store) => {
       const seeded = await startCapture({ root, storeDir: store });

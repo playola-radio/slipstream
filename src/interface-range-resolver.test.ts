@@ -47,6 +47,14 @@ function envelope(e: Event): Record<string, unknown> {
 const content = (sha256: string, size = 1) => ({ kind: 'content', sha256: sha256.repeat(64), size });
 const absent = { kind: 'absent' };
 
+test('discloses frozen ignore rules from the public session start record', async () => {
+  await withLog([event(1, 'session.started', { capture_ignores: { version: 1, git: null, slipstreamignore: '*.log\n' } })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 1n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind === 'resolved') assert.deepEqual(result.inventory.policyExclusions, ['store-directory', '.git', 'symlinks', 'ignore-rules']);
+  });
+});
+
 function options(logPath: string, beforeSeq: bigint, afterSeq: bigint, extra = {}) {
   return { logPath, sessionId, durableSeq: afterSeq, beforeSeq, afterSeq,
     scanBudget: { records: 100_000, bytes: 16 * 1024 * 1024 }, ...extra };
@@ -105,7 +113,7 @@ test('an unavailable observation remains the endpoint and never equals another u
   });
 });
 
-test('all 67 successful fixture histories replay through the production resolver', async () => {
+test('all 68 successful fixture histories replay through the production resolver', async () => {
   let resolvedCases = 0;
   let errorCases = 0;
   for (const name of (await readdir(casesDir)).sort()) {
@@ -192,7 +200,7 @@ test('all 67 successful fixture histories replay through the production resolver
         expected.files.map((f) => f.path), `${name}: expected row order`);
     });
   }
-  assert.equal(resolvedCases, 67);
+  assert.equal(resolvedCases, 68);
   assert.equal(errorCases, 4);
 });
 

@@ -639,7 +639,9 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
     else {
       extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
       if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
-      if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
+      const exclusions = (history.events[0]?.data as Obj | undefined)?.capture_ignores === undefined
+        ? POLICY_EXCLUSIONS : [...POLICY_EXCLUSIONS, 'ignore-rules'];
+      if (!isDeepStrictEqual(inventory.policy_exclusions, exclusions)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(exclusions)}`);
       const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
       checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
     }

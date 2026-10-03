@@ -26,6 +26,7 @@
   },
   "dependencies": {
     "@parcel/watcher": "^2.5.1",
+    "ignore": "7.0.12",
     "tree-sitter-wasms": "0.1.13",
     "web-tree-sitter": "0.25.10"
   },

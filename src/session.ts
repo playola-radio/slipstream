@@ -2,6 +2,7 @@ import { access, readdir, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
+import { loadCaptureIgnores, compileCaptureIgnores } from './capture-ignores.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { createEngine } from './engine.ts';
@@ -170,6 +171,8 @@ export async function startCapture(
   }
 
   const resuming = opts.resumeSessionId !== undefined;
+  // Fail before creating a session if its exclusion policy cannot be read.
+  let captureIgnores = resuming ? undefined : await loadCaptureIgnores(root, storeDir);
   const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
   const blobsDir = join(storeDir, 'blobs');
   const sessionDir = join(storeDir, 'sessions', sessionId);
@@ -305,6 +308,7 @@ export async function startCapture(
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       });
       recovered = await recoverSession(logPath, sessionId, cas);
+      captureIgnores = recovered.captureIgnores;
       if (recovered.root === undefined) {
         throw new Error(`cannot resume session ${sessionId}: no existing session.started record`);
       }
@@ -424,7 +428,12 @@ export async function startCapture(
   // inside the watched root, excluding it is what stops the watcher from
   // observing its own output.
   const excluded = [storeDir, join(root, '.git')];
-  const isExcluded = (abs: string): boolean => excluded.some((e) => isUnder(abs, e));
+  const ignorePath = captureIgnores === undefined ? undefined : compileCaptureIgnores(captureIgnores);
+  const isExcluded = (abs: string, isDir = false): boolean => {
+    if (excluded.some((e) => isUnder(abs, e))) return true;
+    const rel = relative(root, abs);
+    return rel !== '' && !escapesBase(rel) && (ignorePath?.(rel.split(sep).join('/'), isDir) ?? false);
+  };
 
   let live = false;
   const buffer: Array<[string, number]> = [];
@@ -655,7 +664,7 @@ export async function startCapture(
       await appendEvent({
         type: 'slipstream.session.started.v1',
         occurred_at_ms: Date.now(),
-        data: { root, max_bytes: maxBytes },
+        data: { root, max_bytes: maxBytes, capture_ignores: captureIgnores },
       });
 
       const unknownScopes: string[] = [];
@@ -975,7 +984,7 @@ interface EnumerateHandlers {
 async function enumerate(
   root: string,
   dir: string,
-  isExcluded: (abs: string) => boolean,
+  isExcluded: (abs: string, isDir?: boolean) => boolean,
   handlers: EnumerateHandlers,
 ): Promise<void> {
   let entries;
@@ -987,8 +996,8 @@ async function enumerate(
   }
   for (const entry of entries) {
     const abs = join(dir, entry.name);
-    if (isExcluded(abs)) continue;
     if (entry.isSymbolicLink()) continue; // excluded, never followed
+    if (isExcluded(abs, entry.isDirectory())) continue;
     if (entry.isDirectory()) {
       await enumerate(root, abs, isExcluded, handlers);
     } else if (entry.isFile()) {

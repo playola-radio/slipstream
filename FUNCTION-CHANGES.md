@@ -414,6 +414,13 @@ invented.
 }
 ```
 
+Capture-ignore extension (2026-10-03): sessions whose public start event contains
+`data.capture_ignores` append `"ignore-rules"` to this exact exclusion list. The
+versioned start-event policy contains the frozen rule text and tracked exceptions.
+Sessions without that field retain the original three entries. An after-seq of
+zero has not observed a start event and also retains the original list.
+
+
 What the page-level `status` values mean:
 
 - **`ready`**: every returned file is `ready` or `identical`. This includes an

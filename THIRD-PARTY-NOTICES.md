@@ -1,5 +1,11 @@
 # Third-party notices
 
+## Capture ignore matching
+
+- [`ignore`](https://github.com/kaelzhang/node-ignore), pinned to 7.0.12.
+- **License: MIT.** Copyright (c) 2013 Kael Zhang, contributors.
+- The package's full license is distributed in `node_modules/ignore/LICENSE-MIT`.
+
 Third-party components bundled or loaded at runtime, with their licenses kept
 distinct. Slipstream is not itself relicensed by anything here.
 

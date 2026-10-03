@@ -7,6 +7,7 @@ import { sourceFor, type AnyEvent } from './event.ts';
 import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
+import { parseCaptureIgnores, type CaptureIgnores } from './capture-ignores.ts';
 
 /**
  * A mid-log defect that cannot be honestly repaired. Only bytes after the final
@@ -22,6 +23,7 @@ export class CorruptLogError extends Error {
 }
 
 export interface RecoveredSession {
+  captureIgnores?: CaptureIgnores;
   /** Canonical worktree from `session.started`; undefined if the log had no records. */
   root: string | undefined;
   maxBytes: number | undefined;
@@ -133,6 +135,7 @@ export async function recoverSession(
 
   let root: string | undefined;
   let maxBytes: number | undefined;
+  let captureIgnores: CaptureIgnores | undefined;
   let baselineCompleted = false;
   let currentTaskId: string | undefined;
   let seq = 0n;
@@ -224,6 +227,10 @@ export async function recoverSession(
         if (i !== 0) throw new CorruptLogError(`${at}: duplicate session.started`);
         root = event.data.root;
         maxBytes = event.data.max_bytes;
+        if (event.data.capture_ignores !== undefined) {
+          try { captureIgnores = parseCaptureIgnores(event.data.capture_ignores); }
+          catch (err) { throw new CorruptLogError(`${at}: ${(err as Error).message}`); }
+        }
         break;
       }
       case 'slipstream.file.baselined.v1': {
@@ -337,6 +344,7 @@ export async function recoverSession(
 
   return {
     root,
+    captureIgnores,
     maxBytes,
     recoveredThroughSeq: seq,
     discardedTailBytes,

@@ -98,8 +98,8 @@
         },
         "policy_exclusions": {
           "type": "array",
-          "items": { "enum": ["store-directory", ".git", "symlinks"] },
-          "$comment": "Static capture policy, always exactly [\"store-directory\", \".git\", \"symlinks\"] (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them."
+          "items": { "enum": ["store-directory", ".git", "symlinks", "ignore-rules"] },
+          "$comment": "Exactly store-directory, .git, symlinks; append ignore-rules when session.started carries capture_ignores. Frozen rule text is available from the public start event."
         }
       }
     },

@@ -1,6 +1,11 @@
 /** Additive public events outside the byte-frozen display-fold.v1 dependencies. */
 import { EVENT_TYPES, buildEnvelope, sourceFor, SPEC_VERSION, DATA_CONTENT_TYPE, type AnyEvent, type EventInput, type HarnessName } from './event.ts';
 import type { QuestionContext } from './questions.ts';
+import type { CaptureIgnores } from './capture-ignores.ts';
+
+/** Keep the released display fold's original event types byte-for-byte intact. */
+type WithCaptureIgnores<T> = T extends { type: 'slipstream.session.started.v1' }
+  ? T & { data: { capture_ignores?: CaptureIgnores } } : T;
 
 export const PUBLIC_EVENT_TYPES = [...EVENT_TYPES, 'slipstream.question.queued.v1', 'slipstream.question.dispatch_attempted.v1',
   'slipstream.question.answered.v1'] as const;
@@ -55,11 +60,11 @@ export interface QuestionAnsweredEvent {
   subject: string;
   data: QuestionAnsweredData;
 }
-export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent;
+export type PublicEvent = WithCaptureIgnores<AnyEvent> | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent;
 export type QuestionQueuedInput = { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
 export type QuestionDispatchAttemptedInput = { type: 'slipstream.question.dispatch_attempted.v1'; occurred_at_ms: number; data: { question_id: string; queued_seq: string; attempted_at_ms: number } };
 export type QuestionAnsweredInput = { type: 'slipstream.question.answered.v1'; occurred_at_ms: number; data: Omit<QuestionAnsweredData, 'session_id'> };
-export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput;
+export type PublicEventInput = WithCaptureIgnores<EventInput> | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput;
 export function buildPublicEnvelope(input: PublicEventInput, seq: bigint, sessionId: string): PublicEvent {
   if (input.type !== 'slipstream.question.queued.v1' && input.type !== 'slipstream.question.dispatch_attempted.v1'
     && input.type !== 'slipstream.question.answered.v1') return buildEnvelope(input, seq, sessionId);

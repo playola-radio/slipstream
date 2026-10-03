@@ -2,6 +2,7 @@
  * FD4 owns blob retention, extraction, response pagination and HTTP mapping. */
 import { openLogCursor, LogCorruptError, LogReadAbortedError, LogReadLimitError, type ReaderEvent } from './log-reader.ts';
 import { assertSafePath } from './recovery.ts';
+import { parseCaptureIgnores } from './capture-ignores.ts';
 import { sourceFor } from './event.ts';
 import type { Snapshot, UnavailableReason } from './snapshot.ts';
 
@@ -45,7 +46,7 @@ export interface ResolveRecordedRangeOptions {
 }
 export type ResolveRecordedRangeResult =
   | { kind: 'resolved'; inventory: { scope: 'observed'; baselineCompletedSeq: string | null; unknownScopes: string[];
-      policyExclusions: typeof POLICY_EXCLUSIONS };
+      policyExclusions: readonly string[] };
       gaps: RangeGap[]; files: RangeFile[]; scan: RangeScanStats }
   | { kind: 'beyondDurable' }
   | { kind: 'scanLimit'; scan: RangeScanStats }
@@ -136,6 +137,7 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
   const gaps: RangeGap[] = [];
   let baselineCompletedSeq: string | null = null;
   let unknownScopes: string[] = [];
+  let policyExclusions: readonly string[] = POLICY_EXCLUSIONS;
   let lastSeq = 0n;
   const cursor = await openLogCursor(logPath, 0n);
   try {
@@ -172,6 +174,11 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     if (data.session_id !== sessionId) corrupt(`session mismatch at ${seq}`);
     if (record.id !== seq) corrupt(`envelope id ${record.id} != seq ${seq} at ${seq}`);
     if (record.source !== sourceFor(sessionId)) corrupt(`envelope source ${record.source} != ${sourceFor(sessionId)} at ${seq}`);
+    if (seq === '1' && record.type === 'slipstream.session.started.v1' && data.capture_ignores !== undefined) {
+      try { parseCaptureIgnores(data.capture_ignores); }
+      catch (err) { corrupt((err as Error).message); }
+      policyExclusions = [...POLICY_EXCLUSIONS, 'ignore-rules'];
+    }
     if (record.type === BASELINED || record.type === CHANGED) {
       const path = checkPath(data.path, seq);
       const state = states.get(path) ?? {};
@@ -218,5 +225,5 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
   }
   files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   return { kind: 'resolved', inventory: { scope: 'observed', baselineCompletedSeq, unknownScopes,
-    policyExclusions: POLICY_EXCLUSIONS }, gaps, files, scan: scan() };
+    policyExclusions }, gaps, files, scan: scan() };
 }

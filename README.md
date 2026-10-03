@@ -114,3 +114,43 @@ over the owner-only `<store>/control.sock` using existing NDJSON framing. No
 harness identity is required from the client. Full details, limits and lifecycle:
 [queue contract](docs/ask-agent/contract.md). Receiving-answer UI remains
 separate work.
+## Capture ignores
+
+New captures follow Git's ignore rules for untracked files: repository and nested
+`.gitignore` files, `info/exclude`, and the configured global excludes file. Files
+already tracked by Git remain eligible, even inside an ignored directory.
+
+For additional capture-only exclusions, put a **`.slipstreamignore`** file at the
+watched root. It uses Gitignore patterns and also excludes tracked files. For example:
+
+```gitignore
+.gstack/
+*.log
+*.png
+```
+
+Choose the patterns you need; images and log files are not excluded globally.
+Negations (`!keep.log`) undo rules in `.slipstreamignore`, but cannot undo Git
+exclusions or the built-in store, `.git`, and symlink exclusions. Only the root
+`.slipstreamignore` is read. Outside a Git worktree, only `.slipstreamignore` and
+the built-in exclusions apply. Slipstream patterns are case-sensitive; Git rules
+use the repository's `core.ignoreCase` setting.
+
+Rules and tracked-file exceptions are **frozen when the capture starts**. Editing
+a rule file or changing what Git tracks takes effect in a **new capture**, not
+when resuming the same session. Old recordings are retained. Sessions created
+before this feature keep their original built-in-only exclusions on resume.
+
+The public `slipstream.session.started.v1` event records the complete versioned
+`capture_ignores` policy, so another client can explain and reproduce the scope.
+The comparison API appends `ignore-rules` to `inventory.policy_exclusions` for
+these sessions. Install the client compatibility update before starting captures
+with this daemon. Do not resume these sessions with an older daemon that ignores
+the new field.
+
+Capture refuses to start if rules cannot be read, Git metadata is broken, a rule
+file inside the worktree is a symlink, or the saved policy exceeds 512 KiB. It
+never silently truncates rules. Git commands at startup have a 10-second bound;
+live observations and resumed sessions run no Git commands. Ignored directories
+are pruned during rule discovery and the baseline scan. Native watcher delivery
+is unchanged; ignored live observations are filtered before capture reads files.

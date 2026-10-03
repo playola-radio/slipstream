@@ -1,5 +1,15 @@
 # Slipstream — MVP Implementation Plan
 
+## Capture ignores — 2026-10-03
+
+Status: implemented; validation and review in progress. Brian merges.
+
+New captures use frozen Git ignore rules plus root `.slipstreamignore` additions.
+Baseline, live capture, and restart reconciliation share the recorded policy;
+legacy sessions retain their prior scope. Public start-event metadata and the
+comparison `ignore-rules` marker disclose the exclusions. Roll out the companion
+Swift decoder update before the daemon. No FD5 measurements or admission changes.
+
 Date: 2026-09-16
 Status: approved to build (Brian, after Codex adversarial review)
 
