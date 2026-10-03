@@ -31,8 +31,20 @@ was not rerun independently.
 
 ## Evidence reviewed
 
-Artifacts are kept outside the repository in `~/fd5-postfix-20261003/` (`RESULT.md` plus the live,
-model and full-suite logs). No bearer configuration is copied into this record.
+Artifacts are kept outside the repository in `~/fd5-postfix-20261003/`. No bearer configuration is
+copied into this record. The following are the evidence files used here, named relative to that
+directory and pinned by SHA-256:
+
+| File | SHA-256 |
+|---|---|
+| `RESULT.md` | `403ebb66af136183af89dacacf2f162ab359efa07caa86c6f82d501473ac40d9` |
+| `summary.json` | `1dcb41e925a928ef5c21bd7a6df0695ec4d14073fd402698a049579ab0720747` |
+| `app-ready-pre-restart.log` | `7bc398c441fe02c2c847fd28aef808ecbeb95d9523e6839ea4bec1ea3002a121` |
+| `app-ready-post-restart.log` | `1760c4aab25275a806a3e60517eb3c1a2d46bb4d33e45f67588a0452a4709a00` |
+| `app-blob-loss.log` | `6f242be33931da6cfcb77a6d2882c73f44001df72177478752c1bd87e6b623bf` |
+| `app-session-removed.log` | `bdf7b2a5a43d03aeb8a6423eaa684957a7b2b863723af6aa4d6bd2c502f1a0de` |
+| `model-tests.log` | `8a21989c9f03dad264ba0d197e506df922f816ea96105850ea8efc090ddfafee` |
+| `viewer-full.log` | `bbcc57fa8369cd4d18a7794745529e7542ed24157217f6a36d1d38490963443b` |
 
 - **Live invocations.** Each of the four invocations (ready before restart, ready after restart,
   blob loss, session removed) was counted independently: one test passed and two intentional skips.
@@ -61,9 +73,15 @@ is claimed as an observed in-process live reconnect.
 ## What is not verified
 
 - The native app's visual presentation of restart, blob loss and `410` was not observed. This stays
-  explicitly unverified at the visual level. It does not block acceptance under the approved focused
-  post-fix brief, because app-model live behaviour and the earlier native responsiveness evidence
-  meet that brief.
+  explicitly unverified at the visual level. It does not block acceptance under the focused post-fix
+  brief at
+  `/Users/brian/conductor/workspaces/slipstream-client-swift/hangzhou-v2/.context/orchestrate-feature/function-changes/brief-mvp-postfix-client-check.md`
+  (outside git). That brief requires a dated, commit-pinned result for the selected live and model
+  rows, explicit PASS/FAIL/UNVERIFIED levels and counts, preservation of the 2026-10-02 FAIL, and no
+  performance claim. For cancellation, it replaces the manual close-during-a-sub-300-ms-load race
+  with the deterministic `cancellationPreventsLatePageFromPublishing` test: the late page is rejected
+  and the comparison reloads successfully. The app-model live behaviour and earlier native
+  responsiveness evidence meet those focused criteria.
 - A manual sub-300 ms close-to-cancel and a post-fix main-thread profile were not required and were
   not captured.
 - The header overflowing in a narrow window remains follow-up work.
