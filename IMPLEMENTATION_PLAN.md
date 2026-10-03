@@ -737,7 +737,7 @@ recording a spaced edit while a comparison runs, a usable native UI, and
 cancellation followed by a successful comparison. The result is recorded in
 `docs/fd5-mvp-functional-check-2026-10-02.md`: **FAIL** on 2026-10-02. Comparisons
 and capture were correct, but the native app stops responding for several seconds
-while a comparison loads, so close-to-cancel during a request could not be observed. This narrows the MVP scope; it is
+while a comparison loads, so close-to-cancel during a request could not be observed. The freeze was fixed in client PR #17 (2026-10-03) and Brian's informal re-check found the app responsive; close-to-cancel during a load is still unobserved. This narrows the MVP scope; it is
 not a passing FD5 campaign. D7 is not established, no production admission value
 is measured or approved, and heavy-load behaviour stays unproven. Interface
 10,000 ms, clip 100 ms and C=2/Q=8/W=8 stay unchanged. The two failed campaign

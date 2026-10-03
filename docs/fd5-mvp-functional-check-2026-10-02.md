@@ -210,6 +210,27 @@ Other native-UI findings, not failures under the brief:
   folder look identical, so the right one could only be picked from the reader's session order.
 - The Swift name `greet(name:loud:)` wraps in the middle of the declaration card.
 
+## Follow-up: the freeze is fixed (2026-10-03)
+
+The cause was in the native app, not the daemon. Sampling the main thread (Debug and Release)
+put about 94% of the busy time in SwiftUI's `ViewThatFits`. The comparison header nested one
+`ViewThatFits` inside another, and each candidate held the AppKit search field and mode picker,
+so the app measured them over and over.
+
+Client PR #17 (merged as `99c6a5e`) flattens the header into one `ViewThatFits`. In a window
+shaped like the app's, the first layout dropped from 2.3–2.7 s to about 0.1 s, and a resize
+from 1.3–1.7 s to about 0.03 s. A layout-timing test fails on the old header and passes on the
+new one.
+
+Brian re-checked the fixed app (`0d4fe52`, Release, same kept store) and reported it "much
+better". This was an informal re-check, not a re-run of this check:
+
+- No main-thread sample of the fixed app was kept.
+- Close-to-cancel during a load is still unobserved. Comparisons on this store finish in under
+  300 ms, so the panel cannot be closed mid-request by hand.
+
+The 2026-10-02 verdict above stands as recorded.
+
 ## What this does not establish
 
 - D7 is not established.
