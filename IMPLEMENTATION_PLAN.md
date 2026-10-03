@@ -737,7 +737,14 @@ recording a spaced edit while a comparison runs, a usable native UI, and
 cancellation followed by a successful comparison. The result is recorded in
 `docs/fd5-mvp-functional-check-2026-10-02.md`: **FAIL** on 2026-10-02. Comparisons
 and capture were correct, but the native app stops responding for several seconds
-while a comparison loads, so close-to-cancel during a request could not be observed. The freeze was fixed in client PR #17 (2026-10-03) and Brian's informal re-check found the app responsive; close-to-cancel during a load is still unobserved. This narrows the MVP scope; it is
+while a comparison loads, so close-to-cancel during a request could not be observed. The freeze was fixed in client PR #17 (2026-10-03) and Brian's informal re-check found the app responsive; close-to-cancel during a load is still unobserved.
+**Current status (2026-10-03): MVP functional acceptance PASS; heavy-load
+characterization deferred; D7 not established.** The accepted post-fix result is a
+separate record, `docs/fd5-mvp-functional-acceptance-2026-10-03.md`: daemon
+`35b7926`, client `0bbec6f` (PR #17 fix and PR #18 labels), and live acceptance tests
+merged in client PR #19 (`1b49d84`). It does not change the 2026-10-02 FAIL, which
+stays recorded. Native visuals of restart, blob loss and `410` were not observed, and
+the narrow-window header overflow remains follow-up work. This narrows the MVP scope; it is
 not a passing FD5 campaign. D7 is not established, no production admission value
 is measured or approved, and heavy-load behaviour stays unproven. Interface
 10,000 ms, clip 100 ms and C=2/Q=8/W=8 stay unchanged. The two failed campaign

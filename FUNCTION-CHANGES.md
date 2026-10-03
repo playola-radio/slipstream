@@ -8,7 +8,10 @@
 > it; where they differ, the schema and fixtures win. FD4 is merged. On
 > 2026-10-01 Brian deferred the FD5 measured admission gate (D7) for MVP and
 > replaced it with a small functional check; D7 is not established and
-> heavy-load behaviour stays unproven (`FD5-PROTOCOL.md`).
+> heavy-load behaviour stays unproven (`FD5-PROTOCOL.md`). On 2026-10-03 the
+> post-fix result was accepted: MVP functional acceptance PASS; heavy-load
+> characterization deferred; D7 not established
+> (`docs/fd5-mvp-functional-acceptance-2026-10-03.md`).
 
 This document defines how the daemon reports what changed in functions'
 inputs and outputs over a stretch of captured work. It is the design for the
