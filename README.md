@@ -116,9 +116,13 @@ harness identity is required from the client. Full details, limits and lifecycle
 separate work.
 ## Capture ignores
 
-New captures follow Git's ignore rules for untracked files: repository and nested
-`.gitignore` files, `info/exclude`, and the configured global excludes file. Files
+New captures follow repository and nested `.gitignore` rules for untracked files. Files
 already tracked by Git remain eligible, even inside an ignored directory.
+Global Git excludes and `info/exclude` are not read or copied into the capture;
+put capture-only rules in `.slipstreamignore`. Independent nested repositories
+are treated as ordinary captured folders under the outer capture's rules; their
+own Git settings and ignore files are not loaded. Watch a nested repository
+directly to use its own policy and tracked-file exceptions.
 
 For additional capture-only exclusions, put a **`.slipstreamignore`** file at the
 watched root. It uses Gitignore patterns and also excludes tracked files. For example:
@@ -148,9 +152,11 @@ these sessions. Install the client compatibility update before starting captures
 with this daemon. Do not resume these sessions with an older daemon that ignores
 the new field.
 
-Capture refuses to start if rules cannot be read, Git metadata is broken, a rule
-file inside the worktree is a symlink, or the saved policy exceeds 512 KiB. It
-never silently truncates rules. Git commands at startup have a 10-second bound;
+Capture refuses to start if rules or a non-ignored directory cannot be read,
+Git is unavailable or its metadata is broken, rule text or tracked paths are not
+UTF-8, a rule file is a symlink, or the saved policy exceeds 512 KiB. It never
+silently truncates rules. Vanished directories are skipped. Rule discovery has
+a 10-second budget, checked between filesystem reads and enforced on Git commands;
 live observations and resumed sessions run no Git commands. Ignored directories
 are pruned during rule discovery and the baseline scan. Native watcher delivery
 is unchanged; ignored live observations are filtered before capture reads files.

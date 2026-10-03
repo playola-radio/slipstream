@@ -173,6 +173,7 @@ export async function startCapture(
   const resuming = opts.resumeSessionId !== undefined;
   // Fail before creating a session if its exclusion policy cannot be read.
   let captureIgnores = resuming ? undefined : await loadCaptureIgnores(root, storeDir);
+  let ignorePath = captureIgnores === undefined ? undefined : compileCaptureIgnores(captureIgnores);
   const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
   const blobsDir = join(storeDir, 'blobs');
   const sessionDir = join(storeDir, 'sessions', sessionId);
@@ -309,6 +310,7 @@ export async function startCapture(
       });
       recovered = await recoverSession(logPath, sessionId, cas);
       captureIgnores = recovered.captureIgnores;
+      ignorePath = captureIgnores === undefined ? undefined : compileCaptureIgnores(captureIgnores);
       if (recovered.root === undefined) {
         throw new Error(`cannot resume session ${sessionId}: no existing session.started record`);
       }
@@ -428,11 +430,10 @@ export async function startCapture(
   // inside the watched root, excluding it is what stops the watcher from
   // observing its own output.
   const excluded = [storeDir, join(root, '.git')];
-  const ignorePath = captureIgnores === undefined ? undefined : compileCaptureIgnores(captureIgnores);
   const isExcluded = (abs: string, isDir = false): boolean => {
     if (excluded.some((e) => isUnder(abs, e))) return true;
     const rel = relative(root, abs);
-    return rel !== '' && !escapesBase(rel) && (ignorePath?.(rel.split(sep).join('/'), isDir) ?? false);
+    return !escapesBase(rel) && (ignorePath?.(rel.split(sep).join('/'), isDir) ?? false);
   };
 
   let live = false;

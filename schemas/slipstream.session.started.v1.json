@@ -106,18 +106,10 @@
                       "items": {
                         "type": "object",
                         "required": [
-                          "kind",
                           "dir",
                           "text"
                         ],
                         "properties": {
-                          "kind": {
-                            "enum": [
-                              "gitignore",
-                              "info/exclude",
-                              "core.excludesFile"
-                            ]
-                          },
                           "dir": {
                             "type": "string"
                           },

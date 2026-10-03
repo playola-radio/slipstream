@@ -13,13 +13,30 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile, rm, rename, chmod } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, writeFile, rm, rename, chmod, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { changesFor, withSession, readRecords } from './test/helpers.ts';
+import { changesFor, withSession, readRecords, withTempDir } from './test/helpers.ts';
+import { startCapture } from './session.ts';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 describe('session (real OS)', () => {
+  it('refuses an unreadable Git rule scope before creating a capture session', async () => {
+    await withTempDir(async (base) => {
+      const root = join(base, 'repo');
+      const store = join(base, 'store');
+      await mkdir(root);
+      execFileSync('git', ['init', '-q', root]);
+      await mkdir(join(root, 'locked'));
+      await chmod(join(root, 'locked'), 0o000);
+      try {
+        await assert.rejects(startCapture({ root, storeDir: store }), /Capture ignore policy/);
+        await assert.rejects(stat(join(store, 'sessions')), { code: 'ENOENT' });
+      } finally { await chmod(join(root, 'locked'), 0o700); }
+    });
+  });
+
   it('captures source edits while ignored noise and unreadable ignored directories stay out', async () => {
     await withSession(async (root) => {
       await writeFile(join(root, '.slipstreamignore'), '.gstack/\n*.png\n');

@@ -20,6 +20,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { loadAllSchemas, validate, type JsonSchema } from '../src/schema.ts';
 import { SOURCE_PREFIX } from '../src/event.ts';
 import { assertSafePath, CorruptLogError } from '../src/recovery.ts';
+import { parseCaptureIgnores } from '../src/capture-ignores.ts';
 
 const CONTRACT_DIR = fileURLToPath(new URL('../contracts/interface/v2/', import.meta.url));
 const CASES_DIR = join(CONTRACT_DIR, 'cases');
@@ -185,6 +186,10 @@ function checkHistory(raw: unknown, schemas: Map<string, JsonSchema>, errors: st
       return;
     }
     for (const e of validate(schemas.get(event.type)!, event)) errors.push(`${where}: ${e}`);
+    if (event.type === 'slipstream.session.started.v1' && isObj(event.data) && event.data.capture_ignores !== undefined) {
+      try { parseCaptureIgnores(event.data.capture_ignores); }
+      catch (err) { errors.push(`${where}: ${(err as Error).message}`); }
+    }
     if (typeof event.seq !== 'string' || !SEQ.test(event.seq)) return;
     const seq = BigInt(event.seq);
     if (seq !== previous + 1n) errors.push(`${where}: seq ${event.seq} is not contiguous (expected ${previous + 1n})`);

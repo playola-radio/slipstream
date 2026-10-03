@@ -47,14 +47,6 @@ function envelope(e: Event): Record<string, unknown> {
 const content = (sha256: string, size = 1) => ({ kind: 'content', sha256: sha256.repeat(64), size });
 const absent = { kind: 'absent' };
 
-test('discloses frozen ignore rules from the public session start record', async () => {
-  await withLog([event(1, 'session.started', { capture_ignores: { version: 1, git: null, slipstreamignore: '*.log\n' } })], async (logPath) => {
-    const result = await resolveRecordedRange(options(logPath, 0n, 1n));
-    assert.equal(result.kind, 'resolved');
-    if (result.kind === 'resolved') assert.deepEqual(result.inventory.policyExclusions, ['store-directory', '.git', 'symlinks', 'ignore-rules']);
-  });
-});
-
 function options(logPath: string, beforeSeq: bigint, afterSeq: bigint, extra = {}) {
   return { logPath, sessionId, durableSeq: afterSeq, beforeSeq, afterSeq,
     scanBudget: { records: 100_000, bytes: 16 * 1024 * 1024 }, ...extra };

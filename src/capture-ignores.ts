@@ -1,15 +1,14 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { lstat, open, readdir } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, open, readdir, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import ignore from 'ignore';
 
 // Keep the complete start event well below the client's 1 MiB SSE line limit.
 const POLICY_BYTES = 512 * 1024;
 const exec = promisify(execFile);
-type RuleSource = { kind: 'gitignore' | 'info/exclude' | 'core.excludesFile'; dir: string; text: string };
+type RuleSource = { dir: string; text: string };
 export interface CaptureIgnores {
   version: 1;
   git: null | { root_prefix: string; ignore_case: boolean; sources: RuleSource[]; tracked_exceptions: string[] };
@@ -41,9 +40,7 @@ export function parseCaptureIgnores(value: unknown): CaptureIgnores {
       || !(g.root_prefix === '' || g.root_prefix.endsWith('/') && safePath(g.root_prefix.slice(0, -1)))
       || typeof g.ignore_case !== 'boolean' || !Array.isArray(g.sources) || !Array.isArray(g.tracked_exceptions)) fail('invalid Git policy');
     for (const s of g.sources) {
-      if (!s || !['gitignore', 'info/exclude', 'core.excludesFile'].includes(s.kind)
-        || !safePath(s.dir, true) || s.dir.endsWith('/') || typeof s.text !== 'string'
-        || s.kind !== 'gitignore' && s.dir !== '') fail('invalid rule source path or text');
+      if (!s || !safePath(s.dir, true) || s.dir.endsWith('/') || typeof s.text !== 'string') fail('invalid rule source path or text');
     }
     for (const path of g.tracked_exceptions) if (!safePath(path) || path.endsWith('/')) fail('invalid tracked exception path');
   }
@@ -82,9 +79,9 @@ export function compileCaptureIgnores(policy: CaptureIgnores): (rel: string, isD
   const slip = ignore({ ignorecase: false }).add(policy.slipstreamignore ?? '');
   const git = policy.git;
   const matcher = ignore({ ignorecase: git?.ignore_case ?? false });
-  const rank = (s: RuleSource) => s.kind === 'core.excludesFile' ? -2 : s.kind === 'info/exclude' ? -1 : s.dir.split('/').length;
-  for (const s of [...(git?.sources ?? [])].sort((a, b) => rank(a) - rank(b))) matcher.add(scopedPatterns(s));
-  const tracked = new Set(git?.tracked_exceptions ?? []);
+  for (const s of git?.sources ?? []) matcher.add(scopedPatterns(s));
+  const key = (path: string) => git?.ignore_case ? path.toLowerCase() : path;
+  const tracked = new Set((git?.tracked_exceptions ?? []).map(key));
   const parents = new Set<string>();
   for (const path of tracked) {
     const parts = path.split('/');
@@ -95,7 +92,7 @@ export function compileCaptureIgnores(policy: CaptureIgnores): (rel: string, isD
     if (rel === '') return false;
     const query = rel + (isDir ? '/' : '');
     if (slip.ignores(query)) return true;
-    if (!git || (isDir ? parents : tracked).has(rel)) return false;
+    if (!git || (isDir ? parents : tracked).has(key(rel))) return false;
     return matcher.ignores(git.root_prefix + query);
   };
 }
@@ -103,13 +100,17 @@ export function compileCaptureIgnores(policy: CaptureIgnores): (rel: string, isD
 /** Git runs only at capture start. Rule text and tracked exceptions are frozen
  * in the public log; neither live observations nor recovery consult Git. */
 export async function loadCaptureIgnores(root: string, storeDir?: string): Promise<CaptureIgnores> {
+  root = await realpath(root);
+  const deadline = Date.now() + 10_000;
+  const checkTime = () => { if (Date.now() >= deadline) fail('rule discovery exceeded its 10-second budget'); };
   let readBytes = 0;
-  const readRule = async (path: string, inTree: boolean): Promise<string | null> => {
+  const readRule = async (path: string): Promise<string | null> => {
+    checkTime();
     let handle;
     try {
-      handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | (inTree ? constants.O_NOFOLLOW : 0));
+      handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      if (['ENOENT', 'ENOTDIR'].includes((err as NodeJS.ErrnoException).code ?? '')) return null;
       return fail(`cannot read ${path}: ${(err as Error).message}`);
     }
     try {
@@ -120,6 +121,7 @@ export async function loadCaptureIgnores(root: string, storeDir?: string): Promi
       const bytes = Buffer.alloc(remaining + 1);
       let used = 0;
       while (used < bytes.length) {
+        checkTime();
         const { bytesRead } = await handle.read(bytes, used, bytes.length - used, null);
         if (bytesRead === 0) break;
         used += bytesRead;
@@ -130,7 +132,7 @@ export async function loadCaptureIgnores(root: string, storeDir?: string): Promi
     } catch (err) { return fail(`cannot read ${path}: ${(err as Error).message}`); }
     finally { await handle.close(); }
   };
-  const policy: CaptureIgnores = { version: 1, git: null, slipstreamignore: await readRule(join(root, '.slipstreamignore'), true) };
+  const policy: CaptureIgnores = { version: 1, git: null, slipstreamignore: await readRule(join(root, '.slipstreamignore')) };
   let repo: string | undefined;
   for (let dir = root; ; dir = dirname(dir)) {
     try { await lstat(join(dir, '.git')); repo = dir; break; }
@@ -141,47 +143,67 @@ export async function loadCaptureIgnores(root: string, storeDir?: string): Promi
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   env.GIT_OPTIONAL_LOCKS = '0';
   const git = async (args: string[], optional = false): Promise<string> => {
+    checkTime();
     try {
-      const { stdout } = await exec('git', ['-c', 'core.fsmonitor=false', ...args], {
-        cwd: root, env, timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: POLICY_BYTES, encoding: 'buffer',
+      const { stdout } = await exec('git', ['-c', 'core.fsmonitor=false', '-c', 'core.excludesFile=/dev/null', ...args], {
+        cwd: root, env, timeout: Math.max(1, deadline - Date.now()), killSignal: 'SIGKILL', maxBuffer: POLICY_BYTES, encoding: 'buffer',
       });
-      return new TextDecoder('utf-8', { fatal: true }).decode(stdout);
+      checkTime();
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(stdout);
     } catch (err) {
       if (optional && (err as { code?: number }).code === 1) return '';
+      if ((err as { code?: string }).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') fail(`Git ${args[0]} output exceeds the 512 KiB policy limit`);
       return fail(`Git ${args[0]} failed: ${(err as Error).message}`);
     }
   };
   const chomp = (s: string) => s.endsWith('\n') ? s.slice(0, -1) : s;
-  const excludePath = chomp(await git(['rev-parse', '--git-path', 'info/exclude']));
-  const globalPath = chomp(await git(['config', '--path', '--get', 'core.excludesFile'], true))
-    || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'git', 'ignore');
+  repo = await realpath(chomp(await git(['rev-parse', '--show-toplevel'])));
+  if (!within(root, repo)) fail('Git worktree does not contain the capture root');
   const ignoreCase = chomp(await git(['config', '--bool', '--get', 'core.ignoreCase'], true)) === 'true';
-  const tracked = (await git(['ls-files', '-z', '--cached', '--ignored', '--exclude-standard'])).split('\0').filter(Boolean);
+  const tracked = (await git(['ls-files', '-z', '--cached', '--ignored', '--exclude-per-directory=.gitignore'])).split('\0').filter(Boolean);
   const prefix = relative(repo, root).split(sep).join('/');
   policy.git = { root_prefix: prefix ? `${prefix}/` : '', ignore_case: ignoreCase, sources: [], tracked_exceptions: [...new Set(tracked)].sort() };
-  const addSource = async (path: string, kind: RuleSource['kind'], dir: string) => {
-    // /dev/null is a conventional way to disable Git's global excludes file.
-    const text = !inTreeKind(kind) && path === '/dev/null' ? null : await readRule(path, inTreeKind(kind));
-    if (text !== null) { policy.git!.sources.push({ kind, dir, text }); bounded(policy); }
+  let policyBytes = Buffer.byteLength(JSON.stringify(bounded(policy)));
+  const addSource = async (path: string, dir: string) => {
+    const text = await readRule(path);
+    if (text === null) return;
+    const source = { dir, text };
+    policyBytes += Buffer.byteLength(JSON.stringify(source)) + (policy.git!.sources.length ? 1 : 0);
+    if (policyBytes > POLICY_BYTES) fail('saved rules exceed the 512 KiB limit');
+    policy.git!.sources.push(source);
   };
-  const inTreeKind = (kind: RuleSource['kind']) => kind === 'gitignore';
-  await addSource(resolve(root, globalPath), 'core.excludesFile', '');
-  await addSource(resolve(root, excludePath), 'info/exclude', '');
   let ancestor = repo;
   while (ancestor !== root) {
-    await addSource(join(ancestor, '.gitignore'), 'gitignore', relative(repo, ancestor).split(sep).join('/'));
+    await addSource(join(ancestor, '.gitignore'), relative(repo, ancestor).split(sep).join('/'));
     const next = relative(ancestor, root).split(sep)[0]!;
     ancestor = join(ancestor, next);
   }
+  let compiledSources = -1;
+  let discoveryMatcher: ReturnType<typeof compileCaptureIgnores>;
   const walk = async (dir: string): Promise<void> => {
-    await addSource(join(dir, '.gitignore'), 'gitignore', relative(repo!, dir).split(sep).join('/'));
-    const excludes = compileCaptureIgnores({ ...policy, git: { ...policy.git!, tracked_exceptions: [] } });
-    const entries = await readdir(dir, { withFileTypes: true });
+    await addSource(join(dir, '.gitignore'), relative(repo!, dir).split(sep).join('/'));
+    if (compiledSources !== policy.git!.sources.length) {
+      discoveryMatcher = compileCaptureIgnores({ ...policy, git: { ...policy.git!, tracked_exceptions: [] } });
+      compiledSources = policy.git!.sources.length;
+    }
+    const excludes = discoveryMatcher;
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch (err) {
+      if (['ENOENT', 'ENOTDIR'].includes((err as NodeJS.ErrnoException).code ?? '')) return;
+      throw err;
+    }
+    checkTime();
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name === '.git') continue;
       const abs = join(dir, entry.name);
       if (storeDir && within(abs, storeDir)) continue;
       if (excludes(relative(root, abs).split(sep).join('/'), true)) continue;
+      // Nested worktrees have their own index and policy; do not pretend their
+      // rules use the outer repository's tracked exceptions. Capture retains
+      // its existing scope there, governed by the outer capture's rules only.
+      try { await lstat(join(abs, '.git')); continue; }
+      catch (err) { if (!['ENOENT', 'ENOTDIR'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err; }
       await walk(abs);
     }
   };

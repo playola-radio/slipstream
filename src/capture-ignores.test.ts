@@ -23,6 +23,32 @@ async function put(root: string, path: string, text = 'content') {
 }
 
 describe('capture ignore policy', () => {
+  it('does not read or publish external Git exclude files', async () => {
+    await fixture(async (root) => {
+      await put(root, 'private-excludes', 'PRIVATE_GLOBAL_CONTENT\n*.log\n');
+      await exec('git', ['-C', root, 'config', 'core.excludesFile', join(root, 'private-excludes')]);
+      await put(root, '.git/info/exclude', 'PRIVATE_INFO_CONTENT\n*.png\n');
+      const policy = await loadCaptureIgnores(root);
+      assert.ok(!JSON.stringify(policy).includes('PRIVATE_'));
+      const ignores = compileCaptureIgnores(policy);
+      assert.equal(ignores('debug.log'), false);
+      assert.equal(ignores('shot.png'), false);
+    });
+  });
+
+  it('preserves tracked files after case-only changes in a case-insensitive repository', async () => {
+    await fixture(async (root) => {
+      await exec('git', ['-C', root, 'config', 'core.ignoreCase', 'true']);
+      await put(root, '.gitignore', 'Build/\n');
+      await put(root, 'Build/Keep.ts');
+      await exec('git', ['-C', root, 'add', '-f', 'Build/Keep.ts']);
+      const ignores = compileCaptureIgnores(await loadCaptureIgnores(root));
+      assert.equal(ignores('build', true), false);
+      assert.equal(ignores('build/keep.ts'), false);
+      assert.equal(ignores('build/other.ts'), true);
+    });
+  });
+
   it('matches Git across nested rules, directory pruning, negation and escaped names', async () => {
     await fixture(async (root) => {
       await put(root, '.gitignore', '*.log\n!keep.log\nbuild/\n!build/keep.txt\nx/y/\nsub/.gitignore\n');
@@ -61,7 +87,7 @@ describe('capture ignore policy', () => {
     });
   });
 
-  it('reads ancestor rules for a subdirectory and info/exclude in a linked worktree', async () => {
+  it('reads ancestor rules for a subdirectory and repository rules in a linked worktree', async () => {
     await fixture(async (root) => {
       await put(root, '.gitignore', '/sub/generated/\n');
       await put(root, 'sub/generated/a.ts');
@@ -73,7 +99,7 @@ describe('capture ignore policy', () => {
       await exec('git', ['-C', root, '-c', 'user.name=QA', '-c', 'user.email=qa@example.invalid', 'commit', '-qm', 'fixture']);
       const linked = join(root, 'linked');
       await exec('git', ['-C', root, 'worktree', 'add', '-q', '--detach', linked]);
-      await put(root, '.git/info/exclude', '*.noise\n');
+      await put(linked, '.gitignore', '*.noise\n');
       assert.equal(compileCaptureIgnores(await loadCaptureIgnores(linked))('run.noise'), true);
     });
   });
@@ -104,6 +130,18 @@ describe('capture ignore policy', () => {
     });
   });
 
+  it('does not apply a nested repository rule using the outer index', async () => {
+    await fixture(async (root) => {
+      await mkdir(join(root, 'nested'));
+      await exec('git', ['init', '-q', join(root, 'nested')]);
+      await put(root, 'nested/.gitignore', '*.ts\n');
+      await put(root, 'nested/keep.ts');
+      await exec('git', ['-C', join(root, 'nested'), 'add', '-f', 'keep.ts']);
+      const ignores = compileCaptureIgnores(await loadCaptureIgnores(root));
+      assert.equal(ignores('nested/keep.ts'), false);
+    });
+  });
+
   it('rejects broken Git metadata, symlink rule files and oversized policies explicitly', async () => {
     await fixture(async (root) => {
       await symlink('/does-not-exist', join(root, '.slipstreamignore'));
@@ -120,6 +158,6 @@ describe('capture ignore policy', () => {
 
   it('rejects unsupported versions and unsafe saved paths', () => {
     assert.throws(() => parseCaptureIgnores({ version: 2, git: null, slipstreamignore: null }), /version|policy/i);
-    assert.throws(() => parseCaptureIgnores({ version: 1, git: { root_prefix: '../', sources: [], tracked_exceptions: [] }, slipstreamignore: null }), /path|policy/i);
+    assert.throws(() => parseCaptureIgnores({ version: 1, git: { root_prefix: '../', ignore_case: false, sources: [], tracked_exceptions: [] }, slipstreamignore: null }), /path|policy/i);
   });
 });

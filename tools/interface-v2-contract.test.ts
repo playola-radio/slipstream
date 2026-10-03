@@ -47,6 +47,16 @@ function asError(c: Case, httpStatus: number): void {
 }
 
 describe('interface.v2 contract fixtures', () => {
+  it('rejects malformed ignore policies even when the projection marker agrees', () => {
+    const errors = errorsAfter((c) => {
+      c.history.events[0].data.capture_ignores = {
+        version: 1, git: { root_prefix: '', ignore_case: false,
+          sources: [{ dir: '../outside', text: '*.log' }], tracked_exceptions: [] }, slipstreamignore: null,
+      };
+    }, 'range-ignore-rules');
+    assert.ok(errors.some((e) => e.includes('invalid rule source path')));
+  });
+
   it('the CLI validates every case and proves its negative control is rejected', async () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
