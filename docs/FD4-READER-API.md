@@ -154,4 +154,11 @@ The prior failures are recorded in
 `.context/fd5-collector-profile-tools-after-review.txt`; the passing run is
 `.context/fd4-completeness-tools-test.log`. Neither failure is claimed fixed.
 The accepted no-row/unchanged-cursor and Swift host-error limitations remain
-follow-ups. Overall feature completion and release remain gated on FD5.
+follow-ups.
+
+On 2026-10-01 Brian deferred the combined-load FD5 campaign and D7 for MVP and
+replaced them, as the MVP gate, with a small functional check
+(`docs/fd5-mvp-functional-check-2026-10-02.md`). D7 is not established and
+heavy-load behaviour stays unproven; the FD5 items above remain the work for a
+later heavy-load characterization. Current interface, clip and C/Q/W policies are
+unchanged.

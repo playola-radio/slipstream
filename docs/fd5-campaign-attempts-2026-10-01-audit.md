@@ -196,6 +196,8 @@ completed in combined r2.
 ## Owner decisions needed before a valid next run
 
 Nothing in this list is implemented. Any further measurement needs a separately approved packet.
+On 2026-10-01 Brian deferred this campaign for MVP (see `FD5-PROTOCOL.md`), so every item below is
+deferred with it; none is rejected or approved.
 
 **Proposed load-generator changes.** These change how load is produced. They do not change what
 counts as sufficient.
@@ -229,6 +231,6 @@ counts as sufficient.
 
 **Run parameters to confirm.**
 
-- The 2300 s preparation cap and 180 s arm cap. The fixes below make both fixed protocol values.
+- The 2300 s preparation cap and 180 s arm cap. The review fixes in `8179597` make both fixed protocol values.
 - Correct the stale window/watchdog prose in the config's packet decisions.
 - Name the measured revision. A next run would measure the fixed head, not `1ecd667`.

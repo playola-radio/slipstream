@@ -696,8 +696,8 @@ per-change `interface.v1` endpoint (the v1 core and corpus stay). Decisions F1�
 were settled as A on 2026-09-27 (delegated by Brian). The contract
 (`contracts/interface/v2/`: schema, hand-written fixtures, and the
 `projection-check interface-v2-contract` validator) is written. Its slices
-(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2 and FD3 are merged;
-FD4's implementation is accepted for merge on reader-API PR #44; Brian merges.
+(FD1–FD5 daemon, FS1–FS3 Swift) are unblocked. FD1, FD2, FD3 and FD4 (reader-API PR #44)
+are merged.
 This is separate from FD5's measured feature-completion gate. Brian approved a 10,000 ms
 interface-only default page budget on 2026-09-30 for completeness; clip retains
 100 ms and the shared `C/Q/W` remain provisional. The earlier 100 ms cold Swift
@@ -720,16 +720,28 @@ mode exceeded the approved latency tolerance and stopped the sequence; the raw
 failure remains preserved. The revised v2 interface scorer is integrated for
 future diagnostics, with no v2 execution authorized. Observer cost and D7 values
 remain open. The bounded acceptance protocol for the current 10-second policy
-and shared queue/clip pressure is prepared in `FD5-PROTOCOL.md` and awaits
-Brian's approval of a window and its packet decisions; nothing has run. The
+and shared queue/clip pressure is in `FD5-PROTOCOL.md`; two campaign attempts on
+2026-10-01 failed (`docs/fd5-campaign-attempts-2026-10-01-audit.md`). The
 failed tracing overhead gate stays failed: the 12 scored arms run untraced, and
 three traced witness arms supply trace-only evidence with diagnostic-only
 latency. The archived native/WASM diagnostic
 timeout does not require completing the deferred Rust spike for this Node path.
 The Swift fixture-backed view remains FS2's work, and FS3
-live wiring may proceed after FD4 merges, alongside FD5. Overall feature
-completion still waits for FD5 approval. No success criterion or ratified
-decision changes.
+live wiring may proceed after FD4 merges, alongside FD5.
+
+**FD5 MVP scope (owner decision, 2026-10-01).** Brian deferred the combined-load
+FD5 campaign and D7 characterization for MVP and replaced them, as the MVP gate,
+with one small functional check: TypeScript and Swift comparisons that agree with
+an independent authenticated reader at the same frozen cutoffs, capture that keeps
+recording a spaced edit while a comparison runs, a usable native UI, and
+cancellation followed by a successful comparison. The result is recorded in
+`docs/fd5-mvp-functional-check-2026-10-02.md`. This narrows the MVP scope; it is
+not a passing FD5 campaign. D7 is not established, no production admission value
+is measured or approved, and heavy-load behaviour stays unproven. Interface
+10,000 ms, clip 100 ms and C=2/Q=8/W=8 stay unchanged. The two failed campaign
+attempts, revision `1ecd667`, the failed tracing-overhead evidence and the audit
+corrections are preserved. Feature completion must state this narrowed scope and
+the retained heavy-load limitation.
 
 **Status**: In Progress. T-QA (live QA harness) merged (#25). T0.1 (`display-fold.v1` contract + oracle, `DISPLAY-FOLD.md`) is in review. T0.2 onward is Not Started.
 
