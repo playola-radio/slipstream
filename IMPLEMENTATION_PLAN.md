@@ -2,13 +2,19 @@
 
 ## Capture ignores — 2026-10-03
 
-Status: implemented; validation and review in progress. Brian merges.
+Status: implemented and verified; awaiting merge. Brian merges.
 
-New captures use frozen Git ignore rules plus root `.slipstreamignore` additions.
+New captures use frozen repository `.gitignore` rules plus root `.slipstreamignore` additions.
 Baseline, live capture, and restart reconciliation share the recorded policy;
 legacy sessions retain their prior scope. Public start-event metadata and the
 comparison `ignore-rules` marker disclose the exclusions. Roll out the companion
 Swift decoder update before the daemon. No FD5 measurements or admission changes.
+
+Code head c5924af: typecheck; 1,249 source tests; 590 tools tests; 14 OS tests;
+72 contract cases with negative control; cumulative QA and fold release passed.
+Independent authenticated-reader acceptance and decoding its response in the
+companion Swift client passed. Opus correctness review, challenge, excess audit,
+combined fix wave and final re-review completed with PASS.
 
 Date: 2026-09-16
 Status: approved to build (Brian, after Codex adversarial review)
