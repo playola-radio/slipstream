@@ -1,16 +1,20 @@
 # FD5 MVP functional check — 2026-10-02
 
-**MVP functional acceptance: UNVERIFIED; heavy-load characterization deferred; D7 not established.**
+**MVP functional acceptance: FAIL; heavy-load characterization deferred; D7 not established.**
 
 On 2026-10-01 Brian replaced the four-arm FD5 campaign as the MVP gate with this small functional
 check (see the owner decision in `IMPLEMENTATION_PLAN.md` and `FD5-PROTOCOL.md`). This is a
 narrower check, not a passing FD5 result. No production limit changed: interface 10,000 ms, clip
 100 ms, C=2, Q=8, W=8.
 
-The check made one attempt with no retries, harness changes or production changes. The automated
-part ran for 521 ms of active time (2026-10-02T15:42:08Z–15:42:09Z). It found no product defect.
-The overall verdict is UNVERIFIED because nobody observed the native UI rows or the cancellation
-row (see below). It is not PASS.
+The automated part ran once, for 521 ms of active time (2026-10-02T15:42:08Z–15:42:09Z), with no
+retries, harness changes or production changes. It found no reader or capture defect. The native UI
+rows could not be observed in that attempt, so Brian directed a second, observed run of the native
+app on the same store ([run 2](#run-2-native-app-observed-by-brian)).
+
+The verdict is **FAIL** because of one known defect found in run 2. The native app stops responding
+for several seconds while a function comparison loads, so you cannot use it or close the panel
+during the request. The comparison results themselves are correct.
 
 ## Setup
 
@@ -50,10 +54,11 @@ Kept outside the repository (it contains captured source bytes) in `~/fd5-mvp-20
 | App model matches the independent reader | PASS, with a harness caveat | See [app model vs reader](#app-model-vs-reader) |
 | Capture continues while a comparison is pending | PASS (literal criterion) | See [continued capture](#continued-capture) |
 | Normal clip use | PASS | `mvp-check-result.json` `clips`; `post-exercise-clip-10.json` |
-| Feed and clip use in the native app | PASS (Brian's report) | See [native UI](#native-ui) |
-| Native comparison display for session `fc6cb49c` | UNVERIFIED | Both screenshots received were an unrelated board, not the panel |
-| Native UI responsive while a comparison loads | UNVERIFIED | Loads finish in under 300 ms here, so there was nothing to observe |
-| Cancel by closing or changing the comparison | UNVERIFIED | See [cancellation and recovery](#cancellation-and-recovery) |
+| Feed and clip use in the native app | PASS (Brian's report) | See [native UI](#native-ui) and [run 2](#run-2-native-app-observed-by-brian) |
+| Native comparison display | PASS (run 2) | `run2-compare-panel.png`; `run2-reader-page.json` |
+| Native UI usable while a comparison loads | **FAIL** (run 2) | The app does not respond for several seconds, until the comparison finishes |
+| Cancel by closing the comparison while it loads | UNVERIFIED | The frozen UI prevents clicking Close during the request; see [cancellation and recovery](#cancellation-and-recovery) |
+| Close and compare again (after loading) | PASS (run 2) | Brian's report |
 | A new comparison completes after the cancel attempt | PASS | See [cancellation and recovery](#cancellation-and-recovery) |
 | Capture is healthy after the cancel attempt | PASS | Probe edit 2 durable at seq 12 with the expected sha `546c9680…` |
 | Stale responses are discarded | PASS (existing automated test) | See [stale responses](#stale-responses) |
@@ -120,15 +125,14 @@ He reported that the feed responded. He also saw a compare panel with two greets
 probe. That panel was for the seeding session, where every function is newly added, so it is
 correct for that session.
 
-The comparison display for session `fc6cb49c` is still unobserved. The expected display is three
-signature changes: TS `greet`, Swift `greet` and `probe`. The two `add` functions are hidden unless
-"Show unchanged branches" is on. `post-ui-reader-page-7-16.json` holds the reader page the app
-would request.
+The comparison display for session `fc6cb49c` was never observed: both screenshots received
+showed an unrelated board. Run 2 below observed the display on a new session instead.
 
 ### Cancellation and recovery
 
 The script aborted request R2 at 50 ms, but R2 had already completed with 200, so the abort path was
-never exercised. HTTP cancellation and close-to-cancel in the app were not observed.
+never exercised. HTTP cancellation was not observed. In run 2 the app freezes while the comparison loads, so
+Close cannot be clicked during the request, and close-to-cancel remains unobserved.
 
 Existing automated coverage passed in `native-model-tests.log`:
 `SlipstreamViewerTests/Views/Pages/FunctionChangesPage/FunctionChangesLiveTests.swift:248`,
@@ -174,30 +178,37 @@ xcodebuild only passes the variables to the test runner with a `TEST_RUNNER_` pr
 not evidence that the app handled restart, blob loss or 410. This check did not re-test those
 cases in the app.
 
-## Manual steps to close the UNVERIFIED UI rows
+## Run 2: native app, observed by Brian
 
-The store is kept. Start the daemon and the app with new log names so the earlier logs are
-preserved:
+Brian asked for a second run so the native UI rows could be observed. It used the same revisions and
+the same kept store, with new log names; nothing earlier was overwritten.
 
-```sh
-cd ~/fd5-mvp-20261002/daemon-9856c11 && node tools/qa-daemon.ts --root ~/fd5-mvp-20261002/qa2 --reuse --keep \
-  > ~/fd5-mvp-20261002/qa-daemon-manual.out 2> ~/fd5-mvp-20261002/qa-daemon-manual.err &
-cd ~/fd5-mvp-20261002 && SLIPSTREAM_STORE=$PWD/qa2/store \
-  client-dd/Build/Products/Debug/SlipstreamViewer.app/Contents/MacOS/SlipstreamViewer
-```
+| Item | Value |
+|---|---|
+| Session | `051f35d8-0e61-46c3-9ec4-e8088ecf6c8b`; baseline at seq 7 |
+| Edits | `loud: boolean` added to TS `greet` (seq 10) and `loud: Bool` added to Swift `greet` (seq 9) |
+| Reader page (B=7, A=10) | `run2-reader-page.json`: `ready`, complete; both greets `signatureChanged` with the added parameter; helpers and probe `identical` |
+| Artifacts | `qa-daemon-run2.out/err`, `app-run2-*.log`, `run2-compare-panel.png`, `run2-session-picker.png` |
 
-Restarting opens a new capture session as well. Select session `fc6cb49c…` (the one with the greet
-edits, not the seeding one), then:
+Brian's observations:
 
-1. Click **Compare functions**. You should see three signature changes: `greet` in
-   `mvp-greet.ts` (`number`→`string`), `greet` in `MvpGreet.swift` (`Int`→`String`) and `probe`.
-   Neither `add` should appear until "Show unchanged branches" is turned on.
-2. While the panel is open, scroll the feed and open a clip to confirm the UI stays usable.
-3. Click **Close**, then **Compare functions** again. The same result should load without an
-   error.
+1. **Comparison display: PASS.** The panel showed "Recorded at #7 → Recorded at #12" and
+   "2 detected changes". It listed `MvpGreet.swift` with `name: String` unchanged and `+ loud: Bool`,
+   and `mvp-greet.ts` with `name: string` unchanged and `+ loud: boolean`. No unchanged declaration
+   appeared.
+2. **Feed and clip with the panel open: PASS.** Clicking the clip's changed line in the feed opened
+   the agent composer while the comparison panel was open. Nothing was sent.
+3. **UI usable during a comparison: FAIL.** Each comparison takes multiple seconds in the app. During
+   that time the app does not respond, including to feed scrolling and Close, until the comparison
+   finishes. The reader answers the same request in under 300 ms, so the delay is on the client side.
+   The cause was not investigated in this check.
+4. **Close, then compare again: PASS.** The same two changes came back without an error.
 
-Quit the app and press Ctrl-C in the daemon terminal when done. Each row stays UNVERIFIED until it
-is reported.
+Other native-UI findings, not failures under the brief:
+
+- The session picker labels every session with its worktree path only. Three captures of the same
+  folder look identical, so the right one could only be picked from the reader's session order.
+- The Swift name `greet(name:loud:)` wraps in the middle of the declaration card.
 
 ## What this does not establish
 
