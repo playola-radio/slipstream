@@ -17,6 +17,8 @@ export interface AdmissionTrace {
   outcome: AdmissionOutcome;
   /** True only after the owned compute actually exited following cancellation. */
   exitedAtNs?: bigint;
+  /** A parser process linked to this unit was alive when it was cancelled and then actually exited. */
+  parserCancelled?: boolean;
 }
 
 function tracesWithin(group: AdmissionTrace[], start: bigint, end: bigint): AdmissionTrace[] {
@@ -96,6 +98,8 @@ export interface ExpectedFile {
   afterRecordSeq: string;
   /** Expected complete structured changes, from a hand-specified fixture. */
   changes: unknown[];
+  /** A fixture that must never be reported ready, e.g. a parse failure. */
+  incompleteReason?: string;
 }
 export interface ExpectedInterfaceRequest {
   key: string;
@@ -107,6 +111,7 @@ export interface ExpectedInterfaceRequest {
   beforeSeq: string;
   afterSeq: string;
   files: ExpectedFile[];
+  variant?: 'unicode' | 'malformed';
 }
 export interface InterfaceAttempt {
   requestId: string;
@@ -118,7 +123,11 @@ export interface InterfaceAttempt {
   error?: string;
   /** Test-only per-file service observations, never inferred from HTTP readiness. */
   freshnessByPath?: Record<string, 'fresh' | 'cache-hit' | 'none'>;
+  /** Set when the load client deliberately disconnects after this many milliseconds. */
+  plannedAbortMs?: number;
 }
+/** The only error a planned client disconnect may record. */
+export const PLANNED_ABORT = 'planned-abort';
 export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts: InterfaceAttempt[]):
   { traces: AdmissionTrace[]; attempts: InterfaceAttempt[]; faults: string[];
     processExitsVerified: boolean; clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[];
@@ -146,6 +155,11 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
   const finished = new Map<number, bigint>();
   const parserRequests = new Set<number>();
   const processes = new Map<number, { startedAtNs: bigint; exitedAtNs?: bigint; unitIds: Set<number> }>();
+  // A process started for, or retired by, a unit belongs to that unit's parse rather than a shared pool.
+  const ownedByUnit = new Map<number, Set<number>>();
+  const own = (unitId: number, processId: number): void => {
+    ownedByUnit.set(unitId, (ownedByUnit.get(unitId) ?? new Set()).add(processId));
+  };
   const clipCacheBypasses: Extract<ProjectionTraceEvent, { kind: 'clip-cache-bypass' }>[] = [];
   const processUses: Array<{ unitId: number; processId: number }> = [];
   for (const event of events) {
@@ -182,13 +196,15 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
         else high = middle;
       }
       const target = group[low - 1];
-      if (!target || event.atNs > (target.completedAtNs ?? -1n)) {
+      // A planned disconnect has no response body; its completed rows remain lifecycle evidence.
+      const planned = target?.error === PLANNED_ABORT;
+      if (!target || !planned && event.atNs > (target.completedAtNs ?? -1n)) {
         faults.push('interface-file event has no unique HTTP attempt'); continue;
       }
       if (!target.expected.files.some(f => f.path === event.path)) { faults.push('interface-file event names unexpected path'); continue; }
       if (target.freshnessByPath?.[event.path] !== undefined) { faults.push('duplicate interface-file event'); continue; }
       const row = (object(target.body)?.files as unknown[] | undefined)?.find(raw => object(raw)?.path === event.path);
-      if (object(row)?.status !== event.resultStatus) { faults.push('interface-file status disagrees with HTTP row'); continue; }
+      if (!planned && object(row)?.status !== event.resultStatus) { faults.push('interface-file status disagrees with HTTP row'); continue; }
       target.freshnessByPath![event.path] = event.freshness;
     } else if (event.kind === 'task-finished') {
       if (!units.has(event.unitId) || finished.has(event.unitId)) faults.push('invalid task completion');
@@ -202,6 +218,7 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
         processes.set(event.processId, { startedAtNs: event.atNs,
           unitIds: new Set(event.unitId === undefined ? [] : [event.unitId]) });
         if (event.unitId !== undefined) {
+          own(event.unitId, event.processId);
           if (!parserRequests.has(event.unitId)) faults.push('process started without parser request');
           processUses.push({ unitId: event.unitId, processId: event.processId });
         }
@@ -216,7 +233,7 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
       const process = processes.get(event.processId);
       if (!process || !units.has(event.unitId) || process.exitedAtNs !== undefined)
         faults.push('invalid process retirement');
-      else process.unitIds.add(event.unitId);
+      else { process.unitIds.add(event.unitId); own(event.unitId, event.processId); }
     } else if (event.kind === 'process-exit') {
       const process = processes.get(event.processId);
       if (!process || process.exitedAtNs !== undefined || event.atNs < process.startedAtNs)
@@ -252,6 +269,11 @@ export function assembleProjectionTrace(events: ProjectionTraceEvent[], attempts
       if (taskAt !== undefined && (!parserRequests.has(unit.trace.unitId!) || linked.length > 0)
         && linked.every(process => process.exitedAtNs !== undefined))
         unit.trace.exitedAtNs = linked.reduce((at, process) => process.exitedAtNs! > at ? process.exitedAtNs! : at, taskAt);
+      const settledAt = unit.trace.settledAtNs!;
+      const owned = [...ownedByUnit.get(unit.trace.unitId!) ?? []].map(id => processes.get(id)!);
+      if (unit.trace.outcome === 'cancelled' && parserRequests.has(unit.trace.unitId!) && owned.some(process =>
+        process.startedAtNs <= settledAt && process.exitedAtNs !== undefined && process.exitedAtNs >= settledAt))
+        unit.trace.parserCancelled = true;
     }
     traces.push(unit.trace as AdmissionTrace);
   }
@@ -298,7 +320,8 @@ export function scoreProcessStartupTiming(processUses: Array<{ unitId: number; p
 }
 export interface InterfaceLoadInput {
   attempts: InterfaceAttempt[];
-  traces: AdmissionTrace[];
+  /** Null for an untraced arm: classification then rests on HTTP evidence alone. */
+  traces: AdmissionTrace[] | null;
   corpusKeys: string[];
   maxConcurrentRequests: number;
   freshServer: boolean;
@@ -314,11 +337,15 @@ export interface InterfaceLoadInput {
 type Counts = { submitted: number; rejected: number; admitted: number; queueTimeout: number;
   runningTimeout: number; cancelled: number; hostFailure: number; completedPages: number;
   completedFiles: number; usefulComparisons: number; cacheHits: number; unclassified: number;
-  admittedTimeoutFraction: number | null; overloadFraction: number; usefulPerSecond: number };
+  admittedTimeoutFraction: number | null; overloadFraction: number; usefulPerSecond: number;
+  validResponses: number; explicitTimeouts: number; unexplainedIncomplete: number;
+  /** HTTP cannot tell a look-ahead timeout from other incompleteness, so it bounds the rate. */
+  timeoutFractionBounds: { lower: number; upper: number } | null };
 const emptyCounts = (): Counts => ({ submitted: 0, rejected: 0, admitted: 0, queueTimeout: 0,
   runningTimeout: 0, cancelled: 0, hostFailure: 0, completedPages: 0, completedFiles: 0,
   usefulComparisons: 0, cacheHits: 0, unclassified: 0, admittedTimeoutFraction: null,
-  overloadFraction: 0, usefulPerSecond: 0 });
+  overloadFraction: 0, usefulPerSecond: 0, validResponses: 0, explicitTimeouts: 0,
+  unexplainedIncomplete: 0, timeoutFractionBounds: null });
 const object = (x: unknown): Record<string, unknown> | null => x !== null && typeof x === 'object' && !Array.isArray(x) ? x as Record<string, unknown> : null;
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 const sha = (x: unknown): string | null => {
@@ -357,7 +384,14 @@ export function validateInterfacePage(body: unknown, expected: ExpectedInterface
       || after?.kind !== 'recorded' || after.record_seq !== want.afterRecordSeq || after.field !== 'after'
       || after.observation !== 'watcher') faults.push(`source provenance mismatch ${file.path}`);
     if (file.language !== want.language || file.language_version !== want.languageVersion) faults.push(`language/version mismatch ${file.path}`);
-    if (file.status === 'ready') {
+    if (want.incompleteReason !== undefined) {
+      // The reader's interruptPage reports a file cut off mid-parse as skipped with the interrupt reason.
+      const interrupted = file.status === 'skipped' && ['timeout', 'cancelled'].includes(String(file.fallback_reason))
+        && object(page.page)?.complete !== true;
+      if (file.status === 'incomplete') {
+        if (file.fallback_reason !== want.incompleteReason) faults.push(`incomplete reason mismatch ${file.path}`);
+      } else if (!interrupted) faults.push(`expected incomplete file reported ${String(file.status)} ${file.path}`);
+    } else if (file.status === 'ready') {
       if (!Array.isArray(file.changes) || !same(file.changes, want.changes)) faults.push(`change mismatch ${file.path}`);
     } else if (!['identical', 'incomplete', 'unavailable', 'unsupported', 'skipped'].includes(String(file.status))) {
       faults.push(`invalid file status ${file.path}`);
@@ -385,14 +419,31 @@ export interface InterfaceLoadReport {
   continuousRequests: boolean;
   malformedResponses: number;
   timeoutWithoutHttpReason: number;
+  classification: 'trace' | 'http';
+  plannedCancels: { planned: number; abortedBeforeResponse: number; respondedBeforeAbort: number;
+    cancelledRunning: Record<'typescript' | 'swift', number> };
+  variants: Record<string, { requested: number; handled: number }>;
 }
 
-/** Admission evidence is mandatory. HTTP errors and partial pages cannot classify a denominator. */
+const before = (a: InterfaceAttempt, b: InterfaceAttempt): number =>
+  a.startedAtNs < b.startedAtNs ? -1 : a.startedAtNs > b.startedAtNs ? 1 : 0;
+const isOverloadPage = (page: Record<string, unknown> | null): boolean =>
+  page?.status === 'skipped' && page.fallback_reason === 'overloaded';
+const hasExplicitTimeout = (page: Record<string, unknown>): boolean => page.fallback_reason === 'timeout'
+  || (page.files as unknown[]).some(row => object(row)?.fallback_reason === 'timeout');
+
+/**
+ * With traces, admission evidence is mandatory and every HTTP outcome must agree with it.
+ * Without traces, overload, work and timeouts are classified from validated HTTP pages only;
+ * freshness then rests on the corpus construction (unique content per key on a fresh reader).
+ * Planned client aborts never enter load denominators, windows or useful work.
+ */
 export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadReport {
   const reasons: string[] = [];
   const byLanguage: Record<Language, Counts> = { typescript: emptyCounts(), tsx: emptyCounts(), swift: emptyCounts() };
   const total = emptyCounts();
-  const interfaceTraces = input.traces.filter(t => t.workload === 'interface');
+  const traced = input.traces !== null;
+  const interfaceTraces = (input.traces ?? []).filter(t => t.workload === 'interface');
   const byRoute = new Map<string, AdmissionTrace[]>();
   const unitIds = new Set<number>();
   for (const trace of interfaceTraces) {
@@ -408,14 +459,22 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   const usedUnits = new Set<number>();
   const keys = new Set(input.corpusKeys);
   if (keys.size !== input.corpusKeys.length) reasons.push('cold corpus repeats a key');
-  const ordered = [...input.attempts].sort((a, b) => a.startedAtNs < b.startedAtNs ? -1 : a.startedAtNs > b.startedAtNs ? 1 : 0);
+  const ordered = [...input.attempts].sort(before);
   const prior = new Map<string, InterfaceAttempt>();
   const seenIds = new Set<string>();
+  const plannedCancels: InterfaceLoadReport['plannedCancels'] = { planned: 0, abortedBeforeResponse: 0,
+    respondedBeforeAbort: 0, cancelledRunning: { typescript: 0, swift: 0 } };
+  const variants: InterfaceLoadReport['variants'] = {};
+  const overloaded = new Set<string>();
+  const loadBearing: InterfaceAttempt[] = [];
+  let plannedTraces = 0;
   let malformedResponses = 0;
   let timeoutWithoutHttpReason = 0;
+  const requireExit = (trace: AdmissionTrace): void => {
+    if (trace.startedAtNs !== undefined && ['timeout', 'cancelled', 'closed'].includes(trace.outcome) && trace.exitedAtNs === undefined)
+      reasons.push('cancelled compute has no actual exit');
+  };
   for (const attempt of ordered) {
-    const counts = byLanguage[attempt.expected.language];
-    counts.submitted++; total.submitted++;
     const extension = attempt.expected.language === 'swift' ? '.swift'
       : attempt.expected.language === 'tsx' ? '.tsx' : '.ts';
     if (attempt.expected.files.some(file => !file.path.endsWith(extension)))
@@ -424,84 +483,136 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
     seenIds.add(attempt.requestId);
     if (!keys.has(attempt.expected.key)) reasons.push('request key is outside cold corpus');
     const previous = prior.get(attempt.expected.key);
-    if (previous) {
-      const preceding = matched.get(previous.requestId);
-      const priorPage = object(previous.body);
-      if (preceding?.outcome !== 'overloaded' || priorPage?.status !== 'skipped' || priorPage.fallback_reason !== 'overloaded'
-        || previous.completedAtNs === undefined || previous.completedAtNs > attempt.startedAtNs)
-        reasons.push('cold key repeated without completed uncached overload');
-    }
+    if (previous && (!overloaded.has(previous.requestId)
+      || previous.completedAtNs === undefined || previous.completedAtNs > attempt.startedAtNs))
+      reasons.push('cold key repeated without completed uncached overload');
     prior.set(attempt.expected.key, attempt);
-    const candidates = tracesWithin(byRoute.get(attempt.expected.routeKey) ?? [],
-      attempt.startedAtNs, attempt.completedAtNs ?? -1n);
-    const trace = candidates.length === 1 ? candidates[0] : undefined;
-    if (!trace || usedUnits.has(trace.unitId)) {
-      counts.unclassified++; total.unclassified++;
-      reasons.push('request lacks correlated admission outcome');
+    const body = attempt.httpStatus === 200 ? object(attempt.body) : null;
+
+    if (attempt.plannedAbortMs !== undefined) {
+      plannedCancels.planned++;
+      if (attempt.error === PLANNED_ABORT) plannedCancels.abortedBeforeResponse++;
+      else if (attempt.httpStatus === 200 && !attempt.error) {
+        plannedCancels.respondedBeforeAbort++;
+        const faults = validateInterfacePage(attempt.body, attempt.expected);
+        if (faults.length) { malformedResponses++; reasons.push(...faults); }
+        else if (isOverloadPage(body)) overloaded.add(attempt.requestId);
+      } else reasons.push('HTTP or host failure');
+      if (!traced) continue;
+      // A disconnect settles after the client gave up, so the unique cold route is the join.
+      const candidates = byRoute.get(attempt.expected.routeKey) ?? [];
+      if (candidates.length > 1) { reasons.push('planned abort has ambiguous admission'); continue; }
+      const trace = candidates[0];
+      if (!trace) continue;
+      plannedTraces++;
+      usedUnits.add(trace.unitId);
+      requireExit(trace);
+      if (trace.outcome === 'cancelled' && trace.parserCancelled === true)
+        plannedCancels.cancelledRunning[attempt.expected.language === 'swift' ? 'swift' : 'typescript']++;
       continue;
     }
-    matched.set(attempt.requestId, trace);
-    usedUnits.add(trace.unitId);
-    if (trace.settledAtNs < trace.submittedAtNs
-      || (trace.admittedAtNs !== undefined && (trace.admittedAtNs < trace.submittedAtNs || trace.admittedAtNs > trace.settledAtNs))
-      || (trace.startedAtNs !== undefined && (trace.admittedAtNs === undefined || trace.startedAtNs < trace.admittedAtNs || trace.startedAtNs > trace.settledAtNs)))
-      reasons.push('admission trace timestamps are contradictory');
-    if ((trace.outcome === 'overloaded' && (trace.admittedAtNs !== undefined || trace.startedAtNs !== undefined))
-      || (trace.outcome !== 'overloaded' && trace.admittedAtNs === undefined))
-      reasons.push('admission trace disposition contradicts outcome');
-    if (trace.outcome === 'overloaded') { counts.rejected++; total.rejected++; }
-    else if (trace.admittedAtNs !== undefined) { counts.admitted++; total.admitted++; }
-    else { counts.unclassified++; total.unclassified++; reasons.push('trace has no admission disposition'); }
-    if (trace.outcome === 'timeout') {
-      if (trace.startedAtNs === undefined) { counts.queueTimeout++; total.queueTimeout++; }
-      else { counts.runningTimeout++; total.runningTimeout++; }
+
+    loadBearing.push(attempt);
+    const counts = byLanguage[attempt.expected.language];
+    counts.submitted++; total.submitted++;
+    const variant = attempt.expected.variant ? `${attempt.expected.variant}:${attempt.expected.language}` : undefined;
+    if (variant) (variants[variant] ??= { requested: 0, handled: 0 }).requested++;
+    let trace: AdmissionTrace | undefined;
+    if (traced) {
+      const candidates = tracesWithin(byRoute.get(attempt.expected.routeKey) ?? [],
+        attempt.startedAtNs, attempt.completedAtNs ?? -1n);
+      trace = candidates.length === 1 ? candidates[0] : undefined;
+      if (!trace || usedUnits.has(trace.unitId)) {
+        counts.unclassified++; total.unclassified++;
+        reasons.push('request lacks correlated admission outcome');
+        continue;
+      }
+      matched.set(attempt.requestId, trace);
+      usedUnits.add(trace.unitId);
+      if (trace.settledAtNs < trace.submittedAtNs
+        || (trace.admittedAtNs !== undefined && (trace.admittedAtNs < trace.submittedAtNs || trace.admittedAtNs > trace.settledAtNs))
+        || (trace.startedAtNs !== undefined && (trace.admittedAtNs === undefined || trace.startedAtNs < trace.admittedAtNs || trace.startedAtNs > trace.settledAtNs)))
+        reasons.push('admission trace timestamps are contradictory');
+      if ((trace.outcome === 'overloaded' && (trace.admittedAtNs !== undefined || trace.startedAtNs !== undefined))
+        || (trace.outcome !== 'overloaded' && trace.admittedAtNs === undefined))
+        reasons.push('admission trace disposition contradicts outcome');
+      if (trace.outcome === 'overloaded') { counts.rejected++; total.rejected++; overloaded.add(attempt.requestId); }
+      else if (trace.admittedAtNs !== undefined) { counts.admitted++; total.admitted++; }
+      else { counts.unclassified++; total.unclassified++; reasons.push('trace has no admission disposition'); }
+      if (trace.outcome === 'timeout') {
+        if (trace.startedAtNs === undefined) { counts.queueTimeout++; total.queueTimeout++; }
+        else { counts.runningTimeout++; total.runningTimeout++; }
+      }
+      if (trace.outcome === 'cancelled') { counts.cancelled++; total.cancelled++; }
+      requireExit(trace);
     }
-    if (trace.outcome === 'cancelled') { counts.cancelled++; total.cancelled++; }
-    if (trace.outcome === 'error' || attempt.error || attempt.httpStatus !== 200) {
+    if (trace?.outcome === 'error' || attempt.error || attempt.httpStatus !== 200) {
       counts.hostFailure++; total.hostFailure++;
       reasons.push('HTTP or host failure');
     }
-    if (trace.startedAtNs !== undefined && ['timeout', 'cancelled', 'closed'].includes(trace.outcome) && trace.exitedAtNs === undefined)
-      reasons.push('cancelled compute has no actual exit');
-    if (attempt.httpStatus === 200) {
-      const faults = validateInterfacePage(attempt.body, attempt.expected);
-      if (faults.length) { malformedResponses++; reasons.push(...faults); continue; }
-      const page = object(attempt.body)!;
-      const rows = page.files as Record<string, unknown>[];
-      for (const row of rows) {
-        const freshness = attempt.freshnessByPath?.[String(row.path)];
-        if (row.status === 'ready' && freshness === undefined)
-          reasons.push('ready comparison row lacks observed freshness');
-        if (freshness === 'cache-hit') reasons.push('cold comparison served cached row');
-        if (row.status === 'unavailable' || row.status === 'unsupported')
-          reasons.push('cold comparison source unavailable or unsupported');
-      }
-      if (page.status === 'ready' && object(page.page)?.complete === true) { counts.completedPages++; total.completedPages++; }
-      for (const row of rows) if (row.status === 'ready') { counts.completedFiles++; total.completedFiles++; }
-      const cacheHits = rows.filter(row => attempt.freshnessByPath?.[String(row.path)] === 'cache-hit').length;
-      counts.cacheHits += cacheHits; total.cacheHits += cacheHits;
-      if (trace.startedAtNs !== undefined && trace.outcome === 'ok') {
-        const useful = rows.filter(row => row.status === 'ready' && Array.isArray(row.changes)
-          && row.changes.length > 0 && attempt.freshnessByPath?.[String(row.path)] === 'fresh').length;
-        counts.usefulComparisons += useful; total.usefulComparisons += useful;
-      }
+    if (attempt.httpStatus !== 200) continue;
+    const faults = validateInterfacePage(attempt.body, attempt.expected);
+    if (faults.length) { malformedResponses++; reasons.push(...faults); continue; }
+    const page = body!;
+    const rows = page.files as Record<string, unknown>[];
+    if (!traced && isOverloadPage(page)) {
+      counts.rejected++; total.rejected++; overloaded.add(attempt.requestId); continue;
+    }
+    if (trace?.outcome === 'overloaded') {
+      if (!isOverloadPage(page)) reasons.push('overload trace disagrees with HTTP page');
+      continue;
+    }
+    if (!traced) { counts.admitted++; total.admitted++; }
+    const complete = object(page.page)?.complete === true;
+    const explicitTimeout = hasExplicitTimeout(page);
+    counts.validResponses++; total.validResponses++;
+    if (explicitTimeout) { counts.explicitTimeouts++; total.explicitTimeouts++; }
+    else if (!complete) { counts.unexplainedIncomplete++; total.unexplainedIncomplete++; }
+    if (variant && !explicitTimeout && complete && attempt.expected.files.every(file => rows.some(row =>
+      row.path === file.path && (file.incompleteReason === undefined
+        ? row.status === 'ready'
+        : row.status === 'incomplete' && row.fallback_reason === file.incompleteReason))))
+      variants[variant]!.handled++;
+    for (const row of rows) {
+      const freshness = attempt.freshnessByPath?.[String(row.path)];
+      if (traced && row.status === 'ready' && freshness === undefined)
+        reasons.push('ready comparison row lacks observed freshness');
+      if (freshness === 'cache-hit') reasons.push('cold comparison served cached row');
+      if (row.status === 'unavailable' || row.status === 'unsupported')
+        reasons.push('cold comparison source unavailable or unsupported');
+    }
+    if (page.status === 'ready' && complete) { counts.completedPages++; total.completedPages++; }
+    for (const row of rows) if (row.status === 'ready') { counts.completedFiles++; total.completedFiles++; }
+    const cacheHits = rows.filter(row => attempt.freshnessByPath?.[String(row.path)] === 'cache-hit').length;
+    counts.cacheHits += cacheHits; total.cacheHits += cacheHits;
+    const workFinished = trace ? trace.startedAtNs !== undefined && trace.outcome === 'ok' : complete && !explicitTimeout;
+    if (workFinished) {
+      const useful = rows.filter(row => row.status === 'ready' && Array.isArray(row.changes) && row.changes.length > 0
+        && (!traced || attempt.freshnessByPath?.[String(row.path)] === 'fresh')).length;
+      counts.usefulComparisons += useful; total.usefulComparisons += useful;
+    }
+    if (trace) {
+      if (explicitTimeout !== (trace.outcome === 'timeout') && (explicitTimeout || complete))
+        reasons.push('HTTP timeout disagrees with admission');
+      if (!explicitTimeout && !complete && trace.outcome !== 'timeout') reasons.push('incomplete page lacks timeout evidence');
       // Partial rows may already be ready, but the request timed out in look-ahead.
-      if (trace.outcome === 'timeout' && page.fallback_reason !== 'timeout' && !rows.some(row => row.fallback_reason === 'timeout'))
-        timeoutWithoutHttpReason++;
-      if (trace.outcome === 'timeout' && object(page.page)?.complete === true)
-        reasons.push('timed-out request claims complete page');
-      if (trace.outcome === 'overloaded' && (page.status !== 'skipped' || page.fallback_reason !== 'overloaded'))
-        reasons.push('overload trace disagrees with HTTP page');
+      if (trace.outcome === 'timeout' && !explicitTimeout) timeoutWithoutHttpReason++;
+      if (trace.outcome === 'timeout' && complete) reasons.push('timed-out request claims complete page');
     }
   }
-  if (input.attempts.length !== interfaceTraces.length || usedUnits.size !== interfaceTraces.length)
+  if (traced && (usedUnits.size !== interfaceTraces.length
+    || loadBearing.length + plannedTraces !== interfaceTraces.length))
     reasons.push('admission trace count differs from request count');
   const duration = Number(input.lastDurableAtNs - input.firstWriteAtNs) / 1e9;
   for (const counts of [...Object.values(byLanguage), total]) {
-    counts.admittedTimeoutFraction = counts.admitted ? (counts.queueTimeout + counts.runningTimeout) / counts.admitted : null;
+    counts.admittedTimeoutFraction = traced && counts.admitted ? (counts.queueTimeout + counts.runningTimeout) / counts.admitted : null;
     counts.overloadFraction = counts.submitted ? counts.rejected / counts.submitted : 0;
     counts.usefulPerSecond = duration > 0 ? counts.usefulComparisons / duration : 0;
+    counts.timeoutFractionBounds = counts.validResponses ? { lower: counts.explicitTimeouts / counts.validResponses,
+      upper: (counts.explicitTimeouts + counts.unexplainedIncomplete) / counts.validResponses } : null;
   }
+  for (const [variant, coverage] of Object.entries(variants))
+    if (!coverage.handled) reasons.push(`variant ${variant} was never handled`);
   if (input.maxConcurrentRequests < 16) reasons.push('fewer than 16 request slots active');
   if (!input.freshServer) reasons.push('reader server was not fresh');
   if (input.corpusExhausted) reasons.push('cold corpus exhausted');
@@ -513,7 +624,7 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   if (byLanguage.typescript.usefulComparisons === 0 || byLanguage.tsx.usefulComparisons === 0 || byLanguage.swift.usefulComparisons === 0)
     reasons.push('one or more languages had no useful fresh comparison');
   if (total.rejected === total.submitted) reasons.push('overload-only load did no work');
-  const intervals = ordered.filter(a => a.completedAtNs !== undefined);
+  const intervals = loadBearing.filter(a => a.completedAtNs !== undefined);
   let covered = input.firstWriteAtNs;
   for (const attempt of intervals) {
     if (attempt.startedAtNs > covered) break;
@@ -521,6 +632,7 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
   }
   const continuousRequests = covered >= input.lastDurableAtNs;
   if (!continuousRequests) reasons.push('request intervals do not continuously cover capture');
+  const windowed = loadBearing.filter(a => a.completedAtNs !== undefined);
   const activityWindows: InterfaceLoadReport['activityWindows'] = [];
   if (input.lastDurableAtNs > input.firstWriteAtNs) {
     const span = input.lastDurableAtNs - input.firstWriteAtNs;
@@ -529,18 +641,36 @@ export function scoreInterfaceLoad(input: InterfaceLoadInput): InterfaceLoadRepo
       const start = input.firstWriteAtNs + span * BigInt(i) / BigInt(windows);
       const end = input.firstWriteAtNs + span * BigInt(i + 1) / BigInt(windows);
       activityWindows.push({
-        ready: intervals.filter(a => a.startedAtNs >= start && a.completedAtNs! <= end
-          && matched.get(a.requestId)?.outcome === 'ok'
+        ready: windowed.filter(a => a.startedAtNs >= start && a.completedAtNs! <= end
+          && (!traced || matched.get(a.requestId)?.outcome === 'ok')
           && object(a.body)?.status === 'ready' && object(object(a.body)?.page)?.complete === true
           && (object(a.body)?.files as unknown[] | undefined)?.some(row => object(row)?.status === 'ready'
-            && a.freshnessByPath?.[String(object(row)?.path)] === 'fresh' && (object(row)?.changes as unknown[] | undefined)?.length)).length,
-        overloaded: intervals.filter(a => a.completedAtNs! >= start && a.completedAtNs! < end && matched.get(a.requestId)?.outcome === 'overloaded').length,
+            && (!traced || a.freshnessByPath?.[String(object(row)?.path)] === 'fresh')
+            && (object(row)?.changes as unknown[] | undefined)?.length)).length,
+        overloaded: windowed.filter(a => a.completedAtNs! >= start && a.completedAtNs! < end && overloaded.has(a.requestId)).length,
       });
     }
   }
   if (!activityWindows.length || activityWindows.some(w => !w.ready || !w.overloaded)) reasons.push('window lacked fresh ready comparison or overload');
   return { sufficient: reasons.length === 0, reasons: [...new Set(reasons)], byLanguage, total,
-    activityWindows, continuousRequests, malformedResponses, timeoutWithoutHttpReason };
+    activityWindows, continuousRequests, malformedResponses, timeoutWithoutHttpReason,
+    classification: traced ? 'trace' : 'http', plannedCancels, variants };
+}
+
+const REQUIRED_VARIANTS = ['malformed:typescript', 'malformed:tsx', 'malformed:swift', 'unicode:typescript', 'unicode:tsx'];
+/** Evidence only a traced witness can supply: planned disconnects cancelled a live parser in each family,
+ * every input variant was handled, and at least one retired TypeScript worker actually exited. */
+export function witnessCoverageFaults(report: InterfaceLoadReport, events: ProjectionTraceEvent[]): string[] {
+  const faults: string[] = [];
+  for (const family of ['typescript', 'swift'] as const)
+    if (report.plannedCancels.cancelledRunning[family] < 1) faults.push(`no ${family} planned abort cancelled running work`);
+  for (const variant of REQUIRED_VARIANTS)
+    if (!report.variants[variant]?.handled) faults.push(`variant ${variant} was never handled`);
+  const tsWorkers = new Set(events.flatMap(event => event.kind === 'process-start' && event.process === 'ts-worker' ? [event.processId] : []));
+  const retired = new Set(events.flatMap(event => event.kind === 'process-retire' && tsWorkers.has(event.processId) ? [event.processId] : []));
+  if (!events.some(event => event.kind === 'process-exit' && retired.has(event.processId)))
+    faults.push('no retired TypeScript worker exited');
+  return faults;
 }
 
 export interface FD5CaptureComparison {

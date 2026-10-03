@@ -1,13 +1,12 @@
 /** Deliberately separate from the registered 12-arm FD5 campaign. Raw diagnostic evidence only. */
 import { createHash } from 'node:crypto';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, open, realpath, rm } from 'node:fs/promises';
-import { arch, availableParallelism, cpus, loadavg, release, tmpdir } from 'node:os';
+import { arch, availableParallelism, cpus, release, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface as createLineReader } from 'node:readline';
-import { promisify } from 'node:util';
 import { isDeepStrictEqual } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startCapture, type CaptureSession } from '../src/session.ts';
@@ -17,17 +16,18 @@ import { createHistoricalCorpus, readRecords, runWriter, scoreCaptureArm, waitFo
 import { verifyTypeScriptGrammarArtifact } from '../src/interface-v2-typescript.ts';
 import type { ProjectionTraceEvent } from '../src/projection-trace.ts';
 import { SWIFT_V1 } from '../src/swift-interface.ts';
-import { createInterfaceCorpus, type CorpusPage } from './fd5-bench.ts';
+import { createInterfaceCorpus, diagnosticCorpusPlan, type CorpusPage } from './fd5-bench.ts';
 import { assembleProjectionTrace, scoreClipTrace, scoreProcessStartupTiming, validateInterfacePage,
   type InterfaceAttempt } from './fd5-score.ts';
 import { createProjectionTraceCollector } from './fd5-trace.ts';
 import { startDiagnosticLoad, type DiagnosticLoad } from './fd5-diag-load.ts';
 import { startDiagnosticHttpClient } from './fd5-diag-http-client.ts';
 import type { DiagnosticConfig, DiagnosticMode } from './fd5-diag.ts';
+import { acquireWithin, bounded, cleanupWithin, encode, Journal, monitorHost, preflight, startCap } from './fd5-host.ts';
 
-const encode = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) =>
-  typeof item === 'bigint' ? item.toString() : item);
 const sha = (body: string | Uint8Array): string => createHash('sha256').update(body).digest('hex');
+const windowEnd = (config: DiagnosticConfig): string =>
+  (config.approvalRequired.measurementWindow as { endUtc: string }).endUtc;
 interface DiagnosticLatency { n: number; p50: number | null; p95: number | null; p99: number | null }
 function latency(samples: number[]): DiagnosticLatency {
   const sorted = samples.filter(Number.isFinite).sort((a, b) => a - b);
@@ -145,143 +145,6 @@ export function scoreInterfaceCohort(planned: PlannedInterface[], attempts: Inte
     fullArm: { count: attempts.length, outcomes: allOutcomes, httpLatency: latency(allDurations) } };
 }
 
-/** Every record is appended in order. Result/failure records are durably synced. */
-class Journal {
-  private pending = Promise.resolve();
-  private fault: Error | undefined;
-  private readonly file: Awaited<ReturnType<typeof open>>;
-  constructor(file: Awaited<ReturnType<typeof open>>) { this.file = file; }
-  record(value: unknown, durable = false): Promise<void> {
-    const next = this.pending.then(async () => {
-      if (this.fault) return;
-      await this.file.appendFile(encode(value) + '\n');
-      if (durable) await this.file.sync();
-    }).catch(error => { this.fault = error instanceof Error ? error : new Error(String(error)); });
-    this.pending = next;
-    return next;
-  }
-  async assertHealthy(): Promise<void> { await this.pending; if (this.fault) throw this.fault; }
-  async close(): Promise<void> { await this.pending; await this.file.close(); if (this.fault) throw this.fault; }
-}
-
-function startCap(seconds: number): { signal: AbortSignal; expired: () => boolean; close: () => void } {
-  const controller = new AbortController();
-  let hit = false;
-  const timer = setTimeout(() => { hit = true; controller.abort(new Error('diagnostic wall-time cap')); }, seconds * 1000);
-  return { signal: controller.signal, expired: () => hit, close: () => clearTimeout(timer) };
-}
-async function bounded<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw signal.reason;
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => { signal.removeEventListener('abort', onAbort); reject(signal.reason); };
-    signal.addEventListener('abort', onAbort, { once: true });
-    void work.then(value => { signal.removeEventListener('abort', onAbort); resolve(value); }, error => {
-      signal.removeEventListener('abort', onAbort); reject(error);
-    });
-  });
-}
-async function cleanupWithin<T>(work: Promise<T>): Promise<T> {
-  return bounded(work, AbortSignal.timeout(5_000));
-}
-export async function acquireWithin<T>(work: Promise<T>, signal: AbortSignal,
-  cleanup: (value: T) => Promise<void>): Promise<T> {
-  try { return await bounded(work, signal); }
-  catch (error) {
-    if (signal.aborted) {
-      const lateCleanup = work.then(cleanup);
-      void lateCleanup.catch(() => {});
-      await cleanupWithin(lateCleanup).catch(() => {});
-    }
-    throw error;
-  }
-}
-const execFileAsync = promisify(execFile);
-async function command(binary: string, args: string[]): Promise<string | null> {
-  try { return (await execFileAsync(binary, args, { encoding: 'utf8', timeout: 2000,
-    maxBuffer: 64 * 1024 })).stdout.trim(); }
-  catch { return null; }
-}
-async function hostEvidence(config: DiagnosticConfig): Promise<{ at: string; load5: number; physicalCores: number | null;
-  acPower: boolean | null; normalThermal: boolean | null; noMemoryWarning: boolean | null;
-  swapUsedBytes: number | null; faults: string[] }> {
-  const [batt, therm, memoryLevel, swap, cores] = await Promise.all([
-    command('pmset', ['-g', 'batt']), command('pmset', ['-g', 'therm']),
-    command('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
-    command('sysctl', ['vm.swapusage']), command('sysctl', ['-n', 'hw.physicalcpu']),
-  ]);
-  const used = swap?.match(/used\s*=\s*([\d.]+)([KMG])/i);
-  const scale = used?.[2]?.toUpperCase() === 'G' ? 2 ** 30 : used?.[2]?.toUpperCase() === 'M' ? 2 ** 20 : 2 ** 10;
-  const swapUsedBytes = used ? Math.round(Number(used[1]) * scale) : null;
-  const load5 = loadavg()[1]!;
-  const physicalCores = cores !== null && Number.isSafeInteger(Number(cores)) && Number(cores) > 0
-    ? Number(cores) : null;
-  const acPower = batt === null ? null : batt.includes('AC Power');
-  const normalThermal = therm === null ? null :
-    therm.includes('No thermal warning level has been recorded') &&
-    therm.includes('No performance warning level has been recorded');
-  const noMemoryWarning = memoryLevel === null ? null : memoryLevel === '1';
-  const faults = [
-    ...(physicalCores === null ? ['physical core count unverified'] :
-      load5 >= config.host.maxFiveMinuteLoadFractionOfPhysicalCores * physicalCores ? ['host load veto'] : []),
-    ...(config.host.requireAcPower && acPower !== true ? ['AC power unverified or absent'] : []),
-    ...(config.host.requireNormalThermal && normalThermal !== true ? ['normal thermal state unverified'] : []),
-    ...(config.host.requireNoMemoryPressureWarning && noMemoryWarning !== true ? ['memory pressure unverified or warned'] : []),
-    ...(swapUsedBytes === null ? ['swap usage unverified'] : []),
-  ];
-  return { at: new Date().toISOString(), load5, physicalCores, acPower, normalThermal,
-    noMemoryWarning, swapUsedBytes, faults };
-}
-async function preflight(config: DiagnosticConfig, journal: Journal): Promise<void> {
-  let first: Awaited<ReturnType<typeof hostEvidence>> | undefined;
-  for (let i = 0; i <= config.host.preflightQuietSeconds; i++) {
-    const sample = await hostEvidence(config);
-    const window = config.approvalRequired.measurementWindow as { endUtc: string };
-    if (Date.now() >= Date.parse(window.endUtc)) throw new Error('approved measurement window ended during preflight');
-    if (!first) first = sample;
-    const swapGrowth = first.swapUsedBytes !== null && sample.swapUsedBytes !== null
-      ? sample.swapUsedBytes - first.swapUsedBytes : null;
-    await journal.record({ type: 'preflight-sample', sample, swapGrowthBytes: swapGrowth });
-    if (sample.faults.length || swapGrowth === null || swapGrowth > config.host.maxSwapGrowthBytes)
-      throw new Error(`host preflight veto: ${[...sample.faults, ...(swapGrowth === null ? ['swap growth unknown'] :
-        swapGrowth > config.host.maxSwapGrowthBytes ? ['swap growth'] : [])].join(', ')}`);
-    if (i < config.host.preflightQuietSeconds) await delay(1000);
-  }
-}
-function monitorHost(config: DiagnosticConfig, journal: Journal): { stop: () => Promise<string[]> } {
-  const faults: string[] = [];
-  let previousSwap: number | null = null;
-  let previousSampleAt: bigint | undefined;
-  let pending = Promise.resolve();
-  let sampling = false;
-  const sample = async (): Promise<void> => {
-    const startedAt = process.hrtime.bigint();
-    if (previousSampleAt !== undefined && Number(startedAt - previousSampleAt) / 1e9 >
-      config.host.sampleIntervalSeconds * 1.5) faults.push('host sample interval exceeded');
-    previousSampleAt = startedAt;
-    const item = await hostEvidence(config);
-    const window = config.approvalRequired.measurementWindow as { endUtc: string };
-    if (Date.now() >= Date.parse(window.endUtc)) faults.push('approved measurement window ended');
-    const hadPrevious = previousSwap !== null;
-    const growth = hadPrevious && item.swapUsedBytes !== null ? item.swapUsedBytes - previousSwap! : null;
-    previousSwap = item.swapUsedBytes;
-    faults.push(...item.faults);
-    if (hadPrevious && (growth === null || growth > config.host.maxSwapGrowthBytes))
-      faults.push('host swap growth unknown or positive');
-    await journal.record({ type: 'host-sample', sample: item, swapGrowthBytes: growth });
-  };
-  const schedule = (): void => {
-    if (sampling) { faults.push('host sample missed its interval'); return; }
-    sampling = true;
-    pending = sample().catch(error => { faults.push(`host sample: ${error}`); })
-      .finally(() => { sampling = false; });
-  };
-  schedule();
-  const timer = setInterval(schedule, config.host.sampleIntervalSeconds * 1000);
-  return { stop: async () => { clearInterval(timer); await pending;
-    await journal.record({ type: 'host-monitor-ended' });
-    return [...new Set(faults)]; } };
-}
-
 async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeDir: string,
   clipCorpus: HistoricalChange[], interfaceCorpus: CorpusPage[], spec: {
     name: string; clip: boolean; interfaces: boolean; trace: boolean; C: number; Q: number; W: number;
@@ -299,7 +162,7 @@ async function runCaptureCell(config: DiagnosticConfig, journal: Journal, storeD
   let off: (() => void) | undefined;
   let drained = false, captureStopped = false, readerClosed = false, worktreeRemoved = false;
   const faults: string[] = [];
-  const host = monitorHost(config, journal);
+  const host = monitorHost(config.host, windowEnd(config), journal);
   const sharedCount = new SharedArrayBuffer(4);
   let clipSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
   let interfaceSummary: Awaited<ReturnType<DiagnosticLoad['stop']>> | undefined;
@@ -464,7 +327,7 @@ async function runCaptureMode(mode: 'smoke' | 'overhead' | 'queue', config: Diag
   try {
     clipCorpus = await createHistoricalCorpus(storeDir, clipCount, preparation.signal);
     interfaceCorpus = await createInterfaceCorpus(storeDir, interfaceCount, `${config.seed}-${mode}`,
-      undefined, preparation.signal);
+      diagnosticCorpusPlan, preparation.signal);
     preparation.signal.throwIfAborted();
   } finally { preparation.close(); }
   const base = { C: config.admission.C, Q: config.admission.Q, W: config.admission.W,
@@ -607,16 +470,15 @@ export function scoreDiagnosticOverhead(reports: Array<{ capture: CaptureArmRepo
 async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
   let requested = 0;
   const cacheDone = new Set<string>();
-  const usefulSwift: number[] = [];
   const cells = config.unqueued.cells;
-  const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<number> => {
+  const runCell = async (cell: typeof cells[number], deadlineMs: number, label: string): Promise<void> => {
     const cap = startCap(config.unqueued.maxSecondsPerCell);
     let pages: CorpusPage[];
     let hostFaults: string[] = [];
     try {
       pages = await createInterfaceCorpus(storeDir,
         config.unqueued.observationsPerCell + (cell.warmth === 'initialized-worker-new-content' ? 1 : 0),
-        `${config.seed}-${label}`, { language: cell.language, sizeClass: cell.size, files: cell.files }, cap.signal);
+        `${config.seed}-${label}`, () => ({ language: cell.language, sizeClass: cell.size, limit: cell.files }), cap.signal);
     } catch (error) { cap.close(); throw error; }
     let server: Awaited<ReturnType<typeof startReaderServer>> | undefined;
     const client = startDiagnosticHttpClient();
@@ -625,7 +487,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
     const purposeById = new Map<string, string>();
     let useful = 0;
     const faults: string[] = [];
-    const host = monitorHost(config, journal);
+    const host = monitorHost(config.host, windowEnd(config), journal);
     const finishServer = async (): Promise<void> => {
       if (!server) return;
       const current = server;
@@ -659,7 +521,7 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       cap.signal, late => late.close());
     };
     const request = async (page: CorpusPage, purpose: string): Promise<InterfaceAttempt> => {
-      if (++requested > config.unqueued.maxRequestsIncludingConditional)
+      if (++requested > config.unqueued.maxRequests)
         throw new Error('unqueued global request cap reached');
       const attempt = await bounded(client.interface(server!.url, server!.token, page,
         deadlineMs + 2000, cap.signal), cap.signal);
@@ -697,23 +559,14 @@ async function runUnqueued(config: DiagnosticConfig, journal: Journal, storeDir:
       usefulFresh: useful, cacheControlAvailable: cacheDone.has(cell.language), requested,
       faults: [...new Set(faults)], diagnosticValid: faults.length === 0 }, true);
     if (faults.length) throw new Error(`unqueued cell ${label} invalid: ${faults.join('; ')}`);
-    return useful;
   };
-  for (const [index, cell] of cells.entries()) {
-    const useful = await runCell(cell, config.admission.interfaceDeadlineMs, `400-${index}-${cell.language}-${cell.files}-${cell.warmth}`);
-    if (cell.language === 'swift') usefulSwift.push(useful);
-  }
+  const deadlineMs = config.admission.interfaceDeadlineMs;
+  for (const [index, cell] of cells.entries())
+    await runCell(cell, deadlineMs, `${deadlineMs}-${index}-${cell.language}-${cell.files}-${cell.warmth}`);
   for (const language of ['typescript', 'tsx', 'swift']) if (!cacheDone.has(language))
     await journal.record({ type: 'cache-control-unavailable', language,
       reason: 'no cacheable ready result; zero cache-control requests' }, true);
-  if (usefulSwift.length === 3 && usefulSwift.every(count => count === 0)) {
-    await journal.record({ type: 'conditional-800-trigger', basis: usefulSwift }, true);
-    let total = 0;
-    for (const [index, cell] of cells.filter(cell => cell.language === 'swift').entries())
-      total += await runCell(cell, config.admission.conditionalInterfaceDeadlineMs, `800-${index}-swift-${cell.files}`);
-    if (total === 0) throw new Error('conditional 800ms Swift cells yielded zero useful fresh work');
-  }
-  if (requested > config.unqueued.maxRequestsIncludingConditional) throw new Error('unqueued request cap exceeded');
+  if (requested > config.unqueued.maxRequests) throw new Error('unqueued request cap exceeded');
 }
 
 async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir: string): Promise<void> {
@@ -727,7 +580,7 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   for (const [capIndex, W] of spec.waiterCaps.entries()) {
     const timer = startCap(spec.maxSecondsPerCap);
     const collector = createProjectionTraceCollector(100_000);
-    const host = monitorHost(config, journal);
+    const host = monitorHost(config.host, windowEnd(config), journal);
     let release: (() => void) | undefined;
     let entered: (() => void) | undefined;
     let enteredPromise: Promise<void> = Promise.resolve();
@@ -851,13 +704,15 @@ async function runWPressure(config: DiagnosticConfig, journal: Journal, storeDir
   if (totalRequests !== spec.maxRequests) throw new Error('W request count differs from frozen bound');
 }
 
-export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now()): string[] {
+/** W pressure checks coalescing counts, not latency, so it is gated only by the
+ * window and its own hook approval; every other mode needs every approval. */
+export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now(), mode?: DiagnosticMode): string[] {
   const approvals = config.approvalRequired;
   const tolerance = approvals.tracingOverheadTolerance as Partial<OverheadTolerance> | null;
   const window = approvals.measurementWindow as { approved?: unknown; startUtc?: unknown; endUtc?: unknown;
     hostVetoesApproved?: unknown } | null;
   const points = approvals.diagnosticDeadlinePoints as { approved?: unknown; interfaceMs?: unknown;
-    conditional800?: unknown; cellsAndCountsApproved?: unknown } | null;
+    cellsAndCountsApproved?: unknown } | null;
   const w = approvals.wPressureRuntimeHook as { approved?: unknown } | null;
   const clip = approvals.clipHistoricalComparison as { approved?: unknown; treatment?: unknown } | null;
   const numeric = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
@@ -867,31 +722,33 @@ export function executionApprovalFaults(config: DiagnosticConfig, now = Date.now
   const end = typeof window?.endUtc === 'string' ? Date.parse(window.endUtc) : NaN;
   const utc = (value: unknown): boolean => typeof value === 'string'
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
+  const windowFaults = window?.approved === true && window.hostVetoesApproved === true
+    && utc(window.startUtc) && utc(window.endUtc) && Number.isFinite(start)
+    && Number.isFinite(end) && start <= now && now < end ? [] : ['measurement window or host veto approval missing'];
+  const wFaults = w?.approved === true ? [] : ['W runtime hook approval missing'];
+  if (mode === 'w-pressure') return [...windowFaults, ...wFaults];
   return [
-    ...(window?.approved === true && window.hostVetoesApproved === true
-      && utc(window.startUtc) && utc(window.endUtc) && Number.isFinite(start)
-      && Number.isFinite(end) && start <= now && now < end ? [] : ['measurement window or host veto approval missing']),
+    ...windowFaults,
     ...(tolerance?.approved === true && ratios(tolerance.maxCaptureLatencyRatio)
       && ratios(tolerance.maxRequestLatencyRatio) && numeric(tolerance.minCaptureThroughputRatio)
       && numeric(tolerance.minReadyRatio)
       ? [] : ['tracing overhead tolerance missing']),
     ...(points?.approved === true && JSON.stringify(points.interfaceMs) === JSON.stringify([
-      config.admission.interfaceDeadlineMs, config.admission.conditionalInterfaceDeadlineMs])
-      && points.conditional800 === true && points.cellsAndCountsApproved === true
+      config.admission.interfaceDeadlineMs]) && points.cellsAndCountsApproved === true
       ? [] : ['diagnostic deadline points or selected cells/counts approval missing']),
-    ...(w?.approved === true ? [] : ['W runtime hook approval missing']),
+    ...wFaults,
     ...(clip?.approved === true && clip.treatment === 'historical-only'
       ? [] : ['clip historical comparison disposition missing']),
   ];
 }
 const previousMode: Partial<Record<DiagnosticMode, DiagnosticMode>> = {
-  overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued', 'w-pressure': 'queue',
+  overhead: 'smoke', unqueued: 'overhead', queue: 'unqueued',
 };
 export async function readPrior(path: string | undefined, mode: DiagnosticMode, revision: string,
   configSha256: string, scorerVersion: string):
   Promise<{ selectedDeadlineMs?: number }> {
   const expected = previousMode[mode];
-  if (!expected) { if (path) throw new Error('smoke has no prior diagnostic'); return {}; }
+  if (!expected) { if (path) throw new Error(`${mode} has no prior diagnostic`); return {}; }
   if (!path) throw new Error(`${mode} requires the preceding ${expected} report`);
   let started: Record<string, unknown> | undefined, final: Record<string, unknown> | undefined;
   const useful: Record<string, unknown>[] = [];
@@ -920,7 +777,7 @@ export async function readPrior(path: string | undefined, mode: DiagnosticMode, 
 }
 export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: DiagnosticMode,
   outputPath: string, priorPath?: string): Promise<void> {
-  const approvalFaults = executionApprovalFaults(config);
+  const approvalFaults = executionApprovalFaults(config, Date.now(), mode);
   if (approvalFaults.length) throw new Error(`owner execution decisions are incomplete in approvalRequired: ${approvalFaults.join('; ')}`);
   const repository = await realpath(fileURLToPath(new URL('..', import.meta.url)));
   const output = resolve(outputPath);
@@ -950,7 +807,7 @@ export async function runBoundedDiagnostic(config: DiagnosticConfig, mode: Diagn
       cpu: cpus()[0]?.model, availableCpuThreads: availableParallelism(),
       parserArtifacts: { typescript: sha(verifyTypeScriptGrammarArtifact('typescript')),
         tsx: sha(verifyTypeScriptGrammarArtifact('tsx')), swift: SWIFT_V1 } }, true);
-    await preflight(config, journal);
+    await preflight(config.host, windowEnd(config), journal);
     storeDir = await mkdtemp(join(tmpdir(), 'slip-fd5-diag-store-'));
     if (mode === 'smoke' || mode === 'overhead' || mode === 'queue')
       await runCaptureMode(mode, config, journal, storeDir, prior.selectedDeadlineMs);

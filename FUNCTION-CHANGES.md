@@ -1,12 +1,14 @@
 # Function input/output changes: design and contract
 
-> **Status: CONTRACT — FD1–FD3 merged, FD4 in progress.** Brian delegated
+> **Status: CONTRACT — FD1–FD4 merged; FD5 narrowed to an MVP functional check.** Brian delegated
 > decisions F1–F6 on 2026-09-27 and all six were settled as **A** (see
 > [Decisions](#3-decisions-for-brian)). The authoritative contract is
 > `contracts/interface/v2/schema.json` plus the validated fixtures under
 > `contracts/interface/v2/cases/` (§5.3). The JSON in this document illustrates
-> it; where they differ, the schema and fixtures win. FD4 reader integration
-> and the FD5 measured admission gate remain in progress (§6).
+> it; where they differ, the schema and fixtures win. FD4 is merged. On
+> 2026-10-01 Brian deferred the FD5 measured admission gate (D7) for MVP and
+> replaced it with a small functional check; D7 is not established and
+> heavy-load behaviour stays unproven (`FD5-PROTOCOL.md`).
 
 This document defines how the daemon reports what changed in functions'
 inputs and outputs over a stretch of captured work. It is the design for the

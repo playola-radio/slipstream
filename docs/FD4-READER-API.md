@@ -129,17 +129,19 @@ decision; no status was fabricated in this PR.
 
 The original FD5 tracing-overhead failure remains failed under its frozen
 configuration, so the existing measurement cannot establish D7 acceptance.
-Prepare a bounded acceptance protocol for the current 10-second policy and
-queue/clip pressure, including how the failed instrumentation-overhead gate
-affects result validity. Execution needs separate approval; no diagnostic rerun
-or campaign is authorized by FD4 closeout. The archived native/WASM diagnostic
+`FD5-PROTOCOL.md` now holds the bounded acceptance protocol for the current
+10-second policy and queue/clip pressure: the scored arms run untraced, and
+three traced witness arms supply trace-only evidence with diagnostic-only
+latency. Execution needs Brian's separate approval of the window and packet
+decisions; the runner refuses to start without them, and no diagnostic rerun or
+campaign is authorized by FD4 closeout. The archived native/WASM diagnostic
 timeout remains unresolved, but the deferred Rust spike is not a prerequisite
 for the existing Node path.
 
 Two historical intermittent tools tests remain tracked follow-ups, despite
-passing in the 2026-09-30 tools run (557/557):
+passing in the 2026-09-30 (557/557) and 2026-10-01 (576/576, 587/587) tools runs:
 
-- `tools/fd5-bench.test.ts:168`, “real clip cache bypass is separate from
+- `tools/fd5-bench.test.ts:331`, “real clip cache bypass is separate from
   admission and blob loss forces a new compute”: a prior full tools run counted
   3 clip admissions where 2 were expected; it also failed once in isolation.
   FD5 must retain shared-admission and cache-bypass coverage.
@@ -152,4 +154,11 @@ The prior failures are recorded in
 `.context/fd5-collector-profile-tools-after-review.txt`; the passing run is
 `.context/fd4-completeness-tools-test.log`. Neither failure is claimed fixed.
 The accepted no-row/unchanged-cursor and Swift host-error limitations remain
-follow-ups. Overall feature completion and release remain gated on FD5.
+follow-ups.
+
+On 2026-10-01 Brian deferred the combined-load FD5 campaign and D7 for MVP and
+replaced them, as the MVP gate, with a small functional check
+(`docs/fd5-mvp-functional-check-2026-10-02.md`). D7 is not established and
+heavy-load behaviour stays unproven; the FD5 items above remain the work for a
+later heavy-load characterization. Current interface, clip and C/Q/W policies are
+unchanged.

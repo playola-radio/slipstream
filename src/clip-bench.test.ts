@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import { runWriter, scoreCaptureArm, waitForQuietCapture } from './clip-bench.ts';
 import type { CaptureSession } from './session.ts';
 import type { ClipResponse } from './clip-bench.ts';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Worker } from 'node:worker_threads';
 
 const ns = (ms: number) => BigInt(ms) * 1_000_000n;
 
@@ -32,6 +33,35 @@ test('writer streams each completed write and abort retains its partial evidence
     } }), /aborted/);
     assert.deepEqual(observed, ['scheduled-0-0.ts']);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+async function assertWriterExitsBeforeRejecting(failure: RegExp,
+  trigger: (controller: AbortController) => void): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'slip-writer-exit-'));
+  const controller = new AbortController();
+  let exited = false;
+  const track = (worker: Worker) => worker.once('exit', () => { exited = true; });
+  process.on('worker', track);
+  try {
+    const rejection = await runWriter(root, 0, { repetitions: 1, scheduledWrites: 20,
+      scheduledIntervalMs: 50, burstWrites: 0, concurrentClipRequests: 0, corpusChanges: 1 },
+    { signal: controller.signal, requireExit: true, onWrite: () => trigger(controller) })
+      .then(() => assert.fail('writer resolved'), (error: unknown) => ({ error, exited }));
+    assert.match(String(rejection.error), failure);
+    assert.equal(rejection.exited, true, 'writer rejected before its worker exited');
+    assert.ok((await readdir(root)).length < 20);
+  } finally {
+    process.off('worker', track);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test('writer abort with requireExit rejects only after the worker exits', async () => {
+  await assertWriterExitsBeforeRejecting(/aborted/, controller => controller.abort());
+});
+
+test('writer failure with requireExit rejects only after the worker exits', async () => {
+  await assertWriterExitsBeforeRejecting(/observer failed/, () => { throw new Error('observer failed'); });
 });
 function loadScenario(responses: ClipResponse[], durableMs = 3_000) {
   const keyed = responses.map((r, i) => ({ ...r, key: r.key ?? `key-${i}` }));

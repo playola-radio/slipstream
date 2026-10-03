@@ -11,7 +11,7 @@ type ApprovalFields = { measurementWindow: unknown; tracingOverheadTolerance: un
 export interface DiagnosticConfig {
   protocol: string; interfaceScorer: string; seed: string; maxPreparationSeconds: number;
   admission: { C: number; Q: number; W: number; clipDeadlineMs: number;
-    interfaceDeadlineMs: number; conditionalInterfaceDeadlineMs: number };
+    interfaceDeadlineMs: number };
   smoke: { scheduledWrites: number; burstWrites: number;
     clipSlots: number; interfaceSlots: number; coldKeysPerWorkload: number; maxArmSeconds: number;
     minRequestIntervalMs: number };
@@ -21,7 +21,7 @@ export interface DiagnosticConfig {
   unqueued: { C: number; Q: number; W: number; observationsPerCell: number;
     cells: Array<{ language: 'typescript' | 'tsx' | 'swift'; size: 'tiny' | 'representative';
       files: 1 | 4 | 16; warmth: 'fresh-worker' | 'initialized-worker-new-content' | 'fresh-child' }>;
-    cacheControlRequestsPerVariant: number; maxRequestsIncludingConditional: number; maxSecondsPerCell: number };
+    cacheControlRequestsPerVariant: number; maxRequests: number; maxSecondsPerCell: number };
   queue: { queueWaiterCells: Array<[number, number]>; repetitionsPerCell: number;
     clipSlots: number; interfaceSlots: number; scheduledWritesPerCell: number;
     scheduledIntervalMs: number; burstWritesPerCell: number; coldKeysPerWorkload: number; maxAttemptsPerCell: number;
@@ -88,8 +88,9 @@ export function parseDiagnosticArgs(argv: string[]): { configPath: string; mode:
   const outputPath = values.get('--out');
   if (!describe && !outputPath || describe && outputPath) throw new Error('--out is required only with --execute');
   const priorPath = values.get('--prior');
-  if (describe && priorPath || !describe && mode !== 'smoke' && !priorPath || !describe && mode === 'smoke' && priorPath)
-    throw new Error('each diagnostic mode after smoke requires its preceding report via --prior');
+  const chained = mode !== 'smoke' && mode !== 'w-pressure';
+  if (describe && priorPath || !describe && chained !== Boolean(priorPath))
+    throw new Error('smoke and w-pressure take no --prior; every other mode requires its preceding report via --prior');
   return { configPath, mode: mode as DiagnosticMode, ...(outputPath ? { outputPath } : {}),
     ...(priorPath ? { priorPath } : {}), describe };
 }
@@ -109,9 +110,7 @@ export function describeDiagnosticMode(config: DiagnosticConfig, mode: Diagnosti
       measured: config.unqueued.cells.length * config.unqueued.observationsPerCell,
       warmups: config.unqueued.cells.filter(cell => cell.warmth === 'initialized-worker-new-content').length,
       cacheControlsMaximum: 3 * config.unqueued.cacheControlRequestsPerVariant,
-      conditionalSwiftMaximum: config.unqueued.cells.filter(cell => cell.language === 'swift').length
-        * config.unqueued.observationsPerCell,
-      maxRequests: config.unqueued.maxRequestsIncludingConditional };
+      maxRequests: config.unqueued.maxRequests };
     case 'queue': return { cells: config.queue.queueWaiterCells.length * config.queue.repetitionsPerCell,
       writes: config.queue.queueWaiterCells.length * config.queue.repetitionsPerCell
         * (config.queue.scheduledWritesPerCell + config.queue.burstWritesPerCell),

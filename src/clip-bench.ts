@@ -267,7 +267,14 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
     });
     let settled = false;
     let completed: WorkerWrite[] | undefined;
-    const onAbort = () => finish(new Error('clip benchmark writer aborted'));
+    let failure: Error | undefined;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      if (!options?.requireExit) { finish(error); return; }
+      failure ??= error;
+      void worker.terminate();
+    };
+    const onAbort = () => fail(new Error('clip benchmark writer aborted'));
     options?.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (result: WorkerWrite[] | Error): void => {
       if (settled) return;
@@ -278,16 +285,17 @@ export function runWriter(root: string, repetition: number, config: BenchmarkCon
         reject(result);
       } else resolve(result);
     };
-    worker.once('error', (err) => finish(err));
+    worker.once('error', (err) => fail(err));
     worker.once('exit', (code) => {
       if (settled) return;
-      if (code === 0 && options?.requireExit && completed) finish(completed);
+      if (failure) finish(failure);
+      else if (code === 0 && options?.requireExit && completed) finish(completed);
       else finish(new Error(`clip benchmark writer exited unexpectedly (${code})`));
     });
     worker.on('message', (message: { type: string; write?: WorkerWrite; written?: WorkerWrite[]; error?: string }) => {
-      if (message.type === 'error') finish(new Error(message.error));
+      if (message.type === 'error') fail(new Error(message.error));
       if (message.type === 'written' && message.write && !settled) {
-        try { options?.onWrite?.(message.write); } catch (error) { finish(error as Error); }
+        try { options?.onWrite?.(message.write); } catch (error) { fail(error as Error); }
       }
       if (message.type === 'complete') {
         if (options?.requireExit) completed = message.written ?? [];

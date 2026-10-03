@@ -4,7 +4,8 @@ import { test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describeDiagnosticMode, parseDiagnosticArgs, validateDiagnosticConfig } from './fd5-diag.ts';
-import { acquireWithin, executionApprovalFaults, planInterfaceCohort, scoreInterfaceCohort,
+import { acquireWithin } from './fd5-host.ts';
+import { executionApprovalFaults, planInterfaceCohort, scoreInterfaceCohort,
   readPrior, runBoundedDiagnostic, scoreDiagnosticOverhead } from './fd5-diag-run.ts';
 import type { CaptureArmReport } from '../src/clip-bench.ts';
 import type { CorpusPage } from './fd5-bench.ts';
@@ -16,9 +17,8 @@ test('bounded diagnostic CLI requires one named mode and an explicit execution s
   assert.deepEqual(parseDiagnosticArgs(['--config', 'proposed.json', '--mode', 'smoke', '--describe']),
     { configPath: 'proposed.json', mode: 'smoke', describe: true });
   assert.deepEqual(parseDiagnosticArgs(['--config', 'approved.json', '--mode', 'w-pressure',
-    '--out', '/tmp/new.jsonl', '--prior', '/tmp/queue.jsonl', '--execute']),
-  { configPath: 'approved.json', mode: 'w-pressure', outputPath: '/tmp/new.jsonl',
-    priorPath: '/tmp/queue.jsonl', describe: false });
+    '--out', '/tmp/new.jsonl', '--execute']),
+  { configPath: 'approved.json', mode: 'w-pressure', outputPath: '/tmp/new.jsonl', describe: false });
   for (const argv of [
     ['--config', 'x', '--mode', 'smoke'],
     ['--config', 'x', '--mode', 'full', '--describe'],
@@ -26,6 +26,7 @@ test('bounded diagnostic CLI requires one named mode and an explicit execution s
     ['--config', 'x', '--mode', 'smoke', '--describe', '--execute'],
     ['--config', 'x', '--mode', 'smoke', '--describe', '--unknown'],
     ['--config', 'x', '--mode', 'queue', '--out', '/tmp/q', '--execute'],
+    ['--config', 'x', '--mode', 'w-pressure', '--out', '/tmp/w', '--prior', '/tmp/q', '--execute'],
   ]) assert.throws(() => parseDiagnosticArgs(argv));
 });
 
@@ -35,7 +36,8 @@ test('configuration pins bounded counts, separate modes and approval fields', ()
   assert.deepEqual(describeDiagnosticMode(config, 'overhead'), { arms: 8, writes: 1600,
     maxRequests: 9600, perArmGuard: 5000 });
   assert.deepEqual(describeDiagnosticMode(config, 'unqueued'), { cells: 7, measured: 350,
-    warmups: 2, cacheControlsMaximum: 60, conditionalSwiftMaximum: 150, maxRequests: 562 });
+    warmups: 2, cacheControlsMaximum: 60, maxRequests: 412 });
+  assert.deepEqual(config.admission, { C: 2, Q: 8, W: 8, clipDeadlineMs: 100, interfaceDeadlineMs: 10_000 });
   assert.deepEqual(describeDiagnosticMode(config, 'queue'), { cells: 6, writes: 1200, maxRequests: 14400,
     perCellGuard: 5000,
     maxCellSecondsIncludingDrain: 30 });
@@ -46,8 +48,8 @@ test('configuration pins bounded counts, separate modes and approval fields', ()
     ...(proposal as { overhead: object }).overhead, maxArmSeconds: 300,
   } }), /maxArmSeconds/);
   assert.throws(() => validateDiagnosticConfig({ ...(proposal as object), unqueued: {
-    ...(proposal as { unqueued: object }).unqueued, maxRequestsIncludingConditional: 563,
-  } }), /maxRequestsIncludingConditional/);
+    ...(proposal as { unqueued: object }).unqueued, maxRequests: 413,
+  } }), /maxRequests/);
   assert.equal(config.protocol, 'fd5-bounded-diagnostic.v2-proposal');
   assert.equal(config.interfaceScorer, 'terminal200-first180-v2');
   assert.throws(() => validateDiagnosticConfig({ ...config, interfaceScorer: 'ready-only-v1' }), /interfaceScorer/);
@@ -85,15 +87,35 @@ test('explicit approvals reject denial and expired windows without running a mod
       maxCaptureLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 },
       maxRequestLatencyRatio: { p50: 1.05, p95: 1.05, p99: 1.05 },
       minCaptureThroughputRatio: 0.95, minReadyRatio: 0.95 },
-    diagnosticDeadlinePoints: { approved: true, interfaceMs: [400, 800],
-      conditional800: true, cellsAndCountsApproved: true },
+    diagnosticDeadlinePoints: { approved: true, interfaceMs: [10_000], cellsAndCountsApproved: true },
     wPressureRuntimeHook: { approved: true },
     clipHistoricalComparison: { approved: true, treatment: 'historical-only' },
   };
   assert.deepEqual(executionApprovalFaults(config, Date.parse('2026-09-28T01:00:00Z')), []);
   assert.match(executionApprovalFaults(config, Date.parse('2026-09-28T03:00:00Z')).join(' '), /window/);
+  config.approvalRequired.diagnosticDeadlinePoints = { approved: true, interfaceMs: [400, 800],
+    conditional800: true, cellsAndCountsApproved: true };
+  assert.match(executionApprovalFaults(config, Date.parse('2026-09-28T01:00:00Z')).join(' '), /deadline points/);
   config.approvalRequired.wPressureRuntimeHook = { approved: false };
   assert.match(executionApprovalFaults(config, Date.parse('2026-09-28T01:00:00Z')).join(' '), /W runtime/);
+});
+
+test('standalone W pressure needs only its window and runtime-hook approvals', () => {
+  const config = structuredClone(validateDiagnosticConfig(proposal));
+  config.approvalRequired.measurementWindow = { approved: true, hostVetoesApproved: true,
+    startUtc: '2026-09-28T00:00:00Z', endUtc: '2026-09-28T02:00:00Z' };
+  config.approvalRequired.wPressureRuntimeHook = { approved: true };
+  const at = Date.parse('2026-09-28T01:00:00Z');
+  assert.deepEqual(executionApprovalFaults(config, at, 'w-pressure'), []);
+  assert.match(executionApprovalFaults(config, at, 'queue').join(' '), /tracing overhead/);
+  config.approvalRequired.wPressureRuntimeHook = null;
+  assert.match(executionApprovalFaults(config, at, 'w-pressure').join(' '), /W runtime/);
+});
+
+test('W pressure ignores any prior report; other modes keep their chain', async () => {
+  assert.deepEqual(await readPrior(undefined, 'w-pressure', 'same', 'same', 'terminal200-first180-v2'), {});
+  await assert.rejects(readPrior('/tmp/x.jsonl', 'w-pressure', 'same', 'same', 'terminal200-first180-v2'), /no prior/);
+  await assert.rejects(readPrior(undefined, 'queue', 'same', 'same', 'terminal200-first180-v2'), /requires the preceding/);
 });
 
 test('late startup after a wall cap invokes ownership cleanup', async () => {
