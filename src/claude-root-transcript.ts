@@ -6,6 +6,7 @@ export type ClaudeRootResult = { ok: true } | { ok: false; reason: 'unavailable'
 
 const RUNTIMES = new Map([
   ['2.1.280', 'sdk-ts'], // Conductor's observed Claude Code launch
+  ['2.1.284', 'sdk-ts'], // Conductor's observed Claude Code launch
   ['2.1.283', 'sdk-cli'], // Terminal's observed Claude Code launch
 ]);
 const FATAL_UTF8 = new TextDecoder('utf8', { fatal: true });

@@ -66,14 +66,16 @@ async function withDaemon(
 }
 
 describe('daemon control verbs', () => {
-  it('attaches only to a verified Claude root and lets only that root claim once', async () => {
+  for (const [version, entrypoint] of [
+    ['2.1.283', 'sdk-cli'], ['2.1.280', 'sdk-ts'], ['2.1.284', 'sdk-ts'],
+  ] as const) it(`attaches only to the verified Claude ${version}/${entrypoint} root and lets only that root claim once`, async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-wt-'));
     const otherWorktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-other-'));
     const transcript = join(store, 'root.jsonl');
     const otherTranscript = join(store, 'other.jsonl');
     const meta = (id = 'root') => JSON.stringify({ type: 'user', sessionId: id, cwd: worktree,
-      version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n';
+      version, entrypoint, userType: 'external', isSidechain: false }) + '\n';
     const daemon = await startDaemon({ storeDir: store, captureDependencies: {
       platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'selected',
     } });

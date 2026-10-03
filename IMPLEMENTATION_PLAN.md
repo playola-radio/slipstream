@@ -956,9 +956,15 @@ path has been shown to reach them.
 D3 adds bounded Claude root transcript verification at attach and a Claude
 Code `PostToolUse` command using the D2 claim/attempt contract. Supported
 observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
-`2.1.280`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
+`2.1.280`/`sdk-ts` or `2.1.284`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
 capture source, Swift UI, launcher, hook installer or automatic hook trust is
 added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+Compatibility follow-up (2026-10-03): the Conductor `2.1.284`/`sdk-ts` root
+identity was observed and its real transcript passed read-only verification.
+The existing root-only, single-claim daemon test now covers all three supported
+pairs. This does not extend the historical live-delivery proof to `2.1.284`;
+Terminal `2.1.284`/`sdk-cli` remains unsupported.
 
 ## D4: Answer return (2026-09-26)
 
