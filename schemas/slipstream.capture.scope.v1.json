@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.capture.scope.v1.json",
+  "title": "slipstream.capture.scope.v1",
+  "$comment": "Which paths capture follows from this point on. policy git: paths git would not merge (ignored and untracked) are not captured; status unavailable means git could not be asked, so affected observations were dropped and their prior state is unknown. policy filesystem: the root is not a git work tree and every path is captured. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.capture.scope.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "policy",
+        "status"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["policy", "status"],
+          "properties": {
+            "policy": { "const": "git" },
+            "status": { "const": "active" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["policy", "status", "reason"],
+          "properties": {
+            "policy": { "const": "git" },
+            "status": { "const": "unavailable" },
+            "reason": { "const": "git-error" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["policy", "status", "reason"],
+          "properties": {
+            "policy": { "const": "filesystem" },
+            "status": { "const": "active" },
+            "reason": { "const": "not-a-repository" }
+          }
+        }
+      ]
+    }
+  }
+}

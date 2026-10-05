@@ -92,6 +92,28 @@ describe('engine', () => {
       });
     });
 
+    it('does not treat a sibling sharing a name prefix as baseline-unknown', async () => {
+      await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('locked');
+        engine.notify('locked-out/a.ts', 1);
+        await engine.drain();
+        const [rec] = await read();
+        assert.ok(rec?.type === CHANGED);
+        assert.deepEqual(rec.data.before, { kind: 'absent' });
+      });
+    });
+
+    it('treats every path as baseline-unknown when the whole root is marked', async () => {
+      await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('');
+        engine.notify('deep/nested/a.ts', 1);
+        await engine.drain();
+        const [rec] = await read();
+        assert.ok(rec?.type === CHANGED);
+        assert.deepEqual(rec.data.before, { kind: 'unavailable', reason: 'baseline-unknown' });
+      });
+    });
+
     it('does not treat a sibling outside the unreadable dir as baseline-unknown', async () => {
       await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
         engine.markBaselineUnknown('locked');

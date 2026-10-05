@@ -16,9 +16,10 @@ export interface Engine {
   /** Record a path's starting state without emitting a change (baseline). */
   setBaseline(path: string, snapshot: Snapshot): void;
   /**
-   * Mark a directory whose baseline could not be enumerated. Descendants with
-   * no observed baseline get an honest `unavailable/baseline-unknown` before
-   * state instead of a fabricated `absent`.
+   * Mark a path (usually a directory) whose prior state capture does not know:
+   * its baseline could not be enumerated, or capture skipped it as out of
+   * scope. It and its descendants with no recorded snapshot get an honest
+   * `unavailable/baseline-unknown` before state instead of a fabricated `absent`.
    */
   markBaselineUnknown(relDir: string): void;
   /** Signal that a path may have changed, observed at `observedAtMs`. */
@@ -28,6 +29,18 @@ export interface Engine {
   /** Discard notification metadata after `drain()` when durable recovery will
    * rebuild committed baselines from the log and filesystem. */
   resetNotifications(): void;
+}
+
+/** Whether `path` equals or sits under one of `scopes` (`''` covers every path).
+ * Walks the path's ancestors, so the cost is its depth, not the scope count. */
+export function isUnderUnknownScope(path: string, scopes: ReadonlySet<string>): boolean {
+  if (scopes.has('')) return true;
+  for (let p = path; ; ) {
+    if (scopes.has(p)) return true;
+    const i = p.lastIndexOf(sep);
+    if (i < 0) return false;
+    p = p.slice(0, i);
+  }
 }
 
 /**
@@ -56,14 +69,8 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
   // The prior state of a path we never baselined is honestly unknown when its
   // directory could not be scanned; elsewhere, no baseline means it did not
   // exist yet.
-  const priorFor = (path: string): Snapshot => {
-    for (const prefix of baselineUnknown) {
-      if (prefix === '' || path === prefix || path.startsWith(prefix + sep)) {
-        return { kind: 'unavailable', reason: 'baseline-unknown' };
-      }
-    }
-    return { kind: 'absent' };
-  };
+  const priorFor = (path: string): Snapshot =>
+    isUnderUnknownScope(path, baselineUnknown) ? { kind: 'unavailable', reason: 'baseline-unknown' } : { kind: 'absent' };
 
   const notify = (path: string, observedAtMs: number): void => {
     const prior = pending.get(path);
