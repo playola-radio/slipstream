@@ -95,20 +95,27 @@ async function stop(child: ChildProcess, exited: Promise<unknown>): Promise<void
   }
 }
 
-function run(command: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<RunResult> {
+export function run(command: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    let timeoutError: Error | undefined;
     const exited = new Promise<void>((done) => child.on('close', () => done()));
     const timer = setTimeout(() => {
-      void stop(child, exited).then(() => reject(new Error(
-        `${command} ${args.join(' ')} did not finish in ${timeoutMs / 1000}s:\n${stdout}\n${stderr}`)));
+      timedOut = true;
+      timeoutError = new Error(`${command} ${args.join(' ')} did not finish in ${timeoutMs / 1000}s:\n${stdout}\n${stderr}`);
+      void stop(child, exited);
     }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });
     child.stderr.setEncoding('utf8').on('data', (d: string) => { stderr += d; });
     child.on('error', (err) => { clearTimeout(timer); reject(err); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut) reject(timeoutError);
+      else resolve({ code, stdout, stderr });
+    });
   });
 }
 
@@ -131,7 +138,7 @@ async function checkInstalledFiles(project: string): Promise<void> {
 
 /** `serve` loads the whole CLI import graph, the native watcher, and the HTTP
  * reader; fetching a schema through it proves the reader finds shipped data. */
-async function checkServe(project: string, bin: string, work: string): Promise<void> {
+export async function checkServe(project: string, bin: string, work: string, requestTimeoutMs = 30_000): Promise<void> {
   const worktree = join(work, 'worktree');
   const store = join(work, 'store');
   await mkdir(worktree);
@@ -154,7 +161,7 @@ async function checkServe(project: string, bin: string, work: string): Promise<v
     const { url, token } = JSON.parse(await readFile(descriptorPath, 'utf8')) as { url: string; token: string };
     const headers = { authorization: `Bearer ${token}` };
     for (const path of ['v1/schemas/slipstream.file.changed.v1', 'v1/schemas/projections/interface.v2']) {
-      const res = await fetch(new URL(path, url), { headers });
+      const res = await fetch(new URL(path, url), { headers, signal: AbortSignal.timeout(requestTimeoutMs) });
       if (res.status !== 200) fail('serve', `GET ${path} -> ${res.status}`);
       JSON.parse(await res.text());
     }
@@ -167,7 +174,7 @@ async function checkServe(project: string, bin: string, work: string): Promise<v
   if (LOADER_FAILURE.test(stderr)) fail('serve', stderr);
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const work = await mkdtemp(join(tmpdir(), 'slipstream-package-check-'));
   try {
     const packDir = join(work, 'pack');
@@ -204,7 +211,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exitCode = 1;
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  });
+}
