@@ -60,8 +60,8 @@ export interface QuestionAnsweredEvent {
  * `filesystem`: the root is not a git work tree, so every path is in scope. */
 export type CaptureScopeData =
   | { session_id: string; policy: 'git'; status: 'active' }
-  | { session_id: string; policy: 'git'; status: 'unavailable'; reason: 'git-error' }
-  | { session_id: string; policy: 'filesystem'; status: 'active'; reason: 'not-a-repository' };
+  | { session_id: string; policy: 'git'; status: 'unavailable' }
+  | { session_id: string; policy: 'filesystem'; status: 'active' };
 export interface CaptureScopeEvent {
   specversion: typeof SPEC_VERSION;
   id: string;

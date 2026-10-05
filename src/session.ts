@@ -379,7 +379,6 @@ export async function startCapture(
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
-  function appendEvent(input: CaptureScopeInput): Promise<PublicEvent>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -442,7 +441,7 @@ export async function startCapture(
   // Raw observations not yet handed to the engine. Under the git policy every
   // observation waits here until git has classified it; otherwise only those
   // arriving while capture is not live.
-  const buffer: Array<[string, number]> = [];
+  let buffer: Array<[string, number]> = [];
   const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
@@ -472,7 +471,7 @@ export async function startCapture(
     occurred_at_ms: Date.now(),
     data: scope.policy === 'git'
       ? { policy: 'git', status: 'active' }
-      : { policy: 'filesystem', status: 'active', reason: 'not-a-repository' },
+      : { policy: 'filesystem', status: 'active' },
   });
 
   const isRegularFile = (rel: string): Promise<boolean> =>
@@ -487,7 +486,9 @@ export async function startCapture(
   const pumpClassifier = (): void => {
     if (scope.policy !== 'git' || classifierRunning || !live || buffer.length === 0) return;
     classifierRunning = true;
-    classifierDone = classifyLoop();
+    classifierDone = classifyLoop().catch((err: unknown) => {
+      console.error(`slipstream: git classification failed: ${(err as Error).message}`);
+    });
   };
   const classifyLoop = async (): Promise<void> => {
     if (scope.policy !== 'git') return;
@@ -499,7 +500,7 @@ export async function startCapture(
           ignored = await scope.ignored([...new Set(batch.map(([rel]) => rel))]);
         } catch (err) {
           if (!live) {
-            buffer.unshift(...batch);
+            buffer = batch.concat(buffer); // no spread: a batch can exceed the argument limit
             return;
           }
           // Fail closed: never capture what might be ignored. The dropped paths'
@@ -510,7 +511,7 @@ export async function startCapture(
             await appendEvent({
               type: 'slipstream.capture.scope.v1',
               occurred_at_ms: Date.now(),
-              data: { policy: 'git', status: 'unavailable', reason: 'git-error' },
+              data: { policy: 'git', status: 'unavailable' },
             }).then(() => { scopeAvailable = false; }, () => {});
           }
           continue;
@@ -519,14 +520,19 @@ export async function startCapture(
         for (const [rel, ts] of batch) {
           if (ignored.has(rel)) markIgnored(rel);
           // An ignored directory is out of scope once deleted too, though git no
-          // longer matches its vanished path. Directories are never captured.
-          else if (!ignoredPaths.has(rel) || (await isRegularFile(rel))) forward.push([rel, ts]);
+          // longer matches its vanished path. Directories are never captured. A
+          // file forwarded here is in scope, so its later deletion is captured.
+          else if (!ignoredPaths.has(rel)) forward.push([rel, ts]);
+          else if (await isRegularFile(rel)) {
+            ignoredPaths.delete(rel);
+            forward.push([rel, ts]);
+          }
         }
         if (live && !scopeAvailable) {
           await appendEvent(scopeEvent()).then(() => { scopeAvailable = true; }, () => {});
         }
         if (!live || !scopeAvailable) {
-          buffer.unshift(...batch);
+          buffer = batch.concat(buffer); // no spread: a batch can exceed the argument limit
           return;
         }
         for (const [rel, ts] of forward) engine.notify(rel, ts);
@@ -536,13 +542,24 @@ export async function startCapture(
     }
   };
 
-  // The walk skips what git ignores, as of the start of the walk. Skipped
-  // entries are marked prior-unknown.
-  const walkExclusions = async (): Promise<(abs: string) => boolean> => {
-    if (scope.policy !== 'git') return isExcluded;
+  // Walk the worktree, skipping what git ignores; skipped paths are marked
+  // prior-unknown. Ignored entries listed up front prune whole directories. A
+  // file created after that listing is caught by asking git about every file
+  // found before any is read.
+  const walk = async (handlers: EnumerateHandlers): Promise<void> => {
+    if (scope.policy !== 'git') return deps.enumerate(root, root, isExcluded, handlers);
     const entries = new Set(await scope.ignoredEntries());
     for (const rel of entries) markIgnored(rel);
-    return (abs) => isExcluded(abs) || entries.has(relative(root, abs));
+    const files: string[] = [];
+    await deps.enumerate(root, root, (abs) => isExcluded(abs) || entries.has(relative(root, abs)), {
+      onFile: async (rel) => { files.push(rel); },
+      onDirError: handlers.onDirError,
+    });
+    const ignored = await scope.ignored(files);
+    for (const rel of files) {
+      if (ignored.has(rel)) markIgnored(rel);
+      else await handlers.onFile(rel);
+    }
   };
 
   // A native-watcher error means delivery may have lapsed; disclose an honest
@@ -570,7 +587,7 @@ export async function startCapture(
   ): Promise<void> => {
     const current = new Map<string, Snapshot>();
     const newUnknownDirs = new Set<string>();
-    await deps.enumerate(root, root, await walkExclusions(), {
+    await walk({
       onFile: async (rel) => { current.set(rel, await reader.read(rel)); },
       onDirError: async (relDir) => { newUnknownDirs.add(relDir); },
     });
@@ -780,7 +797,7 @@ export async function startCapture(
       await appendEvent(scopeEvent());
 
       const unknownScopes: string[] = [];
-      await deps.enumerate(root, root, await walkExclusions(), {
+      await walk({
         onFile: async (rel) => {
           const snapshot = await reader.read(rel);
           await appendEvent({

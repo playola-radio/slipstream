@@ -1017,7 +1017,9 @@ now. Design settled through a Codex consult (two rounds).
   so tracked files are never ignored; nested `.gitignore`, `info/exclude` and
   the global excludes file all apply). Each baseline/reconcile walk prunes the
   entries listed by one `git ls-files --others --ignored --exclude-standard
-  --directory`.
+  --directory`, then classifies every remaining file before reading it, so a
+  file created mid-walk is never read if git ignores it. A git warning (an
+  unreadable ignore file) or a timeout counts as a failure.
 - **Not a repository** → capture everything as before, disclosed. A git root
   where git itself fails → capture refuses to start.
 - **No fabricated `absent`.** Every pruned or dropped path is marked
@@ -1034,6 +1036,7 @@ now. Design settled through a Codex consult (two rounds).
   periods as `capture-scope-unavailable` gaps.
 - **Not in scope:** watcher-level pruning of ignored directories (the native
   ignore list is fixed at subscribe and cannot follow rule changes); a
-  backfill scan when rules change; persisted exclusion history.
+  backfill scan when rules change; persisted exclusion history; editor temp
+  files that git does not ignore.
 
-**Status**: In Progress.
+**Status**: Complete.

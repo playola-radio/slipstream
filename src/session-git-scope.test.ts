@@ -109,6 +109,30 @@ describe('session under the git capture scope', () => {
       );
     });
 
+    it('never baselines an ignored file created while the baseline walk runs', async () => {
+      await withGitRepo(
+        async (root) => {
+          await put(root, '.gitignore', '*.log\n');
+          await put(root, 'src/a.ts', 'kept');
+        },
+        async ({ root, store, start }) => {
+          const session = await start({
+            wrap: (real) => ({
+              ...real,
+              ignoredEntries: async () => {
+                const entries = await real.ignoredEntries();
+                await put(root, 'secret.log', 'created mid-walk');
+                return entries;
+              },
+            }),
+          });
+          const recs = await readRecords(session.logPath);
+          assert.deepEqual(new Set(baselined(recs)), new Set(['.gitignore', 'src/a.ts']));
+          assert.equal(await blobExists(store, 'created mid-walk'), false);
+        },
+      );
+    });
+
     it('still baselines a tracked file inside an ignored pattern', async () => {
       await withGitRepo(
         async (root) => {
@@ -177,6 +201,28 @@ describe('session under the git capture scope', () => {
       );
     });
 
+    it('records the deletion of a file captured after it stopped being ignored', async () => {
+      await withGitRepo(
+        async (root) => {
+          await put(root, '.gitignore', '*.log\n');
+          await put(root, 'existing.log', 'there at attach');
+        },
+        async ({ root, platform, start }) => {
+          const session = await start();
+          await writeFile(join(root, '.gitignore'), '');
+          platform.observe('.gitignore');
+          await writeFile(join(root, 'existing.log'), 'edited once in scope');
+          platform.observe('existing.log');
+          await waitForRecords(session.logPath, (r) => changesFor(r, 'existing.log').length >= 1);
+
+          await rm(join(root, 'existing.log'));
+          platform.observe('existing.log');
+          const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'existing.log').length >= 2);
+          assert.deepEqual(changesFor(recs, 'existing.log')[1]!.data.after, { kind: 'absent' });
+        },
+      );
+    });
+
     it('records nothing when an ignored directory is deleted', async () => {
       await withGitRepo(
         async (root) => {
@@ -240,7 +286,7 @@ describe('session under the git capture scope', () => {
       await withGitRepo(
         async () => {},
         async ({ root, platform, start }) => {
-          let failing = true;
+          let failing = false;
           const session = await start({
             wrap: (real) => ({
               ...real,
@@ -250,6 +296,7 @@ describe('session under the git capture scope', () => {
               },
             }),
           });
+          failing = true;
           await put(root, 'lost.ts', 'created during the outage');
           platform.observe('lost.ts');
           await waitForRecords(session.logPath, (r) => scopeEvents(r).some((e) => e.data.status === 'unavailable'));
@@ -307,17 +354,20 @@ describe('session under the git capture scope', () => {
         async () => {},
         async ({ root, platform, start }) => {
           const held = gate();
+          let armed = false;
           let calls = 0;
           const session = await start({
             wrap: (real) => ({
               ...real,
               ignored: async (paths) => {
+                if (!armed) return real.ignored(paths);
                 calls += 1;
                 await held.wait;
                 return real.ignored(paths);
               },
             }),
           });
+          armed = true;
           await put(root, 'last.ts', 'final edit');
           platform.observe('last.ts');
           while (calls === 0) await new Promise((r) => setTimeout(r, 5));
@@ -348,13 +398,14 @@ describe('session under the git capture scope', () => {
             };
           };
           const held = gate();
+          let armed = false;
           let firstCall = true;
           const session = await start({
             createLog: failingLog,
             wrap: (real) => ({
               ...real,
               ignored: async (paths) => {
-                if (firstCall) {
+                if (armed && firstCall) {
                   firstCall = false;
                   await held.wait;
                 }
@@ -362,11 +413,13 @@ describe('session under the git capture scope', () => {
               },
             }),
           });
+          armed = true;
           await writeFile(join(root, 'a.ts'), 'v2');
           platform.observe('a.ts');
           diskFull = true;
           await session.beginTask({ title: 't', requestId: 'r' }).catch(() => {});
           while (session.health.snapshot().state !== 'failing') await new Promise((r) => setTimeout(r, 5));
+          await new Promise((r) => setTimeout(r, 100)); // past the first recovery attempt, which suspends capture
           held.open(); // git answers while capture is suspended
           await new Promise((r) => setTimeout(r, 50));
           diskFull = false;
@@ -381,6 +434,72 @@ describe('session under the git capture scope', () => {
           // Replaying the log checks every change against its predecessor.
           const resumed = await start({ resumeSessionId: session.sessionId });
           await resumed.stop();
+        },
+      );
+    });
+  });
+
+  describe('very large batches', () => {
+    it('puts a huge batch back intact when capture is suspended mid-classification', async (t) => {
+      await withGitRepo(
+        async (root) => { await put(root, 'a.ts', 'v1'); },
+        async ({ root, platform, start }) => {
+          let diskFull = false;
+          const failingLog: typeof createLog = async (o) => {
+            const real = await createLog(o);
+            return {
+              durableSeq: () => real.durableSeq(),
+              close: () => real.close(),
+              append: async (input) => {
+                if (diskFull) throw new StorageError('append', Object.assign(new Error('disk full'), { code: 'ENOSPC' }));
+                return real.append(input);
+              },
+            };
+          };
+          const first = gate();
+          const second = gate();
+          const secondAsked = gate();
+          let armed = false;
+          let calls = 0;
+          const session = await start({
+            createLog: failingLog,
+            wrap: (real) => ({
+              ...real,
+              ignored: async (paths) => {
+                if (!armed) return real.ignored(paths);
+                calls += 1;
+                if (calls === 1) await first.wait;
+                if (calls === 2) {
+                  secondAsked.open();
+                  await second.wait;
+                }
+                return real.ignored(paths);
+              },
+            }),
+          });
+          const errors: string[] = [];
+          const consoleError = console.error;
+          console.error = (...args: unknown[]) => { errors.push(args.join(' ')); };
+          t.after(() => { console.error = consoleError; });
+          armed = true;
+          platform.observe('a.ts');
+          await writeFile(join(root, 'a.ts'), 'v2');
+          for (let i = 0; i < 200_000; i += 1) platform.observe('a.ts');
+          first.open();
+          await secondAsked.wait;
+          diskFull = true;
+          await session.beginTask({ title: 't', requestId: 'r' }).catch(() => {});
+          while (session.health.snapshot().state !== 'failing') await new Promise((r) => setTimeout(r, 5));
+          await new Promise((r) => setTimeout(r, 100)); // past the first recovery attempt, which suspends capture
+          second.open();
+          await new Promise((r) => setTimeout(r, 50));
+          diskFull = false;
+          while (session.health.snapshot().state !== 'healthy') await new Promise((r) => setTimeout(r, 5));
+          await session.stop();
+
+          const last = changesFor(await readRecords(session.logPath), 'a.ts').at(-1);
+          assert.ok(last && last.data.after.kind === 'content' && last.data.after.sha256 === sha('v2'));
+          assert.deepEqual(errors.filter((m) => m.includes('classification failed')), []);
         },
       );
     });
@@ -439,7 +558,6 @@ describe('session under the git capture scope', () => {
           const recs = await readRecords(session.logPath);
           const [scope] = scopeEvents(recs);
           assert.equal(scope!.data.policy, 'filesystem');
-          assert.equal('reason' in scope!.data && scope!.data.reason, 'not-a-repository');
           assert.ok(baselined(recs).includes('debug.log'));
         } finally {
           await session.stop();

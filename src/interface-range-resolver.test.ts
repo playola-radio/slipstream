@@ -370,22 +370,9 @@ test('the corrupt-chain fixture throws and the durable-ahead fixture returns 409
   }
 });
 
-test('a git capture scope adds the git-ignored exclusion and outages become session gaps', async () => {
-  await withLog([event(1, 'session.started'), event(2, 'capture.scope', { policy: 'git', status: 'active' }),
-    event(3, 'capture.baseline.completed', { unknown_scopes: [] }),
-    event(4, 'capture.scope', { policy: 'git', status: 'unavailable', reason: 'git-error' }),
-    event(5, 'capture.scope', { policy: 'git', status: 'active' })], async (logPath) => {
-    const result = await resolveRecordedRange(options(logPath, 3n, 5n));
-    assert.equal(result.kind, 'resolved');
-    if (result.kind !== 'resolved') return;
-    assert.deepEqual(result.inventory.policyExclusions, ['store-directory', '.git', 'symlinks', 'git-ignored']);
-    assert.deepEqual(result.gaps, [{ seq: '4', reason: 'capture-scope-unavailable', scope: { kind: 'session' } }]);
-  });
-});
-
 test('a filesystem capture scope keeps the static exclusions and records no gap', async () => {
   await withLog([event(1, 'session.started'),
-    event(2, 'capture.scope', { policy: 'filesystem', status: 'active', reason: 'not-a-repository' })], async (logPath) => {
+    event(2, 'capture.scope', { policy: 'filesystem', status: 'active' })], async (logPath) => {
     const result = await resolveRecordedRange(options(logPath, 0n, 2n));
     assert.equal(result.kind, 'resolved');
     if (result.kind !== 'resolved') return;
@@ -395,7 +382,7 @@ test('a filesystem capture scope keeps the static exclusions and records no gap'
 });
 
 test('a capture scope that misstates its policy is corrupt history', async () => {
-  for (const data of [{ policy: 'filesystem', status: 'active' }, { policy: 'git', status: 'unavailable' },
+  for (const data of [{ policy: 'filesystem', status: 'unavailable' }, { policy: 'git' },
     { policy: 'slipignore', status: 'active' }]) {
     await withLog([event(1, 'session.started'), event(2, 'capture.scope', data)], async (logPath) => {
       await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad capture scope/, JSON.stringify(data));

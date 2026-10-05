@@ -208,8 +208,8 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     } else if (record.type === GAP) {
       gaps.push(checkGap(data, seq));
     } else if (record.type === SCOPE) {
-      const valid = (data.policy === 'git' && (data.status === 'active' || (data.status === 'unavailable' && data.reason === 'git-error')))
-        || (data.policy === 'filesystem' && data.status === 'active' && data.reason === 'not-a-repository');
+      const valid = (data.policy === 'git' && (data.status === 'active' || data.status === 'unavailable'))
+        || (data.policy === 'filesystem' && data.status === 'active');
       if (!valid) corrupt(`bad capture scope at ${seq}`);
       if (data.policy === 'git') gitScoped = true;
       if (data.status === 'unavailable') gaps.push({ seq, reason: 'capture-scope-unavailable', scope: { kind: 'session' } });

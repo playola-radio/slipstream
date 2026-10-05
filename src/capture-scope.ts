@@ -37,32 +37,54 @@ interface GitResult {
 
 function runGit(root: string, args: string[], input?: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-C', root, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Its own process group, so a timeout also kills helpers git started (an
+    // fsmonitor hook) that would otherwise hold the pipes open past the deadline.
+    const child = spawn('git', ['-C', root, ...args], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
     // Not spawn's own `timeout`: its timer outlives a failed spawn.
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    const timer = setTimeout(() => {
+      settle(() => reject(new GitError(`git ${args[0]} timed out after ${timeoutMs}ms`)));
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }, timeoutMs);
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     child.stdout.on('data', (b: Buffer) => out.push(b));
     child.stderr.on('data', (b: Buffer) => err.push(b));
     child.stdin.on('error', () => {}); // a git that exits early closes stdin; the exit code reports it
     child.on('error', (e) => {
-      clearTimeout(timer);
-      reject(new GitError(`git ${args[0]} could not run: ${e.message}`));
+      settle(() => reject(new GitError(`git ${args[0]} could not run: ${e.message}`)));
     });
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
       const stderr = Buffer.concat(err).toString('utf8').trim();
       if (code === null) {
-        reject(new GitError(`git ${args[0]} was killed (${signal ?? 'unknown signal'})${stderr ? `: ${stderr}` : ''}`));
+        settle(() => reject(new GitError(`git ${args[0]} was killed (${signal ?? 'unknown signal'})${stderr ? `: ${stderr}` : ''}`)));
         return;
       }
-      resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr });
+      settle(() => resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr }));
     });
     child.stdin.end(input ?? '');
   });
 }
 
 const splitNul = (s: string): string[] => s.split('\0').filter((p) => p.length > 0);
+
+/** Git reports an ignore file it could not read only as a warning and still
+ * exits successfully, so its answer may be missing rules. Never trust it. */
+function rejectWarnings(command: string, r: GitResult): void {
+  if (r.stderr) throw new GitError(`git ${command} warned: ${r.stderr}`);
+}
 
 export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): CaptureScope {
   return {
@@ -73,6 +95,7 @@ export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): Captu
       // 0: some paths ignored, 1: none ignored. Anything else is a failure, and
       // partial output from a failed run is never trusted.
       if (r.code !== 0 && r.code !== 1) throw new GitError(`git check-ignore exited ${r.code}: ${r.stderr}`);
+      rejectWarnings('check-ignore', r);
       return new Set(splitNul(r.stdout));
     },
     ignoredEntries: async () => {
@@ -83,6 +106,7 @@ export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): Captu
         timeoutMs,
       );
       if (r.code !== 0) throw new GitError(`git ls-files exited ${r.code}: ${r.stderr}`);
+      rejectWarnings('ls-files', r);
       return splitNul(r.stdout).map((p) => (p.endsWith('/') ? p.slice(0, -1) : p));
     },
   };
@@ -98,6 +122,8 @@ export async function detectCaptureScope(root: string): Promise<CaptureScope> {
   const r = await runGit(root, ['rev-parse', '--is-inside-work-tree']);
   if (r.code === 0 && r.stdout.trim() === 'true') return gitCaptureScope(root);
   if (r.code === 0 && r.stdout.trim() === 'false') return { policy: 'filesystem' };
-  if (r.code === 128 && /not a git repository/i.test(r.stderr)) return { policy: 'filesystem' };
+  // Only git's search-found-nothing message. `not a git repository: '<dir>'`
+  // means an explicit GIT_DIR git cannot open, which is a failure.
+  if (r.code === 128 && /not a git repository \(or any/i.test(r.stderr)) return { policy: 'filesystem' };
   throw new GitError(`cannot tell whether ${root} is a git work tree: git rev-parse exited ${r.code}: ${r.stderr}`);
 }

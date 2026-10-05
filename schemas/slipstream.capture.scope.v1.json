@@ -63,20 +63,18 @@
         },
         {
           "type": "object",
-          "required": ["policy", "status", "reason"],
+          "required": ["policy", "status"],
           "properties": {
             "policy": { "const": "git" },
-            "status": { "const": "unavailable" },
-            "reason": { "const": "git-error" }
+            "status": { "const": "unavailable" }
           }
         },
         {
           "type": "object",
-          "required": ["policy", "status", "reason"],
+          "required": ["policy", "status"],
           "properties": {
             "policy": { "const": "filesystem" },
-            "status": { "const": "active" },
-            "reason": { "const": "not-a-repository" }
+            "status": { "const": "active" }
           }
         }
       ]

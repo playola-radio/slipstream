@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectCaptureScope, gitCaptureScope, GitError, type CaptureScope } from './capture-scope.ts';
@@ -23,6 +23,22 @@ async function withRepo(fn: (root: string) => Promise<void>): Promise<void> {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+/** A repo whose excludes file git cannot read: git warns but still exits 0/1. */
+async function withUnreadableExcludes(fn: (scope: Extract<CaptureScope, { policy: 'git' }>) => Promise<void>): Promise<void> {
+  await withRepo(async (root) => {
+    const excludes = join(root, '..', `${root.split('/').pop()}-excludes`);
+    await writeFile(excludes, '*.log\n');
+    await chmod(excludes, 0o000);
+    try {
+      git(root, 'config', 'core.excludesFile', excludes);
+      await put(root, 'a.log');
+      await fn(asGit(await detectCaptureScope(root)));
+    } finally {
+      await rm(excludes, { force: true });
+    }
+  });
 }
 
 async function put(root: string, rel: string, body = 'x'): Promise<void> {
@@ -70,6 +86,19 @@ describe('capture scope', () => {
           await rm(linked, { recursive: true, force: true });
         }
       });
+    });
+
+    it('rejects a repository git cannot open rather than capturing everything', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'slip-nogit-'));
+      const gitDir = process.env.GIT_DIR;
+      process.env.GIT_DIR = join(root, 'missing');
+      try {
+        await assert.rejects(detectCaptureScope(root), GitError);
+      } finally {
+        if (gitDir === undefined) delete process.env.GIT_DIR;
+        else process.env.GIT_DIR = gitDir;
+        await rm(root, { recursive: true, force: true });
+      }
     });
 
     it('rejects when git cannot be run at all', async () => {
@@ -145,10 +174,26 @@ describe('capture scope', () => {
       }
     });
 
+    it('rejects when git warns that it could not read an ignore rule', async () => {
+      await withUnreadableExcludes(async (scope) => {
+        await assert.rejects(scope.ignored(['a.log']), /unable to access/);
+      });
+    });
+
     it('rejects when git outlives its timeout', async () => {
       await withRepo(async (root) => {
         const scope = asGit(gitCaptureScope(root, 1));
-        await assert.rejects(scope.ignored(['a.ts']), /killed/);
+        await assert.rejects(scope.ignored(['a.ts']), /timed out/);
+      });
+    });
+
+    it('rejects at its deadline even when a process git started keeps running', async () => {
+      await withRepo(async (root) => {
+        git(root, 'config', 'core.fsmonitor', 'sleep 5; echo token');
+        const scope = asGit(gitCaptureScope(root, 200));
+        const started = Date.now();
+        await assert.rejects(scope.ignored(['a.ts']), /timed out/);
+        assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`);
       });
     });
   });
@@ -166,6 +211,12 @@ describe('capture scope', () => {
         await put(root, 'src/a.ts');
         const scope = asGit(await detectCaptureScope(root));
         assert.deepEqual(new Set(await scope.ignoredEntries()), new Set(['node_modules', 'src/x.log', 'build/out.js']));
+      });
+    });
+
+    it('rejects when git warns that it could not read an ignore rule', async () => {
+      await withUnreadableExcludes(async (scope) => {
+        await assert.rejects(scope.ignoredEntries(), /unable to access/);
       });
     });
 
@@ -187,8 +238,8 @@ describe('capture scope', () => {
       const schema = await loadSchema('slipstream.capture.scope.v1');
       for (const data of [
         { policy: 'git', status: 'active' },
-        { policy: 'git', status: 'unavailable', reason: 'git-error' },
-        { policy: 'filesystem', status: 'active', reason: 'not-a-repository' },
+        { policy: 'git', status: 'unavailable' },
+        { policy: 'filesystem', status: 'active' },
       ]) {
         const event = scopeEvent(data);
         assert.equal(event.data.session_id, SESSION);
@@ -200,9 +251,8 @@ describe('capture scope', () => {
     it('rejects combinations that would misstate the scope', async () => {
       const schema = await loadSchema('slipstream.capture.scope.v1');
       for (const data of [
-        { policy: 'filesystem', status: 'active' },
-        { policy: 'filesystem', status: 'unavailable', reason: 'git-error' },
-        { policy: 'git', status: 'unavailable' },
+        { policy: 'filesystem', status: 'unavailable' },
+        { policy: 'git' },
         { policy: 'slipignore', status: 'active' },
       ]) {
         assert.ok(validate(schema, scopeEvent(data)).length > 0, JSON.stringify(data));
