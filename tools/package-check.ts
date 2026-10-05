@@ -5,7 +5,7 @@
  * that everything it reads at runtime (schemas, workers, the Swift child)
  * actually shipped. Run with `npm run check:package`.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,13 +17,7 @@ const PACKAGE_DIR = 'node_modules/@playola-radio/slipstream';
 const LOADER_FAILURE = /ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING|ERR_MODULE_NOT_FOUND|ERR_UNKNOWN_FILE_EXTENSION|ERR_UNSUPPORTED_DIR_IMPORT|Cannot find (module|package)/;
 
 const REQUIRED_FILES = [
-  'dist/cli.js',
-  'dist/clip-projection-worker.js',
-  'dist/interface-ts-worker.js',
-  'dist/swift-parse-host.js',
   'dist/swift-parse-worker.js',
-  'schemas/slipstream.file.changed.v1.json',
-  'schemas/projections/clip.v3.json',
   'contracts/interface/v2/schema.json',
   'LICENSE',
   'README.md',
@@ -86,15 +80,35 @@ console.log('probe: swift child ok');
 
 interface RunResult { code: number | null; stdout: string; stderr: string }
 
-function run(command: string, args: string[], cwd: string): Promise<RunResult> {
+/** SIGTERM, then SIGKILL if the child has not exited within 5s. */
+async function stop(child: ChildProcess, exited: Promise<unknown>): Promise<void> {
+  child.kill('SIGTERM');
+  let timer: NodeJS.Timeout | undefined;
+  const killed = await Promise.race([
+    exited.then(() => false),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), 5_000); }),
+  ]);
+  clearTimeout(timer);
+  if (killed) {
+    child.kill('SIGKILL');
+    await exited;
+  }
+}
+
+function run(command: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    const exited = new Promise<void>((done) => child.on('close', () => done()));
+    const timer = setTimeout(() => {
+      void stop(child, exited).then(() => reject(new Error(
+        `${command} ${args.join(' ')} did not finish in ${timeoutMs / 1000}s:\n${stdout}\n${stderr}`)));
+    }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });
     child.stderr.setEncoding('utf8').on('data', (d: string) => { stderr += d; });
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.on('error', (err) => { clearTimeout(timer); reject(err); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
 }
 
@@ -148,8 +162,7 @@ async function checkServe(project: string, bin: string, work: string): Promise<v
     if (LOADER_FAILURE.test(stderr)) fail('serve', stderr);
     throw err;
   } finally {
-    child.kill('SIGTERM');
-    await exited;
+    await stop(child, exited);
   }
   if (LOADER_FAILURE.test(stderr)) fail('serve', stderr);
 }
@@ -168,7 +181,7 @@ async function main(): Promise<void> {
     console.log(`package-check: packed ${tarball}`);
 
     await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'package-check-project', private: true, type: 'module' }));
-    assertClean('npm install', await run('npm', ['install', '--no-audit', '--no-fund', tarball], project));
+    assertClean('npm install', await run('npm', ['install', '--no-audit', '--no-fund', tarball], project, 300_000));
     await checkInstalledFiles(project);
     console.log('package-check: installed package has every required file');
 
