@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { access, chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectCaptureScope, gitCaptureScope, GitError, type CaptureScope } from './capture-scope.ts';
@@ -180,17 +180,24 @@ describe('capture scope', () => {
       });
     });
 
-    it('rejects when the git executable outlives its timeout', async () => {
+    it('rejects at its timeout and kills helpers git started that hold its pipes', async () => {
       await withRepo(async (root) => {
         const bin = await mkdtemp(join(tmpdir(), 'slip-slow-git-'));
         const oldPath = process.env.PATH;
         try {
           const fakeGit = join(bin, 'git');
-          await writeFile(fakeGit, '#!/bin/sh\nsleep 1\n');
+          const helperPid = join(bin, 'helper.pid');
+          await writeFile(fakeGit, `#!/bin/sh\nsleep 30 &\necho $! > '${helperPid}'\nwait\n`);
           await chmod(fakeGit, 0o755);
           process.env.PATH = `${bin}:${oldPath ?? ''}`;
-          const scope = asGit(gitCaptureScope(root, 50));
+          // Long enough for the script to start its helper; far short of the helper's 30s.
+          const scope = asGit(gitCaptureScope(root, 2000));
+          const started = Date.now();
           await assert.rejects(scope.ignored(['a.ts']), /timed out/);
+          assert.ok(Date.now() - started < 10_000);
+          const pid = Number(await readFile(helperPid, 'utf8'));
+          await new Promise((r) => setTimeout(r, 100));
+          assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
         } finally {
           if (oldPath === undefined) delete process.env.PATH;
           else process.env.PATH = oldPath;
