@@ -45,13 +45,10 @@ export function isUnderUnknownScope(path: string, scopes: ReadonlySet<string>): 
   }
 }
 
-/** Add an unknown scope only when no existing ancestor already covers it. When a
- * new ancestor arrives, its now-redundant descendants are discarded. */
+/** Add an unknown scope unless an existing one already covers it. Descendants
+ * added earlier are kept: pruning them costs a scan of every scope per add. */
 export function addUnknownScope(scope: string, scopes: Set<string>): boolean {
   if (isUnderUnknownScope(scope, scopes)) return false;
-  for (const existing of scopes) {
-    if (scope === '' || existing.startsWith(`${scope}${sep}`)) scopes.delete(existing);
-  }
   scopes.add(scope);
   return true;
 }

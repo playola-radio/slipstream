@@ -10,11 +10,9 @@ const GAP = 'slipstream.capture.gap.v1';
 
 describe('engine', () => {
   describe('unknown baseline scopes', () => {
-    it('keeps only the shallowest scopes without changing their coverage', () => {
-      const scopes = new Set(['generated/a.js', 'generated/b.js']);
+    it('does not store a scope an existing one already covers', () => {
+      const scopes = new Set(['generated']);
 
-      assert.equal(addUnknownScope('generated', scopes), true);
-      assert.deepEqual(scopes, new Set(['generated']));
       assert.equal(addUnknownScope('generated/c.js', scopes), false);
       assert.deepEqual(scopes, new Set(['generated']));
     });
