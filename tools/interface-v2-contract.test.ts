@@ -51,7 +51,7 @@ describe('interface.v2 contract fixtures', () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     const report = JSON.parse(out[0] ?? '{}');
-    assert.equal(report.cases, 71);
+    assert.equal(report.cases, 73);
     assert.deepEqual(report.failures, []);
     assert.equal(report.negative_control_rejected, true);
     assert.equal(code, EXIT.PASS);
@@ -121,6 +121,10 @@ describe('interface.v2 contract validator rejects', () => {
   rejects('a wrong baseline disclosure', /baseline_completed_seq/, (c) => { c.expected.inventory.baseline_completed_seq = null; });
   rejects('missing policy exclusions', /policy_exclusions/, (c) => { c.expected.inventory.policy_exclusions = []; });
   rejects('a gap list that omits a recorded gap', /the full recorded list/, (c) => { c.expected.gaps = []; }, 'range-gap-unchanged-hashes');
+  rejects('a git-scoped history that hides the git-ignored exclusion', /policy_exclusions/, (c) => {
+    c.expected.inventory.policy_exclusions = ['store-directory', '.git', 'symlinks'];
+  }, 'range-git-scope');
+  rejects('a gap list that omits a git outage', /the full recorded list/, (c) => { c.expected.gaps = []; }, 'range-git-scope-unavailable');
   rejects('a history that does not start with session.started', /session.started must be the first record/, (c) => { c.history.events[0].type = 'slipstream.capture.baseline.completed.v1'; });
   rejects('a history with a seq hole', /not contiguous/, (c) => { c.history.events.splice(2, 1); });
   rejects('a durable high-water past the last event', /must be the last event seq/, (c) => { c.history.durable_seq = '5'; });

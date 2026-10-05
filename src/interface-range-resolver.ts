@@ -9,9 +9,11 @@ const BASELINED = 'slipstream.file.baselined.v1';
 const CHANGED = 'slipstream.file.changed.v1';
 const COMPLETED = 'slipstream.capture.baseline.completed.v1';
 const GAP = 'slipstream.capture.gap.v1';
+const SCOPE = 'slipstream.capture.scope.v1';
 const SHA = /^[0-9a-f]{64}$/;
 const SEQ = /^[1-9][0-9]*$/;
 const POLICY_EXCLUSIONS = ['store-directory', '.git', 'symlinks'] as const;
+export type PolicyExclusion = typeof POLICY_EXCLUSIONS[number] | 'git-ignored';
 
 export type RecordedEndpoint = {
   kind: 'recorded'; record_seq: string; field: 'snapshot' | 'before' | 'after'; snapshot: Snapshot;
@@ -27,7 +29,9 @@ export interface RangeFile {
 }
 export interface RangeGap {
   seq: string;
-  reason: 'coalesced' | 'baseline-unreadable' | 'watcher-error' | 'restart' | 'storage';
+  /** `capture-scope-unavailable`: git could not classify observations, which
+   * were dropped. A later recovery does not erase the gap. */
+  reason: 'coalesced' | 'baseline-unreadable' | 'watcher-error' | 'restart' | 'storage' | 'capture-scope-unavailable';
   scope: { kind: 'session' } | { kind: 'directory' | 'path'; path: string };
 }
 export interface RangeScanStats { records: number; bytes: number; elapsedMs: number }
@@ -45,7 +49,7 @@ export interface ResolveRecordedRangeOptions {
 }
 export type ResolveRecordedRangeResult =
   | { kind: 'resolved'; inventory: { scope: 'observed'; baselineCompletedSeq: string | null; unknownScopes: string[];
-      policyExclusions: typeof POLICY_EXCLUSIONS };
+      policyExclusions: readonly PolicyExclusion[] };
       gaps: RangeGap[]; files: RangeFile[]; scan: RangeScanStats }
   | { kind: 'beyondDurable' }
   | { kind: 'scanLimit'; scan: RangeScanStats }
@@ -136,6 +140,7 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
   const gaps: RangeGap[] = [];
   let baselineCompletedSeq: string | null = null;
   let unknownScopes: string[] = [];
+  let gitScoped = false;
   let lastSeq = 0n;
   const cursor = await openLogCursor(logPath, 0n);
   try {
@@ -202,6 +207,12 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
       unknownScopes = [...data.unknown_scopes].sort();
     } else if (record.type === GAP) {
       gaps.push(checkGap(data, seq));
+    } else if (record.type === SCOPE) {
+      const valid = (data.policy === 'git' && (data.status === 'active' || (data.status === 'unavailable' && data.reason === 'git-error')))
+        || (data.policy === 'filesystem' && data.status === 'active' && data.reason === 'not-a-repository');
+      if (!valid) corrupt(`bad capture scope at ${seq}`);
+      if (data.policy === 'git') gitScoped = true;
+      if (data.status === 'unavailable') gaps.push({ seq, reason: 'capture-scope-unavailable', scope: { kind: 'session' } });
     }
   }
 
@@ -218,5 +229,5 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
   }
   files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   return { kind: 'resolved', inventory: { scope: 'observed', baselineCompletedSeq, unknownScopes,
-    policyExclusions: POLICY_EXCLUSIONS }, gaps, files, scan: scan() };
+    policyExclusions: gitScoped ? [...POLICY_EXCLUSIONS, 'git-ignored'] : POLICY_EXCLUSIONS }, gaps, files, scan: scan() };
 }

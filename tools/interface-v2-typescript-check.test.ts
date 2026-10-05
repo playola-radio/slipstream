@@ -19,6 +19,7 @@ test('standalone TypeScript v2 checker extracts disposable captured pairs', () =
     'range-cancelled-mid-page/src/a.ts',
     'range-deadline-mid-page/src/a.ts',
     'range-gap-before-b/src/f.ts', 'range-gap-cap/src/f.ts',
+    'range-git-scope/src/f.ts', 'range-git-scope-unavailable/src/f.ts',
     'range-lookahead-timeout/src/a.ts',
     'range-page-boundary-first/src/a.ts', 'range-page-boundary-second/src/b.ts',
     'range-rename/src/a.ts', 'range-rename/src/b.ts',

@@ -35,6 +35,8 @@ const POLICY_EXCLUSIONS = ['store-directory', '.git', 'symlinks'];
 const BASELINED = 'slipstream.file.baselined.v1';
 const CHANGED = 'slipstream.file.changed.v1';
 const COMPLETED = 'slipstream.capture.baseline.completed.v1';
+const GAP = 'slipstream.capture.gap.v1';
+const SCOPE = 'slipstream.capture.scope.v1';
 const ROW_KIND_ORDER = ['removed', 'signatureChanged', 'added'];
 /** D6: the only (language, language_version) pairs a client can decode (§4.6). */
 const LANGUAGE_VERSIONS: Record<string, string> = { typescript: 'typescript.v2', swift: 'swift.v1' };
@@ -639,13 +641,19 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
     else {
       extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
       if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
-      if (!isDeepStrictEqual(inventory.policy_exclusions, POLICY_EXCLUSIONS)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(POLICY_EXCLUSIONS)}`);
+      const gitScoped = history.events.some((e) => e.type === SCOPE && (e.data as Obj).policy === 'git' && BigInt(e.seq as string) <= req.after);
+      const exclusions = gitScoped ? [...POLICY_EXCLUSIONS, 'git-ignored'] : POLICY_EXCLUSIONS;
+      if (!isDeepStrictEqual(inventory.policy_exclusions, exclusions)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(exclusions)}`);
       const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
       checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);
     }
+    // A git outage (capture.scope unavailable) is a session-wide gap in seq order.
     const recordedGaps = history.events
-      .filter((e) => e.type === 'slipstream.capture.gap.v1' && BigInt(e.seq as string) <= req.after)
-      .map((e) => ({ seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }));
+      .filter((e) => BigInt(e.seq as string) <= req.after
+        && (e.type === GAP || (e.type === SCOPE && (e.data as Obj).status === 'unavailable')))
+      .map((e) => e.type === GAP
+        ? { seq: e.seq, reason: (e.data as Obj).reason, scope: (e.data as Obj).scope }
+        : { seq: e.seq, reason: 'capture-scope-unavailable', scope: { kind: 'session' } });
     if (!Array.isArray(body.gaps)) errors.push('expected.gaps: resolved page needs gaps');
     else checkMetadataList(body.gaps, body.gaps_complete, recordedGaps, harness.noMetadataBudget, 'expected.gaps', errors);
   }
