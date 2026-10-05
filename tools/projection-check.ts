@@ -71,8 +71,8 @@ import {
   interfaceToLine,
   parseInterfaceInput,
 } from './interface-projection-oracle.ts';
-import { runSwiftParseChild, runSwiftParseFile, runSwiftParseStdin, swiftFixturePath, SwiftFixtureError } from './swift-parse.ts';
-import type { HostResult } from './swift-parse-host.ts';
+import { runSwiftParseChild, runSwiftParseFile, runSwiftParseStdin, swiftFixturePath, SwiftFixtureError } from '../src/swift-parse.ts';
+import type { HostResult } from '../src/swift-parse-host.ts';
 import { runFoldRelease } from './fold-release-check.ts';
 import { runAdmission } from './projection-admission-check.ts';
 import { runInterfaceV2Contract } from './interface-v2-contract.ts';

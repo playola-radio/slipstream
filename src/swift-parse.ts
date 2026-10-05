@@ -1,21 +1,22 @@
 /**
  * Runner + corpus helpers for the Swift-parse feasibility harness. Everything
  * that must load the grammar goes through `runSwiftParseChild`, which spawns the
- * isolated `--liftoff-only` host (tools/swift-parse-host.ts), so the calling
+ * isolated `--liftoff-only` host (src/swift-parse-host.ts), so the calling
  * process (checker, test runner, acceptance) never loads Swift itself and can
  * never be aborted by the OOM. The runner owns the child's deadline, abort
  * wiring, and abnormal-exit reporting.
  */
 import { spawn } from 'node:child_process';
+import { siblingModuleUrl } from './sibling-module.ts';
 import { readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { SWIFT_UNISOLATED_ENV } from '../src/swift-grammar.ts';
+import { SWIFT_UNISOLATED_ENV } from './swift-grammar.ts';
 import type { HostRequest, HostResult } from './swift-parse-host.ts';
-import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from '../src/projection-trace.ts';
+import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export const SWIFT_CORPUS_DIR = fileURLToPath(new URL('../contracts/swift-syntax/v1/', import.meta.url));
-const HOST_PATH = fileURLToPath(new URL('./swift-parse-host.ts', import.meta.url));
+const HOST_PATH = fileURLToPath(siblingModuleUrl('swift-parse-host', import.meta.url));
 const CASE_NAME = /^[a-z0-9][a-z0-9-]*$/;
 
 export class SwiftFixtureError extends Error {}

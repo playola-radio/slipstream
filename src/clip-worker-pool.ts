@@ -8,6 +8,7 @@
  * one worker), so the worker is always free synchronously.
  */
 import { Worker } from 'node:worker_threads';
+import { siblingModuleUrl } from './sibling-module.ts';
 import { CLIP_PROJECTION_VERSION, type ClipProjection } from './clip-projection.ts';
 import type { ClipJob } from './clip-blob-reader.ts';
 import type { ClipWorkerRequest, ClipWorkerResponse } from './clip-projection-worker.ts';
@@ -18,7 +19,7 @@ export type ClipCompute = (job: ClipJob, traceUnitId?: number) => ClipComputeHan
 
 export interface ClipWorkerPool { run: ClipCompute; close: () => Promise<void> }
 
-const WORKER_URL = new URL('./clip-projection-worker.ts', import.meta.url);
+const WORKER_URL = siblingModuleUrl('clip-projection-worker', import.meta.url);
 
 function workerErrorResult(): ClipProjection {
   return {

@@ -2,7 +2,7 @@
  * T5a.3 acceptance: Swift-WASM feasibility (SWIFT-GRAMMAR.md).
  *
  * Proves the four feasibility claims of the PR against the LIVE artifact by
- * driving the isolated `--liftoff-only` host (tools/swift-parse-host.ts):
+ * driving the isolated `--liftoff-only` host (src/swift-parse-host.ts):
  *
  *  1. the pinned grammar loads with the exact sha256/ABI and its two licenses;
  *  2. parse diagnostics carry UTF-8 byte half-open spans, not UTF-16 indices;
@@ -19,8 +19,8 @@
  */
 import { readFile } from 'node:fs/promises';
 import { EXPECTED_SHA256, EXPECTED_ABI, GRAMMAR, WRAPPER, type SwiftDiagnostic, type SwiftParseResult } from '../../../src/swift-grammar.ts';
-import { runSwiftParseChild, listSwiftFixtures, swiftFixturePath, SwiftChildError } from '../../swift-parse.ts';
-import type { HostResult } from '../../swift-parse-host.ts';
+import { runSwiftParseChild, listSwiftFixtures, swiftFixturePath, SwiftChildError } from '../../../src/swift-parse.ts';
+import type { HostResult } from '../../../src/swift-parse-host.ts';
 import type { Assertion } from '../../qa-support.ts';
 import type { AcceptanceModule } from './types.ts';
 

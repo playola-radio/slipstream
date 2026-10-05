@@ -15,6 +15,22 @@ written. No code yet.
 - [`NOTES-architecture.md`](NOTES-architecture.md) — decision record, verified
   findings, and the Codex adversarial review
 
+## Install
+
+```sh
+npm install -g @playola-radio/slipstream
+```
+
+Node.js 24 or newer is required. The published package ships compiled
+JavaScript; developing in this repo still runs the TypeScript sources directly
+(`npm run slipstream`, `npm test`) with no build step. To put a clone on your
+PATH with `npm link`, run `npm run build` first, and again after pulling: the
+linked command runs the compiled `dist/`, not the sources.
+
+## License
+
+Apache-2.0. Copyright Playola Radio, Incorporated. See [`LICENSE`](LICENSE).
+
 ## What it promises — and does not
 
 > Slipstream streams **a live history of observed filesystem states, with

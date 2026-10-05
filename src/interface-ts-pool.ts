@@ -1,8 +1,9 @@
 import { Worker } from 'node:worker_threads';
+import { siblingModuleUrl } from './sibling-module.ts';
 import type { TypeScriptJob, TypeScriptReply, TypeScriptResult } from './interface-ts-worker.ts';
 import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from './projection-trace.ts';
 
-const WORKER_URL = new URL('./interface-ts-worker.ts', import.meta.url);
+const WORKER_URL = siblingModuleUrl('interface-ts-worker', import.meta.url);
 
 /** One persistent parser worker. Cancellation terminates synchronous WASM work. */
 export function createTypeScriptPool(trace?: ProjectionTraceObserver) {

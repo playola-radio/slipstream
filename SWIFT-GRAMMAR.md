@@ -79,7 +79,7 @@ ineffective or rejected — the flag must be set at process launch.
 
 **Consequence for this PR — Option C.** All Swift loading and parsing is confined
 to a dedicated `node --liftoff-only` child process
-(`tools/swift-parse-host.ts`). The checker, the test runner, the acceptance
+(`src/swift-parse-host.ts`). The checker, the test runner, the acceptance
 runner, and the daemon spawn that child and never load the grammar themselves, so
 a stray parse can never take them down. Merely *importing* `src/swift-grammar.ts`
 is safe — nothing initializes eagerly, not even resolving the artifact path (a

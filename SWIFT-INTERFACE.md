@@ -15,7 +15,7 @@ settings, inspect function bodies, or infer behavior.
   launches no child.
 - The parent API batches sides into one invocation of the existing
   `node --liftoff-only` host. Grammar loading and AST traversal occur only in
-  that child. The existing `tools/swift-parse.ts` runner owns its deadline,
+  that child. The existing `src/swift-parse.ts` runner owns its deadline,
   abort listener and child cleanup. The prior cancellation demonstration and
   OOM controls remain in place.
 - `src/interface-v2-core.ts` exports `compareV2(before, after)`. Its input is
