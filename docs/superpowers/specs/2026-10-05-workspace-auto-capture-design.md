@@ -199,7 +199,7 @@ auto-captures.
 
 ## Out of scope
 
-npm packaging (to be published as `@playola/slipstream`; needs a build step
+npm packaging (to be published as `@playola-radio/slipstream`; needs a build step
 because Node will not strip TypeScript types inside `node_modules`), agent binding
 for auto-captures, automatic retention, daemon folder discovery, Codex version
 allowlist changes.
