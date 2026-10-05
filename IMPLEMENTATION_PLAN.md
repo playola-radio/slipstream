@@ -74,7 +74,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
 | Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery and Claude delivery D3 merged, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
-| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree |
+| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree — see "Future: several simultaneous captures" below |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
 | Q6 | MCP topology | stdio thin forwarder → one long-running daemon (verified necessary) |
 | Q7 | Event envelope | CloudEvents structured JSON; minimal effort spent on it |
@@ -105,7 +105,15 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
   identities. A transcript record may *update attribution*; it may never
   *create* a filesystem-change event. This avoids double-capture structurally.
 
-### Future: several simultaneous captures (not built; Q4 stands)
+### Future: several simultaneous captures (not built; Q4 amended 2026-10-05)
+
+**Amendment (Brian, 2026-10-05).** Q4 is lifted so every new Conductor
+workspace can be captured automatically. Design and PR graph:
+`docs/superpowers/specs/2026-10-05-workspace-auto-capture-design.md` (status:
+spec in review). The amendment covers watch-only auto-captures only; the Stage 3
+manual-start, explicit-selection and detach-before-switch criteria still govern
+harness-bound captures, and identity verification and watcher-primary capture
+are unchanged. The text below predates the amendment and still applies.
 
 Capturing several worktrees at once, and later auto-connecting new Conductor
 workspaces, is the intended direction after the MVP. It is not built, and Q4
