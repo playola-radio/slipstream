@@ -1,19 +1,42 @@
 {
-  "name": "slipstream",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@playola-radio/slipstream",
+  "version": "0.1.0",
+  "description": "Live, honest stream of the file changes a coding agent makes in a worktree, so you can review as it works.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/playola-radio/slipstream.git"
+  },
+  "homepage": "https://github.com/playola-radio/slipstream#readme",
+  "bugs": {
+    "url": "https://github.com/playola-radio/slipstream/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
   },
   "bin": {
-    "slipstream": "./src/cli.ts"
+    "slipstream": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "contracts/interface/v2/schema.json",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md",
+    "README.md",
+    "SKILL.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 'src/**/!(*.os).test.ts'",
     "test:os": "node --test --test-concurrency=1 'src/**/*.os.test.ts'",
     "test:tools": "node --test --test-concurrency=1 'tools/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "bench": "node src/bench.ts",
     "slipstream": "node src/cli.ts",
     "live-feed": "node tools/live-feed/cli.ts",

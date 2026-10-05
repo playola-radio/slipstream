@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/test/**",
+    "src/bench.ts",
+    "src/clip-bench.ts",
+    "src/clip-bench-writer.ts",
+    "src/loss.ts",
+    "src/fold-release.ts"
+  ]
+}
