@@ -8,13 +8,14 @@
  * test runner, or the daemon.
  */
 import { Worker } from 'node:worker_threads';
+import { siblingModuleUrl } from './sibling-module.ts';
 import { readFile } from 'node:fs/promises';
 import { isMainModule } from './entrypoint.ts';
 import { loadSwiftLanguage, parseSwiftSource, type ArtifactProvenance, type SwiftParseResult } from './swift-grammar.ts';
 import type { WorkerMessage } from './swift-parse-worker.ts';
 import { extractSwiftSource, type SwiftLimits, type SwiftSide } from './swift-interface-extract.ts';
 
-const WORKER_URL = new URL('./swift-parse-worker.ts', import.meta.url);
+const WORKER_URL = siblingModuleUrl('swift-parse-worker', import.meta.url);
 
 export type HostRequest =
   | { op: 'parse'; source: string }
