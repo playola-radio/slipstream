@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEngine } from './engine.ts';
+import { addUnknownScope, createEngine } from './engine.ts';
 import type { Reader } from './reader.ts';
 import type { Snapshot } from './snapshot.ts';
 import { content, scriptedReader, withEngine } from './test/helpers.ts';
@@ -9,6 +9,17 @@ const CHANGED = 'slipstream.file.changed.v1';
 const GAP = 'slipstream.capture.gap.v1';
 
 describe('engine', () => {
+  describe('unknown baseline scopes', () => {
+    it('keeps only the shallowest scopes without changing their coverage', () => {
+      const scopes = new Set(['generated/a.js', 'generated/b.js']);
+
+      assert.equal(addUnknownScope('generated', scopes), true);
+      assert.deepEqual(scopes, new Set(['generated']));
+      assert.equal(addUnknownScope('generated/c.js', scopes), false);
+      assert.deepEqual(scopes, new Set(['generated']));
+    });
+  });
+
   describe('change detection', () => {
     it('emits one file.changed with the correct before/after for a change from the baseline', async () => {
       await withEngine(scriptedReader([content('bbb')]), async ({ engine, read }) => {

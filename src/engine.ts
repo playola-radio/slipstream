@@ -45,6 +45,17 @@ export function isUnderUnknownScope(path: string, scopes: ReadonlySet<string>): 
   }
 }
 
+/** Add an unknown scope only when no existing ancestor already covers it. When a
+ * new ancestor arrives, its now-redundant descendants are discarded. */
+export function addUnknownScope(scope: string, scopes: Set<string>): boolean {
+  if (isUnderUnknownScope(scope, scopes)) return false;
+  for (const existing of scopes) {
+    if (scope === '' || existing.startsWith(`${scope}${sep}`)) scopes.delete(existing);
+  }
+  scopes.add(scope);
+  return true;
+}
+
 /**
  * Per-path serialized capture. Each path compares the freshly-read snapshot
  * against the *last committed* snapshot — never against whatever is on disk
@@ -65,7 +76,7 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
   };
 
   const markBaselineUnknown = (relDir: string): void => {
-    baselineUnknown.add(relDir);
+    addUnknownScope(relDir, baselineUnknown);
   };
 
   const isRecorded = (path: string): boolean => committed.has(path);

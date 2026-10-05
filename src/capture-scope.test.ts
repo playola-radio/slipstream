@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectCaptureScope, gitCaptureScope, GitError, type CaptureScope } from './capture-scope.ts';
@@ -180,20 +180,32 @@ describe('capture scope', () => {
       });
     });
 
-    it('rejects when git outlives its timeout', async () => {
+    it('rejects when the git executable outlives its timeout', async () => {
       await withRepo(async (root) => {
-        const scope = asGit(gitCaptureScope(root, 1));
-        await assert.rejects(scope.ignored(['a.ts']), /timed out/);
+        const bin = await mkdtemp(join(tmpdir(), 'slip-slow-git-'));
+        const oldPath = process.env.PATH;
+        try {
+          const fakeGit = join(bin, 'git');
+          await writeFile(fakeGit, '#!/bin/sh\nsleep 1\n');
+          await chmod(fakeGit, 0o755);
+          process.env.PATH = `${bin}:${oldPath ?? ''}`;
+          const scope = asGit(gitCaptureScope(root, 50));
+          await assert.rejects(scope.ignored(['a.ts']), /timed out/);
+        } finally {
+          if (oldPath === undefined) delete process.env.PATH;
+          else process.env.PATH = oldPath;
+          await rm(bin, { recursive: true, force: true });
+        }
       });
     });
 
-    it('rejects at its deadline even when a process git started keeps running', async () => {
+    it('does not run a repository-configured fsmonitor command', async () => {
       await withRepo(async (root) => {
-        git(root, 'config', 'core.fsmonitor', 'sleep 5; echo token');
+        const marker = join(root, 'fsmonitor-ran');
+        git(root, 'config', 'core.fsmonitor', `sh -c 'touch "$0"; sleep 1' ${JSON.stringify(marker)}`);
         const scope = asGit(gitCaptureScope(root, 200));
-        const started = Date.now();
-        await assert.rejects(scope.ignored(['a.ts']), /timed out/);
-        assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`);
+        await scope.ignored(['a.ts']);
+        await assert.rejects(access(marker));
       });
     });
   });

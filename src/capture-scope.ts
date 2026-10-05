@@ -37,9 +37,9 @@ interface GitResult {
 
 function runGit(root: string, args: string[], input?: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   return new Promise((resolve, reject) => {
-    // Its own process group, so a timeout also kills helpers git started (an
-    // fsmonitor hook) that would otherwise hold the pipes open past the deadline.
-    const child = spawn('git', ['-C', root, ...args], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    // Its own process group, so a timeout also kills any helpers git starts
+    // that would otherwise hold the pipes open past the deadline.
+    const child = spawn('git', ['-c', 'core.fsmonitor=false', '-C', root, ...args], { stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     let settled = false;
     const settle = (fn: () => void): void => {
       if (settled) return;

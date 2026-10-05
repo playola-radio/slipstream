@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
-import { createEngine, isUnderUnknownScope } from './engine.ts';
+import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
 import { detectCaptureScope, type DetectCaptureScope } from './capture-scope.ts';
 import { createHealth, type Health, type HealthFailure } from './health.ts';
 import { acquireSessionLock, type SessionLock } from './lock.ts';
@@ -459,7 +459,7 @@ export async function startCapture(
   // created. Only the shallowest skipped path is kept.
   const ignoredPaths = new Set<string>();
   const markIgnored = (rel: string): void => {
-    if (!isUnderUnknownScope(rel, ignoredPaths)) ignoredPaths.add(rel);
+    if (!addUnknownScope(rel, ignoredPaths)) return;
     engine.markBaselineUnknown(rel);
   };
 
