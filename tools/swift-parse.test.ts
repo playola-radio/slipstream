@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runSwiftParseChild, swiftFixturePath, SwiftChildError, SwiftFixtureError } from './swift-parse.ts';
+import { runSwiftParseChild, swiftFixturePath, SwiftChildError, SwiftFixtureError } from '../src/swift-parse.ts';
 import { EXPECTED_SHA256, EXPECTED_ABI } from '../src/swift-grammar.ts';
-import type { HostResult } from './swift-parse-host.ts';
-import { runInWorker } from './swift-parse-host.ts';
+import type { HostResult } from '../src/swift-parse-host.ts';
+import { runInWorker } from '../src/swift-parse-host.ts';
 
 // End-to-end coverage for loading and parsing the Swift grammar. Every case runs
 // inside the isolated --liftoff-only child (the test runner itself never loads

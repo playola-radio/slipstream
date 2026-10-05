@@ -10,7 +10,7 @@
  * (turboshaft) with `Fatal process out of memory: Zone`. The only mitigation
  * found is launching the host process with `node --liftoff-only` (single-tier
  * baseline WASM); workers inherit it. So `loadSwiftLanguage`/`parseSwiftSource`
- * must only ever execute inside such a process (see tools/swift-parse-host.ts).
+ * must only ever execute inside such a process (see src/swift-parse-host.ts).
  * Merely importing this module is safe — nothing here initializes eagerly, not
  * even resolving the artifact path — and `loadSwiftLanguage` refuses to run
  * outside a `--liftoff-only` process so an accidental in-process load fails loud
@@ -30,7 +30,7 @@ const require = createRequire(import.meta.url);
 const SWIFT_WASM_SPECIFIER = 'tree-sitter-wasms/out/tree-sitter-swift.wasm';
 
 /** Env escape that lets a NON-`--liftoff-only` process load the grammar anyway.
- * Set by ONLY the OOM negative control (tools/swift-parse.ts), which must reach
+ * Set by ONLY the OOM negative control (src/swift-parse.ts), which must reach
  * the load to prove the default launch aborts. Nothing else should set it. */
 export const SWIFT_UNISOLATED_ENV = 'SLIPSTREAM_SWIFT_ALLOW_UNISOLATED';
 
@@ -96,7 +96,7 @@ function assertIsolatedProcess(): void {
   if (process.env[SWIFT_UNISOLATED_ENV] === '1') return;
   throw new SwiftArtifactError('refusing to load the Swift grammar outside a --liftoff-only process', {
     execArgv: process.execArgv,
-    hint: 'load via runSwiftParseChild (tools/swift-parse.ts), which spawns the isolated host',
+    hint: 'load via runSwiftParseChild (src/swift-parse.ts), which spawns the isolated host',
   });
 }
 

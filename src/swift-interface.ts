@@ -1,5 +1,5 @@
 /** FD2 parent API. Grammar loading/parsing stays in the liftoff-only child. */
-import { runSwiftParseChild, SwiftChildError } from '../tools/swift-parse.ts';
+import { runSwiftParseChild, SwiftChildError } from './swift-parse.ts';
 import { SWIFT_V1, type SwiftLimits, type SwiftSide } from './swift-interface-extract.ts';
 import { emitProjectionTrace, type ProjectionTraceObserver } from './projection-trace.ts';
 

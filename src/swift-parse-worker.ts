@@ -1,7 +1,7 @@
 /**
  * A terminable Swift-parse worker, used only to demonstrate cancellation
  * (STAGE-T-PREREQS 3.4). It inherits `--liftoff-only` from the host that spawns
- * it (tools/swift-parse-host.ts), so it can load the grammar without aborting.
+ * it (src/swift-parse-host.ts), so it can load the grammar without aborting.
  *
  * Protocol: the parent posts `{ source, progress? }`; the worker posts
  * `{ type: 'started' }` immediately before the (synchronous, blocking) parse,
@@ -14,7 +14,7 @@
  * the clip worker precedent (src/clip-worker-pool.ts).
  */
 import { parentPort } from 'node:worker_threads';
-import { loadSwiftLanguage, parseSwiftSource, type LoadedSwift } from '../src/swift-grammar.ts';
+import { loadSwiftLanguage, parseSwiftSource, type LoadedSwift } from './swift-grammar.ts';
 
 interface WorkerRequest {
   source: string;

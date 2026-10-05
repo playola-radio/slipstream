@@ -1,7 +1,7 @@
 /**
  * The isolated feasibility child: the ONLY process that loads and parses the
  * Swift grammar. It must be launched with `node --liftoff-only` (see
- * src/swift-grammar.ts for why); the runner (tools/swift-parse.ts) does that.
+ * src/swift-grammar.ts for why); the runner (src/swift-parse.ts) does that.
  * It reads one JSON request on stdin, performs one operation, prints one JSON
  * result line on stdout, and exits. Keeping every real Swift load behind this
  * boundary means a stray default-launch parse can never abort the checker, the
@@ -9,10 +9,10 @@
  */
 import { Worker } from 'node:worker_threads';
 import { readFile } from 'node:fs/promises';
-import { isMainModule } from '../src/entrypoint.ts';
-import { loadSwiftLanguage, parseSwiftSource, type ArtifactProvenance, type SwiftParseResult } from '../src/swift-grammar.ts';
+import { isMainModule } from './entrypoint.ts';
+import { loadSwiftLanguage, parseSwiftSource, type ArtifactProvenance, type SwiftParseResult } from './swift-grammar.ts';
 import type { WorkerMessage } from './swift-parse-worker.ts';
-import { extractSwiftSource, type SwiftLimits, type SwiftSide } from '../src/swift-interface-extract.ts';
+import { extractSwiftSource, type SwiftLimits, type SwiftSide } from './swift-interface-extract.ts';
 
 const WORKER_URL = new URL('./swift-parse-worker.ts', import.meta.url);
 
