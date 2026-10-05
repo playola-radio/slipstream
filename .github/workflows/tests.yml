@@ -46,6 +46,12 @@ jobs:
       - name: Run tool tests
         run: npm run test:tools
 
+      - name: Check the published package
+        # Packs the repo, installs the tarball into a fresh project, and runs the
+        # installed CLI, schema loading, and workers from node_modules (where
+        # Node refuses to strip types). Needs the npm registry for dependencies.
+        run: npm run check:package
+
       - name: Run QA acceptance checks (macOS only)
         # qa:check drives REAL daemons; several acceptance modules are darwin-gated
         # (they need real FSEvents capture) and projection-check REFUSES them with a
