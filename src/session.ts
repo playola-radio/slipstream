@@ -521,9 +521,10 @@ export async function startCapture(
           if (ignored.has(rel)) markIgnored(rel);
           // An ignored directory is out of scope once deleted too, though git no
           // longer matches its vanished path. Directories are never captured. A
-          // file forwarded here is in scope, so its later deletion is captured.
+          // file forwarded here, or one captured before, is in scope, so its
+          // deletion is captured.
           else if (!ignoredPaths.has(rel)) forward.push([rel, ts]);
-          else if (await isRegularFile(rel)) {
+          else if (engine.isRecorded(rel) || await isRegularFile(rel)) {
             ignoredPaths.delete(rel);
             forward.push([rel, ts]);
           }

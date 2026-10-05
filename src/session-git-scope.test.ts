@@ -223,6 +223,31 @@ describe('session under the git capture scope', () => {
       );
     });
 
+    it('records the deletion of a captured file after a rule briefly ignored it', async () => {
+      await withGitRepo(
+        async (root) => {
+          await put(root, 'a.txt', 'v1');
+        },
+        async ({ root, platform, start }) => {
+          const session = await start();
+          await writeFile(join(root, '.gitignore'), 'a.txt\n');
+          await writeFile(join(root, 'a.txt'), 'edited while ignored');
+          platform.observe('a.txt');
+          await put(root, 'marker1.ts', 'm');
+          platform.observe('marker1.ts');
+          await waitForRecords(session.logPath, (r) => changesFor(r, 'marker1.ts').length >= 1);
+
+          await writeFile(join(root, '.gitignore'), '');
+          await rm(join(root, 'a.txt'));
+          platform.observe('a.txt');
+          const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'a.txt').length >= 1);
+          const change = changesFor(recs, 'a.txt')[0]!;
+          assert.equal(change.data.before.kind, 'content');
+          assert.deepEqual(change.data.after, { kind: 'absent' });
+        },
+      );
+    });
+
     it('records nothing when an ignored directory is deleted', async () => {
       await withGitRepo(
         async (root) => {

@@ -22,6 +22,8 @@ export interface Engine {
    * `unavailable/baseline-unknown` before state instead of a fabricated `absent`.
    */
   markBaselineUnknown(relDir: string): void;
+  /** Whether capture holds a snapshot for `path` (baselined or changed). */
+  isRecorded(path: string): boolean;
   /** Signal that a path may have changed, observed at `observedAtMs`. */
   notify(path: string, observedAtMs: number): void;
   /** Resolve once all queued processing (and its appends) have settled. */
@@ -65,6 +67,8 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
   const markBaselineUnknown = (relDir: string): void => {
     baselineUnknown.add(relDir);
   };
+
+  const isRecorded = (path: string): boolean => committed.has(path);
 
   // The prior state of a path we never baselined is honestly unknown when its
   // directory could not be scanned; elsewhere, no baseline means it did not
@@ -152,5 +156,5 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
     coalesced.clear();
   };
 
-  return { setBaseline, markBaselineUnknown, notify, drain, resetNotifications };
+  return { setBaseline, markBaselineUnknown, isRecorded, notify, drain, resetNotifications };
 }
