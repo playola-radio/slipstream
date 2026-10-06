@@ -16,11 +16,14 @@ export interface Engine {
   /** Record a path's starting state without emitting a change (baseline). */
   setBaseline(path: string, snapshot: Snapshot): void;
   /**
-   * Mark a directory whose baseline could not be enumerated. Descendants with
-   * no observed baseline get an honest `unavailable/baseline-unknown` before
-   * state instead of a fabricated `absent`.
+   * Mark a path (usually a directory) whose prior state capture does not know:
+   * its baseline could not be enumerated, or capture skipped it as out of
+   * scope. It and its descendants with no recorded snapshot get an honest
+   * `unavailable/baseline-unknown` before state instead of a fabricated `absent`.
    */
   markBaselineUnknown(relDir: string): void;
+  /** Whether capture holds a snapshot for `path` (baselined or changed). */
+  isRecorded(path: string): boolean;
   /** Signal that a path may have changed, observed at `observedAtMs`. */
   notify(path: string, observedAtMs: number): void;
   /** Resolve once all queued processing (and its appends) have settled. */
@@ -28,6 +31,26 @@ export interface Engine {
   /** Discard notification metadata after `drain()` when durable recovery will
    * rebuild committed baselines from the log and filesystem. */
   resetNotifications(): void;
+}
+
+/** Whether `path` equals or sits under one of `scopes` (`''` covers every path).
+ * Walks the path's ancestors, so the cost is its depth, not the scope count. */
+export function isUnderUnknownScope(path: string, scopes: ReadonlySet<string>): boolean {
+  if (scopes.has('')) return true;
+  for (let p = path; ; ) {
+    if (scopes.has(p)) return true;
+    const i = p.lastIndexOf(sep);
+    if (i < 0) return false;
+    p = p.slice(0, i);
+  }
+}
+
+/** Add an unknown scope unless an existing one already covers it. Descendants
+ * added earlier are kept: pruning them costs a scan of every scope per add. */
+export function addUnknownScope(scope: string, scopes: Set<string>): boolean {
+  if (isUnderUnknownScope(scope, scopes)) return false;
+  scopes.add(scope);
+  return true;
 }
 
 /**
@@ -50,20 +73,16 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
   };
 
   const markBaselineUnknown = (relDir: string): void => {
-    baselineUnknown.add(relDir);
+    addUnknownScope(relDir, baselineUnknown);
   };
+
+  const isRecorded = (path: string): boolean => committed.has(path);
 
   // The prior state of a path we never baselined is honestly unknown when its
   // directory could not be scanned; elsewhere, no baseline means it did not
   // exist yet.
-  const priorFor = (path: string): Snapshot => {
-    for (const prefix of baselineUnknown) {
-      if (prefix === '' || path === prefix || path.startsWith(prefix + sep)) {
-        return { kind: 'unavailable', reason: 'baseline-unknown' };
-      }
-    }
-    return { kind: 'absent' };
-  };
+  const priorFor = (path: string): Snapshot =>
+    isUnderUnknownScope(path, baselineUnknown) ? { kind: 'unavailable', reason: 'baseline-unknown' } : { kind: 'absent' };
 
   const notify = (path: string, observedAtMs: number): void => {
     const prior = pending.get(path);
@@ -145,5 +164,5 @@ export function createEngine({ reader, log, now = Date.now }: EngineOptions): En
     coalesced.clear();
   };
 
-  return { setBaseline, markBaselineUnknown, notify, drain, resetNotifications };
+  return { setBaseline, markBaselineUnknown, isRecorded, notify, drain, resetNotifications };
 }

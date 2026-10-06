@@ -18,8 +18,10 @@ coverage and cursor advancement. A recorded `unavailable` tag is never equal,
 even to the same reason. FD4 maps recorded absent/unavailable and
 `unknownBoundary` to side coverage; content coverage depends on later blob and
 language work. Inventory is explicitly observed, carries the first baseline
-completion through A, its unknown scopes, and the static policy exclusions.
-Gaps include those before B. Reconciliation observation and gap reference remain
+completion through A, its unknown scopes, and the policy exclusions (with
+`git-ignored` once a git capture scope is recorded through A). Gaps include
+those before B, and each git-scope outage as a `capture-scope-unavailable`
+session gap. Reconciliation observation and gap reference remain
 on either endpoint. A first-change predecessor has `record_seq > B`; that is
 later-record provenance, not proof of an atomic state at B. FD4 must keep that
 provenance and the gap list visible. The public event stream carries change-level
@@ -57,7 +59,7 @@ owned by FD1/FD2/FD4, not claimed by FD3. The exact 62 successful-case names,
 selected from actual corpus membership, are:
 
 - `py-missing-blob-unsupported`, `py-unsupported-language`.
-- `range-add-then-remove-py`, `range-add-then-remove-ts`, `range-admission-skipped`, `range-all-failed-page`, `range-cancelled-mid-page`, `range-deadline-mid-page`, `range-gap-before-b`, `range-gap-cap`, `range-gap-unchanged-hashes`, `range-page-boundary-first`, `range-page-boundary-second`, `range-rename`, `range-restart-reconciliation`, `range-reverted-hidden`, `range-reverted-listed`, `range-too-large-first-file`, `range-unknown-scopes`.
+- `range-add-then-remove-py`, `range-add-then-remove-ts`, `range-admission-skipped`, `range-all-failed-page`, `range-cancelled-mid-page`, `range-deadline-mid-page`, `range-gap-before-b`, `range-gap-cap`, `range-gap-unchanged-hashes`, `range-git-scope`, `range-git-scope-unavailable`, `range-page-boundary-first`, `range-page-boundary-second`, `range-rename`, `range-restart-reconciliation`, `range-reverted-hidden`, `range-reverted-listed`, `range-too-large-first-file`, `range-unknown-scopes`.
 - `swift-added-file`, `swift-added-function`, `swift-capture-unavailable`, `swift-extension-member`, `swift-generics-where`, `swift-guard-move`, `swift-inferred-return`, `swift-init-failable`, `swift-known-path-incomplete-baseline`, `swift-labels-defaults-effects`, `swift-missing-blob`, `swift-overload-ambiguity`, `swift-parameter-change`, `swift-parameter-reorder`, `swift-parse-failure`, `swift-preview`, `swift-removed-file`, `swift-removed-function`, `swift-return-change`, `swift-shared-type-only`, `swift-unchanged-signature`, `swift-unknown-boundary`, `swift-variadic`.
 - `ts-added-file`, `ts-added-function`, `ts-capture-unavailable`, `ts-constructor-change`, `ts-destructured-param`, `ts-inferred-return`, `ts-known-path-incomplete-baseline`, `ts-missing-blob`, `ts-optional-rest-default`, `ts-overload-ambiguity`, `ts-parameter-change`, `ts-parameter-reorder`, `ts-parse-failure`, `ts-removed-file`, `ts-removed-function`, `ts-return-change`, `ts-shared-type-only`, `ts-unchanged-signature`, `ts-unicode-span`, `ts-unknown-boundary`.
 

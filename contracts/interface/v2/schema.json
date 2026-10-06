@@ -98,8 +98,8 @@
         },
         "policy_exclusions": {
           "type": "array",
-          "items": { "enum": ["store-directory", ".git", "symlinks"] },
-          "$comment": "Static capture policy, always exactly [\"store-directory\", \".git\", \"symlinks\"] (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them."
+          "items": { "enum": ["store-directory", ".git", "symlinks", "git-ignored"] },
+          "$comment": "Capture policy (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them. Always [\"store-directory\", \".git\", \"symlinks\"], followed by \"git-ignored\" when a capture.scope event with policy git is recorded by after_seq: paths git ignores and does not track are outside capture."
         }
       }
     },
@@ -151,7 +151,7 @@
       "required": ["seq", "reason", "scope"],
       "properties": {
         "seq": { "$ref": "#/$defs/seq" },
-        "reason": { "enum": ["coalesced", "baseline-unreadable", "watcher-error", "restart", "storage"] },
+        "reason": { "enum": ["coalesced", "baseline-unreadable", "watcher-error", "restart", "storage", "capture-scope-unavailable"] },
         "scope": {
           "oneOf": [
             {

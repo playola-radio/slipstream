@@ -1003,3 +1003,40 @@ a root-only witness is a later follow-up). There is no timeout, expiry,
 Release gate: the Swift client's tolerance patch (Swift brief S0) must be
 released no later than this, or the current viewer shows an "Unsupported event"
 marker for each answer.
+
+## G1: Capture only what git would merge (2026-10-05)
+
+**Decision (Brian, 2026-10-05):** Slipstream shows what is going to be merged,
+so its capture scope is what git would merge. A path git ignores, and that is
+not tracked, is not captured. Motivation: gitignored noise (`.gstack/` tool
+state, build output, editor droppings) floods the feed. No `.slipignore` for
+now. Design settled through a Codex consult (two rounds).
+
+- **Git decides.** Never re-implement ignore rules. Live observations are
+  classified per batch by a fresh `git check-ignore -z --stdin` (index-aware,
+  so tracked files are never ignored; nested `.gitignore`, `info/exclude` and
+  the global excludes file all apply). Each baseline/reconcile walk prunes the
+  entries listed by one `git ls-files --others --ignored --exclude-standard
+  --directory`, then classifies every remaining file before reading it, so a
+  file created mid-walk is never read if git ignores it. A git warning (an
+  unreadable ignore file) or a timeout counts as a failure.
+- **Not a repository** → capture everything as before, disclosed. A git root
+  where git itself fails → capture refuses to start.
+- **No fabricated `absent`.** Every pruned or dropped path is marked
+  prior-unknown, so a file that becomes un-ignored is reported with
+  `before: unavailable/baseline-unknown`, never as newly created.
+  Reconciliation in a git-filtered session reports never-recorded paths the
+  same way. Recorded predecessors always win.
+- **Disclosed in the log.** New public event `slipstream.capture.scope.v1`
+  (policy `git`/`filesystem`, status `active`/`unavailable`) is appended at
+  start and resume. A live classification failure drops the batch (fail
+  closed), marks its paths prior-unknown, and appends `unavailable`; the next
+  success appends `active`. The interface reader adds `git-ignored` to
+  `policy_exclusions` once a git policy is recorded, and reports unavailable
+  periods as `capture-scope-unavailable` gaps.
+- **Not in scope:** watcher-level pruning of ignored directories (the native
+  ignore list is fixed at subscribe and cannot follow rule changes); a
+  backfill scan when rules change; persisted exclusion history; editor temp
+  files that git does not ignore.
+
+**Status**: Complete.

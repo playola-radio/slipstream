@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEngine } from './engine.ts';
+import { addUnknownScope, createEngine } from './engine.ts';
 import type { Reader } from './reader.ts';
 import type { Snapshot } from './snapshot.ts';
 import { content, scriptedReader, withEngine } from './test/helpers.ts';
@@ -9,6 +9,15 @@ const CHANGED = 'slipstream.file.changed.v1';
 const GAP = 'slipstream.capture.gap.v1';
 
 describe('engine', () => {
+  describe('unknown baseline scopes', () => {
+    it('does not store a scope an existing one already covers', () => {
+      const scopes = new Set(['generated']);
+
+      assert.equal(addUnknownScope('generated/c.js', scopes), false);
+      assert.deepEqual(scopes, new Set(['generated']));
+    });
+  });
+
   describe('change detection', () => {
     it('emits one file.changed with the correct before/after for a change from the baseline', async () => {
       await withEngine(scriptedReader([content('bbb')]), async ({ engine, read }) => {
@@ -89,6 +98,28 @@ describe('engine', () => {
         } else {
           assert.fail('expected a file.changed record');
         }
+      });
+    });
+
+    it('does not treat a sibling sharing a name prefix as baseline-unknown', async () => {
+      await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('locked');
+        engine.notify('locked-out/a.ts', 1);
+        await engine.drain();
+        const [rec] = await read();
+        assert.ok(rec?.type === CHANGED);
+        assert.deepEqual(rec.data.before, { kind: 'absent' });
+      });
+    });
+
+    it('treats every path as baseline-unknown when the whole root is marked', async () => {
+      await withEngine(scriptedReader([content('new')]), async ({ engine, read }) => {
+        engine.markBaselineUnknown('');
+        engine.notify('deep/nested/a.ts', 1);
+        await engine.drain();
+        const [rec] = await read();
+        assert.ok(rec?.type === CHANGED);
+        assert.deepEqual(rec.data.before, { kind: 'unavailable', reason: 'baseline-unknown' });
       });
     });
 

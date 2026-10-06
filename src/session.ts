@@ -1,10 +1,11 @@
-import { access, readdir, realpath } from 'node:fs/promises';
+import { access, lstat, readdir, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
-import { createEngine } from './engine.ts';
+import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
+import { detectCaptureScope, type DetectCaptureScope } from './capture-scope.ts';
 import { createHealth, type Health, type HealthFailure } from './health.ts';
 import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
@@ -19,7 +20,7 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
+import type { CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
@@ -126,9 +127,16 @@ interface CaptureDependencies {
   platform: Platform;
   enumerate: typeof enumerate;
   readQuestionContext: typeof readQuestionContext;
+  detectScope: DetectCaptureScope;
 }
 
-const defaultDependencies: CaptureDependencies = { createLog, platform: createPlatform(), enumerate, readQuestionContext };
+const defaultDependencies: CaptureDependencies = {
+  createLog,
+  platform: createPlatform(),
+  enumerate,
+  readQuestionContext,
+  detectScope: detectCaptureScope,
+};
 
 /** A relative path escapes its base only via a leading `..` segment (or when it
  * comes back absolute); a filename that merely starts with `..`, like
@@ -162,6 +170,9 @@ export async function startCapture(
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
+  // Decided before anything is written: a git root git cannot read rejects here
+  // rather than silently capturing what git would not merge.
+  const scope = await deps.detectScope(root);
   await mkdirpDurable(opts.storeDir);
   const storeDir = await realpath(opts.storeDir);
   await assertOwnerOnly(storeDir, 'dir');
@@ -262,7 +273,7 @@ export async function startCapture(
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
       if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
-        && event.type !== 'slipstream.question.answered.v1') producer?.noteCommitted(event);
+        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1') producer?.noteCommitted(event);
     },
   };
 
@@ -427,13 +438,129 @@ export async function startCapture(
   const isExcluded = (abs: string): boolean => excluded.some((e) => isUnder(abs, e));
 
   let live = false;
-  const buffer: Array<[string, number]> = [];
+  // Raw observations not yet handed to the engine. Under the git policy every
+  // observation waits here until git has classified it; otherwise only those
+  // arriving while capture is not live.
+  let buffer: Array<[string, number]> = [];
   const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
     if (rel === '' || escapesBase(rel)) return;
-    if (live) engine.notify(rel, observedAtMs);
-    else buffer.push([rel, observedAtMs]);
+    if (live && scope.policy === 'filesystem') {
+      engine.notify(rel, observedAtMs);
+      return;
+    }
+    buffer.push([rel, observedAtMs]);
+    pumpClassifier();
+  };
+
+  // Paths skipped because git ignores them. Each is also marked prior-unknown in
+  // the engine, so if one later comes into scope it is never reported as newly
+  // created. Only the shallowest skipped path is kept.
+  const ignoredPaths = new Set<string>();
+  const markIgnored = (rel: string): void => {
+    if (!addUnknownScope(rel, ignoredPaths)) return;
+    engine.markBaselineUnknown(rel);
+  };
+
+  // Whether the git filter is working, as last durably disclosed. Flipped only
+  // once the disclosing scope event is committed.
+  let scopeAvailable = true;
+  const scopeEvent = (): CaptureScopeInput => ({
+    type: 'slipstream.capture.scope.v1',
+    occurred_at_ms: Date.now(),
+    data: scope.policy === 'git'
+      ? { policy: 'git', status: 'active' }
+      : { policy: 'filesystem', status: 'active' },
+  });
+
+  const isRegularFile = (rel: string): Promise<boolean> =>
+    lstat(join(root, rel)).then((st) => st.isFile(), () => false);
+
+  // One serial loop asks git about everything buffered so far in a single call;
+  // observations arriving meanwhile go in the next round. It runs only while
+  // live: a round that finishes after capture stopped being live puts its batch
+  // back to be classified afresh when capture is live again.
+  let classifierRunning = false;
+  let classifierDone: Promise<void> = Promise.resolve();
+  const pumpClassifier = (): void => {
+    if (scope.policy !== 'git' || classifierRunning || !live || buffer.length === 0) return;
+    classifierRunning = true;
+    classifierDone = classifyLoop().catch((err: unknown) => {
+      console.error(`slipstream: git classification failed: ${(err as Error).message}`);
+    });
+  };
+  const classifyLoop = async (): Promise<void> => {
+    if (scope.policy !== 'git') return;
+    try {
+      while (live && buffer.length > 0) {
+        const batch = buffer.splice(0);
+        let ignored: Set<string>;
+        try {
+          ignored = await scope.ignored([...new Set(batch.map(([rel]) => rel))]);
+        } catch (err) {
+          if (!live) {
+            buffer = batch.concat(buffer); // no spread: a batch can exceed the argument limit
+            return;
+          }
+          // Fail closed: never capture what might be ignored. The dropped paths'
+          // prior state is now unknown, and the outage is disclosed once.
+          console.error(`slipstream: git could not classify ${batch.length} observation(s): ${(err as Error).message}`);
+          for (const [rel] of batch) engine.markBaselineUnknown(rel);
+          if (scopeAvailable) {
+            await appendEvent({
+              type: 'slipstream.capture.scope.v1',
+              occurred_at_ms: Date.now(),
+              data: { policy: 'git', status: 'unavailable' },
+            }).then(() => { scopeAvailable = false; }, () => {});
+          }
+          continue;
+        }
+        const forward: Array<[string, number]> = [];
+        for (const [rel, ts] of batch) {
+          if (ignored.has(rel)) markIgnored(rel);
+          // An ignored directory is out of scope once deleted too, though git no
+          // longer matches its vanished path. Directories are never captured. A
+          // file forwarded here, or one captured before, is in scope, so its
+          // deletion is captured.
+          else if (!ignoredPaths.has(rel)) forward.push([rel, ts]);
+          else if (engine.isRecorded(rel) || await isRegularFile(rel)) {
+            ignoredPaths.delete(rel);
+            forward.push([rel, ts]);
+          }
+        }
+        if (live && !scopeAvailable) {
+          await appendEvent(scopeEvent()).then(() => { scopeAvailable = true; }, () => {});
+        }
+        if (!live || !scopeAvailable) {
+          buffer = batch.concat(buffer); // no spread: a batch can exceed the argument limit
+          return;
+        }
+        for (const [rel, ts] of forward) engine.notify(rel, ts);
+      }
+    } finally {
+      classifierRunning = false;
+    }
+  };
+
+  // Walk the worktree, skipping what git ignores; skipped paths are marked
+  // prior-unknown. Ignored entries listed up front prune whole directories. A
+  // file created after that listing is caught by asking git about every file
+  // found before any is read.
+  const walk = async (handlers: EnumerateHandlers): Promise<void> => {
+    if (scope.policy !== 'git') return deps.enumerate(root, root, isExcluded, handlers);
+    const entries = new Set(await scope.ignoredEntries());
+    for (const rel of entries) markIgnored(rel);
+    const files: string[] = [];
+    await deps.enumerate(root, root, (abs) => isExcluded(abs) || entries.has(relative(root, abs)), {
+      onFile: async (rel) => { files.push(rel); },
+      onDirError: handlers.onDirError,
+    });
+    const ignored = await scope.ignored(files);
+    for (const rel of files) {
+      if (ignored.has(rel)) markIgnored(rel);
+      else await handlers.onFile(rel);
+    }
   };
 
   // A native-watcher error means delivery may have lapsed; disclose an honest
@@ -447,14 +574,8 @@ export async function startCapture(
     }).catch(() => {});
   };
 
-  const priorFor = (path: string, unknownDirs: Set<string>): Snapshot => {
-    for (const prefix of unknownDirs) {
-      if (prefix === '' || path === prefix || path.startsWith(prefix + sep)) {
-        return { kind: 'unavailable', reason: 'baseline-unknown' };
-      }
-    }
-    return { kind: 'absent' };
-  };
+  const priorFor = (path: string, unknownDirs: Set<string>): Snapshot =>
+    isUnderUnknownScope(path, unknownDirs) ? { kind: 'unavailable', reason: 'baseline-unknown' } : { kind: 'absent' };
 
   // Re-observe the whole worktree against the last committed snapshots and emit a
   // reconciliation change for every differing endpoint. Enumeration omission is
@@ -467,14 +588,25 @@ export async function startCapture(
   ): Promise<void> => {
     const current = new Map<string, Snapshot>();
     const newUnknownDirs = new Set<string>();
-    await deps.enumerate(root, root, isExcluded, {
+    await walk({
       onFile: async (rel) => { current.set(rel, await reader.read(rel)); },
       onDirError: async (relDir) => { newUnknownDirs.add(relDir); },
     });
 
     const unknownDirs = new Set([...state.baselineUnknownDirs, ...newUnknownDirs]);
+    // Under the git policy a path first seen now may have existed, ignored,
+    // while capture was down: its prior state is unknown, never absent.
+    if (scope.policy === 'git') unknownDirs.add('');
+    // A recorded path the walk did not find is either gone or now ignored. An
+    // ignored one is out of scope: keep its last recorded state, never read it.
+    const unscanned = [...state.committed.keys()].filter((p) => !current.has(p));
+    const ignoredUnscanned = scope.policy === 'git' ? await scope.ignored(unscanned) : new Set<string>();
     const union = new Set<string>([...state.committed.keys(), ...current.keys()]);
     for (const path of union) {
+      if (ignoredUnscanned.has(path)) {
+        engine.setBaseline(path, state.committed.get(path)!);
+        continue;
+      }
       const after = current.get(path) ?? (await reader.read(path));
       const before = state.committed.get(path) ?? priorFor(path, unknownDirs);
       if (!snapshotsEqual(before, after)) {
@@ -499,7 +631,8 @@ export async function startCapture(
     // Install every unknown directory — recovered as well as newly-failed — so a
     // later live observation of a never-baselined path reports baseline-unknown
     // rather than a fabricated absent prior state.
-    for (const relDir of unknownDirs) engine.markBaselineUnknown(relDir);
+    for (const relDir of state.baselineUnknownDirs) engine.markBaselineUnknown(relDir);
+    for (const relDir of newUnknownDirs) engine.markBaselineUnknown(relDir);
   };
 
   const goLive = (): void => {
@@ -508,6 +641,10 @@ export async function startCapture(
     // lock release, and no observation may be appended past that point.
     if (stopped) return;
     live = true;
+    if (scope.policy === 'git') {
+      pumpClassifier();
+      return;
+    }
     for (const [rel, ts] of buffer) engine.notify(rel, ts);
     buffer.length = 0;
   };
@@ -642,6 +779,7 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { scope: { kind: 'session' }, reason: 'restart' },
       });
+      await appendEvent(scopeEvent());
       await producer.ensurePolicy(enrichmentPolicy);
       await reconcile(
         {
@@ -657,9 +795,10 @@ export async function startCapture(
         occurred_at_ms: Date.now(),
         data: { root, max_bytes: maxBytes },
       });
+      await appendEvent(scopeEvent());
 
       const unknownScopes: string[] = [];
-      await deps.enumerate(root, root, isExcluded, {
+      await walk({
         onFile: async (rel) => {
           const snapshot = await reader.read(rel);
           await appendEvent({
@@ -925,8 +1064,10 @@ export async function startCapture(
     // Stop feeding the engine immediately: if the watcher unsubscribe below
     // rejects, late observations buffer instead of appending after the lock is
     // released. Every step is then best-effort so a single failure never skips
-    // closing the log or releasing the lock; the first error is rethrown.
-    live = false;
+    // closing the log or releasing the lock; the first error is rethrown. Under
+    // the git policy capture stays live until git has classified what the
+    // watcher already delivered, so stopping never drops an observed edit.
+    if (scope.policy === 'filesystem') live = false;
     let firstError: unknown;
     const record = (err: unknown): void => {
       if (firstError === undefined) firstError = err;
@@ -935,6 +1076,8 @@ export async function startCapture(
     // evidence and coverage through both, and an append after close would throw.
     await coverageRunner?.stop().catch(record);
     await subscription?.close().catch(record);
+    while (classifierRunning) await classifierDone;
+    live = false;
     // Await any in-flight recovery: it may be mid-reopen, and appending after
     // we release the lock would let a second owner's writes interleave. The
     // loop stops starting new attempts once `stopped` is set.
