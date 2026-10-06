@@ -35,9 +35,10 @@ not recorded, and the tool result says so.
   npm install -g @playola-radio/slipstream
   ```
 
-  (Developing from a clone instead? Build once with `npm run build`, then
-  `npm link`; both commands run the compiled `dist/`. Or point `command` at
-  `node` with the absolute path to `dist/mcp-forwarder.js`.)
+  (Developing from a clone instead? Run `npm run build`, then `npm link`.
+  Rebuild after pulling or editing sources — the linked commands run the
+  compiled `dist/`, not your `.ts` files. Or point `command` at `node` with the
+  absolute path to `dist/mcp-forwarder.js`.)
 - The Slipstream **daemon** running against the store you want to feed. See the
   main `README.md` / CLI for starting it and for `slipstream attach` (which
   selects the watched worktree). The forwarder only *forwards* to a daemon; it
