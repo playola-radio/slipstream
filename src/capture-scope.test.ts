@@ -217,6 +217,71 @@ describe('capture scope', () => {
     });
   });
 
+  describe('slipstream ignore layer', () => {
+    // A frozen copy of a .slipstreamignore, supplied to git as its lowest-precedence
+    // excludes file. It may only add exclusions, never un-ignore what git keeps.
+    const withSlip = async (root: string, body: string): Promise<string> => {
+      const file = join(root, '..', `${root.split('/').pop()}-slip`);
+      await writeFile(file, body);
+      return file;
+    };
+
+    it('adds slipstream matches to the git-ignored set', async () => {
+      await withRepo(async (root) => {
+        await writeFile(join(root, '.gitignore'), '*.log\n');
+        const slip = await withSlip(root, 'secret.txt\n');
+        try {
+          for (const p of ['secret.txt', 'a.log', 'keep.ts']) await put(root, p);
+          const scope = asGit(await detectCaptureScope(root, slip));
+          assert.deepEqual(
+            await scope.ignored(['secret.txt', 'a.log', 'keep.ts']),
+            new Set(['secret.txt', 'a.log']),
+          );
+        } finally {
+          await rm(slip, { force: true });
+        }
+      });
+    });
+
+    it('excludes a tracked file that only the slipstream file names', async () => {
+      await withRepo(async (root) => {
+        await put(root, 'committed.ts');
+        git(root, 'add', 'committed.ts');
+        git(root, 'commit', '-qm', 'init');
+        const slip = await withSlip(root, 'committed.ts\n');
+        try {
+          const scope = asGit(await detectCaptureScope(root, slip));
+          assert.deepEqual(await scope.ignored(['committed.ts']), new Set(['committed.ts']));
+        } finally {
+          await rm(slip, { force: true });
+        }
+      });
+    });
+
+    it('cannot un-ignore a path a higher-precedence git rule keeps out', async () => {
+      await withRepo(async (root) => {
+        await writeFile(join(root, '.gitignore'), 'build/\n');
+        const slip = await withSlip(root, '!build/\n');
+        try {
+          await put(root, 'build/out.js');
+          const scope = asGit(await detectCaptureScope(root, slip));
+          assert.deepEqual(await scope.ignored(['build/out.js']), new Set(['build/out.js']));
+        } finally {
+          await rm(slip, { force: true });
+        }
+      });
+    });
+
+    it('leaves the git-ignored set unchanged when no slipstream file is supplied', async () => {
+      await withRepo(async (root) => {
+        await writeFile(join(root, '.gitignore'), '*.log\n');
+        for (const p of ['a.log', 'keep.ts']) await put(root, p);
+        const scope = asGit(await detectCaptureScope(root));
+        assert.deepEqual(await scope.ignored(['a.log', 'keep.ts']), new Set(['a.log']));
+      });
+    });
+  });
+
   describe('ignoredEntries', () => {
     it('collapses ignored directories and keeps tracked descendants out', async () => {
       await withRepo(async (root) => {
