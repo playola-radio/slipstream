@@ -5,6 +5,7 @@
  * that everything it reads at runtime (schemas, workers, the Swift child)
  * actually shipped. Run with `npm run check:package`.
  */
+import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -174,6 +175,44 @@ export async function checkServe(project: string, bin: string, work: string, req
   if (LOADER_FAILURE.test(stderr)) fail('serve', stderr);
 }
 
+/** Drive the installed `slipstream-mcp` launcher over stdio. The forwarder must
+ * answer `initialize` and `tools/list` without a daemon (it only reaches one on a
+ * tool call), so listing both tools proves the published `bin` entry resolves to
+ * compiled JS that loads its whole import graph. */
+export async function checkForwarder(bin: string, cwd: string, requestTimeoutMs = 30_000): Promise<void> {
+  const child = spawn(bin, [], { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = new Promise<void>((done) => child.on('close', () => done()));
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });
+  child.stderr.setEncoding('utf8').on('data', (d: string) => { stderr += d; });
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }) + '\n');
+    const deadline = Date.now() + requestTimeoutMs;
+    let listed: { result?: { tools?: { name?: string }[] } } | undefined;
+    while (Date.now() < deadline) {
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as { id?: number; result?: { tools?: { name?: string }[] } };
+          if (msg.id === 2) listed = msg;
+        } catch { /* a partial line; wait for more */ }
+      }
+      if (listed) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (LOADER_FAILURE.test(stderr)) fail('slipstream-mcp', stderr);
+    if (!listed) fail('slipstream-mcp', `no tools/list response:\n${stdout}\n${stderr}`);
+    const names = (listed.result?.tools ?? []).map((t) => t.name).sort();
+    assert.deepEqual(names, ['slipstream_answer_question', 'slipstream_begin_task'],
+      `unexpected tools from slipstream-mcp: ${JSON.stringify(names)}\n${stderr}`);
+  } finally {
+    child.stdin.end();
+    await stop(child, exited);
+  }
+}
+
 export async function main(): Promise<void> {
   const work = await mkdtemp(join(tmpdir(), 'slipstream-package-check-'));
   try {
@@ -200,6 +239,10 @@ export async function main(): Promise<void> {
 
     await checkServe(project, bin, work);
     console.log('package-check: installed CLI serves schemas');
+
+    const forwarderBin = join(project, 'node_modules/.bin/slipstream-mcp');
+    await checkForwarder(forwarderBin, project);
+    console.log('package-check: installed MCP forwarder lists its tools');
 
     await writeFile(join(project, 'probe.mjs'), PROBE);
     const probe = await run(process.execPath, ['probe.mjs'], project);

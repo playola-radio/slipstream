@@ -16,7 +16,8 @@
     "node": ">=24"
   },
   "bin": {
-    "slipstream": "./dist/cli.js"
+    "slipstream": "./dist/cli.js",
+    "slipstream-mcp": "./dist/mcp-forwarder.js"
   },
   "files": [
     "dist",
