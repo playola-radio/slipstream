@@ -46,6 +46,21 @@ Similarly, attribution is revisable inference with an explicit status
 (`pending` / `heuristic` / `ambiguous` / `unknown`), never a verified claim of
 authorship. A timestamp near an agent's tool call is evidence, not proof.
 
+## What gets captured
+
+Inside a git work tree, capture follows what git would merge: a path git ignores
+and does not track is out of scope, decided by git itself rather than a
+re-implemented matcher. Outside a git work tree, every path is captured.
+
+You can exclude extra paths with a root **`.slipstreamignore`** file. It uses
+git's own ignore syntax and, unlike `.gitignore`, can also exclude files git
+*tracks* (a committed-but-noisy generated file, say). Its rules are frozen when a
+capture starts, so editing the file takes effect on the next capture, not the
+running one. The file is honored only inside a git work tree; a non-git root
+ignores it. Excluded paths are never read or recorded, and the comparison API
+discloses that the layer was active (`inventory.policy_exclusions` lists
+`"slipstream-ignored"`).
+
 ## Design constraints
 
 - **The event schema is the public interface.** The on-disk JSONL log plus

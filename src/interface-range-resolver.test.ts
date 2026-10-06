@@ -381,6 +381,28 @@ test('a filesystem capture scope keeps the static exclusions and records no gap'
   });
 });
 
+test('a git scope with the slipstream layer active adds slipstream-ignored to the exclusions', async () => {
+  await withLog([event(1, 'session.started'),
+    event(2, 'capture.scope', { policy: 'git', status: 'active', slipstream_ignore: 'active' })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 2n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.inventory.policyExclusions,
+      ['store-directory', '.git', 'symlinks', 'git-ignored', 'slipstream-ignored']);
+  });
+});
+
+test('a git scope without the slipstream layer keeps only git-ignored', async () => {
+  await withLog([event(1, 'session.started'),
+    event(2, 'capture.scope', { policy: 'git', status: 'active' })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 2n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.inventory.policyExclusions,
+      ['store-directory', '.git', 'symlinks', 'git-ignored']);
+  });
+});
+
 test('a capture scope that misstates its policy is corrupt history', async () => {
   for (const data of [{ policy: 'filesystem', status: 'unavailable' }, { policy: 'git' },
     { policy: 'slipignore', status: 'active' }]) {

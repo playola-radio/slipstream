@@ -58,9 +58,12 @@ export interface QuestionAnsweredEvent {
 /** Which paths capture follows, and whether that filter is currently working.
  * `git`: paths git would not merge (ignored and untracked) are out of scope.
  * `filesystem`: the root is not a git work tree, so every path is in scope. */
+/** `slipstream_ignore: 'active'` means a root `.slipstreamignore` was frozen at
+ * capture start and is excluding extra paths (git-only; a non-git root ignores
+ * the file). Absent means no such file was in effect. */
 export type CaptureScopeData =
-  | { session_id: string; policy: 'git'; status: 'active' }
-  | { session_id: string; policy: 'git'; status: 'unavailable' }
+  | { session_id: string; policy: 'git'; status: 'active'; slipstream_ignore?: 'active' }
+  | { session_id: string; policy: 'git'; status: 'unavailable'; slipstream_ignore?: 'active' }
   | { session_id: string; policy: 'filesystem'; status: 'active' };
 export interface CaptureScopeEvent {
   specversion: typeof SPEC_VERSION;

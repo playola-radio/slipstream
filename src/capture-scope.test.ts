@@ -323,6 +323,8 @@ describe('capture scope', () => {
       for (const data of [
         { policy: 'git', status: 'active' },
         { policy: 'git', status: 'unavailable' },
+        { policy: 'git', status: 'active', slipstream_ignore: 'active' },
+        { policy: 'git', status: 'unavailable', slipstream_ignore: 'active' },
         { policy: 'filesystem', status: 'active' },
       ]) {
         const event = scopeEvent(data);
@@ -338,6 +340,7 @@ describe('capture scope', () => {
         { policy: 'filesystem', status: 'unavailable' },
         { policy: 'git' },
         { policy: 'slipignore', status: 'active' },
+        { policy: 'git', status: 'active', slipstream_ignore: 'yes' },
       ]) {
         assert.ok(validate(schema, scopeEvent(data)).length > 0, JSON.stringify(data));
       }

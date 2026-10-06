@@ -20,7 +20,7 @@ export type CaptureScope =
       ignoredEntries(): Promise<string[]>;
     };
 
-export type DetectCaptureScope = (root: string) => Promise<CaptureScope>;
+export type DetectCaptureScope = (root: string, slipExcludesFile?: string) => Promise<CaptureScope>;
 
 export class GitError extends Error {
   constructor(message: string) {
