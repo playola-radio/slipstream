@@ -27,8 +27,18 @@ not recorded, and the tool result says so.
 
 ## Prerequisites
 
-- **Node 24+** (the project runs TypeScript directly via Node's type stripping;
-  no build step). `node --version` should report `v24` or newer.
+- **Node 24+** (`node --version` should report `v24` or newer).
+- **Slipstream installed**, which puts the forwarder on your PATH as
+  `slipstream-mcp`:
+
+  ```sh
+  npm install -g @playola-radio/slipstream
+  ```
+
+  (Developing from a clone instead? Run `npm run build`, then `npm link`.
+  Rebuild after pulling or editing sources — the linked commands run the
+  compiled `dist/`, not your `.ts` files. Or point `command` at `node` with the
+  absolute path to `dist/mcp-forwarder.js`.)
 - The Slipstream **daemon** running against the store you want to feed. See the
   main `README.md` / CLI for starting it and for `slipstream attach` (which
   selects the watched worktree). The forwarder only *forwards* to a daemon; it
@@ -42,8 +52,8 @@ default store, `~/.slipstream`. Whatever you choose, **the forwarder, the
 daemon, and the CLI must all agree on the same store** — otherwise the forwarder
 connects to the wrong (or no) daemon.
 
-Use an **absolute path** for the checkout and the store in the config below;
-harnesses spawn the server from an unspecified working directory.
+Use an **absolute path** for the store in the config below; harnesses spawn the
+server from an unspecified working directory.
 
 ## Claude Code
 
@@ -54,9 +64,8 @@ Add a server entry to your user-level MCP config (`~/.claude.json`, under
 {
   "mcpServers": {
     "slipstream": {
-      "command": "node",
+      "command": "slipstream-mcp",
       "args": [
-        "/absolute/path/to/slipstream/src/mcp-forwarder.ts",
         "--store",
         "/absolute/path/to/your/store"
       ]
@@ -73,9 +82,8 @@ Add the equivalent entry to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.slipstream]
-command = "node"
+command = "slipstream-mcp"
 args = [
-  "/absolute/path/to/slipstream/src/mcp-forwarder.ts",
   "--store",
   "/absolute/path/to/your/store",
 ]
