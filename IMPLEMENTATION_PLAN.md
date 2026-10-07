@@ -1114,9 +1114,12 @@ pending-with-step / refusal honestly.
 ### Stage A5.3: Swift client gate
 **Success Criteria**: Ask Agent disabled with an explanation unless the selected
 capture is connected; drafts stay with their capture.
-**Status**: In Progress
+**Status**: Complete (client repo PR; covered by model tests)
 
 ### Stage A5.4: Live acceptance
 **Success Criteria**: disposable stores, real agents; validated Terminal/Conductor
 × Claude/Codex paths recorded.
-**Status**: Not Started
+**Status**: In Progress — Terminal Claude (`claude -p`) and Codex SDK/TUI pass;
+both Conductor paths blocked because every runtime Conductor ships is outside
+the verified set (version policy, PR #48). See
+`docs/ask-agent/attach-acceptance-2026-10-07.md`.

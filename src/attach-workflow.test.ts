@@ -1,10 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat, chmod } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runAttachWorkflow, type AttachDeps } from './attach-workflow.ts';
+import { defaultDaemonStore } from './daemon-location.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
 const CLAUDE_ID = '11111111-2222-4333-8444-555555555555';
@@ -280,6 +281,59 @@ describe('slipstream attach (one command)', () => {
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
       assert.equal(code, 1);
       assert.match(f.err.join('\n'), /STORAGE_UNAVAILABLE: disk full/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+  it('names launch mode, not only the directory, when the transcript does not match', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f, '2.1.283', 'cli');
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /launched in a way Slipstream has not verified \(such as an interactive `claude`/);
+      assert.equal(attachRequests(f).length, 0);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('repeats a non-default store in the printed next step, and omits the default one', async () => {
+    for (const isDefault of [false, true]) {
+      const f = await fixture();
+      try {
+        await claudeTranscript(f);
+        const store = isDefault ? defaultDaemonStore(f.home) : f.store;
+        await runAttachWorkflow({ dir: f.worktree, store }, deps(f, claudeEnv, { live: true }));
+        assert.match(f.out.join('\n'), isDefault ? /run `slipstream attach` again there/
+          : new RegExp(`run \`slipstream attach --store ${f.store}\` again there`));
+      } finally { await rm(f.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('refuses with an explanation when the chat cannot write the workspace config', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      await mkdir(join(f.worktree, '.codex'));
+      await chmod(join(f.worktree, '.codex'), 0o500);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /could not write .*\.codex\/hooks\.json \(EACCES\).*sandbox.*Nothing was recorded/s);
+      assert.equal(attachRequests(f).length, 0);
+    } finally {
+      await chmod(join(f.worktree, '.codex'), 0o700);
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it('tells a Codex chat to trust the Slipstream hook through Codex itself', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+      assert.match(f.out.join('\n'), /trust the Slipstream hook when Codex shows its hook review/);
+      f.out.length = 0;
+      await runAttachWorkflow({ dir: f.worktree, store: f.store },
+        deps(f, { ...codexEnv, CONDUCTOR_SESSION_ID: 'c-1' }, { live: true }));
+      assert.match(f.out.join('\n'),
+        new RegExp(`run \`codex\` in ${f.worktree}, trust the Slipstream hook in its hook review`));
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 });

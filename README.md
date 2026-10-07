@@ -104,7 +104,8 @@ ID, transcript path, Node path, or checkout path.
 - If attach had to install the hook or tool, the running chat must reload to see
   them. Attach prints the exact step: `claude --resume <id>` or
   `codex resume <id>` in the workspace, then `slipstream attach` again. The
-  conversation is kept.
+  conversation is kept. Codex runs the new hook only after you trust it in
+  Codex's own hook review.
 - Running it again in the same chat reports the existing capture; it never starts
   a second recording or changes the binding.
 - One workspace is recorded at a time. If another workspace or another chat is
@@ -127,9 +128,18 @@ approve it.
 
 Limitations:
 
-- Verified runtimes only: Claude Code 2.1.283 in Terminal and 2.1.280 in
-  Conductor; Codex 0.154.0 and 0.155.1 launched through its SDK (`exec` or
-  `vscode` source). Other versions are refused rather than guessed at.
+- Verified runtimes only: Claude Code 2.1.283 started with `claude -p` and
+  2.1.280 in Conductor; Codex 0.154.0 and 0.155.1 launched through its SDK
+  (`exec` or `vscode` source). Other versions, and interactive `claude` or
+  `codex exec` chats, are refused rather than guessed at. The Claude Code and
+  Codex versions Conductor ships today are outside this set, so Conductor chats
+  are refused for now. See the
+  [acceptance record](docs/ask-agent/attach-acceptance-2026-10-07.md).
+- Codex SDK chats, including Conductor's, never show Codex's hook review. Run
+  `codex` once in the workspace and trust the Slipstream hook there; attach
+  prints this step.
+- A Codex chat in the `workspace-write` sandbox cannot write `.codex/`; attach
+  refuses and says so.
 - A connected chat stays connected until detach; there is no heartbeat, so a
   chat that has since closed still shows as connected.
 - Conductor has no verified way to reload a running chat's hooks and tools, so a

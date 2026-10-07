@@ -14,6 +14,7 @@ import { promisify } from 'node:util';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import { defaultDaemonStore } from './daemon-location.ts';
 
 type Harness = 'claude-code' | 'codex';
 
@@ -76,7 +77,7 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
       : `Attached successfully: recording ${worktree}, agent connected.`);
   } else {
     deps.out(`${again ? 'Already recording' : 'Recording'} ${worktree}; agent setup pending.`);
-    deps.out(pendingStep(chat, worktree, changed));
+    deps.out(pendingStep(chat, worktree, changed, storeFlag(opts.store, deps.home)));
   }
   deps.out(`session_id: ${String(res.session_id)}`);
   deps.out(`agent_connection: ${connection}`);
@@ -147,7 +148,9 @@ async function verifyTranscript(chat: Chat, transcript: string, worktree: string
     + `transcript does not match ${worktree}. Questions could not be delivered reliably, so nothing was installed `
     + 'or recorded.');
   if (chat.harness === 'codex') {
-    if (!await verifyCodexRootTranscript(transcript, chat.id, worktree)) throw unverified('Codex chat');
+    if (!await verifyCodexRootTranscript(transcript, chat.id, worktree)) {
+      throw unverified('Codex chat\'s version or launch mode (such as `codex exec`)');
+    }
     return;
   }
   const result = await verifyClaudeRootTranscript(transcript, chat.id, worktree);
@@ -161,8 +164,9 @@ async function verifyTranscript(chat: Chat, transcript: string, worktree: string
       + 'Nothing was recorded.');
   }
   if (result.reason === 'unsupported-version') throw unverified('Claude Code version');
-  throw new Refusal(`this chat's transcript does not match ${worktree} (was the chat started in another directory?). `
-    + 'Nothing was recorded.');
+  throw new Refusal(`this chat's transcript does not match ${worktree}: the chat may have been started in another `
+    + 'directory, or launched in a way Slipstream has not verified (such as an interactive `claude` session in a '
+    + 'terminal). Questions could not be delivered reliably, so nothing was installed or recorded.');
 }
 
 async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {
@@ -227,7 +231,7 @@ async function installAgentConfig(chat: Chat, worktree: string, store: string, d
   const created: string[] = [];
   for (const edit of [hookEdit, toolEdit]) {
     if (!edit) continue;
-    await writeAtomic(edit.path, edit.text);
+    await writeOrRefuse(edit.path, () => writeAtomic(edit.path, edit.text));
     if (edit.created) created.push(edit.path);
     deps.out(`Installed the Slipstream ${edit === hookEdit ? 'question hook' : 'answer tool'} in ${edit.path}`);
   }
@@ -331,6 +335,18 @@ async function claudeToolMissing(chat: Chat, worktree: string, deps: AttachDeps,
     + 'or make it use this store. Nothing was recorded.');
 }
 
+/** A sandboxed chat may not be allowed to write workspace config (Codex keeps
+ * `.codex/` and `.git/` read-only in workspace-write mode); say so, not crash. */
+async function writeOrRefuse(path: string, write: () => Promise<void>): Promise<void> {
+  try { await write(); }
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? (err as Error).message;
+    throw new Refusal(`could not write ${path} (${code}). This chat's sandbox may block writing there; allow the `
+      + 'command to run with write access to the workspace, or start the chat with full access, then run attach '
+      + 'again. Nothing was recorded.');
+  }
+}
+
 async function writeAtomic(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.${randomUUID()}.tmp`;
@@ -350,20 +366,31 @@ async function excludeFromGit(worktree: string, created: string[]): Promise<void
   const have = new Set(current.split('\n'));
   const add = created.map((p) => `/${relative(worktree, p)}`).filter((line) => !have.has(line));
   if (add.length === 0) return;
-  await mkdir(dirname(exclude), { recursive: true });
-  await appendFile(exclude, `${current === '' || current.endsWith('\n') ? '' : '\n'}${add.join('\n')}\n`);
+  await writeOrRefuse(exclude, async () => {
+    await mkdir(dirname(exclude), { recursive: true });
+    await appendFile(exclude, `${current === '' || current.endsWith('\n') ? '' : '\n'}${add.join('\n')}\n`);
+  });
 }
 
-function pendingStep(chat: Chat, worktree: string, installed: boolean): string {
-  const reload = chat.conductor
-    ? 'Conductor has no verified way to reload a running chat\'s hooks and tools, so this stays pending until '
-      + 'the chat confirms. Send this chat another message; if it is still pending, run `slipstream status` to check.'
-    : chat.harness === 'claude-code'
-      ? `Exit this chat, run \`claude --resume ${chat.id}\` in ${worktree}, then run \`slipstream attach\` again there.`
-      : `Exit this chat, run \`codex resume ${chat.id}\` in ${worktree} (trust the Slipstream hook if Codex asks), `
-        + 'then run `slipstream attach` again there.';
+function storeFlag(store: string, home: string): string {
+  return store === defaultDaemonStore(home) ? '' : ` --store ${shellWord(store)}`;
+}
+
+function pendingStep(chat: Chat, worktree: string, installed: boolean, store: string): string {
+  const status = `\`slipstream status${store}\``;
+  const conductorReload = 'Conductor has no verified way to reload a running chat\'s hooks and tools, so this stays '
+    + `pending until the chat confirms. Send this chat another message; if it is still pending, run ${status} to check.`;
+  const reload = chat.harness === 'claude-code'
+    ? chat.conductor ? conductorReload
+      : `Exit this chat, run \`claude --resume ${chat.id}\` in ${worktree}, then run \`slipstream attach${store}\` `
+        + 'again there.'
+    : chat.conductor
+      ? 'Codex runs a project hook only after you trust it, and Conductor does not show that review: in a terminal, '
+        + `run \`codex\` in ${worktree}, trust the Slipstream hook in its hook review, and quit. ${conductorReload}`
+      : `Exit this chat, run \`codex resume ${chat.id}\` in ${worktree}, trust the Slipstream hook when Codex shows `
+        + `its hook review, then run \`slipstream attach${store}\` again there.`;
   return installed
     ? `Next step: the chat must reload to load the new hook and tool. ${reload}`
     : 'Next step: this chat confirms after its next tool call (usually right after this command); check with '
-      + `\`slipstream status\`. If it stays setup_pending: ${reload}`;
+      + `${status}. If it stays setup_pending: ${reload}`;
 }
