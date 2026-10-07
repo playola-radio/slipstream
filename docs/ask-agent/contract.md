@@ -225,7 +225,11 @@ Attachment reads a bounded, complete transcript head (at most 64 records,
 4 MiB total, 256 KiB per record). It requires a matching session ID,
 canonical worktree, external user, root `isSidechain:false`, and an observed
 runtime/entrypoint pair: Terminal Claude Code `2.1.283`/`sdk-cli` or Conductor
-Claude Code `2.1.280`/`sdk-ts`. Missing, truncated, contradictory, or newer
+Claude Code `2.1.280`/`sdk-ts` or `2.1.284`/`sdk-ts`. The `2.1.284` pair was
+observed in a Conductor root transcript and verified read-only against the
+attach validator. Root-only, single-claim delivery controls are regression
+tested for all three pairs; this is not a new end-to-end agent receipt proof.
+`2.1.284`/`sdk-cli` remains unverified and is not accepted. Missing, truncated, contradictory, or newer
 unverified metadata fails closed; test a newer runtime before adding it. A
 record still being written inside the bounded head, including one after a valid
 identity record, makes attach fail as retryable (`IDENTITY_UNRESOLVED`); retry
