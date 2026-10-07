@@ -104,13 +104,18 @@ async function slipstreamMatched(root: string, slipExcludesFile: string, paths: 
   rejectWarnings('check-ignore', r);
   // -z --verbose emits repeating NUL-separated groups of (source, linenum,
   // pattern, pathname), only for paths that match. Keep those whose source is
-  // the slipstream file, so a git rule's match is never miscredited to it.
+  // the slipstream file, so a git rule's match is never miscredited to it. A
+  // negated pattern (`!keep.txt`) is listed as the winning match but un-ignores
+  // the path, so it must not be treated as an exclusion.
   const fields = r.stdout.split('\0');
   if (fields.at(-1) === '') fields.pop();
   const matched: string[] = [];
   for (let i = 0; i + 3 < fields.length; i += 4) {
+    const pattern = fields[i + 2];
     const path = fields[i + 3];
-    if (path !== undefined && fields[i] === slipExcludesFile) matched.push(path);
+    if (path !== undefined && fields[i] === slipExcludesFile && pattern !== undefined && !pattern.startsWith('!')) {
+      matched.push(path);
+    }
   }
   return matched;
 }

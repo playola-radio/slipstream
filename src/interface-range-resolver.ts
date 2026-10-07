@@ -211,7 +211,14 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     } else if (record.type === SCOPE) {
       const valid = (data.policy === 'git' && (data.status === 'active' || data.status === 'unavailable'))
         || (data.policy === 'filesystem' && data.status === 'active');
-      if (!valid) corrupt(`bad capture scope at ${seq}`);
+      // Under the git policy the event schema pins slipstream_ignore to the
+      // literal "active", so reject any other present value here too — otherwise
+      // this reader would silently drop the disclosure for history the schema
+      // and recovery reader reject. Other policies tolerate unknown fields, as
+      // the schema does for forward compatibility.
+      const slipOk = data.policy !== 'git'
+        || data.slipstream_ignore === undefined || data.slipstream_ignore === 'active';
+      if (!valid || !slipOk) corrupt(`bad capture scope at ${seq}`);
       if (data.policy === 'git') gitScoped = true;
       if (data.policy === 'git' && data.slipstream_ignore === 'active') slipstreamScoped = true;
       if (data.status === 'unavailable') gaps.push({ seq, reason: 'capture-scope-unavailable', scope: { kind: 'session' } });

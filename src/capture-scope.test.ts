@@ -272,6 +272,19 @@ describe('capture scope', () => {
       });
     });
 
+    it('respects a negation that un-ignores a path the slipstream file matched earlier', async () => {
+      await withRepo(async (root) => {
+        const slip = await withSlip(root, '*.tmp\n!keep.tmp\n');
+        try {
+          for (const p of ['drop.tmp', 'keep.tmp']) await put(root, p);
+          const scope = asGit(await detectCaptureScope(root, slip));
+          assert.deepEqual(await scope.ignored(['drop.tmp', 'keep.tmp']), new Set(['drop.tmp']));
+        } finally {
+          await rm(slip, { force: true });
+        }
+      });
+    });
+
     it('leaves the git-ignored set unchanged when no slipstream file is supplied', async () => {
       await withRepo(async (root) => {
         await writeFile(join(root, '.gitignore'), '*.log\n');

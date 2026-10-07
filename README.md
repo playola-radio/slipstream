@@ -57,7 +57,9 @@ git's own ignore syntax and, unlike `.gitignore`, can also exclude files git
 *tracks* (a committed-but-noisy generated file, say). Its rules are frozen when a
 capture starts, so editing the file takes effect on the next capture, not the
 running one. The file is honored only inside a git work tree; a non-git root
-ignores it. Excluded paths are never read or recorded, and the comparison API
+ignores it. Patterns anchored with a leading slash (`/build`) are relative to the
+git worktree root, as git's own excludes are — so place `.slipstreamignore` at
+the worktree root rather than in a watched subdirectory. Excluded paths are never read or recorded, and the comparison API
 discloses that the layer was active (`inventory.policy_exclusions` lists
 `"slipstream-ignored"`).
 

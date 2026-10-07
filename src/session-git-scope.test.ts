@@ -649,6 +649,15 @@ describe('session under the git capture scope', () => {
       );
     });
 
+    it('refuses to start when .slipstreamignore is not a regular file', async () => {
+      await withGitRepo(
+        async (root) => { await mkdir(join(root, '.slipstreamignore')); },
+        async ({ start }) => {
+          await assert.rejects(start(), /not a regular file/);
+        },
+      );
+    });
+
     it('freezes the rules so deleting .slipstreamignore mid-capture does not widen scope', async () => {
       await withGitRepo(
         async (root) => {
