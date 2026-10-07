@@ -112,7 +112,6 @@ export const f4Answer: AcceptanceModule = {
             if (res.code !== 0) throw new Error(`ask failed: ${res.stderr}`);
             return (JSON.parse(res.stdout) as { question_id: string }).question_id;
           };
-          const q1 = await ask(); const q2 = await ask();
           const claude = { CLAUDE_CODE_SESSION_ID: harnessSessionId, CLAUDE_PROJECT_DIR: worktree };
           const answer = (question_id: string, text: string, env: Record<string, string> = claude) => answerViaForwarder(store, env, question_id, text);
           const claim = async () => {
@@ -121,6 +120,12 @@ export const f4Answer: AcceptanceModule = {
             if (res.code !== 0 || !res.stdout.includes('slipstream_answer_question')) throw new Error('root hook did not deliver the answer instruction');
           };
           const text = 'It interpolates name into the greeting; a template literal is the idiomatic way.';
+          const setup = await cli(['hook', 'claude-code', 'post-tool-use', '--store', store], { hook_event_name: 'PostToolUse',
+            session_id: harnessSessionId, cwd: worktree, transcript_path: transcript, tool_name: 'Bash' });
+          const checkId = /Slipstream setup check ([0-9a-f-]{36})\./.exec(setup.stdout)?.[1];
+          if (!checkId) throw new Error('root hook did not deliver the setup check');
+          expectAck('setup-check-through-forwarder', await answer(checkId, 'connected'), checkId, false);
+          const q1 = await ask(); const q2 = await ask();
 
           expectCode('answer-before-dispatch', await answer(q1, 'early'), 'QUESTION_NOT_FOUND');
           await claim();

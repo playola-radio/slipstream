@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.agent.connection.v1.json",
+  "title": "slipstream.agent.connection.v1",
+  "$comment": "Whether the agent chat bound to this capture can take questions. setup_pending: the chat was bound at attach but no setup check has completed. connected: the bound chat received a one-time setup check through its tool-use callback and returned it through its answer tool, proving delivery and answer return at this event's time. It does not prove the chat is still open later; a capture that is no longer live has no agent connection, which /v1/sessions reports. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "source": { "type": "string", "pattern": "^urn:slipstream:session:" },
+    "type": { "const": "slipstream.agent.connection.v1" },
+    "datacontenttype": { "const": "application/json" },
+    "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "time": { "type": "string", "format": "date-time" },
+    "data": {
+      "type": "object",
+      "required": ["session_id", "state", "target"],
+      "properties": {
+        "session_id": { "type": "string" },
+        "state": { "enum": ["setup_pending", "connected"] },
+        "target": {
+          "type": "object",
+          "required": ["harness", "harness_session_id", "worktree"],
+          "properties": {
+            "harness": { "enum": ["claude-code", "codex"] },
+            "harness_session_id": { "type": "string", "minLength": 1 },
+            "worktree": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

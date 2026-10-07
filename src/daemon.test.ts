@@ -28,6 +28,27 @@ function rec(res: ResponseEnvelope): Record<string, string> {
 
 /** A control request without the protocol version the harness adds. */
 type CallRequest = { verb: string; [key: string]: unknown };
+type Call = (req: CallRequest) => Promise<ResponseEnvelope>;
+
+/** Complete the bound chat's setup round trip so the capture admits questions. */
+async function connectAgent(call: Call, claim: CallRequest): Promise<void> {
+  const check = (rec(await call(claim)) as unknown as { setup_check?: { check_id: string } }).setup_check;
+  assert.ok(check, 'expected a setup check');
+  const { harness, harness_session_id, worktree } = claim;
+  const ack = await call({ verb: 'answer_question', harness, harness_session_id, worktree, question_id: check.check_id, text: 'connected' });
+  assert.equal(ack.ok, true);
+}
+
+/** Attach `IDENTITY` through a verified Claude root transcript and connect it. */
+async function attachConnected(call: Call, worktree: string, store: string): Promise<ResponseEnvelope> {
+  const transcript = join(store, 'abc123.jsonl');
+  await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: IDENTITY.harness_session_id, cwd: await realpath(worktree),
+    version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+  const attached = await call({ verb: 'attach', worktree, ...IDENTITY, root_transcript: transcript });
+  assert.equal(attached.ok, true);
+  await connectAgent(call, { verb: 'claim_question', ...IDENTITY, worktree, transcript_path: transcript });
+  return attached;
+}
 
 /** A daemon over throwaway store + worktree dirs, with capture driven by the fake
  * platform so no real FSEvents watcher runs. */
@@ -96,9 +117,10 @@ describe('daemon control verbs', () => {
       assert.equal(attached.ok, true);
       const captureId = rec(attached).session_id!;
       assert.equal(rec(await call({ verb: 'status' })).root_transcript, await realpath(transcript));
+      const identity = { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript };
+      await connectAgent(call, identity);
       const ask = await call({ verb: 'ask', session_id: captureId, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
       assert.equal(ask.ok, true);
-      const identity = { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript };
       const negatives = [
         { ...identity, agent_id: null }, { ...identity, agent_type: null },
         { ...identity, agent_id: 'child', agent_type: 'general-purpose' },
@@ -120,8 +142,9 @@ describe('daemon control verbs', () => {
       assert.equal((await call(identity)).ok, false);
       const captureOnly = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root' });
       assert.equal(captureOnly.ok, true);
-      assert.equal((await call({ verb: 'ask', session_id: rec(captureOnly).session_id, request_id: ASK_REQUEST,
-        text: 'Why?', context: ASK_CONTEXT })).ok, true);
+      const unbound = await call({ verb: 'ask', session_id: rec(captureOnly).session_id, request_id: ASK_REQUEST,
+        text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(unbound.ok === false && unbound.code, 'AGENT_NOT_CONNECTED');
       assert.equal((await call(identity)).ok, false);
     } finally {
       await daemon.stop();
@@ -153,6 +176,7 @@ describe('daemon control verbs', () => {
     try {
       const first = await call(attach);
       assert.equal(first.ok, true);
+      await connectAgent(call, claim);
       assert.equal((await call({ verb: 'ask', session_id: rec(first).session_id, request_id: ASK_REQUEST,
         text: 'Why?', context: ASK_CONTEXT })).ok, true);
       hold = true;
@@ -161,6 +185,7 @@ describe('daemon control verbs', () => {
       assert.equal((await call({ verb: 'detach' })).ok, true);
       const second = await call(attach);
       assert.equal(second.ok, true);
+      await connectAgent(call, claim);
       assert.equal((await call({ verb: 'ask', session_id: rec(second).session_id, request_id: ASK_REQUEST,
         text: 'Why?', context: ASK_CONTEXT })).ok, true);
       release();
@@ -199,6 +224,7 @@ describe('daemon control verbs', () => {
       const attached = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript });
       assert.equal(attached.ok, true);
       const captureId = rec(attached).session_id!;
+      await connectAgent(call, { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript });
       const ask = await call({ verb: 'ask', session_id: captureId, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
       const id = rec(ask).question_id!;
       assert.equal(await codeOf({ ...answer, question_id: id }), 'QUESTION_NOT_FOUND');
@@ -257,7 +283,9 @@ describe('daemon control verbs', () => {
     const claim = { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript };
     try {
       const first = await call(attach);
+      await connectAgent(call, claim);
       const ask = await call({ verb: 'ask', session_id: rec(first).session_id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(ask.ok, true);
       assert.equal((await call(claim)).ok, true);
       const answer = { verb: 'answer_question', harness: 'claude-code', harness_session_id: 'root', worktree,
         question_id: rec(ask).question_id, text: 'Because.' };
@@ -296,6 +324,7 @@ describe('daemon control verbs', () => {
     try {
       const attached = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript });
       assert.equal(attached.ok, true);
+      await connectAgent(call, { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript });
       // Synthetic protocol-boundary path: the widest accepted path with the widest JSON escaping.
       const path = '\u0001'.repeat(4096);
       const ask = await call({ verb: 'ask', session_id: rec(attached).session_id, request_id: ASK_REQUEST, text: 'Q'.repeat(8192),
@@ -347,8 +376,9 @@ describe('daemon control verbs', () => {
       assert.equal(attach.ok, true);
       assert.equal(rec(await call({ verb: 'status' })).root_transcript, await realpath(rootTranscript));
       const session_id = rec(attach).session_id;
-      assert.equal((await call({ verb: 'ask', session_id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).ok, true);
       const identity = { verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: rootTranscript };
+      await connectAgent(call, identity);
+      assert.equal((await call({ verb: 'ask', session_id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).ok, true);
       for (const bad of [
         { ...identity, agent_id: null }, { ...identity, agent_type: '' },
         { ...identity, transcript_path: otherTranscript }, { ...identity, harness_session_id: 'second-chat' },
@@ -379,6 +409,7 @@ describe('daemon control verbs', () => {
       const attach = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: transcript });
       assert.equal(attach.ok, true);
       const oldId = rec(attach).session_id;
+      await connectAgent(call, { verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: transcript });
       assert.equal((await call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT })).ok, true);
       await daemon.stop();
       daemon = await startDaemon({ storeDir: store, captureDependencies: { ...deps, platform: createFakePlatform() } });
@@ -443,11 +474,12 @@ describe('daemon control verbs', () => {
     });
   });
 
-  it('refuses a second attach while a session is already active', async () => {
+  it('reports the existing capture when the same identity attaches again', async () => {
     await withDaemon(async ({ worktree, call }) => {
-      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const first = await call({ verb: 'attach', worktree, ...IDENTITY });
       const res = await call({ verb: 'attach', worktree, ...IDENTITY });
-      assert.equal(res.ok === false && res.code, 'SESSION_ACTIVE');
+      assert.equal(rec(res).session_id, rec(first).session_id);
+      assert.equal(rec(res).already_active, true);
     });
   });
 
@@ -587,7 +619,7 @@ describe('daemon control verbs', () => {
       socketPath: daemon.socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs: 5000,
     });
     try {
-      const attached = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const attached = await attachConnected(call, worktree, store);
       const sessionId = rec(attached).session_id!;
       const ask = { verb: 'ask', session_id: sessionId, request_id: ASK_REQUEST,
         text: 'What changed?', context: ASK_CONTEXT,
@@ -630,7 +662,7 @@ describe('daemon control verbs', () => {
     } });
     const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs: 5000 });
     try {
-      const attached = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const attached = await attachConnected(call, worktree, store);
       const oldId = rec(attached).session_id!;
       const askP = call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
       await entered;
@@ -660,7 +692,8 @@ describe('daemon control verbs', () => {
     } });
     const reqBase = (id: string): CallRequest => ({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
     try {
-      const attached = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+      const attached = await attachConnected(call, worktree, store);
       const id = rec(attached).session_id!;
       const unknown = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...reqBase(id) }, responseTimeoutMs: 10 });
       await entered;
@@ -691,7 +724,8 @@ describe('daemon control verbs', () => {
       },
     } });
     try {
-      const attached = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
+      const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+      const attached = await attachConnected(call, worktree, store);
       const id = rec(attached).session_id!;
       const ask = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT } });
       // Shutdown destroys the socket before the append gate opens; attach a
@@ -830,6 +864,153 @@ describe('daemon control verbs', () => {
       await rm(store, { recursive: true, force: true });
       await rm(worktree, { recursive: true, force: true });
     }
+  });
+});
+
+/** A daemon with a verified Claude root transcript for chat `root` in `worktree`. */
+async function withClaudeRoot(
+  fn: (ctx: {
+    store: string; worktree: string; transcript: string;
+    call: (req: CallRequest) => Promise<ResponseEnvelope>;
+    attachReq: CallRequest; claimReq: CallRequest; answerReq: CallRequest;
+    listedConnection: () => Promise<unknown>;
+  }) => Promise<void>,
+): Promise<void> {
+  const store = await mkdtemp(join(tmpdir(), 'slip-daemon-agent-'));
+  const worktree = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-agent-wt-')));
+  const transcript = join(store, 'root.jsonl');
+  await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: 'root', cwd: worktree,
+    version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+  const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+    platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'selected',
+  } });
+  const call = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
+  try {
+    await fn({
+      store, worktree, transcript, call,
+      attachReq: { verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'root', root_transcript: transcript },
+      claimReq: { verb: 'claim_question', harness: 'claude-code', harness_session_id: 'root', worktree, transcript_path: transcript },
+      answerReq: { verb: 'answer_question', harness: 'claude-code', harness_session_id: 'root', worktree, text: 'connected' },
+      listedConnection: async () => {
+        const res = await fetch(`${daemon.readerUrl}/v1/sessions`, { headers: { authorization: `Bearer ${daemon.readerToken}` } });
+        return ((await res.json()) as Array<{ agent_connection: unknown }>)[0]!.agent_connection;
+      },
+    });
+  } finally {
+    await daemon.stop();
+    await rm(store, { recursive: true, force: true });
+    await rm(worktree, { recursive: true, force: true });
+  }
+}
+
+async function connectionEvents(store: string, sessionId: string): Promise<Array<{ seq: string; data: Record<string, unknown> }>> {
+  return (await readFile(sessionLogPath(store, sessionId), 'utf8')).trim().split('\n')
+    .map(s => JSON.parse(s) as { type: string; seq: string; data: Record<string, unknown> })
+    .filter(e => e.type === 'slipstream.agent.connection.v1');
+}
+
+describe('daemon agent readiness', () => {
+  it('starts a bound capture setup-pending and refuses questions until the setup check returns', async () => {
+    await withClaudeRoot(async ({ store, worktree, call, attachReq, claimReq, answerReq, listedConnection }) => {
+      const attached = await call(attachReq);
+      assert.deepEqual(await listedConnection(), { state: 'setup_pending' });
+      assert.equal(rec(attached).agent_connection, 'setup_pending');
+      const sessionId = rec(attached).session_id!;
+      const target = { harness: 'claude-code', harness_session_id: 'root', worktree };
+      assert.deepEqual((await connectionEvents(store, sessionId)).map(e => e.data),
+        [{ state: 'setup_pending', target, session_id: sessionId }]);
+      assert.equal(rec(await call({ verb: 'status' })).agent_connection, 'setup_pending');
+      const ask = { verb: 'ask', session_id: sessionId, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT };
+      const refused = await call(ask);
+      assert.equal(refused.ok === false && refused.code, 'AGENT_NOT_CONNECTED');
+
+      const claimed = rec(await call(claimReq)) as unknown as { question: unknown; setup_check: { check_id: string } };
+      assert.equal(claimed.question, null);
+      const checkId = claimed.setup_check.check_id;
+      assert.match(checkId, /^[0-9a-f-]{36}$/);
+      assert.deepEqual(rec(await call(claimReq)), { v: 1, ok: true, question: null }, 'a check is delivered once per arm');
+
+      const accepted = rec(await call({ ...answerReq, question_id: checkId }));
+      assert.deepEqual({ ...accepted, answered_at_ms: 0 }, { v: 1, ok: true, session_id: sessionId, question_id: checkId,
+        event_id: accepted.seq, seq: accepted.seq, answered_at_ms: 0, duplicate: false });
+      assert.equal(typeof accepted.answered_at_ms, 'number');
+      assert.deepEqual(rec(await call({ ...answerReq, question_id: checkId })), { ...accepted, duplicate: true });
+      const events = await connectionEvents(store, sessionId);
+      assert.deepEqual(events.map(e => e.data.state), ['setup_pending', 'connected']);
+      assert.equal(events[1]!.seq, accepted.seq);
+      assert.equal(rec(await call({ verb: 'status' })).agent_connection, 'connected');
+      assert.deepEqual(await listedConnection(), { state: 'connected' });
+      assert.equal((await call(ask)).ok, true);
+      await call({ verb: 'detach' });
+      assert.deepEqual(await listedConnection(), { state: 'disconnected', reason: 'capture_not_live' });
+    });
+  });
+
+  it('accepts the setup check only from the bound chat', async () => {
+    await withClaudeRoot(async ({ call, attachReq, claimReq, answerReq }) => {
+      await call(attachReq);
+      const checkId = (rec(await call(claimReq)) as unknown as { setup_check: { check_id: string } }).setup_check.check_id;
+      for (const bad of [{ harness: 'codex' }, { harness_session_id: 'other' }, { worktree: tmpdir() }]) {
+        const res = await call({ ...answerReq, question_id: checkId, ...bad });
+        assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED', JSON.stringify(bad));
+      }
+      const blank = await call({ ...answerReq, question_id: checkId, text: ' ' });
+      assert.equal(blank.ok === false && blank.code, 'INVALID_ANSWER');
+      assert.equal(rec(await call({ verb: 'status' })).agent_connection, 'setup_pending');
+    });
+  });
+
+  it('reports the same capture when the same chat attaches again, re-arming a pending check', async () => {
+    await withClaudeRoot(async ({ store, worktree, call, attachReq, claimReq, answerReq }) => {
+      const first = rec(await call(attachReq));
+      await call(claimReq);
+      const linked = join(store, 'linked');
+      await symlink(worktree, linked);
+      const again = rec(await call({ ...attachReq, worktree: linked }));
+      assert.deepEqual(again, { v: 1, ok: true, session_id: first.session_id, already_active: true, agent_connection: 'setup_pending' });
+      const rearmed = (rec(await call(claimReq)) as unknown as { setup_check?: { check_id: string } }).setup_check;
+      assert.ok(rearmed, 'a repeated attach re-arms the pending check');
+      await call({ ...answerReq, question_id: rearmed.check_id });
+      const connected = rec(await call(attachReq));
+      assert.equal(connected.agent_connection, 'connected');
+      assert.equal(connected.already_active, true);
+      assert.deepEqual(rec(await call(claimReq)), { v: 1, ok: true, question: null });
+      assert.deepEqual((await connectionEvents(store, first.session_id!)).map(e => e.data.state), ['setup_pending', 'connected']);
+    });
+  });
+
+  it('refuses another chat in the same workspace and keeps the existing binding', async () => {
+    await withClaudeRoot(async ({ call, attachReq }) => {
+      const first = rec(await call(attachReq));
+      const before = rec(await call({ verb: 'status' }));
+      const other = await call({ ...attachReq, harness_session_id: 'other' });
+      assert.equal(other.ok === false && other.code, 'SESSION_ACTIVE');
+      assert.match(other.ok === false ? other.message : '', /another agent chat/);
+      assert.deepEqual(rec(await call({ verb: 'status' })), before);
+      assert.equal(before.session_id, first.session_id);
+    });
+  });
+
+  it('refuses another workspace and names the one being recorded', async () => {
+    await withClaudeRoot(async ({ worktree, call, attachReq }) => {
+      await call(attachReq);
+      const elsewhere = await mkdtemp(join(tmpdir(), 'slip-daemon-agent-else-'));
+      try {
+        const res = await call({ ...attachReq, worktree: elsewhere });
+        assert.equal(res.ok === false && res.code, 'SESSION_ACTIVE');
+        assert.ok(res.ok === false && res.message.includes(worktree), res.ok === false ? res.message : '');
+      } finally { await rm(elsewhere, { recursive: true, force: true }); }
+    });
+  });
+
+  it('reports no agent connection for a capture without a verified root chat', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const attached = rec(await call({ verb: 'attach', worktree, ...IDENTITY }));
+      assert.equal(attached.agent_connection, 'disconnected');
+      assert.deepEqual(await connectionEvents(store, attached.session_id!), []);
+      const res = await call({ verb: 'ask', session_id: attached.session_id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(res.ok === false && res.code, 'AGENT_NOT_CONNECTED');
+    });
   });
 });
 

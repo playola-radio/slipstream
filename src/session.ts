@@ -21,7 +21,7 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
+import type { AgentConnectionEvent, AgentConnectionInput, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
@@ -120,6 +120,8 @@ export interface CaptureSession {
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
+  /** Durably record the bound agent chat's connection state; never attribution. */
+  recordAgentConnection(data: AgentConnectionInput['data'], assertOwnership?: () => void): Promise<AgentConnectionEvent>;
   stop(): Promise<void>;
 }
 
@@ -320,7 +322,8 @@ export async function startCapture(
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
       if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
-        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1') producer?.noteCommitted(event);
+        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1'
+        && event.type !== 'slipstream.agent.connection.v1') producer?.noteCommitted(event);
     },
   };
 
@@ -429,6 +432,7 @@ export async function startCapture(
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
+  function appendEvent(input: AgentConnectionInput): Promise<AgentConnectionEvent>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -1112,6 +1116,15 @@ export async function startCapture(
     finally { inflightAnswers.delete(id); }
   };
 
+  const recordAgentConnection = async (data: AgentConnectionInput['data'], assertOwnership: () => void = () => {}): Promise<AgentConnectionEvent> => {
+    assertOwnership();
+    questionReady();
+    const event = await appendEvent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: now(), data });
+    if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+    assertOwnership();
+    return event;
+  };
+
   const doStop = async (): Promise<void> => {
     stopped = true;
     // Stop feeding the engine immediately: if the watcher unsubscribe below
@@ -1159,6 +1172,7 @@ export async function startCapture(
     askQuestion,
     claimQuestion,
     answerQuestion,
+    recordAgentConnection,
     ingestEvidence,
     stop: () => (stopPromise ??= doStop()),
   };

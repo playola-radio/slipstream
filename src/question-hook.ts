@@ -23,7 +23,16 @@ async function postToolUse(harness: 'codex' | 'claude-code', input: unknown, sto
       request: { v: 1, verb: 'claim_question', harness, harness_session_id: event.session_id,
         worktree: event.cwd, transcript_path: event.transcript_path },
       connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs });
-    if (!reply.ok || reply.question === null) return null;
+    if (!reply.ok) return null;
+    if (reply.question === null) {
+      const check = object(reply.setup_check);
+      if (!check || typeof check.check_id !== 'string' || !UUID.test(check.check_id)) return null;
+      return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: [
+        `Slipstream setup check ${check.check_id}. Slipstream needs one confirmation that this chat can answer questions from the Slipstream app.`,
+        `Call the slipstream_answer_question tool with question_id ${check.check_id} and text "connected" now, then continue your original work.`,
+        'If that tool is not available in this chat, tell the user that Slipstream agent setup is still pending and repeat the reload step slipstream attach printed.',
+      ].join('\n') } });
+    }
     const q = object(reply.question);
     const context = object(q?.context);
     if (!q || !context || !nonempty(q.question_id) || !nonempty(q.text, 8192)

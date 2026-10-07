@@ -14,6 +14,7 @@ import { liveBoundary, staticBoundary } from './reader-runtime.ts';
 import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
+const NOT_LIVE = { state: 'disconnected', reason: 'capture_not_live' };
 
 async function storeWithSession(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'slip-http-'));
@@ -56,7 +57,23 @@ describe('http-reader core', () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('cache-control'), 'no-store');
     const body = await res.json();
-    assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false }]);
+    assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false,
+      agent_connection: NOT_LIVE }]);
+  });
+
+  it('projects a live capture\'s agent connection, and no agent when none is bound', async () => {
+    const registry = createBoundaryRegistry();
+    registry.installIfAbsent(UUID, staticBoundary(2n));
+    const live = await startReaderServer({ storeDir: dir, registry });
+    try {
+      const list = async () => ((await (await GET(live, '/v1/sessions')).json()) as Array<{ agent_connection: unknown }>)[0]!.agent_connection;
+      registry.setAgentConnection(UUID, 'connected');
+      assert.deepEqual(await list(), { state: 'connected' });
+      registry.setAgentConnection(UUID, 'setup_pending');
+      assert.deepEqual(await list(), { state: 'setup_pending' });
+      registry.setAgentConnection(UUID, 'none');
+      assert.deepEqual(await list(), { state: 'disconnected', reason: 'no_agent' });
+    } finally { await live.close(); }
   });
 
   it('rejects a missing bearer with 401', async () => {
@@ -160,7 +177,7 @@ describe('http-reader corruption honesty', () => {
     });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false, agent_connection: NOT_LIVE }]);
     } finally { await srv.close(); }
   });
 
@@ -582,7 +599,7 @@ describe('http-reader deletion', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: true }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: true, agent_connection: NOT_LIVE }]);
     } finally { await srv.close(); }
   });
 
@@ -734,11 +751,11 @@ describe('http-reader with a boundary registry', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       let body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: false }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: false, agent_connection: NOT_LIVE }]);
       const health = createHealth(2n);
       registry.activate(UUID, liveBoundary(health));
       body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE }]);
     } finally { await srv.close(); }
   });
 
@@ -748,7 +765,7 @@ describe('http-reader with a boundary registry', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE }]);
       const res = await GET(srv, `/v1/sessions/${UUID}/events?after=0`);
       assert.equal(res.status, 200);
       assert.equal((await res.text()).trimEnd().split('\n').length, 2);
@@ -801,7 +818,7 @@ describe('http-reader with a boundary registry', () => {
     });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false, agent_connection: NOT_LIVE }]);
     } finally { await srv.close(); }
   });
 });

@@ -4,7 +4,7 @@ import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
-import { QuestionError } from './questions.ts';
+import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { HarnessName } from './event.ts';
@@ -127,6 +127,18 @@ export class DaemonAlreadyRunningError extends Error {
 
 type DaemonState = 'detached' | 'attaching' | 'active' | 'detaching' | 'wedged';
 
+/** Readiness of the chat bound at attach. The check id is private: only the bound
+ * root's tool-use callback receives it, so its return through the answer tool
+ * proves both delivery and answer return. */
+interface AgentCheck {
+  state: 'setup_pending' | 'connected';
+  checkId: string;
+  /** Delivered once per arm; a repeated attach re-arms a pending check. */
+  delivered: boolean;
+  ack?: Record<string, unknown>;
+  confirming?: Promise<Record<string, unknown> | ErrorFields>;
+}
+
 export const PROBE_TIMEOUT_MS = 1000;
 /** A connection must deliver one complete control request within this window;
  * otherwise it is dropped so it can never wedge shutdown. */
@@ -228,7 +240,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const registry = createBoundaryRegistry();
   let state: DaemonState = 'detached';
   let current:
-    | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string }
+    | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string;
+        agent?: AgentCheck }
     | undefined;
   const inflightTasks = new Set<Promise<unknown>>();
   const connections = new Set<Socket>();
@@ -389,6 +402,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       fields.harness_session_id = current.harnessSessionId;
       if (current.rootTranscript) fields.root_transcript = current.rootTranscript;
       fields.durable_seq = current.session.health.snapshot().durable_seq;
+      fields.agent_connection = current.agent?.state ?? 'disconnected';
     }
     return fields;
   }
@@ -465,7 +479,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
       return errFields('CAPTURE_NOT_READY', (err as Error).message);
     }
-    if (torn || compromised || sessionCompromised || state !== 'attaching') {
+    // A verified root chat starts setup-pending; anything else has no agent to ask.
+    let agent: AgentCheck | undefined;
+    let pendingFailed = false;
+    if (resolvedTranscript !== undefined && !(torn || compromised || sessionCompromised || state !== 'attaching')) {
+      try {
+        await session.recordAgentConnection({ state: 'setup_pending',
+          target: { harness: harness as HarnessName, harness_session_id: harnessSessionId, worktree: resolvedWorktree } });
+        agent = { state: 'setup_pending', checkId: randomUUID(), delivered: false };
+      } catch { pendingFailed = true; }
+    }
+    if (pendingFailed || torn || compromised || sessionCompromised || state !== 'attaching') {
       // Shutdown, store-lock loss, or a session compromise arrived while capture was
       // starting: do not publish this session. Stop it and hold the boundary. A
       // failed stop here is recorded (not swallowed) so teardown can surface it.
@@ -479,9 +503,29 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
     registry.activate(id, liveBoundary(session.health));
-    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript };
+    registry.setAgentConnection(id, agent?.state ?? 'none');
+    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript, agent };
     state = 'active';
-    return { session_id: id };
+    return { session_id: id, agent_connection: agent?.state ?? 'disconnected' };
+  }
+
+  /** Attach while a capture is active never starts or rebinds a capture: the same
+   * chat in the same workspace gets the existing one (re-arming a pending check),
+   * anything else is refused and the binding is kept. */
+  async function attachAgain(req: RequestEnvelope & { worktree: string }): Promise<Record<string, unknown> | ErrorFields> {
+    const binding = current!;
+    let worktree: string;
+    try { worktree = await realpath(req.worktree); } catch { worktree = req.worktree; }
+    if (state !== 'active' || current !== binding) return errFields('CAPTURE_NOT_READY', 'the active capture changed; retry attach');
+    if (worktree !== binding.worktree) {
+      return errFields('SESSION_ACTIVE', `another workspace is being recorded: ${binding.worktree}. Detach it there first; nothing was changed`);
+    }
+    if (req.harness !== binding.harness || req.harness_session_id !== binding.harnessSessionId) {
+      return errFields('SESSION_ACTIVE', `this workspace is already recorded with another agent chat (${binding.harness} ${binding.harnessSessionId}); `
+        + 'that binding was kept. Detach first to switch chats');
+    }
+    if (binding.agent?.state === 'setup_pending') binding.agent.delivered = false;
+    return { session_id: binding.id, already_active: true, agent_connection: binding.agent?.state ?? 'disconnected' };
   }
 
   async function attach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
@@ -495,7 +539,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('IDENTITY_UNRESOLVED', 'root_transcript must be a non-empty existing path');
     }
     if (state !== 'detached') {
-      if (state === 'active') return errFields('SESSION_ACTIVE', 'a session is already attached; detach it first');
+      if (state === 'active' && current) return attachAgain({ ...req, worktree: req.worktree });
       if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
       return errFields('CAPTURE_NOT_READY', `cannot attach while ${state}`);
     }
@@ -637,8 +681,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (state === 'attaching' || state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is not ready to accept questions');
       return errFields('SESSION_NOT_SELECTED', 'no active session');
     }
-    if (current.harness !== 'claude-code' && current.harness !== 'codex') {
-      return errFields('SESSION_NOT_SELECTED', 'the selected capture has no supported question target');
+    if (req.session_id !== current.id) return errFields('SESSION_NOT_SELECTED', 'question addresses a different capture');
+    if (current.agent?.state !== 'connected') {
+      return errFields('AGENT_NOT_CONNECTED', current.agent
+        ? 'the agent chat for this capture has not completed setup; finish the steps slipstream attach printed'
+        : 'this capture has no agent chat to ask; run slipstream attach from the agent');
     }
     // No await may appear before this call and registration: detach/shutdown must
     // see any source verification admitted before they change state.
@@ -685,6 +732,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       || worktree !== binding.worktree || transcript !== binding.rootTranscript) {
       return errFields('SESSION_NOT_SELECTED', 'the callback is not the selected root session');
     }
+    if (binding.agent?.state === 'setup_pending') {
+      if (binding.agent.delivered) return { question: null };
+      binding.agent.delivered = true;
+      return { question: null, setup_check: { check_id: binding.agent.checkId } };
+    }
     const promise = binding.session.claimQuestion({ harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId,
       worktree: binding.worktree }, () => {
       if (compromised || sessionCompromised || current !== binding) {
@@ -719,6 +771,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       || req.harness !== binding.harness || req.harness_session_id !== binding.harnessSessionId || worktree !== binding.worktree) {
       return errFields('SESSION_NOT_SELECTED', 'the caller is not the selected harness session');
     }
+    if (binding.agent && req.question_id === binding.agent.checkId) return confirmAgent(binding, binding.agent, req.text);
     const promise = binding.session.answerQuestion({ question_id: req.question_id, text: req.text },
       { harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId, worktree: binding.worktree }, () => {
         if (compromised || sessionCompromised || current !== binding) {
@@ -733,6 +786,32 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
       return errFields('CAPTURE_NOT_READY', (err as Error).message);
     } finally { inflightTasks.delete(promise); }
+  }
+
+  /** The bound chat returned its setup check: record it connected, once. */
+  async function confirmAgent(binding: NonNullable<typeof current>, agent: AgentCheck, text: unknown): Promise<Record<string, unknown> | ErrorFields> {
+    try { assertAnswerText(text); } catch (err) { return errFields((err as QuestionError).code, (err as Error).message); }
+    if (agent.ack) return { ...agent.ack, duplicate: true };
+    if (agent.confirming) {
+      const settled = await agent.confirming;
+      return isErrorFields(settled) ? settled : { ...settled, duplicate: true };
+    }
+    const promise = binding.session.recordAgentConnection({ state: 'connected', target: { harness: binding.harness as HarnessName,
+      harness_session_id: binding.harnessSessionId, worktree: binding.worktree } }, () => {
+      if (compromised || sessionCompromised || current !== binding) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+      }
+    }).then((event): Record<string, unknown> => {
+      agent.state = 'connected';
+      registry.setAgentConnection(binding.id, 'connected');
+      agent.ack = { session_id: event.data.session_id, question_id: agent.checkId, event_id: event.seq, seq: event.seq,
+        answered_at_ms: Date.parse(event.time), duplicate: false };
+      return agent.ack;
+    }, controlFailure);
+    agent.confirming = promise;
+    inflightTasks.add(promise);
+    try { return await promise; }
+    finally { inflightTasks.delete(promise); agent.confirming = undefined; }
   }
 
   /** Admit and run a detached-only maintenance op. Admission is synchronous through
@@ -930,6 +1009,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 }
 
 interface ErrorFields { __error: true; code: ControlErrorCode; message: string }
+function controlFailure(err: unknown): ErrorFields {
+  if (err instanceof QuestionError) return errFields(err.code, err.message);
+  if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
+  return errFields('CAPTURE_NOT_READY', (err as Error).message);
+}
 function errFields(code: ControlErrorCode, message: string): ErrorFields {
   return { __error: true, code, message };
 }

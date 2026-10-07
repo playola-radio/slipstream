@@ -1103,13 +1103,13 @@ a Codex consult; contract in [docs/ask-agent/contract.md](docs/ask-agent/contrac
 check delivered only to the bound root and verified only through its answer
 path; `ask` refused until connected; connection event durable and on
 `/v1/sessions`.
-**Status**: Not Started
+**Status**: Complete
 
 ### Stage A5.2: CLI orchestration and config install
 **Success Criteria**: no-arg attach detects the chat, starts the daemon, merges
 config idempotently (unrelated entries preserved), and prints connected /
 pending-with-step / refusal honestly.
-**Status**: Not Started
+**Status**: In Progress
 
 ### Stage A5.3: Swift client gate
 **Success Criteria**: Ask Agent disabled with an explanation unless the selected
