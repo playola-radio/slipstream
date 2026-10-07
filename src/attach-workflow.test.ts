@@ -328,7 +328,8 @@ describe('slipstream attach (one command)', () => {
   });
   it('refuses Codex config that declares the Slipstream server in another TOML form, unchanged', async () => {
     for (const toml of ['[ mcp_servers . slipstream ]\ncommand = "x"\n', '["mcp_servers"."slipstream"]\ncommand = "x"\n',
-      'mcp_servers.slipstream.command = "x"\n', '[[mcp_servers]]\nname = "x"\n']) {
+      'mcp_servers.slipstream.command = "x"\n', '[[mcp_servers]]\nname = "x"\n',
+      '["mcp_\\u0073ervers".slipstream]\ncommand = "x"\n']) {
       const f = await fixture();
       try {
         await codexTranscript(f);

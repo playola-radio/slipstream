@@ -343,7 +343,11 @@ async function planCodexTool(path: string, node: string, args: string[]): Promis
  * already declare Slipstream, so appending a table might break the file. */
 function unsafeServerLine(line: string): boolean {
   const t = line.trim();
-  const keyOrHeader = t.startsWith('[') ? t : t.split('=')[0]!;
+  const keyOrHeader = (t.startsWith('[') ? t : t.split('=')[0]!)
+    .replace(/\\u([\da-fA-F]{4})|\\U([\da-fA-F]{8})/g, (_, u, U) => {
+      const code = parseInt(u ?? U, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : '\ufffd';
+    });
   if (t.startsWith('#') || !keyOrHeader.includes('mcp_servers')) return false;
   return !/^\[mcp_servers\.(?!slipstream[.\]])[\w-]+(?:\.[\w-]+)*\]$/.test(t);
 }
