@@ -205,7 +205,9 @@ workspace copy was observed to inherit the main checkout's hook trust without a
 new prompt; that is an observation, not a traced guarantee. Review and trust this exact command through
 Codex's normal hook trust flow before the chat starts. The hook's ability to
 connect to the daemon's external Unix socket depends on the selected sandbox
-configuration. Installation does not bypass trust or launch an agent. This slice has no global automatic installer or Conductor API
+configuration. Installation does not bypass trust or launch an agent. `slipstream attach` run with no
+identity flags from inside the chat writes this entry for its own workspace only
+(README, "Connect an agent chat"); there is no global installer and no Conductor API
 dependency.
 
 ### D3 Claude Code binding and hook
@@ -259,7 +261,8 @@ file, following the host's normal hook trust flow. The hook sends a bounded
 `hookSpecificOutput.additionalContext` of at most 32 KiB on success and is
 silent on missing identity or failure. The daemon commits the public attempt
 before the hook reply. Neither that event nor stdout proves the model saw the
-question. No hook is automatically installed or trusted.
+question. `slipstream attach` with no identity flags installs this hook in the
+chat's own workspace; it never trusts or approves it on the host's behalf.
 
 ## Answer return (D4)
 

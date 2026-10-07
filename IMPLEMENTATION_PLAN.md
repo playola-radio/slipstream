@@ -1109,12 +1109,12 @@ path; `ask` refused until connected; connection event durable and on
 **Success Criteria**: no-arg attach detects the chat, starts the daemon, merges
 config idempotently (unrelated entries preserved), and prints connected /
 pending-with-step / refusal honestly.
-**Status**: In Progress
+**Status**: Complete
 
 ### Stage A5.3: Swift client gate
 **Success Criteria**: Ask Agent disabled with an explanation unless the selected
 capture is connected; drafts stay with their capture.
-**Status**: Not Started
+**Status**: In Progress
 
 ### Stage A5.4: Live acceptance
 **Success Criteria**: disposable stores, real agents; validated Terminal/Conductor

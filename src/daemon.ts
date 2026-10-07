@@ -1,11 +1,11 @@
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { chmod, lstat, unlink, realpath, open } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
 import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
+import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
@@ -62,41 +62,7 @@ export interface DaemonOptions {
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
-const SUPPORTED_CODEX_VERSIONS = new Set(['0.154.0', '0.155.1']);
-const MAX_CODEX_META_BYTES = 64 * 1024;
-
 class RootIdentityError extends Error {}
-
-/** Verify the selected transcript's own first record once at attach. It binds
- * the reported session and worktree without treating either as authorship. */
-async function verifyCodexRootTranscript(path: string, sessionId: string, worktree: string): Promise<void> {
-  try {
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    let bytes: Buffer;
-    try {
-      if (!(await handle.stat()).isFile()) throw new Error('transcript is not a file');
-      const buffer = Buffer.alloc(MAX_CODEX_META_BYTES + 1);
-      let total = 0; let end = -1;
-      while (total < buffer.length && end < 0) {
-        const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
-        if (bytesRead === 0) break;
-        end = buffer.subarray(total, total + bytesRead).indexOf(0x0a);
-        if (end >= 0) end += total;
-        total += bytesRead;
-      }
-      if (end < 0 || end > MAX_CODEX_META_BYTES) throw new Error('transcript metadata exceeds limit');
-      bytes = buffer.subarray(0, end);
-    } finally { await handle.close(); }
-    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as Record<string, unknown>;
-    const payload = record.payload as Record<string, unknown> | undefined;
-    if (record.type !== 'session_meta' || !payload
-      || payload.originator !== 'codex_sdk_ts'
-      || (payload.source !== 'exec' && payload.source !== 'vscode')
-      || !SUPPORTED_CODEX_VERSIONS.has(String(payload.cli_version))
-      || payload.session_id !== sessionId || typeof payload.cwd !== 'string'
-      || await realpath(payload.cwd) !== worktree) throw new Error('transcript metadata does not match selected root');
-  } catch { throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime'); }
-}
 
 /** Build the per-session transcript runtime from resolved config: only harnesses
  * the operator declared `configured` are read. */
@@ -446,7 +412,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
             : 'root Codex transcript cannot be resolved');
         }
         if (harness === 'codex') {
-          await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
+          if (!await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree)) {
+            throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime');
+          }
         } else {
           const verified = await verifyClaudeRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
           if (!verified.ok) {
