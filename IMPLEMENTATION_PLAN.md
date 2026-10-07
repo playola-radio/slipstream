@@ -1068,3 +1068,55 @@ only for now; a non-git root ignores it.
   a git work tree; a `.slipignore` alias.
 
 **Status**: Complete.
+
+## A5: One-command `slipstream attach` (2026-10-07)
+
+**Goal:** `slipstream attach`, run from inside a Claude Code or Codex chat,
+starts the shared daemon if needed, configures that workspace for that chat,
+starts recording, and proves question delivery and answer return with one live
+round trip. Repeating it reports the existing capture. Design settled through
+a Codex consult; contract in [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+- **The chat names itself.** The agent's own environment
+  (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) selects the chat; the root
+  transcript is found automatically and verified as before. No agent identity,
+  or both, refuses without starting a capture. There is no picker and no
+  first-callback guessing.
+- **Connected means a verified round trip.** After attach, the next root hook
+  callback receives a one-time setup check, and the agent returns it through
+  `slipstream_answer_question`. Until then the capture is `setup_pending`, with the
+  exact reload step. The daemon refuses new questions unless the capture is
+  connected. Connection state is a public event
+  (`slipstream.agent.connection.v1`) and is projected on `/v1/sessions`.
+- **Idempotent.** Same workspace and chat: report the existing capture and
+  re-arm a pending check. Same workspace, other chat: refuse and keep the
+  binding. Another workspace: refuse, naming it.
+- **Workspace-scoped config** for the selected harness only, merged without
+  duplicates, using the installed Slipstream command paths. Host trust and
+  approval are never written.
+- **Not in scope:** auto-capture, multiple chats per directory, hook backfill,
+  connection expiry/heartbeat, version-policy changes beyond exact tuples
+  validated live.
+
+### Stage A5.1: Daemon readiness and idempotent attach
+**Success Criteria**: repeated/other-chat/other-workspace attach outcomes; setup
+check delivered only to the bound root and verified only through its answer
+path; `ask` refused until connected; connection event durable and on
+`/v1/sessions`.
+**Status**: Not Started
+
+### Stage A5.2: CLI orchestration and config install
+**Success Criteria**: no-arg attach detects the chat, starts the daemon, merges
+config idempotently (unrelated entries preserved), and prints connected /
+pending-with-step / refusal honestly.
+**Status**: Not Started
+
+### Stage A5.3: Swift client gate
+**Success Criteria**: Ask Agent disabled with an explanation unless the selected
+capture is connected; drafts stay with their capture.
+**Status**: Not Started
+
+### Stage A5.4: Live acceptance
+**Success Criteria**: disposable stores, real agents; validated Terminal/Conductor
+× Claude/Codex paths recorded.
+**Status**: Not Started
