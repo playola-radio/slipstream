@@ -408,6 +408,9 @@ one real round trip through the same path a question takes.
   with the answer-ack shape; a resend replays it with `duplicate: true`.
 - Until then, `ask` returns `AGENT_NOT_CONNECTED`. A capture-only attach never
   becomes connected.
+- Every `status` reply lists `attach_features: ["agent-connection-v1"]`. A
+  daemon without it predates the setup check, so `slipstream attach` refuses
+  rather than install config that daemon would never confirm.
 
 `connected` proves the round trip at the time of the event, not afterwards.
 There is no heartbeat or expiry: a chat that exits after connecting still shows
