@@ -453,7 +453,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (resolvedTranscript !== undefined && !(torn || compromised || sessionCompromised || state !== 'attaching')) {
       try {
         await session.recordAgentConnection({ state: 'setup_pending',
-          target: { harness: harness as HarnessName, harness_session_id: harnessSessionId, worktree: resolvedWorktree } });
+          target: { harness: harness as HarnessName, harness_session_id: harnessSessionId } });
         agent = { state: 'setup_pending', checkId: randomUUID(), delivered: false };
       } catch { pendingFailed = true; }
     }
@@ -765,7 +765,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return isErrorFields(settled) ? settled : { ...settled, duplicate: true };
     }
     const promise = binding.session.recordAgentConnection({ state: 'connected', target: { harness: binding.harness as HarnessName,
-      harness_session_id: binding.harnessSessionId, worktree: binding.worktree } }, () => {
+      harness_session_id: binding.harnessSessionId } }, () => {
       if (compromised || sessionCompromised || current !== binding) {
         throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
       }

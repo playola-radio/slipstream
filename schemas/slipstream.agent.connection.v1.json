@@ -21,11 +21,10 @@
         "state": { "enum": ["setup_pending", "connected"] },
         "target": {
           "type": "object",
-          "required": ["harness", "harness_session_id", "worktree"],
+          "required": ["harness", "harness_session_id"],
           "properties": {
             "harness": { "enum": ["claude-code", "codex"] },
-            "harness_session_id": { "type": "string", "minLength": 1 },
-            "worktree": { "type": "string", "minLength": 1 }
+            "harness_session_id": { "type": "string", "minLength": 1 }
           }
         }
       }

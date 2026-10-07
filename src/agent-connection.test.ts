@@ -4,7 +4,7 @@ import { buildPublicEnvelope, PUBLIC_EVENT_TYPES, type AgentConnectionInput } fr
 import { loadSchema, validate } from './schema.ts';
 
 const SESSION = '00000000-0000-4000-8000-000000000001';
-const TARGET = { harness: 'claude-code', harness_session_id: 'root', worktree: '/w' } as const;
+const TARGET = { harness: 'claude-code', harness_session_id: 'root' } as const;
 const input = (data: AgentConnectionInput['data']): AgentConnectionInput =>
   ({ type: 'slipstream.agent.connection.v1', occurred_at_ms: 1789657200000, data });
 
@@ -28,7 +28,7 @@ describe('slipstream.agent.connection.v1', () => {
     const bad = [
       { state: 'disconnected', target: TARGET },
       { state: 'connected', target: { ...TARGET, harness: 'manual' } },
-      { state: 'connected', target: { harness: 'codex', worktree: '/w' } },
+      { state: 'connected', target: { harness: 'codex' } },
       { state: 'connected' },
     ];
     for (const data of bad) {

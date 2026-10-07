@@ -916,7 +916,7 @@ describe('daemon agent readiness', () => {
       assert.deepEqual(await listedConnection(), { state: 'setup_pending' });
       assert.equal(rec(attached).agent_connection, 'setup_pending');
       const sessionId = rec(attached).session_id!;
-      const target = { harness: 'claude-code', harness_session_id: 'root', worktree };
+      const target = { harness: 'claude-code', harness_session_id: 'root' };
       assert.deepEqual((await connectionEvents(store, sessionId)).map(e => e.data),
         [{ state: 'setup_pending', target, session_id: sessionId }]);
       assert.equal(rec(await call({ verb: 'status' })).agent_connection, 'setup_pending');

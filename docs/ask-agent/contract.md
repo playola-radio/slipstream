@@ -395,8 +395,8 @@ or the host may deny the tool. The daemon therefore admits questions only after
 one real round trip through the same path a question takes.
 
 - `attach` with a `root_transcript` appends
-  `slipstream.agent.connection.v1` with `state: "setup_pending"` and the
-  `target` triple, and arms a private setup check. Its ID appears in no status,
+  `slipstream.agent.connection.v1` with `state: "setup_pending"` and the chat
+  as `target` (`harness`, `harness_session_id`), and arms a private setup check. Its ID appears in no status,
   attach reply, or public event.
 - The bound root's next `claim_question` replies
   `{"v":1,"ok":true,"question":null,"setup_check":{"check_id":"<uuid>"}}`, once

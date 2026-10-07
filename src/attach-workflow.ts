@@ -6,11 +6,9 @@
  * transcript. Success needs both recording and a connected chat; anything less
  * is reported as pending or refused, never as attached.
  */
-import { readdir, readFile, writeFile, rename, mkdir, lstat, realpath, appendFile } from 'node:fs/promises';
-import { dirname, extname, join, relative, resolve } from 'node:path';
+import { readdir, readFile, writeFile, rename, mkdir, lstat, realpath, unlink, chmod, stat } from 'node:fs/promises';
+import { dirname, extname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
@@ -37,7 +35,6 @@ interface Chat { harness: Harness; id: string; conductor: boolean }
 
 class Refusal extends Error {}
 
-const execFileAsync = promisify(execFile);
 const DAEMON_START_MS = 10_000;
 const HOOK_TIMEOUT_S = 3;
 
@@ -58,18 +55,20 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   catch { throw new Refusal(`${opts.dir} does not exist; nothing was recorded`); }
   const transcript = await findTranscript(chat, deps);
   await verifyTranscript(chat, transcript, worktree);
+  const plan = await planAgentConfig(chat, worktree, opts.store, deps);
 
   await ensureDaemon(opts.store, deps);
   const status = await deps.control({ verb: 'status' });
   if (!status.ok) throw new Refusal(`${status.code}: ${status.message}`);
   refuseOtherBinding(status, chat, worktree);
 
-  const changed = await installAgentConfig(chat, worktree, opts.store, deps);
+  const changed = await applyAgentConfig(plan, worktree, deps);
 
   const res = await deps.control({ verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
     root_transcript: transcript });
   if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
   const connection = String(res.agent_connection);
+  if (connection !== 'connected' && connection !== 'setup_pending') throw noDelivery();
   const again = res.already_active === true;
   if (connection === 'connected') {
     deps.out(again
@@ -199,16 +198,25 @@ function refuseOtherBinding(status: Record<string, unknown>, chat: Chat, worktre
     throw new Refusal(`this workspace is already recorded with another agent chat (${String(status.harness)} `
       + `${String(status.harness_session_id)}); that binding was kept. Run \`slipstream detach\` first to switch chats.`);
   }
+  if (status.agent_connection === 'disconnected') throw noDelivery();
+}
+
+function noDelivery(): Refusal {
+  return new Refusal('this workspace is already recorded with this chat, but without question delivery (it was '
+    + 'attached without its transcript). The recording was kept; run `slipstream detach`, then `slipstream attach` '
+    + 'again to connect the chat.');
 }
 
 function shellWord(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-/** Install only the selected harness's hook and answer tool. Unrelated entries
+interface ConfigPlan { hookEdit: Edit | null; toolEdit: Edit | null; claudeTool: string[] | null }
+
+/** Plan only the selected harness's hook and answer tool. Unrelated entries
  * are kept, an identical entry is left alone, and a different Slipstream entry
- * is refused rather than replaced. Returns whether anything was written. */
-async function installAgentConfig(chat: Chat, worktree: string, store: string, deps: AttachDeps): Promise<boolean> {
+ * is refused rather than replaced. Nothing is written yet. */
+async function planAgentConfig(chat: Chat, worktree: string, store: string, deps: AttachDeps): Promise<ConfigPlan> {
   const forwarder = join(dirname(deps.cliPath), `mcp-forwarder${extname(deps.cliPath)}`);
   if (!await isFile(forwarder)) {
     throw new Refusal(`the Slipstream answer tool is missing next to ${deps.cliPath}; reinstall Slipstream. `
@@ -219,37 +227,38 @@ async function installAgentConfig(chat: Chat, worktree: string, store: string, d
   const hookFile = chat.harness === 'claude-code' ? '.claude/settings.local.json' : '.codex/hooks.json';
   const hookEdit = await planHook(join(worktree, hookFile), hook);
   const toolArgs = [forwarder, '--store', store];
-  let toolEdit: Edit | null;
-  let addClaudeTool = false;
   if (chat.harness === 'codex') {
-    toolEdit = await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs);
-  } else {
-    toolEdit = null;
-    addClaudeTool = await claudeToolMissing(chat, worktree, deps, toolArgs);
+    return { hookEdit, toolEdit: await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs),
+      claudeTool: null };
   }
+  const missing = await claudeToolMissing(chat, worktree, deps, toolArgs);
+  return { hookEdit, toolEdit: null, claudeTool: missing ? [deps.nodePath, ...toolArgs] : null };
+}
 
-  const created: string[] = [];
+/** Write the plan, refusing if a file changed since it was planned. Returns
+ * whether anything was written. */
+async function applyAgentConfig(plan: ConfigPlan, worktree: string, deps: AttachDeps): Promise<boolean> {
+  const { hookEdit, toolEdit, claudeTool } = plan;
   for (const edit of [hookEdit, toolEdit]) {
     if (!edit) continue;
-    await writeOrRefuse(edit.path, () => writeAtomic(edit.path, edit.text));
-    if (edit.created) created.push(edit.path);
+    await writeAtomic(edit);
     deps.out(`Installed the Slipstream ${edit === hookEdit ? 'question hook' : 'answer tool'} in ${edit.path}`);
   }
-  if (addClaudeTool) {
+  if (claudeTool) {
     const claude = deps.env.CLAUDE_CODE_EXECPATH ?? 'claude';
     const { code, output } = await deps.run(claude,
-      ['mcp', 'add', '--scope', 'local', 'slipstream', '--', deps.nodePath, ...toolArgs], worktree);
+      ['mcp', 'add', '--scope', 'local', 'slipstream', '--', ...claudeTool], worktree);
     if (code !== 0) {
       throw new Refusal(`could not add the Slipstream answer tool with \`claude mcp add\` (exit ${String(code)}): `
         + `${output.trim()}. Nothing was recorded.`);
     }
     deps.out('Installed the Slipstream answer tool for this workspace (claude mcp add --scope local).');
   }
-  await excludeFromGit(worktree, created);
-  return hookEdit !== null || toolEdit !== null || addClaudeTool;
+  return hookEdit !== null || toolEdit !== null || claudeTool !== null;
 }
 
-interface Edit { path: string; text: string; created: boolean }
+/** `original` is the file as planned; null when it did not exist. */
+interface Edit { path: string; text: string; original: string | null }
 
 async function readConfig(path: string): Promise<string | null> {
   try { return await readFile(path, 'utf8'); }
@@ -261,8 +270,21 @@ async function readConfig(path: string): Promise<string | null> {
 
 const SLIPSTREAM_HOOK = /\bhook (?:claude-code|codex) post-tool-use\b/;
 
+/** Workspace config is edited in place only; a symlinked file or directory may
+ * be shared with other workspaces, so it is refused rather than followed. */
+async function readWorkspaceConfig(path: string): Promise<string | null> {
+  for (const p of [dirname(path), path]) {
+    let link = false;
+    try { link = (await lstat(p)).isSymbolicLink(); } catch { /* missing: created later */ }
+    if (link) {
+      throw new Refusal(`${p} is a symbolic link; attach only edits this workspace's own config. Nothing was recorded.`);
+    }
+  }
+  return readConfig(path);
+}
+
 async function planHook(path: string, command: string): Promise<Edit | null> {
-  const text = await readConfig(path);
+  const text = await readWorkspaceConfig(path);
   let config: Record<string, unknown> = {};
   if (text !== null) {
     try { config = JSON.parse(text) as Record<string, unknown>; }
@@ -276,27 +298,28 @@ async function planHook(path: string, command: string): Promise<Edit | null> {
   if (typeof hooks !== 'object' || Array.isArray(hooks) || !Array.isArray(post)) {
     throw new Refusal(`${path} has an unexpected hooks layout; add the Slipstream hook by hand: ${command}`);
   }
-  const existing = post.flatMap((group) => Array.isArray((group as { hooks?: unknown })?.hooks)
-    ? (group as { hooks: unknown[] }).hooks : [])
-    .map((h) => (h as { command?: unknown })?.command)
-    .filter((c): c is string => typeof c === 'string' && SLIPSTREAM_HOOK.test(c));
-  if (existing.includes(command)) return null;
-  if (existing.length > 0) {
-    throw new Refusal(`${path} already has a different Slipstream hook (${existing[0]}). It was kept; remove it or `
-      + `attach with the store it uses. Nothing was recorded.`);
+  const existing = post.flatMap((group) => {
+    const { matcher, hooks: entries } = (group ?? {}) as { matcher?: unknown; hooks?: unknown };
+    return Array.isArray(entries) ? entries.map((h) => ({ matcher, ...(h ?? {}) as { type?: unknown; command?: unknown } })) : [];
+  }).filter((h) => typeof h.command === 'string' && SLIPSTREAM_HOOK.test(h.command));
+  const different = existing.find((h) => h.matcher !== '*' || h.type !== 'command' || h.command !== command);
+  if (different) {
+    throw new Refusal(`${path} already has a different Slipstream hook (${String(different.command)}, matcher `
+      + `${JSON.stringify(different.matcher)}). It was kept; remove it or make it match. Nothing was recorded.`);
   }
+  if (existing.length > 0) return null;
   const next = { ...config, hooks: { ...hooks, PostToolUse: [...post,
     { matcher: '*', hooks: [{ type: 'command', command, timeout: HOOK_TIMEOUT_S }] }] } };
-  return { path, text: `${JSON.stringify(next, null, 2)}\n`, created: text === null };
+  return { path, text: `${JSON.stringify(next, null, 2)}\n`, original: text };
 }
 
 /** Codex project config is TOML; Slipstream owns only its own server table and
  * appends it as text so the rest of the file stays byte-for-byte unchanged. */
 async function planCodexTool(path: string, node: string, args: string[]): Promise<Edit | null> {
-  const text = await readConfig(path);
+  const text = await readWorkspaceConfig(path);
   const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
     + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
-  if (text === null) return { path, text: block, created: true };
+  if (text === null) return { path, text: block, original: null };
   const lines = text.split('\n');
   const header = lines.findIndex((l) => l.trim() === '[mcp_servers.slipstream]');
   if (header >= 0) {
@@ -307,13 +330,22 @@ async function planCodexTool(path: string, node: string, args: string[]): Promis
     throw new Refusal(`${path} already has a different Slipstream server entry. It was kept; remove it or make it `
       + `match:\n${block}Nothing was recorded.`);
   }
-  if (/^\s*\[mcp_servers\]\s*$/m.test(text) || /^\s*mcp_servers\s*=/m.test(text)
-    || /^\s*\[mcp_servers\.["']?slipstream["']?[.\]]/m.test(text)) {
+  if (lines.some(unsafeServerLine)) {
     throw new Refusal(`${path} declares MCP servers in a form attach cannot safely edit. Add this entry by hand:\n`
       + `${block}Nothing was recorded.`);
   }
   const sep = text === '' ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
-  return { path, text: `${text}${sep}${block}`, created: false };
+  return { path, text: `${text}${sep}${block}`, original: text };
+}
+
+/** Only plain `[mcp_servers.<other name>]` tables are understood; any other
+ * header or key that mentions mcp_servers (quoted, spaced, dotted, arrays) could
+ * already declare Slipstream, so appending a table might break the file. */
+function unsafeServerLine(line: string): boolean {
+  const t = line.trim();
+  const keyOrHeader = t.startsWith('[') ? t : t.split('=')[0]!;
+  if (t.startsWith('#') || !keyOrHeader.includes('mcp_servers')) return false;
+  return !/^\[mcp_servers\.(?!slipstream[.\]])[\w-]+(?:\.[\w-]+)*\]$/.test(t);
 }
 
 /** Claude keeps local-scope servers per project in its own global config; read
@@ -329,47 +361,35 @@ async function claudeToolMissing(chat: Chat, worktree: string, deps: AttachDeps,
     server = config.projects?.[worktree]?.mcpServers?.slipstream;
   } catch { throw new Refusal(`${path} is not valid JSON; cannot check for an existing Slipstream answer tool.`); }
   if (server === undefined) return true;
-  if (server.command === deps.nodePath && JSON.stringify(server.args) === JSON.stringify(args)) return false;
+  if (server !== null && typeof server === 'object' && server.command === deps.nodePath
+    && JSON.stringify(server.args) === JSON.stringify(args)) return false;
   throw new Refusal(`this workspace already has a different \`slipstream\` MCP server for ${chat.harness} `
     + '(see `claude mcp get slipstream`). It was kept; remove it with `claude mcp remove --scope local slipstream` '
     + 'or make it use this store. Nothing was recorded.');
 }
 
-/** A sandboxed chat may not be allowed to write workspace config (Codex keeps
- * `.codex/` and `.git/` read-only in workspace-write mode); say so, not crash. */
-async function writeOrRefuse(path: string, write: () => Promise<void>): Promise<void> {
-  try { await write(); }
-  catch (err) {
+/** Replace a planned file atomically, refusing if it changed since planning. A
+ * sandboxed chat may not be allowed to write workspace config (Codex keeps
+ * `.codex/` read-only in workspace-write mode); that is explained, not crashed on. */
+async function writeAtomic(edit: Edit): Promise<void> {
+  const tmp = `${edit.path}.${randomUUID()}.tmp`;
+  try {
+    await mkdir(dirname(edit.path), { recursive: true });
+    await writeFile(tmp, edit.text, { flag: 'wx' });
+    if (edit.original !== null) await chmod(tmp, (await stat(edit.path)).mode & 0o777);
+    if (await readConfig(edit.path) !== edit.original) {
+      throw new Refusal(`${edit.path} changed while attach was running; it was kept. Run attach again. `
+        + 'Nothing was recorded.');
+    }
+    await rename(tmp, edit.path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    if (err instanceof Refusal) throw err;
     const code = (err as NodeJS.ErrnoException).code ?? (err as Error).message;
-    throw new Refusal(`could not write ${path} (${code}). This chat's sandbox may block writing there; allow the `
+    throw new Refusal(`could not write ${edit.path} (${code}). This chat's sandbox may block writing there; allow the `
       + 'command to run with write access to the workspace, or start the chat with full access, then run attach '
       + 'again. Nothing was recorded.');
   }
-}
-
-async function writeAtomic(path: string, text: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const tmp = `${path}.${randomUUID()}.tmp`;
-  await writeFile(tmp, text, { flag: 'wx' });
-  await rename(tmp, path);
-}
-
-/** Keep generated per-workspace config out of `git status`. Only files attach
- * created are excluded, so a user's own untracked config is never hidden. */
-async function excludeFromGit(worktree: string, created: string[]): Promise<void> {
-  if (created.length === 0) return;
-  let gitPath: string;
-  try { gitPath = (await execFileAsync('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: worktree })).stdout; }
-  catch { return; } // not a git worktree: nothing to keep out of git status
-  const exclude = resolve(worktree, gitPath.trim());
-  const current = (await readConfig(exclude)) ?? '';
-  const have = new Set(current.split('\n'));
-  const add = created.map((p) => `/${relative(worktree, p)}`).filter((line) => !have.has(line));
-  if (add.length === 0) return;
-  await writeOrRefuse(exclude, async () => {
-    await mkdir(dirname(exclude), { recursive: true });
-    await appendFile(exclude, `${current === '' || current.endsWith('\n') ? '' : '\n'}${add.join('\n')}\n`);
-  });
 }
 
 function storeFlag(store: string, home: string): string {

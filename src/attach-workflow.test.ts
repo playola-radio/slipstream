@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat, chmod, symlink } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -139,16 +139,6 @@ describe('slipstream attach (one command)', () => {
       assert.deepEqual(f.commands, []);
       assert.match(f.out.join('\n'), /Attached successfully.*already/);
       assert.match(f.out.join('\n'), /agent_connection: connected$/);
-    } finally { await rm(f.root, { recursive: true, force: true }); }
-  });
-
-  it('excludes newly created config from git once', async () => {
-    const f = await fixture();
-    try {
-      await claudeTranscript(f);
-      await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
-      const exclude = await readFile(join(f.worktree, '.git', 'info', 'exclude'), 'utf8');
-      assert.equal(exclude.split('\n').filter((l) => l === '/.claude/settings.local.json').length, 1);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
@@ -334,6 +324,134 @@ describe('slipstream attach (one command)', () => {
         deps(f, { ...codexEnv, CONDUCTOR_SESSION_ID: 'c-1' }, { live: true }));
       assert.match(f.out.join('\n'),
         new RegExp(`run \`codex\` in ${f.worktree}, trust the Slipstream hook in its hook review`));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+  it('refuses Codex config that declares the Slipstream server in another TOML form, unchanged', async () => {
+    for (const toml of ['[ mcp_servers . slipstream ]\ncommand = "x"\n', '["mcp_servers"."slipstream"]\ncommand = "x"\n',
+      'mcp_servers.slipstream.command = "x"\n', '[[mcp_servers]]\nname = "x"\n']) {
+      const f = await fixture();
+      try {
+        await codexTranscript(f);
+        await mkdir(join(f.worktree, '.codex'));
+        await writeFile(join(f.worktree, '.codex', 'config.toml'), toml);
+        const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+        assert.equal(code, 1, toml);
+        assert.match(f.err.join('\n'), /declares MCP servers in a form attach cannot safely edit/);
+        assert.equal(await readFile(join(f.worktree, '.codex', 'config.toml'), 'utf8'), toml);
+        assert.equal(attachRequests(f).length, 0);
+      } finally { await rm(f.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('refuses instead of overwriting config that changed while attach was running', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const settings = join(f.worktree, '.claude', 'settings.local.json');
+      const d = deps(f, claudeEnv, { live: false });
+      const start = d.startDaemon;
+      d.startDaemon = () => {
+        execFileSync('mkdir', ['-p', join(f.worktree, '.claude')]);
+        execFileSync('sh', ['-c', `printf '{"permissions":{}}' > '${settings}'`]);
+        return start();
+      };
+      d.probe = async () => f.started > 0 ? 'live' : 'stale';
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /changed while attach was running/);
+      assert.equal(await readFile(settings, 'utf8'), '{"permissions":{}}');
+      assert.equal(attachRequests(f).length, 0);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a same-chat capture that was attached without question delivery', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
+        status: { state: 'active', worktree: f.worktree, harness: 'claude-code', harness_session_id: CLAUDE_ID,
+          agent_connection: 'disconnected' } }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /without question delivery.*slipstream detach/s);
+      assert.equal(attachRequests(f).length, 0);
+      await assert.rejects(stat(join(f.worktree, '.claude')));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('does not report pending when the daemon says the chat is disconnected', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
+        attach: { session_id: 'cap-1', already_active: true, agent_connection: 'disconnected' } }));
+      assert.equal(code, 1);
+      assert.doesNotMatch(f.out.join('\n'), /setup pending|Attached successfully/);
+      assert.match(f.err.join('\n'), /without question delivery/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+  it('keeps the permissions of a config file it edits', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      await mkdir(join(f.worktree, '.codex'));
+      const toml = join(f.worktree, '.codex', 'config.toml');
+      await writeFile(toml, 'model = "x"\n', { mode: 0o600 });
+      await chmod(toml, 0o600);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+      assert.equal(code, 0, f.err.join('\n'));
+      assert.equal((await stat(toml)).mode & 0o777, 0o600);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses to edit config reached through a symbolic link', async () => {
+    for (const link of ['dir', 'file'] as const) {
+      const f = await fixture();
+      try {
+        await codexTranscript(f);
+        const shared = join(f.root, 'shared');
+        await mkdir(shared);
+        await writeFile(join(shared, 'config.toml'), 'model = "x"\n');
+        if (link === 'dir') await symlink(shared, join(f.worktree, '.codex'));
+        else {
+          await mkdir(join(f.worktree, '.codex'));
+          await symlink(join(shared, 'config.toml'), join(f.worktree, '.codex', 'config.toml'));
+        }
+        const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+        assert.equal(code, 1, link);
+        assert.match(f.err.join('\n'), /symbolic link/);
+        assert.equal(await readFile(join(shared, 'config.toml'), 'utf8'), 'model = "x"\n');
+        await assert.rejects(stat(join(shared, 'hooks.json')));
+        assert.equal(attachRequests(f).length, 0);
+      } finally { await rm(f.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('refuses a Slipstream hook that only runs for some tools instead of treating it as installed', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      await mkdir(join(f.worktree, '.claude'));
+      const narrow = { hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command',
+        command: `${NODE} ${f.cli} hook claude-code post-tool-use --store ${f.store}`, timeout: 3 }] }] } };
+      await writeFile(join(f.worktree, '.claude', 'settings.local.json'), JSON.stringify(narrow));
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /already has a different Slipstream hook/);
+      assert.equal(attachRequests(f).length, 0);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a malformed existing Claude answer-tool entry without crashing', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      await mkdir(f.home, { recursive: true });
+      await writeFile(join(f.home, '.claude.json'),
+        JSON.stringify({ projects: { [f.worktree]: { mcpServers: { slipstream: null } } } }));
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /different `slipstream` MCP server/);
+      assert.equal(attachRequests(f).length, 0);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 });

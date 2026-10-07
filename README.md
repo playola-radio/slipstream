@@ -120,8 +120,9 @@ own entry: Claude Code gets a `PostToolUse` hook in `.claude/settings.local.json
 and a local-scope `slipstream` MCP server (via `claude mcp add --scope local`);
 Codex gets a hook in `.codex/hooks.json` and a `[mcp_servers.slipstream]` table
 in `.codex/config.toml`. Unrelated hooks, servers, and permissions are kept. An
-existing Slipstream entry pointing somewhere else is reported, not replaced.
-Newly created files are added to the repository's local `info/exclude`. The
+existing Slipstream entry pointing somewhere else is reported, not replaced,
+and symlinked config is refused rather than followed. These files hold local
+paths, so keep them out of commits; attach does not edit git ignore rules. The
 host's own trust and approval prompts still apply: Codex may ask you to trust
 the hook, and both harnesses ask before the first answer-tool call unless you
 approve it.

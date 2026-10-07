@@ -82,7 +82,7 @@ export interface CaptureScopeEvent {
 export interface AgentConnectionData {
   session_id: string;
   state: 'setup_pending' | 'connected';
-  target: { harness: HarnessName; harness_session_id: string; worktree: string };
+  target: { harness: HarnessName; harness_session_id: string };
 }
 export interface AgentConnectionEvent {
   specversion: typeof SPEC_VERSION;
