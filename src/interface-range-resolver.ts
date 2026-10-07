@@ -13,7 +13,7 @@ const SCOPE = 'slipstream.capture.scope.v1';
 const SHA = /^[0-9a-f]{64}$/;
 const SEQ = /^[1-9][0-9]*$/;
 const POLICY_EXCLUSIONS = ['store-directory', '.git', 'symlinks'] as const;
-export type PolicyExclusion = typeof POLICY_EXCLUSIONS[number] | 'git-ignored';
+export type PolicyExclusion = typeof POLICY_EXCLUSIONS[number] | 'git-ignored' | 'slipstream-ignored';
 
 export type RecordedEndpoint = {
   kind: 'recorded'; record_seq: string; field: 'snapshot' | 'before' | 'after'; snapshot: Snapshot;
@@ -141,6 +141,7 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
   let baselineCompletedSeq: string | null = null;
   let unknownScopes: string[] = [];
   let gitScoped = false;
+  let slipstreamScoped = false;
   let lastSeq = 0n;
   const cursor = await openLogCursor(logPath, 0n);
   try {
@@ -210,8 +211,16 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     } else if (record.type === SCOPE) {
       const valid = (data.policy === 'git' && (data.status === 'active' || data.status === 'unavailable'))
         || (data.policy === 'filesystem' && data.status === 'active');
-      if (!valid) corrupt(`bad capture scope at ${seq}`);
+      // Under the git policy the event schema pins slipstream_ignore to the
+      // literal "active", so reject any other present value here too — otherwise
+      // this reader would silently drop the disclosure for history the schema
+      // and recovery reader reject. Other policies tolerate unknown fields, as
+      // the schema does for forward compatibility.
+      const slipOk = data.policy !== 'git'
+        || data.slipstream_ignore === undefined || data.slipstream_ignore === 'active';
+      if (!valid || !slipOk) corrupt(`bad capture scope at ${seq}`);
       if (data.policy === 'git') gitScoped = true;
+      if (data.policy === 'git' && data.slipstream_ignore === 'active') slipstreamScoped = true;
       if (data.status === 'unavailable') gaps.push({ seq, reason: 'capture-scope-unavailable', scope: { kind: 'session' } });
     }
   }
@@ -228,6 +237,9 @@ export async function resolveRecordedRange(options: ResolveRecordedRangeOptions)
     files.push({ path, before, after, endpointsEqual: endpointsEqual(before, after) });
   }
   files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  const policyExclusions: PolicyExclusion[] = [...POLICY_EXCLUSIONS];
+  if (gitScoped) policyExclusions.push('git-ignored');
+  if (slipstreamScoped) policyExclusions.push('slipstream-ignored');
   return { kind: 'resolved', inventory: { scope: 'observed', baselineCompletedSeq, unknownScopes,
-    policyExclusions: gitScoped ? [...POLICY_EXCLUSIONS, 'git-ignored'] : POLICY_EXCLUSIONS }, gaps, files, scan: scan() };
+    policyExclusions }, gaps, files, scan: scan() };
 }

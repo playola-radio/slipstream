@@ -1,11 +1,12 @@
-import { access, lstat, readdir, realpath } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
-import { detectCaptureScope, type DetectCaptureScope } from './capture-scope.ts';
+import { detectCaptureScope, type CaptureScope, type DetectCaptureScope } from './capture-scope.ts';
 import { createHealth, type Health, type HealthFailure } from './health.ts';
 import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
@@ -149,6 +150,34 @@ function isUnder(child: string, parent: string): boolean {
   return !escapesBase(relative(parent, child));
 }
 
+/** A frozen copy of the root `.slipstreamignore`, handed to git as its
+ * lowest-precedence excludes file so capture can drop extra paths — including
+ * tracked ones git would merge. Copied once so a mid-capture edit does not
+ * change this capture's scope; a later restart re-reads it, matching how git's
+ * own rule changes take effect. Returns undefined when the file is absent or
+ * empty. A file that exists but cannot be read rejects rather than silently
+ * widening scope to paths the user meant to exclude. Only consulted inside a
+ * git work tree; a non-git root ignores the file. */
+async function freezeSlipstreamIgnore(root: string): Promise<{ dir: string; file: string } | undefined> {
+  const path = join(root, '.slipstreamignore');
+  // Stat (which follows symlinks but never blocks) before opening: a named pipe
+  // or other non-regular file would otherwise hang the read and stall startup.
+  let info;
+  try {
+    info = await stat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+  if (!info.isFile()) throw new Error(`.slipstreamignore is not a regular file`);
+  const content = await readFile(path, 'utf8');
+  if (content.trim() === '') return undefined;
+  const dir = await mkdtemp(join(tmpdir(), 'slip-ignore-'));
+  const file = join(dir, 'excludes');
+  await writeFile(file, content);
+  return { dir, file };
+}
+
 interface ReconcileState {
   committed: Map<string, Snapshot>;
   baselineUnknownDirs: Set<string>;
@@ -170,15 +199,33 @@ export async function startCapture(
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
-  // Decided before anything is written: a git root git cannot read rejects here
-  // rather than silently capturing what git would not merge.
-  const scope = await deps.detectScope(root);
+  // Validate the store before freezing anything, so a bad store directory fails
+  // without leaving a frozen copy of the ignore rules behind.
   await mkdirpDurable(opts.storeDir);
   const storeDir = await realpath(opts.storeDir);
   await assertOwnerOnly(storeDir, 'dir');
   if (isUnder(root, storeDir)) {
     throw new Error('store directory must not equal or contain the watched root');
   }
+  // Decided before anything is written: a git root git cannot read rejects here
+  // rather than silently capturing what git would not merge.
+  const baseScope = await deps.detectScope(root);
+  // Only a git work tree honors .slipstreamignore; a non-git root never reads it
+  // (so an unreadable file there does not block capture). Frozen before
+  // classification so a mid-capture edit does not change this capture's scope;
+  // cleaned up on a failed start, in the catches below, and in stop().
+  let frozenSlip: { dir: string; file: string } | undefined;
+  let scope: CaptureScope = baseScope;
+  if (baseScope.policy === 'git') {
+    try {
+      frozenSlip = await freezeSlipstreamIgnore(root);
+      if (frozenSlip) scope = await deps.detectScope(root, frozenSlip.file);
+    } catch (err) {
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    }
+  }
+  const slipstreamApplied = frozenSlip !== undefined;
 
   const resuming = opts.resumeSessionId !== undefined;
   const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
@@ -303,6 +350,7 @@ export async function startCapture(
     const logExists = await access(logPath).then(() => true, () => false);
     if (logExists) {
       await lock.release();
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
       throw new Error(
         `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
       );
@@ -325,6 +373,7 @@ export async function startCapture(
       seedTaskState(recovered); // rebuild the dedup index + current task before appends
     } catch (err) {
       await lock.release(); // a failed resume must not leave the session locked
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
       throw err;
     }
   }
@@ -344,6 +393,7 @@ export async function startCapture(
     });
   } catch (err) {
     await lock.release();
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
 
@@ -470,7 +520,7 @@ export async function startCapture(
     type: 'slipstream.capture.scope.v1',
     occurred_at_ms: Date.now(),
     data: scope.policy === 'git'
-      ? { policy: 'git', status: 'active' }
+      ? (slipstreamApplied ? { policy: 'git', status: 'active', slipstream_ignore: 'active' } : { policy: 'git', status: 'active' })
       : { policy: 'filesystem', status: 'active' },
   });
 
@@ -511,7 +561,9 @@ export async function startCapture(
             await appendEvent({
               type: 'slipstream.capture.scope.v1',
               occurred_at_ms: Date.now(),
-              data: { policy: 'git', status: 'unavailable' },
+              data: slipstreamApplied
+                ? { policy: 'git', status: 'unavailable', slipstream_ignore: 'active' }
+                : { policy: 'git', status: 'unavailable' },
             }).then(() => { scopeAvailable = false; }, () => {});
           }
           continue;
@@ -840,6 +892,7 @@ export async function startCapture(
     await engine.drain().catch(() => {});
     await underlying.close().catch(() => {});
     await lock.release();
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
 
@@ -1089,6 +1142,7 @@ export async function startCapture(
     await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
     await underlying.close().catch(record);
     await lock.release().catch(record);
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(record);
     if (firstError !== undefined) throw firstError;
   };
   // Memoized so an overlapping detach + daemon shutdown (both hold the same

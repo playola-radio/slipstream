@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { startCapture, type CaptureSession } from './session.ts';
 import { createLog } from './log.ts';
 import { StorageError } from './storage.ts';
-import { gitCaptureScope, type CaptureScope, type DetectCaptureScope } from './capture-scope.ts';
+import { GIT_TIMEOUT_MS, gitCaptureScope, type CaptureScope, type DetectCaptureScope } from './capture-scope.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import { changesFor, readRecords, waitForRecords, type LoggedRecord } from './test/helpers.ts';
 
@@ -53,8 +53,8 @@ async function withGitRepo(
     await setup(root);
     const platform = createFakePlatform();
     const start: Harness['start'] = async (opts = {}) => {
-      const detectScope: DetectCaptureScope = async (r) => {
-        const real = gitCaptureScope(r) as GitScope;
+      const detectScope: DetectCaptureScope = async (r, slipExcludesFile) => {
+        const real = gitCaptureScope(r, GIT_TIMEOUT_MS, slipExcludesFile) as GitScope;
         return opts.wrap ? opts.wrap(real) : real;
       };
       const s = await startCapture(
@@ -591,6 +591,91 @@ describe('session under the git capture scope', () => {
         await rm(root, { recursive: true, force: true });
         await rm(store, { recursive: true, force: true });
       }
+    });
+
+    it('does not honor a .slipstreamignore without git', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'slip-nogit-'));
+      const store = await mkdtemp(join(tmpdir(), 'slip-gst-'));
+      try {
+        await put(root, '.slipstreamignore', 'scratch.bin\n');
+        await put(root, 'scratch.bin', 'kept: a non-git root ignores the file');
+        const session = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        try {
+          const recs = await readRecords(session.logPath);
+          const [scope] = scopeEvents(recs);
+          assert.equal(scope!.data.policy, 'filesystem');
+          assert.equal('slipstream_ignore' in scope!.data, false);
+          assert.ok(baselined(recs).includes('scratch.bin'));
+        } finally {
+          await session.stop();
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(store, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('the slipstream ignore layer', () => {
+    it('excludes extra paths it names, including a tracked file, and discloses the layer', async () => {
+      await withGitRepo(
+        async (root) => {
+          await put(root, 'tracked-secret.txt', 'committed secret');
+          git(root, 'config', 'user.email', 'test@example.com');
+          git(root, 'config', 'user.name', 'Test');
+          git(root, 'add', 'tracked-secret.txt');
+          git(root, 'commit', '-qm', 'init');
+          await put(root, 'notes.ts', 'kept');
+          await put(root, 'scratch.bin', 'slip-excluded');
+          await put(root, '.slipstreamignore', 'tracked-secret.txt\nscratch.bin\n');
+        },
+        async ({ store, start }) => {
+          const session = await start();
+          const recs = await readRecords(session.logPath);
+          const scope = scopeEvents(recs);
+          assert.equal(scope.length, 1);
+          assert.deepEqual(
+            { ...scope[0]!.data, session_id: undefined },
+            { session_id: undefined, policy: 'git', status: 'active', slipstream_ignore: 'active' },
+          );
+          const b = new Set(baselined(recs));
+          assert.equal(b.has('tracked-secret.txt'), false);
+          assert.equal(b.has('scratch.bin'), false);
+          assert.ok(b.has('notes.ts'));
+          assert.ok(b.has('.slipstreamignore'));
+          assert.equal(await blobExists(store, 'committed secret'), false);
+          assert.equal(await blobExists(store, 'slip-excluded'), false);
+        },
+      );
+    });
+
+    it('refuses to start when .slipstreamignore is not a regular file', async () => {
+      await withGitRepo(
+        async (root) => { await mkdir(join(root, '.slipstreamignore')); },
+        async ({ start }) => {
+          await assert.rejects(start(), /not a regular file/);
+        },
+      );
+    });
+
+    it('freezes the rules so deleting .slipstreamignore mid-capture does not widen scope', async () => {
+      await withGitRepo(
+        async (root) => {
+          await put(root, '.slipstreamignore', 'scratch.bin\n');
+          await put(root, 'notes.ts', 'kept');
+        },
+        async ({ root, platform, start }) => {
+          const session = await start();
+          // The frozen copy still applies even after the source file is gone.
+          await rm(join(root, '.slipstreamignore'), { force: true });
+          await put(root, 'scratch.bin', 'created live');
+          await put(root, 'marker.ts', 'kept');
+          platform.observe('scratch.bin');
+          platform.observe('marker.ts');
+          const recs = await waitForRecords(session.logPath, (r) => changesFor(r, 'marker.ts').length >= 1);
+          assert.equal(changesFor(recs, 'scratch.bin').length, 0);
+        },
+      );
     });
   });
 });

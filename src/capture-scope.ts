@@ -20,7 +20,7 @@ export type CaptureScope =
       ignoredEntries(): Promise<string[]>;
     };
 
-export type DetectCaptureScope = (root: string) => Promise<CaptureScope>;
+export type DetectCaptureScope = (root: string, slipExcludesFile?: string) => Promise<CaptureScope>;
 
 export class GitError extends Error {
   constructor(message: string) {
@@ -86,7 +86,41 @@ function rejectWarnings(command: string, r: GitResult): void {
   if (r.stderr) throw new GitError(`git ${command} warned: ${r.stderr}`);
 }
 
-export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): CaptureScope {
+/**
+ * The root-relative subset of `paths` the slipstream excludes file matches, and
+ * only those: git is asked with that file as its lowest-precedence excludes
+ * source, and `--verbose` lets us keep the paths whose winning rule is the file
+ * itself — never a path a higher-precedence git rule already ignores or keeps.
+ * `--no-index` so the file may exclude tracked paths too, which git never would.
+ */
+async function slipstreamMatched(root: string, slipExcludesFile: string, paths: readonly string[], timeoutMs: number): Promise<string[]> {
+  const r = await runGit(
+    root,
+    ['-c', `core.excludesFile=${slipExcludesFile}`, 'check-ignore', '--no-index', '-z', '--verbose', '--stdin'],
+    paths.map((p) => `${p}\0`).join(''),
+    timeoutMs,
+  );
+  if (r.code !== 0 && r.code !== 1) throw new GitError(`git check-ignore exited ${r.code}: ${r.stderr}`);
+  rejectWarnings('check-ignore', r);
+  // -z --verbose emits repeating NUL-separated groups of (source, linenum,
+  // pattern, pathname), only for paths that match. Keep those whose source is
+  // the slipstream file, so a git rule's match is never miscredited to it. A
+  // negated pattern (`!keep.txt`) is listed as the winning match but un-ignores
+  // the path, so it must not be treated as an exclusion.
+  const fields = r.stdout.split('\0');
+  if (fields.at(-1) === '') fields.pop();
+  const matched: string[] = [];
+  for (let i = 0; i + 3 < fields.length; i += 4) {
+    const pattern = fields[i + 2];
+    const path = fields[i + 3];
+    if (path !== undefined && fields[i] === slipExcludesFile && pattern !== undefined && !pattern.startsWith('!')) {
+      matched.push(path);
+    }
+  }
+  return matched;
+}
+
+export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS, slipExcludesFile?: string): CaptureScope {
   return {
     policy: 'git',
     ignored: async (paths) => {
@@ -96,7 +130,9 @@ export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): Captu
       // partial output from a failed run is never trusted.
       if (r.code !== 0 && r.code !== 1) throw new GitError(`git check-ignore exited ${r.code}: ${r.stderr}`);
       rejectWarnings('check-ignore', r);
-      return new Set(splitNul(r.stdout));
+      const result = new Set(splitNul(r.stdout));
+      if (slipExcludesFile) for (const p of await slipstreamMatched(root, slipExcludesFile, paths, timeoutMs)) result.add(p);
+      return result;
     },
     ignoredEntries: async () => {
       const r = await runGit(
@@ -118,9 +154,9 @@ export function gitCaptureScope(root: string, timeoutMs = GIT_TIMEOUT_MS): Captu
  * a repository git refuses to read — rejects: capture never silently widens
  * to ignored files because git could not be asked.
  */
-export async function detectCaptureScope(root: string): Promise<CaptureScope> {
+export async function detectCaptureScope(root: string, slipExcludesFile?: string): Promise<CaptureScope> {
   const r = await runGit(root, ['rev-parse', '--is-inside-work-tree']);
-  if (r.code === 0 && r.stdout.trim() === 'true') return gitCaptureScope(root);
+  if (r.code === 0 && r.stdout.trim() === 'true') return gitCaptureScope(root, GIT_TIMEOUT_MS, slipExcludesFile);
   if (r.code === 0 && r.stdout.trim() === 'false') return { policy: 'filesystem' };
   // Only git's search-found-nothing message. `not a git repository: '<dir>'`
   // means an explicit GIT_DIR git cannot open, which is a failure.

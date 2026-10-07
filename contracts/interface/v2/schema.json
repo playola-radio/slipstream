@@ -98,8 +98,8 @@
         },
         "policy_exclusions": {
           "type": "array",
-          "items": { "enum": ["store-directory", ".git", "symlinks", "git-ignored"] },
-          "$comment": "Capture policy (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them. Always [\"store-directory\", \".git\", \"symlinks\"], followed by \"git-ignored\" when a capture.scope event with policy git is recorded by after_seq: paths git ignores and does not track are outside capture."
+          "items": { "enum": ["store-directory", ".git", "symlinks", "git-ignored", "slipstream-ignored"] },
+          "$comment": "Capture policy (checked in code; src/schema.ts const is not deep): these targets are never read, and the baseline records no event for them. Always [\"store-directory\", \".git\", \"symlinks\"], followed by \"git-ignored\" when a capture.scope event with policy git is recorded by after_seq: paths git ignores and does not track are outside capture. Then \"slipstream-ignored\" when such an event also carries slipstream_ignore active: a root .slipstreamignore excluded extra paths, including tracked ones."
         }
       }
     },

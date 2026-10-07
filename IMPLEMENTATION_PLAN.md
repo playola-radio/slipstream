@@ -1040,3 +1040,31 @@ now. Design settled through a Codex consult (two rounds).
   files that git does not ignore.
 
 **Status**: Complete.
+
+## G2: A root `.slipstreamignore` for extra exclusions (2026-10-06)
+
+**Decision (Brian, 2026-10-06):** G1 deferred `.slipignore`; this adds it. A
+root `.slipstreamignore` lets the user exclude extra paths from capture — unlike
+`.gitignore`, including files git *tracks* (a committed-but-noisy generated
+file). Single canonical filename (`.slipstreamignore`), root-only, git work tree
+only for now; a non-git root ignores it.
+
+- **Git still decides.** No re-implemented matcher: the file is frozen at
+  capture start and handed to git as its lowest-precedence excludes source
+  (`-c core.excludesFile=<frozen copy>`). `scope.ignored` unions git's own
+  `check-ignore` result with a second `check-ignore --no-index --verbose` pass
+  whose matches are credited to the frozen file. Lowest precedence means the
+  file may only *add* exclusions, never un-ignore what git keeps; `--no-index`
+  means it can exclude tracked files too.
+- **Frozen per capture.** A mid-capture edit does not change the running
+  capture's scope; a restart re-reads the file, matching how git's own rule
+  changes take effect. A file that exists but cannot be read refuses to start
+  (never silently widens scope).
+- **Disclosed in the log.** The `slipstream.capture.scope.v1` event carries
+  `slipstream_ignore: "active"` when the layer is in effect; the interface
+  reader adds a distinct `slipstream-ignored` to `policy_exclusions`, separate
+  from `git-ignored` so a consumer knows why a path was dropped.
+- **Not in scope:** nested `.slipstreamignore` files; honoring the file outside
+  a git work tree; a `.slipignore` alias.
+
+**Status**: Complete.
