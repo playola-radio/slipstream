@@ -117,8 +117,10 @@ All routes: `Cache-Control: no-store`. Unsupported method → `405` with
 `Allow: GET`. Every data route requires bearer auth (see Auth).
 
 ### `GET /v1/sessions`
-JSON array of sessions with minimal metadata: `{ id, durable_seq, removed }`.
+JSON array of sessions with minimal metadata: `{ id, durable_seq, removed, agent_connection }`.
 `durable_seq` is a decimal string. `removed: true` for tombstoned sessions.
+`agent_connection` is defined in the
+[ask-agent contract](../../ask-agent/contract.md#agent-readiness).
 
 ### `GET /v1/sessions/{id}/events?after={seq}&follow={bool}`
 - `after` missing ⇒ `"0"`. Accept only `0` or `[1-9][0-9]*`, else **400**.

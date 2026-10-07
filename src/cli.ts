@@ -15,6 +15,7 @@
  * detached — attach a worktree to begin capture.
  *
  *   slipstream start  [--store <dir>]
+ *   slipstream attach [dir] [--store <dir>]   (from inside the agent chat to connect)
  *   slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id>
  *   slipstream status [--store <dir>]
  *   slipstream detach [--store <dir>]
@@ -24,7 +25,9 @@
  *   slipstream delete <session-id> [--store <dir>]
  *   slipstream gc     [--store <dir>]
  */
-import { readFile, open, lstat, constants } from 'node:fs/promises';
+import { readFile, open, lstat, realpath, constants } from 'node:fs/promises';
+import { spawn, execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
@@ -36,6 +39,7 @@ import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts'
 import { QUESTION_TTL_MS } from './questions.ts';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
+import { runAttachWorkflow } from './attach-workflow.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -275,6 +279,7 @@ function usage(): void {
   console.error('       slipstream serve  [dir] [--store <dir>]');
   console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
+  console.error('       slipstream attach [dir] [--store <dir>]   (run inside the agent chat to connect)');
   console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id> [--root-transcript <path>]');
   console.error('       slipstream hook codex post-tool-use --store <dir>');
   console.error('       slipstream hook claude-code post-tool-use --store <dir>');
@@ -449,6 +454,42 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
   }
 }
 
+/** `slipstream attach` without identity flags connects the chat it runs in. */
+async function runThisChatAttach(dir: string, store: string): Promise<void> {
+  const socketPath = controlSocketPath(store);
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  try {
+    process.exitCode = await runAttachWorkflow({ dir, store }, {
+      env: process.env, home: homedir(), nodePath: process.execPath, cliPath,
+      out: (line) => console.log(line),
+      err: (line) => console.error(line),
+      probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
+      startDaemon: () => {
+        const child = spawn(process.execPath, [cliPath, 'start', '--store', store],
+          { cwd: homedir(), detached: true, stdio: 'ignore' });
+        const exited = new Promise<number | null>((done) => {
+          child.once('exit', (code) => done(code));
+          child.once('error', () => done(null));
+        });
+        child.unref();
+        return { exited };
+      },
+      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
+      run: (command, commandArgs, cwd) => new Promise((done) => {
+        execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
+          const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
+          done({ code, output: `${stdout}${stderr}` });
+        });
+      }),
+    });
+  } catch (err) {
+    if (!(err instanceof OutcomeUnknownError)) throw err;
+    console.error(`slipstream: outcome unknown — ${err.message}`);
+    console.error(`slipstream: ${retryGuidance('attach')}`);
+    process.exitCode = 3;
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (!args) {
@@ -523,6 +564,11 @@ async function main(): Promise<void> {
     await runAskControl(args.store, {
       verb: 'ask', session_id: args.sessionId, request_id: args.requestId, ...input,
     });
+    return;
+  }
+
+  if (args.command === 'attach' && !args.harness && !args.harnessSessionId && !args.rootTranscript) {
+    await runThisChatAttach(args.dir, args.store);
     return;
   }
 

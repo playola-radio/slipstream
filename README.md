@@ -82,6 +82,71 @@ MCP server is a thin stdio forwarder per agent session — verified necessary,
 since each session spawns its own server process — and the daemon owns the store.
 
 
+## Connect an agent chat
+
+From inside the Claude Code or Codex chat you want to connect, run (or ask the
+agent to run) one command in the workspace:
+
+```sh
+slipstream attach
+```
+
+It finds the chat from the harness's own environment, starts the shared daemon
+if it is not running, installs the question hook and the answer tool for that
+harness in this workspace, and starts recording. Nothing needs copying: no chat
+ID, transcript path, Node path, or checkout path.
+
+- **Attached successfully** means both: the workspace is recording *and* the
+  chat proved it can answer. A first attach always starts as `setup_pending`; the
+  chat confirms through a one-time setup check on its next tool call. Until then
+  the Slipstream app shows Ask Agent as unavailable and questions are refused
+  with `AGENT_NOT_CONNECTED`.
+- If attach had to install the hook or tool, the running chat must reload to see
+  them. Attach prints the exact step: `claude --resume <id>` or
+  `codex resume <id>` in the workspace, then `slipstream attach` again. The
+  conversation is kept. Codex runs the new hook only after you trust it in
+  Codex's own hook review.
+- Running it again in the same chat reports the existing capture; it never starts
+  a second recording or changes the binding.
+- One workspace is recorded at a time. If another workspace or another chat is
+  recorded, attach explains and changes nothing; run `slipstream detach` there
+  first.
+- Attach refuses, recording nothing, when it cannot tell which chat it is in,
+  when the chat's transcript cannot be found, or when the harness version is not
+  one Slipstream has verified. It never falls back to recording without an agent.
+
+Files it writes, merging with what is already there and never duplicating its
+own entry: Claude Code gets a `PostToolUse` hook in `.claude/settings.local.json`
+and a local-scope `slipstream` MCP server (via `claude mcp add --scope local`);
+Codex gets a hook in `.codex/hooks.json` and a `[mcp_servers.slipstream]` table
+in `.codex/config.toml`. Unrelated hooks, servers, and permissions are kept. An
+existing Slipstream entry pointing somewhere else is reported, not replaced,
+and symlinked config is refused rather than followed. These files hold local
+paths, so keep them out of commits; attach does not edit git ignore rules. The
+host's own trust and approval prompts still apply: Codex may ask you to trust
+the hook, and both harnesses ask before the first answer-tool call unless you
+approve it.
+
+Limitations:
+
+- Verified runtimes only: Claude Code 2.1.283 started with `claude -p` and
+  2.1.280 in Conductor; Codex 0.154.0 and 0.155.1 launched through its SDK
+  (`exec` or `vscode` source). Other versions, and interactive `claude` or
+  `codex exec` chats, are refused rather than guessed at. The Claude Code and
+  Codex versions Conductor ships today are outside this set, so Conductor chats
+  are refused for now. See the
+  [acceptance record](docs/ask-agent/attach-acceptance-2026-10-07.md).
+- Codex SDK chats, including Conductor's, never show Codex's hook review. Run
+  `codex` once in the workspace and trust the Slipstream hook there; attach
+  prints this step.
+- A Codex chat in the `workspace-write` sandbox cannot write `.codex/`; attach
+  refuses and says so.
+- A connected chat stays connected until detach; there is no heartbeat, so a
+  chat that has since closed still shows as connected.
+- Conductor has no verified way to reload a running chat's hooks and tools, so a
+  Conductor chat that needed new config stays pending until it confirms.
+- One chat per workspace, no chat picker.
+
 ## Queue a question about a captured change
 
 With the shared daemon running (`slipstream start`) and explicitly attached to a
@@ -122,10 +187,10 @@ to an agent or answered. Read `slipstream.question.queued.v1` through the existi
 authenticated `GET /v1/sessions/<id>/events` endpoint; its self-contained schema is
 available at `GET /v1/schemas/slipstream.question.queued.v1`.
 
-Codex and Claude Code delivery require an explicit root transcript binding at
-`attach` and a `PostToolUse` hook configured before the chat starts. See
-[the delivery contract](docs/ask-agent/contract.md#delivery-through-posttooluse)
-for the control fields and setup. The public
+Delivery needs a connected agent chat (see "Connect an agent chat" above).
+[The delivery contract](docs/ask-agent/contract.md#delivery-through-posttooluse)
+documents the control fields and the manual setup that `slipstream attach`
+automates. The public
 `slipstream.question.dispatch_attempted.v1` event means the daemon committed an
 attempt before answering the hook; it does not confirm receipt or an answer.
 Attach Claude shortly after its first root tool call, and keep the chat's
@@ -135,7 +200,8 @@ Retry with the **same request ID, capture ID and input**. Same-ID/body retries
 return the original result without extending the 30-minute TTL. A changed body
 returns `REQUEST_CONFLICT`; more than 16 unexpired questions returns
 `QUESTION_LIMIT`. Other domain errors are `INVALID_QUESTION`, `INVALID_CONTEXT`,
-`SESSION_NOT_SELECTED`, `CAPTURE_NOT_READY`, and `STORAGE_UNAVAILABLE`. Errors
+`SESSION_NOT_SELECTED`, `AGENT_NOT_CONNECTED`, `CAPTURE_NOT_READY`, and
+`STORAGE_UNAVAILABLE`. Errors
 print structured JSON on stderr (exit 1); local file/syntax errors exit 2.
 `STORAGE_UNAVAILABLE`, or a lost/malformed response after transmission, exits 3:
 the outcome is unknown and the record may already be committed. Preserve the same

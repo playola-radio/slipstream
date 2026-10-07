@@ -110,6 +110,16 @@ To let Codex return answers, also:
   project hooks from the chat's own workspace, so a Conductor workspace does not
   read the main checkout's copy.
 
+## Per-workspace setup with `slipstream attach`
+
+Running `slipstream attach` with no identity flags from inside a chat installs
+the forwarder and the question hook for that chat's harness in that workspace
+only (Claude Code: a local-scope server via `claude mcp add --scope local`;
+Codex: `[mcp_servers.slipstream]` in the workspace's `.codex/config.toml`),
+using the absolute Node and Slipstream paths of the command you ran. It does not
+add the approval line above; approve the answer tool through the host's normal
+prompt. See the README, "Connect an agent chat".
+
 ## After installing
 
 MCP servers and hooks load only when a chat starts. Start a new chat after

@@ -312,6 +312,76 @@ it('serve releases the capture lock when reader descriptor publication fails', a
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+describe('cli attach (one command)', () => {
+  const sessionId = '11111111-2222-4333-8444-555555555555';
+  const cleanEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, ...extra };
+    return env;
+  };
+  const run = async (args: string[], env: NodeJS.ProcessEnv) => {
+    const { execFile } = await import('node:child_process');
+    return new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+      execFile(process.execPath, ['src/cli.ts', ...args], { env, timeout: 20_000 }, (error, stdout, stderr) =>
+        done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+    });
+  };
+
+  it('refuses outside an agent chat without starting a daemon', async () => {
+    const { mkdtemp, mkdir, access, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-attach-'));
+    try {
+      await mkdir(join(dir, 'work'));
+      const result = await run(['attach', join(dir, 'work'), '--store', join(dir, 'store')], cleanEnv({ HOME: dir }));
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /no Claude Code or Codex chat detected/);
+      await assert.rejects(access(join(dir, 'store')), { code: 'ENOENT' });
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('starts a stopped daemon, records once, and reuses the capture on a repeat', async () => {
+    const { mkdtemp, mkdir, writeFile, readFile, realpath, chmod, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-attach-')));
+    const work = join(dir, 'work'); const store = join(dir, 'store'); const config = join(dir, 'claude');
+    let pid: number | undefined;
+    try {
+      await mkdir(work);
+      await mkdir(join(config, 'projects', 'p'), { recursive: true });
+      await writeFile(join(config, 'projects', 'p', `${sessionId}.jsonl`), `${JSON.stringify({ type: 'user',
+        sessionId, cwd: work, version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false })}\n`);
+      const fakeClaude = join(dir, 'claude-bin');
+      // Stands in for `claude mcp add --scope local`: record the call and the local server entry.
+      await writeFile(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\n`
+        + `const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(join(dir, 'claude-calls'))}, args.join(' ') + '\\n');\n`
+        + `const sep = args.indexOf('--'); fs.writeFileSync(${JSON.stringify(join(config, '.claude.json'))}, JSON.stringify({ projects: `
+        + `{ [process.cwd()]: { mcpServers: { slipstream: { type: 'stdio', command: args[sep + 1], args: args.slice(sep + 2) } } } } }));\n`);
+      await chmod(fakeClaude, 0o755);
+      const env = cleanEnv({ HOME: dir, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SESSION_ID: sessionId,
+        CLAUDE_CODE_EXECPATH: fakeClaude });
+      const first = await run(['attach', work, '--store', store], env);
+      pid = (JSON.parse(await readFile(join(store, 'owner.lock'), 'utf8')) as { pid: number }).pid;
+      assert.equal(first.code, 0, first.stderr);
+      assert.match(first.stdout, /Recording .*; agent setup pending/);
+      const capture = /session_id: (\S+)/.exec(first.stdout)?.[1];
+      const second = await run(['attach', work, '--store', store], env);
+      assert.equal(second.code, 0, second.stderr);
+      assert.match(second.stdout, /Already recording/);
+      assert.equal(/session_id: (\S+)/.exec(second.stdout)?.[1], capture);
+      assert.equal((await readFile(join(dir, 'claude-calls'), 'utf8')).split('\n').filter(Boolean).length, 1);
+    } finally {
+      if (pid !== undefined) {
+        process.kill(pid, 'SIGTERM');
+        const { probeSocket } = await import('./daemon.ts');
+        while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
     assert.deepEqual(parseArgs(['start', '--store', '/s']), {
@@ -348,7 +418,7 @@ describe('cli parseArgs (daemon commands)', () => {
       { command: 'attach', dir: '/w', store: '/s', harness: 'claude-code', harnessSessionId: 'abc' },
     );
   });
-  it('parses attach with no identity flags (daemon fails it closed, not the parser)', () => {
+  it('parses attach with no identity flags (the one-command workflow detects the chat)', () => {
     const parsed = parseArgs(['attach', '/w', '--store', '/s']);
     assert.equal(parsed?.command, 'attach');
     assert.equal(parsed && 'harness' in parsed ? parsed.harness : 'set', undefined);

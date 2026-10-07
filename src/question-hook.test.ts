@@ -236,3 +236,25 @@ it('switches to the raw path block only past the cap and rejects a reply outside
     }
   });
 });
+
+it('delivers a setup check as an instruction to return it through the answer tool', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-hook-check-'));
+  const checkId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  let reply: unknown = { v: 1, ok: true, question: null, setup_check: { check_id: checkId } };
+  const server = createServer(socket => {
+    socket.on('data', () => socket.end(JSON.stringify(reply) + '\n'));
+  });
+  await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
+  try {
+    const output = await claudePostToolUse(callback, dir);
+    const text = JSON.parse(output!).hookSpecificOutput.additionalContext as string;
+    assert.match(text, new RegExp(`slipstream_answer_question tool with question_id ${checkId}`));
+    assert.match(text, /not available/);
+    for (const bad of [{ check_id: 'not-a-uuid' }, {}, null, 'x']) {
+      reply = { v: 1, ok: true, question: null, setup_check: bad };
+      assert.equal(await claudePostToolUse(callback, dir), null, JSON.stringify(bad));
+    }
+    reply = { v: 1, ok: true, question: null };
+    assert.equal(await claudePostToolUse(callback, dir), null);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); await rm(dir, { recursive: true, force: true }); }
+});

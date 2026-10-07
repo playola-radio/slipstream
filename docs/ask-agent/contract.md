@@ -45,14 +45,14 @@ interface AskRejected {
   ok: false;
   code: 'PROTOCOL' | 'SESSION_NOT_SELECTED' | 'CAPTURE_NOT_READY'
     | 'STORAGE_UNAVAILABLE' | 'INVALID_QUESTION' | 'INVALID_CONTEXT'
-    | 'REQUEST_CONFLICT' | 'QUESTION_LIMIT';
+    | 'REQUEST_CONFLICT' | 'QUESTION_LIMIT' | 'AGENT_NOT_CONNECTED';
   message: string;
 }
 ```
 
 `ok:true` acknowledges a durable queue record for the bound session, never delivery, model receipt, or an answer. The CLI prints acknowledgment/error metadata; it must not print bearer tokens or unnecessary source text.
 
-Protocol framing/version/invalid request_id errors use `PROTOCOL`; text errors use `INVALID_QUESTION`; invalid source identity, range, or unavailable source use `INVALID_CONTEXT`. A broken/unhealthy store uses `STORAGE_UNAVAILABLE` rather than pretending source is empty. `CAPTURE_NOT_READY` retains existing readiness semantics. A mismatched/replaced/inactive capture is `SESSION_NOT_SELECTED`, never an invitation to auto-retarget.
+Protocol framing/version/invalid request_id errors use `PROTOCOL`; text errors use `INVALID_QUESTION`; invalid source identity, range, or unavailable source use `INVALID_CONTEXT`. A broken/unhealthy store uses `STORAGE_UNAVAILABLE` rather than pretending source is empty. `CAPTURE_NOT_READY` retains existing readiness semantics. A mismatched/replaced/inactive capture is `SESSION_NOT_SELECTED`, never an invitation to auto-retarget. A selected capture whose agent chat has not completed the setup check (or that has no verified root chat) is `AGENT_NOT_CONNECTED`; see [Agent readiness](#agent-readiness).
 
 For `ask`, `STORAGE_UNAVAILABLE` is conservatively **outcome unknown**: an append
 may already be committed even when its acknowledgment failed. Keep the original
@@ -129,7 +129,7 @@ canonical cwd, `codex_sdk_ts` originator, observed `exec`/`vscode` source, and
 an observed supported CLI version (`0.154.0` or `0.155.1`). A missing, malformed,
 oversize or mismatched record fails attachment. The daemon holds the canonical
 path in the active binding. Existing capture-only attaches continue to work but cannot
-claim. `slipstream attach <worktree> --store <dir> --harness codex
+claim or accept questions. `slipstream attach <worktree> --store <dir> --harness codex
 --harness-session-id <root-hook-session-id> --root-transcript <root-hook-transcript-path>`
 sets the binding. Use the root callback's identity, never the first callback that
 arrives after attach. The active `status` response includes `root_transcript`
@@ -205,7 +205,9 @@ workspace copy was observed to inherit the main checkout's hook trust without a
 new prompt; that is an observation, not a traced guarantee. Review and trust this exact command through
 Codex's normal hook trust flow before the chat starts. The hook's ability to
 connect to the daemon's external Unix socket depends on the selected sandbox
-configuration. Installation does not bypass trust or launch an agent. This slice has no global automatic installer or Conductor API
+configuration. Installation does not bypass trust or launch an agent. `slipstream attach` run with no
+identity flags from inside the chat writes this entry for its own workspace only
+(README, "Connect an agent chat"); there is no global installer and no Conductor API
 dependency.
 
 ### D3 Claude Code binding and hook
@@ -259,7 +261,8 @@ file, following the host's normal hook trust flow. The hook sends a bounded
 `hookSpecificOutput.additionalContext` of at most 32 KiB on success and is
 silent on missing identity or failure. The daemon commits the public attempt
 before the hook reply. Neither that event nor stdout proves the model saw the
-question. No hook is automatically installed or trusted.
+question. `slipstream attach` with no identity flags installs this hook in the
+chat's own workspace; it never trusts or approves it on the host's behalf.
 
 ## Answer return (D4)
 
@@ -383,3 +386,50 @@ turn is Waiting is a client rule. The delivered follow-up names its parent on
 the line after the question text:
 
 > This follows up Slipstream question <reply_to_question_id> about the same source.
+
+## Agent readiness
+
+A verified root binding is not proof that the chat can receive a question and
+call the answer tool: configuration may be missing, the chat may need a reload,
+or the host may deny the tool. The daemon therefore admits questions only after
+one real round trip through the same path a question takes.
+
+- `attach` with a `root_transcript` appends
+  `slipstream.agent.connection.v1` with `state: "setup_pending"` and the chat
+  as `target` (`harness`, `harness_session_id`), and arms a private setup check. Its ID appears in no status,
+  attach reply, or public event.
+- The bound root's next `claim_question` replies
+  `{"v":1,"ok":true,"question":null,"setup_check":{"check_id":"<uuid>"}}`, once
+  per arm. The hook turns it into context asking the chat to call
+  `slipstream_answer_question` with that ID and the text `connected`.
+- The answer passes the normal `answer_question` identity checks (only the bound
+  chat, harness and worktree). The daemon then appends
+  `slipstream.agent.connection.v1` with `state: "connected"` and acknowledges
+  with the answer-ack shape; a resend replays it with `duplicate: true`.
+- Until then, `ask` returns `AGENT_NOT_CONNECTED`. A capture-only attach never
+  becomes connected.
+- Every `status` reply lists `attach_features: ["agent-connection-v1"]`. A
+  daemon without it predates the setup check, so `slipstream attach` refuses
+  rather than install config that daemon would never confirm.
+
+`connected` proves the round trip at the time of the event, not afterwards.
+There is no heartbeat or expiry: a chat that exits after connecting still shows
+`connected` until detach. Liveness of the capture itself comes from
+`GET /v1/sessions`, whose items carry `agent_connection`:
+
+```ts
+type AgentConnection =
+  | { state: 'connected' | 'setup_pending' }
+  | { state: 'disconnected'; reason: 'capture_not_live' | 'no_agent' };
+```
+
+`capture_not_live` covers detached, replaced, removed and pre-readiness
+recordings; old logs stay readable and their questions stay bound to them.
+
+`attach` is idempotent for the active binding. The same worktree (after
+canonicalization), harness and chat returns the same `session_id` with
+`already_active: true` and the current `agent_connection`; a pending check is
+re-armed so the next root callback delivers it again. Another chat in the same
+worktree, or any other worktree, returns `SESSION_ACTIVE` naming what is being
+recorded, and the existing binding is unchanged.
+
