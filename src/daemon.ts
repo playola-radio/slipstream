@@ -358,7 +358,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const readerRef = reader;
 
   function statusFields(): Record<string, unknown> {
-    const fields: Record<string, unknown> = { state, reader_url: readerRef.url };
+    const fields: Record<string, unknown> = { state, reader_url: readerRef.url,
+      attach_features: ['agent-connection-v1'] };
     if (current) {
       // session_id is capture SCOPE, never authorship. The declared identity is the
       // exact context the caller bound; semantic verification is the P4 forwarder's.

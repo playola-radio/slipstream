@@ -49,7 +49,7 @@ async function codexTranscript(f: Fixture, version = '0.155.1'): Promise<string>
   return path;
 }
 
-interface Daemon { live: boolean; status?: Record<string, unknown>; attach?: Record<string, unknown> }
+interface Daemon { live: boolean; legacy?: boolean; status?: Record<string, unknown>; attach?: Record<string, unknown> }
 
 function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDeps {
   return {
@@ -60,7 +60,8 @@ function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDe
     startDaemon: () => { f.started += 1; daemon.live = true; return { exited: new Promise(() => {}) }; },
     control: async (req) => {
       f.requests.push(req);
-      const fields = req.verb === 'status' ? daemon.status ?? { state: 'detached' }
+      const fields = req.verb === 'status'
+        ? { attach_features: daemon.legacy ? undefined : ['agent-connection-v1'], state: 'detached', ...daemon.status }
         : daemon.attach ?? { session_id: 'cap-1', agent_connection: 'setup_pending' };
       return { v: 1, ok: true, ...fields } as ResponseEnvelope;
     },
@@ -114,6 +115,22 @@ describe('slipstream attach (one command)', () => {
       assert.match(out, new RegExp(`claude --resume ${CLAUDE_ID}`));
       assert.doesNotMatch(out, /Attached successfully/);
       assert.match(out, /session_id: cap-1\nagent_connection: setup_pending$/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a live daemon without setup-check support before changing config or attaching', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, {
+        live: true, legacy: true, status: { state: 'detached' },
+      }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /running daemon does not support chat setup checks/);
+      assert.match(f.err.join('\n'), new RegExp(`slipstream stop --store ${f.store}`));
+      assert.equal(attachRequests(f).length, 0);
+      await assert.rejects(stat(join(f.worktree, '.claude')));
+      assert.deepEqual(f.commands, []);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
@@ -247,6 +264,34 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
+  it('uses an identical user-scope Claude server without adding a duplicate local server', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      await mkdir(f.home, { recursive: true });
+      await writeFile(join(f.home, '.claude.json'), JSON.stringify({ mcpServers: { slipstream: {
+        command: NODE, args: [join(f.root, 'pkg', 'mcp-forwarder.js'), '--store', f.store],
+      } } }));
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
+      assert.equal(code, 0, f.err.join('\n'));
+      assert.deepEqual(f.commands, []);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a different user-scope Codex server before changing workspace config or attaching', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      await mkdir(join(f.home, '.codex'), { recursive: true });
+      await writeFile(join(f.home, '.codex', 'config.toml'), '[mcp_servers.slipstream]\ncommand = "elsewhere"\n');
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /user-wide `slipstream` MCP server/);
+      assert.equal(attachRequests(f).length, 0);
+      await assert.rejects(stat(join(f.worktree, '.codex')));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
   it('explains a daemon that does not come up instead of attaching', async () => {
     const f = await fixture();
     try {
@@ -266,7 +311,7 @@ describe('slipstream attach (one command)', () => {
       await claudeTranscript(f);
       const d = deps(f, claudeEnv, { live: true });
       d.control = async (req) => req.verb === 'status'
-        ? { v: 1, ok: true, state: 'detached' } as ResponseEnvelope
+        ? { v: 1, ok: true, state: 'detached', attach_features: ['agent-connection-v1'] } as ResponseEnvelope
         : { v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'disk full' } as ResponseEnvelope;
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
       assert.equal(code, 1);

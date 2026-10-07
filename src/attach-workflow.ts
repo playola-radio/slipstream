@@ -60,6 +60,7 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   await ensureDaemon(opts.store, deps);
   const status = await deps.control({ verb: 'status' });
   if (!status.ok) throw new Refusal(`${status.code}: ${status.message}`);
+  requireSetupCheck(status, opts.store);
   refuseOtherBinding(status, chat, worktree);
 
   const changed = await applyAgentConfig(plan, worktree, deps);
@@ -81,6 +82,13 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   deps.out(`session_id: ${String(res.session_id)}`);
   deps.out(`agent_connection: ${connection}`);
   return 0;
+}
+
+function requireSetupCheck(status: Record<string, unknown>, store: string): void {
+  const features = status.attach_features;
+  if (Array.isArray(features) && features.includes('agent-connection-v1')) return;
+  throw new Refusal('the running daemon does not support chat setup checks. Run '
+    + `\`slipstream stop --store ${store}\`, then \`slipstream attach --store ${store}\` again. Nothing was installed or recorded.`);
 }
 
 function detectChat(env: Record<string, string | undefined>): Chat {
@@ -228,7 +236,10 @@ async function planAgentConfig(chat: Chat, worktree: string, store: string, deps
   const hookEdit = await planHook(join(worktree, hookFile), hook);
   const toolArgs = [forwarder, '--store', store];
   if (chat.harness === 'codex') {
-    return { hookEdit, toolEdit: await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs),
+    const userConfig = join(deps.env.CODEX_HOME ?? join(deps.home, '.codex'), 'config.toml');
+    const userTool = await readCodexTool(userConfig, deps.nodePath, toolArgs, 'user-wide');
+    return { hookEdit, toolEdit: userTool ? null
+      : await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs),
       claudeTool: null };
   }
   const missing = await claudeToolMissing(chat, worktree, deps, toolArgs);
@@ -317,25 +328,39 @@ async function planHook(path: string, command: string): Promise<Edit | null> {
  * appends it as text so the rest of the file stays byte-for-byte unchanged. */
 async function planCodexTool(path: string, node: string, args: string[]): Promise<Edit | null> {
   const text = await readWorkspaceConfig(path);
+  const existing = codexToolMatches(path, text, node, args, 'workspace');
+  if (existing) return null;
   const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
     + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
   if (text === null) return { path, text: block, original: null };
+  const lines = text.split('\n');
+  const sep = text === '' ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
+  return { path, text: `${text}${sep}${block}`, original: text };
+}
+
+async function readCodexTool(path: string, node: string, args: string[], scope: string): Promise<boolean> {
+  return codexToolMatches(path, await readConfig(path), node, args, scope);
+}
+
+function codexToolMatches(path: string, text: string | null, node: string, args: string[], scope: string): boolean {
+  if (text === null) return false;
+  const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
+    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
   const lines = text.split('\n');
   const header = lines.findIndex((l) => l.trim() === '[mcp_servers.slipstream]');
   if (header >= 0) {
     let end = lines.findIndex((l, i) => i > header && l.trim().startsWith('['));
     if (end < 0) end = lines.length;
     const current = lines.slice(header, end).filter((l) => l.trim() !== '').join('\n');
-    if (current === block.trimEnd()) return null;
-    throw new Refusal(`${path} already has a different Slipstream server entry. It was kept; remove it or make it `
+    if (current === block.trimEnd()) return true;
+    throw new Refusal(`${path} already has a different Slipstream server entry (${scope} \`slipstream\` MCP server). It was kept; remove it or make it `
       + `match:\n${block}Nothing was recorded.`);
   }
   if (lines.some(unsafeServerLine)) {
-    throw new Refusal(`${path} declares MCP servers in a form attach cannot safely edit. Add this entry by hand:\n`
+    throw new Refusal(`${path} declares MCP servers in a form attach cannot safely edit or inspect. Add this entry by hand:\n`
       + `${block}Nothing was recorded.`);
   }
-  const sep = text === '' ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
-  return { path, text: `${text}${sep}${block}`, original: text };
+  return false;
 }
 
 /** Only plain `[mcp_servers.<other name>]` tables are understood; any other
@@ -359,17 +384,22 @@ async function claudeToolMissing(chat: Chat, worktree: string, deps: AttachDeps,
   const path = configDir ? join(configDir, '.claude.json') : join(deps.home, '.claude.json');
   const text = await readConfig(path);
   if (text === null) return true;
-  let server: { command?: unknown; args?: unknown } | undefined;
+  let local: { command?: unknown; args?: unknown } | undefined;
+  let user: { command?: unknown; args?: unknown } | undefined;
   try {
-    const config = JSON.parse(text) as { projects?: Record<string, { mcpServers?: Record<string, typeof server> }> };
-    server = config.projects?.[worktree]?.mcpServers?.slipstream;
+    const config = JSON.parse(text) as { mcpServers?: Record<string, typeof user>;
+      projects?: Record<string, { mcpServers?: Record<string, typeof local> }> };
+    local = config.projects?.[worktree]?.mcpServers?.slipstream;
+    user = config.mcpServers?.slipstream;
   } catch { throw new Refusal(`${path} is not valid JSON; cannot check for an existing Slipstream answer tool.`); }
-  if (server === undefined) return true;
-  if (server !== null && typeof server === 'object' && server.command === deps.nodePath
-    && JSON.stringify(server.args) === JSON.stringify(args)) return false;
-  throw new Refusal(`this workspace already has a different \`slipstream\` MCP server for ${chat.harness} `
-    + '(see `claude mcp get slipstream`). It was kept; remove it with `claude mcp remove --scope local slipstream` '
-    + 'or make it use this store. Nothing was recorded.');
+  for (const [scope, server] of [['workspace', local], ['user-wide', user]] as const) {
+    if (server === undefined) continue;
+    if (server !== null && typeof server === 'object' && server.command === deps.nodePath
+      && JSON.stringify(server.args) === JSON.stringify(args)) return false;
+    throw new Refusal(`this ${scope} has a different \`slipstream\` MCP server for ${chat.harness} `
+      + '(see `claude mcp get slipstream`). It was kept; remove it or make it use this store. Nothing was recorded.');
+  }
+  return true;
 }
 
 /** Replace a planned file atomically, refusing if it changed since planning. A
