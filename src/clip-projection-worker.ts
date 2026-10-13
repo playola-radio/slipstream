@@ -9,6 +9,7 @@
  */
 import { parentPort } from 'node:worker_threads';
 import { computeClipProjection, type ClipJob } from './clip-blob-reader.ts';
+import { warmFunctionIndexers } from './clip-function-parser.ts';
 
 export interface ClipWorkerRequest { id: number; job: ClipJob; traceTimings?: boolean }
 export type ClipWorkerResponse =
@@ -18,6 +19,10 @@ export type ClipWorkerResponse =
 
 if (!parentPort) throw new Error('clip-projection-worker must run as a worker thread');
 const port = parentPort;
+
+// A replacement worker would otherwise pay parser startup inside its first job's
+// deadline. Warm failures are not retained; a job's own load reports them.
+void warmFunctionIndexers().catch(() => {});
 
 port.on('message', (msg: ClipWorkerRequest) => {
   const traceTimings: Array<{ phase: string; durationNs: bigint }> | undefined = msg.traceTimings ? [] : undefined;
