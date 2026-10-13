@@ -88,7 +88,7 @@ function requireSetupCheck(status: Record<string, unknown>, store: string): void
   const features = status.attach_features;
   if (Array.isArray(features) && features.includes('agent-connection-v1')) return;
   throw new Refusal('the running daemon does not support chat setup checks. Run '
-    + `\`slipstream stop --store ${store}\`, then \`slipstream attach --store ${store}\` again. Nothing was installed or recorded.`);
+    + `\`slipstream stop --store ${shellWord(store)}\`, then \`slipstream attach --store ${shellWord(store)}\` again. Nothing was installed or recorded.`);
 }
 
 function detectChat(env: Record<string, string | undefined>): Chat {
@@ -238,8 +238,10 @@ async function planAgentConfig(chat: Chat, worktree: string, store: string, deps
   if (chat.harness === 'codex') {
     const userConfig = join(deps.env.CODEX_HOME ?? join(deps.home, '.codex'), 'config.toml');
     const userTool = await readCodexTool(userConfig, deps.nodePath, toolArgs, 'user-wide');
-    return { hookEdit, toolEdit: userTool ? null
-      : await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs),
+    // A project server takes precedence over the user-wide server. Plan it even
+    // when the user entry matches so a conflicting project entry is refused.
+    const projectTool = await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs);
+    return { hookEdit, toolEdit: userTool ? null : projectTool,
       claudeTool: null };
   }
   const missing = await claudeToolMissing(chat, worktree, deps, toolArgs);

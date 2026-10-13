@@ -22,7 +22,7 @@ const port = parentPort;
 
 // A replacement worker would otherwise pay parser startup inside its first job's
 // deadline. Warm failures are not retained; a job's own load reports them.
-void warmFunctionIndexers().catch(() => {});
+void warmFunctionIndexers().catch(() => {}).then(() => port.postMessage({ kind: 'ready' }));
 
 port.on('message', (msg: ClipWorkerRequest) => {
   const traceTimings: Array<{ phase: string; durationNs: bigint }> | undefined = msg.traceTimings ? [] : undefined;

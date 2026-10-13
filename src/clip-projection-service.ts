@@ -210,6 +210,19 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
 
+    // Eager worker warm-up is deliberately outside the request budget. A
+    // replacement may arrive while waiting, so ensure the currently installed
+    // worker is ready before admitting work to its deadline.
+    if (opts.compute?.ready) {
+      await opts.compute.ready;
+    } else if (pool) {
+      let ready: Promise<void>;
+      do {
+        ready = pool.ready;
+        await ready;
+      } while (ready !== pool.ready);
+    }
+
     // Only the coalescing leader's `run` is ever invoked (the budget calls it
     // once per flight); a coalesced waiter never sees this flip, so only the
     // leader writes the cache entry — waiters would otherwise redundantly

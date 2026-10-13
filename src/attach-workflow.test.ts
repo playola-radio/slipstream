@@ -134,6 +134,20 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
+  it('quotes a spaced store path in the legacy-daemon recovery instructions', async () => {
+    const f = await fixture();
+    try {
+      f.store = join(f.root, 'store with spaces');
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, {
+        live: true, legacy: true, status: { state: 'detached' },
+      }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /slipstream stop --store '.*store with spaces'/);
+      assert.match(f.err.join('\n'), /slipstream attach --store '.*store with spaces'/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
   it('repeats without changing config or capture and says so', async () => {
     const f = await fixture();
     try {
@@ -289,6 +303,25 @@ describe('slipstream attach (one command)', () => {
       assert.match(f.err.join('\n'), /user-wide `slipstream` MCP server/);
       assert.equal(attachRequests(f).length, 0);
       await assert.rejects(stat(join(f.worktree, '.codex')));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a conflicting project Codex server even when the user-wide server matches', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      const args = [join(f.root, 'pkg', 'mcp-forwarder.js'), '--store', f.store];
+      await mkdir(join(f.home, '.codex'), { recursive: true });
+      await writeFile(join(f.home, '.codex', 'config.toml'), `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(NODE)}\n`
+        + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`);
+      await mkdir(join(f.worktree, '.codex'));
+      const project = '[mcp_servers.slipstream]\ncommand = "elsewhere"\n';
+      await writeFile(join(f.worktree, '.codex', 'config.toml'), project);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /workspace `slipstream` MCP server/);
+      assert.equal(await readFile(join(f.worktree, '.codex', 'config.toml'), 'utf8'), project);
+      assert.equal(attachRequests(f).length, 0);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
