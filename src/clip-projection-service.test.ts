@@ -217,7 +217,7 @@ test('worker readiness completes before the clip deadline starts', async (t) => 
   try {
     let settled = false;
     const result = svc.get(contentReq('1', 1)).then(value => { settled = true; return value; });
-    t.mock.timers.tick(11);
+    t.mock.timers.tick(9);
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(settled, false);
     assert.equal(computes, 0);
@@ -225,6 +225,25 @@ test('worker readiness completes before the clip deadline starts', async (t) => 
     assert.equal((await result).fallback_reason, 'function-extraction-unavailable');
     assert.equal(computes, 1);
   } finally { releaseReady(); await svc.close(); }
+});
+
+test('a worker still warming after one deadline yields a transient timeout without dispatch', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let computes = 0;
+  const compute = Object.assign(((job: Parameters<ClipCompute>[0]) => {
+    computes++;
+    return { promise: Promise.resolve(fallback(job.opts.changeSeq)), cancel: () => {} };
+  }) satisfies ClipCompute, { ready: new Promise<void>(() => {}) });
+  const svc = createClipProjectionService({ storeDir: STORE, hasBlob: alwaysPresent, deadlineMs: 10, compute });
+  try {
+    const result = svc.get(contentReq('1', 1));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    t.mock.timers.tick(10);
+    const value = await result;
+    assert.equal(value.status, 'skipped');
+    assert.equal(value.fallback_reason, 'timeout');
+    assert.equal(computes, 0);
+  } finally { await svc.close(); }
 });
 
 test('a coalesced waiter does not redundantly re-write the leader\'s cache entry', async (t) => {
@@ -468,8 +487,10 @@ test('close awaits the busy worker terminated by admission cancellation, not jus
 
   const storeDir = await mkdtemp(join(tmpdir(), 'slip-clipsvc-close-'));
   const events: ProjectionTraceEvent[] = [];
+  let dispatched!: () => void;
+  const dispatchedToWorker = new Promise<void>(resolve => { dispatched = resolve; });
   const svc = createClipProjectionService({ storeDir, deadlineMs: 60_000,
-    projectionTrace: event => events.push(event) });
+    projectionTrace: event => { events.push(event); if (event.kind === 'parser-request') dispatched(); } });
   const cas = await createCas(join(storeDir, 'blobs'));
   const beforeRef = await cas.put(Buffer.from('a\nb\nc\n', 'utf8'));
   const afterRef = await cas.put(Buffer.from('a\nB\nc\n', 'utf8'));
@@ -479,11 +500,9 @@ test('close awaits the busy worker terminated by admission cancellation, not jus
   let closePromise: Promise<void> | undefined;
   try {
     const pending = svc.get({ changeSeq: '1', before, after, traceRouteKey: '/closed-clips' }); // admitted, running
-    // Wait until the warmed worker has actually received the job before
-    // closing; startup readiness is deliberately outside the request budget.
-    for (let i = 0; i < 100 && !events.some(event => event.kind === 'parser-request'); i++)
-      await new Promise((r) => setTimeout(r, 1));
-    assert.ok(events.some(event => event.kind === 'parser-request'));
+    // Close in the same turn the job is posted, so a warm worker cannot have
+    // replied yet; startup readiness is deliberately outside the request budget.
+    await dispatchedToWorker;
 
     let closed = false;
     closePromise = svc.close().then(() => { closed = true; });
