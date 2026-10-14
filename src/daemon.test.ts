@@ -1,17 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';
-import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, readdir, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
-import { blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
+import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
 import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import type { PublicEventInput } from './public-events.ts';
 
 const IDENTITY = { harness: 'claude-code', harness_session_id: 'abc123' };
 const ASK_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -297,11 +298,14 @@ describe('daemon control verbs', () => {
       release();
       const result = await stale;
       assert.equal(result.ok === false && result.code, 'SESSION_NOT_SELECTED');
-      const retargeted = await call(answer);
-      assert.equal(retargeted.ok === false && retargeted.code, 'QUESTION_NOT_FOUND');
-      const oldEvents = (await readFile(sessionLogPath(store, rec(first).session_id!), 'utf8')).trim().split('\n')
+      // The stale answer wrote nothing, so this first accepted answer is not a duplicate
+      // replay. An attempted question keeps its answer handling across a resume.
+      const retried = await call(answer);
+      assert.equal(retried.ok, true);
+      assert.equal((retried as unknown as { duplicate?: boolean }).duplicate, false);
+      const events = (await readFile(sessionLogPath(store, rec(first).session_id!), 'utf8')).trim().split('\n')
         .map(s => JSON.parse(s) as { type: string });
-      assert.equal(oldEvents.filter(e => e.type === 'slipstream.question.answered.v1').length, 0);
+      assert.equal(events.filter(e => e.type === 'slipstream.question.answered.v1').length, 1);
     } finally {
       release();
       await daemon.stop();
@@ -395,7 +399,7 @@ describe('daemon control verbs', () => {
     } finally { await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
 
-  it('does not carry an unattempted question into a fresh capture after daemon restart', async () => {
+  it('does not carry an unattempted question across a resume after daemon restart', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-restart-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claim-restart-wt-'));
     const transcript = join(store, 'root.jsonl');
@@ -415,7 +419,8 @@ describe('daemon control verbs', () => {
       daemon = await startDaemon({ storeDir: store, captureDependencies: { ...deps, platform: createFakePlatform() } });
       const again = (req: CallRequest) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req } });
       const fresh = await again({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'root', root_transcript: transcript });
-      assert.notEqual(rec(fresh).session_id, oldId);
+      assert.equal(rec(fresh).session_id, oldId);
+      await connectAgent(again, { verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: transcript });
       const claim = await again({ verb: 'claim_question', harness: 'codex', harness_session_id: 'root', worktree, transcript_path: transcript });
       assert.equal(claim.ok, true);
       assert.equal(rec(claim).question, null);
@@ -449,14 +454,14 @@ describe('daemon control verbs', () => {
     });
   });
 
-  it('mints a NEW session id on every attach (never reactivates a root)', async () => {
+  it('resumes the same session id when the same chat re-attaches the same workspace', async () => {
     await withDaemon(async ({ worktree, call }) => {
-      const a = await call({ verb: 'attach', worktree, ...IDENTITY });
-      const idA = rec(a).session_id;
+      const idA = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id;
       await call({ verb: 'detach' });
       const b = await call({ verb: 'attach', worktree, ...IDENTITY });
-      const idB = rec(b).session_id;
-      assert.notEqual(idA, idB);
+      assert.equal(b.ok, true);
+      assert.equal(rec(b).session_id, idA);
+      assert.equal(rec(b).already_active, undefined);
     });
   });
 
@@ -650,7 +655,7 @@ describe('daemon control verbs', () => {
     }
   });
 
-  it('drains an admitted source read through detach, then refuses the old capture after reattach', async () => {
+  it('drains an admitted source read through detach, then refuses the question after a capture-only reattach', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-drain-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-drain-wt-'));
     let releaseRead!: () => void; let enteredRead!: () => void;
@@ -673,10 +678,11 @@ describe('daemon control verbs', () => {
       releaseRead();
       assert.equal((await askP).ok, true);
       assert.equal((await detachP).ok, true);
-      const fresh = await call({ verb: 'attach', worktree, ...IDENTITY });
+      const resumed = await call({ verb: 'attach', worktree, ...IDENTITY });
+      assert.equal(rec(resumed).session_id, oldId);
       const oldRetry = await call({ verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT });
-      assert.equal(oldRetry.ok === false && oldRetry.code, 'SESSION_NOT_SELECTED');
-      assert.notEqual(rec(fresh).session_id, oldId);
+      // The earlier connection is not carried across the resume.
+      assert.equal(oldRetry.ok === false && oldRetry.code, 'AGENT_NOT_CONNECTED');
     } finally { releaseRead?.(); await daemon.stop(); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
 
@@ -745,7 +751,7 @@ describe('daemon control verbs', () => {
     } finally { releaseAppend?.(); await daemon.stop().catch(() => {}); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
 
-  it('does not retarget an old ask after a daemon restart and new attach', async () => {
+  it('does not accept an ask after a daemon restart and capture-only resume', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-restart-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-ask-restart-wt-'));
     const deps = { platform: createFakePlatform(), enumerate: async () => {}, readQuestionContext: async () => 'recorded source' };
@@ -756,9 +762,9 @@ describe('daemon control verbs', () => {
       await daemon.stop();
       daemon = await startDaemon({ storeDir: store, captureDependencies: { ...deps, platform: createFakePlatform() } });
       const fresh = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'attach', worktree, ...IDENTITY } });
-      assert.notEqual(rec(fresh).session_id, oldId);
+      assert.equal(rec(fresh).session_id, oldId);
       const old = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'ask', session_id: oldId, request_id: ASK_REQUEST, text: 'Question', context: ASK_CONTEXT } });
-      assert.equal(old.ok === false && old.code, 'SESSION_NOT_SELECTED');
+      assert.equal(old.ok === false && old.code, 'AGENT_NOT_CONNECTED');
     } finally { await daemon.stop().catch(() => {}); await rm(store, { recursive: true, force: true }); await rm(worktree, { recursive: true, force: true }); }
   });
 
@@ -1350,4 +1356,352 @@ it('reports a failed capture stop after store-lock loss without an unhandled rej
     await rm(store, { recursive: true, force: true });
     await rm(worktree, { recursive: true, force: true });
   }
+});
+
+type LogRecord = { seq: string; type: string; data: Record<string, unknown> };
+async function readLog(store: string, id: string): Promise<LogRecord[]> {
+  return (await readFile(sessionLogPath(store, id), 'utf8')).trim().split('\n').map(s => JSON.parse(s) as LogRecord);
+}
+
+/** A daemon with real enumeration (so detached edits reconcile) over a store the
+ * test keeps across daemon restarts. */
+async function withResumeDaemon(
+  fn: (ctx: { store: string; worktree: string; daemon: () => Daemon; call: Call;
+    restart: (extra?: Partial<Parameters<typeof startDaemon>[0]>) => Promise<void> }) => Promise<void>,
+  extra: Partial<Parameters<typeof startDaemon>[0]> = {},
+): Promise<void> {
+  const store = await mkdtemp(join(tmpdir(), 'slip-daemon-resume-'));
+  const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-resume-wt-'));
+  const start = (more: Partial<Parameters<typeof startDaemon>[0]> = {}) => startDaemon({ storeDir: store,
+    captureDependencies: { platform: createFakePlatform(), readQuestionContext: async () => 'selected' }, ...extra, ...more });
+  let daemon = await start();
+  const call: Call = (req) => sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...req }, responseTimeoutMs: 5000 });
+  try {
+    await fn({ store, worktree, daemon: () => daemon, call,
+      restart: async (more) => { await daemon.stop(); daemon = await start(more); } });
+  } finally {
+    await daemon.stop().catch(() => {});
+    await rm(store, { recursive: true, force: true });
+    await rm(worktree, { recursive: true, force: true });
+  }
+}
+
+/** A well-formed log for `root` written by the real writer, so lookup and
+ * recovery see a genuine session that this daemon never touched. */
+async function seedStartedSession(store: string, id: string, root: string, extra: PublicEventInput[] = []): Promise<void> {
+  await mkdir(join(store, 'sessions', id), { recursive: true, mode: 0o700 });
+  const log = await createLog({ filePath: sessionLogPath(store, id), sessionId: id });
+  try {
+    await log.append({ type: 'slipstream.session.started.v1', occurred_at_ms: 1, data: { root, max_bytes: 1024 } });
+    for (const input of extra) await log.append(input);
+  } finally { await log.close(); }
+}
+
+async function sessionsJson(daemon: Daemon): Promise<{ id: string; durable_seq: string }[]> {
+  const res = await fetch(`${daemon.readerUrl}/v1/sessions`, { headers: { authorization: `Bearer ${daemon.readerToken}` } });
+  return (await res.json()) as { id: string; durable_seq: string }[];
+}
+
+/** Read an SSE follow stream until `done` holds or the server ends it. A bounded
+ * deadline aborts a stream the server never ends, so a failure cannot hang. */
+async function follow(daemon: Daemon, id: string, after: string, done: (ids: string[]) => boolean,
+  opened?: () => void): Promise<string[]> {
+  const res = await fetch(`${daemon.readerUrl}/v1/sessions/${id}/events?follow=true`, {
+    headers: { authorization: `Bearer ${daemon.readerToken}`, 'last-event-id': after },
+    signal: AbortSignal.timeout(10_000) });
+  opened?.();
+  const ids: string[] = [];
+  const reader = res.body!.getReader();
+  let text = '';
+  try {
+    while (!done(ids)) {
+      const { value, done: ended } = await reader.read();
+      if (ended) break;
+      text += Buffer.from(value).toString('utf8');
+      let cut;
+      while ((cut = text.indexOf('\n\n')) >= 0) {
+        const frame = text.slice(0, cut); text = text.slice(cut + 2);
+        const idLine = frame.split('\n').find(l => l.startsWith('id:'));
+        if (idLine) ids.push(idLine.slice(3).trim());
+      }
+    }
+  } catch { /* an aborted follower ends with a network error; ids so far stand */ }
+  finally { await reader.cancel().catch(() => {}); }
+  return ids;
+}
+
+describe('daemon workspace resume', () => {
+  it('resumes with a continuous seq and reconciles edits made while detached', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call }) => {
+      await writeFile(join(worktree, 'a.ts'), 'one');
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      assert.equal((await call({ verb: 'detach' })).ok, true);
+      const before = await readLog(store, id);
+      await writeFile(join(worktree, 'a.ts'), 'two');
+      const again = await call({ verb: 'attach', worktree, ...IDENTITY });
+      assert.equal(rec(again).session_id, id);
+      const after = await readLog(store, id);
+      assert.deepEqual(after.map(e => e.seq), after.map((_, i) => String(i + 1)));
+      const tail = after.slice(before.length);
+      assert.equal(tail[0]!.type, 'slipstream.session.resumed.v1');
+      assert.equal(tail[0]!.seq, String(before.length + 1));
+      assert.ok(tail.some(e => e.type === 'slipstream.capture.gap.v1' && e.data.reason === 'restart'));
+      assert.ok(tail.some(e => e.type === 'slipstream.file.changed.v1' && e.data.path === 'a.ts'));
+    });
+  });
+
+  it('resumes a session recorded by a previous daemon run', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, restart }) => {
+      await writeFile(join(worktree, 'a.ts'), 'one');
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      const before = (await readLog(store, id)).length;
+      await restart();
+      await writeFile(join(worktree, 'a.ts'), 'two');
+      assert.equal(rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id, id);
+      const after = await readLog(store, id);
+      assert.equal(after[before]!.type, 'slipstream.session.resumed.v1');
+      assert.ok(after.slice(before).some(e => e.type === 'slipstream.file.changed.v1' && e.data.path === 'a.ts'));
+    });
+  });
+
+  it('resumes through a symlinked path to the same workspace', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      await call({ verb: 'detach' });
+      const alias = join(store, 'alias');
+      await symlink(worktree, alias);
+      assert.equal(rec(await call({ verb: 'attach', worktree: alias, ...IDENTITY })).session_id, id);
+    });
+  });
+
+  it('resumes for a different chat and runs a fresh setup check for it', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      await call({ verb: 'detach' });
+      const transcriptB = join(store, 'chat-b.jsonl');
+      await writeFile(transcriptB, JSON.stringify({ type: 'user', sessionId: 'chat-b', cwd: await realpath(worktree),
+        version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+      const b = await call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: 'chat-b', root_transcript: transcriptB });
+      assert.equal(rec(b).session_id, id);
+      assert.equal(rec(b).agent_connection, 'setup_pending');
+      const log = await readLog(store, id);
+      const resumedAt = log.findIndex(e => e.type === 'slipstream.session.resumed.v1');
+      const pending = log.slice(resumedAt).filter(e => e.type === 'slipstream.agent.connection.v1');
+      assert.equal(pending.length, 1);
+      assert.deepEqual(pending[0]!.data.target, { harness: 'claude-code', harness_session_id: 'chat-b' });
+      const ask = await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(ask.ok === false && ask.code, 'AGENT_NOT_CONNECTED');
+    });
+  });
+
+  it('still refuses a different chat while the workspace is being recorded', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ worktree, call }) => {
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const other = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'other' });
+      assert.equal(other.ok === false && other.code, 'SESSION_ACTIVE');
+    });
+  });
+
+  it('starts a new session after the workspace\'s session was removed', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ worktree, call }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      await call({ verb: 'detach' });
+      assert.equal((await call({ verb: 'delete_session', session_id: id })).ok, true);
+      const fresh = await call({ verb: 'attach', worktree, ...IDENTITY });
+      assert.equal(fresh.ok, true);
+      assert.notEqual(rec(fresh).session_id, id);
+    });
+  });
+
+  it('starts a new session and warns when the only candidate has an unreadable first record', { timeout: 30_000 }, async (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    await withResumeDaemon(async ({ store, worktree, call }) => {
+      await mkdir(join(store, 'sessions', ABSENT_ID), { recursive: true });
+      await writeFile(sessionLogPath(store, ABSENT_ID), '{"torn');
+      const res = await call({ verb: 'attach', worktree, ...IDENTITY });
+      assert.equal(res.ok, true);
+      assert.notEqual(rec(res).session_id, ABSENT_ID);
+      assert.ok(errors.mock.calls.some(c => String(c.arguments[0]).includes(ABSENT_ID)));
+    });
+  });
+});
+
+describe('daemon workspace resume fails closed', () => {
+  const ID = '55555555-5555-4555-8555-555555555555';
+  async function expectResumeFailed(store: string, daemon: Daemon, call: Call, worktree: string, H?: string): Promise<void> {
+    const before = await readdir(join(store, 'sessions'));
+    const res = await call({ verb: 'attach', worktree, ...IDENTITY });
+    assert.equal(res.ok === false && res.code, 'SESSION_RESUME_FAILED');
+    assert.match(res.ok === false ? res.message : '', new RegExp(ID));
+    assert.deepEqual((await readdir(join(store, 'sessions'))).sort(), before.sort(), 'no fallback session may be minted');
+    assert.equal(rec(await call({ verb: 'status' })).state, 'detached');
+    if (H !== undefined) assert.equal((await sessionsJson(daemon)).find(s => s.id === ID)?.durable_seq, H);
+  }
+  const change = (sha: string): PublicEventInput => ({ type: 'slipstream.file.baselined.v1', occurred_at_ms: 2,
+    data: { path: 'f', snapshot: { kind: 'content', sha256: sha, size: 3 } } });
+  const scope = (at: number): PublicEventInput => ({ type: 'slipstream.capture.scope.v1', occurred_at_ms: at,
+    data: { policy: 'filesystem', status: 'active' } } as PublicEventInput);
+
+  it('on a corrupt record in the middle of the log', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      await seedStartedSession(store, ID, await realpath(worktree), [scope(2), scope(3)]);
+      const lines = (await readFile(sessionLogPath(store, ID), 'utf8')).split('\n');
+      lines[1] = '{"seq":"2","broken":true}';
+      await writeFile(sessionLogPath(store, ID), lines.join('\n'));
+      await expectResumeFailed(store, daemon(), call, worktree, '3');
+    });
+  });
+
+  it('on an unreadable final record', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      await seedStartedSession(store, ID, await realpath(worktree));
+      await writeFile(sessionLogPath(store, ID), (await readFile(sessionLogPath(store, ID), 'utf8')) + 'garbage\n');
+      // The listing reads the same corrupt tail, so its durable_seq is not asserted.
+      await expectResumeFailed(store, daemon(), call, worktree);
+    });
+  });
+
+  it('on a missing content blob', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      await seedStartedSession(store, ID, await realpath(worktree), [change(HEX_DEAD)]);
+      await expectResumeFailed(store, daemon(), call, worktree, '2');
+    });
+  });
+
+  it('on a session lock held by another live owner', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      await seedStartedSession(store, ID, await realpath(worktree));
+      await writeFile(join(store, 'sessions', ID, 'owner.lock'), JSON.stringify({ pid: process.pid, nonce: 'someone-else' }));
+      await expectResumeFailed(store, daemon(), call, worktree, '1');
+    });
+  });
+
+  it('on a capture startup failure', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon, restart }) => {
+      await seedStartedSession(store, ID, await realpath(worktree));
+      const failing = createFakePlatform();
+      failing.watch = async () => { throw new Error('watcher refused'); };
+      await restart({ captureDependencies: { platform: failing } });
+      await expectResumeFailed(store, daemon(), call, worktree, '1');
+    });
+  });
+});
+
+describe('daemon workspace resume and readers', () => {
+  it('a follower on the stopped session reconnects and receives every post-resume record once', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      await call({ verb: 'detach' });
+      const H = (await readLog(store, id)).length;
+      let opened!: () => void; const isOpen = new Promise<void>(r => { opened = r; });
+      const first = follow(daemon(), id, String(H), () => false, opened);
+      await isOpen;
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const seen = await first; // ended by the freeze/activate abort
+      const last = seen.at(-1) ?? String(H);
+      const N = (await readLog(store, id)).length;
+      const rest = await follow(daemon(), id, last, ids => ids.at(-1) === String(N));
+      const all = [...seen, ...rest];
+      assert.deepEqual(all, Array.from({ length: N - H }, (_, i) => String(H + 1 + i)));
+    });
+  });
+
+  it('a follower of a session from a previous daemon run also sees the resume', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon, restart }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      await restart();
+      const H = (await readLog(store, id)).length;
+      let opened!: () => void; const isOpen = new Promise<void>(r => { opened = r; });
+      const first = follow(daemon(), id, String(H), () => false, opened);
+      await isOpen;
+      await call({ verb: 'attach', worktree, ...IDENTITY });
+      const seen = await first;
+      const N = (await readLog(store, id)).length;
+      const rest = await follow(daemon(), id, seen.at(-1) ?? String(H), ids => ids.at(-1) === String(N));
+      assert.deepEqual([...seen, ...rest], Array.from({ length: N - H }, (_, i) => String(H + 1 + i)));
+    });
+  });
+
+  it('a finite read during the resume never goes past the pinned boundary', { timeout: 30_000 }, async () => {
+    let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    let entered!: () => void; const entering = new Promise<void>(r => { entered = r; });
+    const failing = { platform: createFakePlatform() };
+    // Hold capture startup inside the watch call: the boundary is already pinned.
+    failing.platform.watch = (orig => async (o: WatchOptions) => { entered(); await gate; return orig(o); })(failing.platform.watch.bind(failing.platform));
+    await withResumeDaemon(async ({ store, worktree, call, daemon, restart }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      await call({ verb: 'detach' });
+      const H = String((await readLog(store, id)).length);
+      await restart({ captureDependencies: failing });
+      const attachP = call({ verb: 'attach', worktree, ...IDENTITY });
+      await entering;
+      assert.equal((await sessionsJson(daemon())).find(s => s.id === id)?.durable_seq, H);
+      release();
+      assert.equal((await attachP).ok, true);
+    });
+  });
+});
+
+describe('daemon workspace resume concurrency', () => {
+  function heldLookup() {
+    let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    let entered!: () => void; const entering = new Promise<void>(r => { entered = r; });
+    let hold = true;
+    const workspaceLookup: typeof findWorkspaceSession = async (s, r) => {
+      if (hold) { hold = false; entered(); await gate; }
+      return findWorkspaceSession(s, r);
+    };
+    return { workspaceLookup, release, entering };
+  }
+
+  it('refuses delete_session and gc while an attach is still looking up the workspace', { timeout: 30_000 }, async () => {
+    const held = heldLookup();
+    await withResumeDaemon(async ({ worktree, call }) => {
+      const attachP = call({ verb: 'attach', worktree, ...IDENTITY });
+      await held.entering;
+      const del = await call({ verb: 'delete_session', session_id: ABSENT_ID });
+      assert.equal(del.ok === false && del.code, 'SESSION_ACTIVE');
+      const gc = await call({ verb: 'gc' });
+      assert.equal(gc.ok === false && gc.code, 'SESSION_ACTIVE');
+      held.release();
+      assert.equal((await attachP).ok, true);
+    }, { workspaceLookup: held.workspaceLookup });
+  });
+
+  it('shutdown waits for an attach that is still looking up the workspace, and nothing starts', { timeout: 30_000 }, async () => {
+    const held = heldLookup();
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      const attachP = call({ verb: 'attach', worktree, ...IDENTITY }).catch(err => err);
+      await held.entering;
+      let stopped = false;
+      const stopP = daemon().stop().then(() => { stopped = true; });
+      await new Promise(r => setTimeout(r, 25));
+      assert.equal(stopped, false, 'shutdown must wait for the in-flight lookup');
+      held.release();
+      await stopP;
+      await attachP;
+      assert.deepEqual(await readdir(join(store, 'sessions')).catch(() => []), []);
+    }, { workspaceLookup: held.workspaceLookup });
+  });
+
+  it('refuses a begin_task that straddles a detach and resume of the same session', { timeout: 30_000 }, async () => {
+    let hold = false;
+    let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    let entered!: () => void; const entering = new Promise<void>(r => { entered = r; });
+    await withResumeDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
+      hold = true;
+      const stale = call({ verb: 'begin_task', title: 'Old', request_id: 'r-old', worktree, ...IDENTITY });
+      await entering;
+      await call({ verb: 'detach' });
+      assert.equal(rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id, id);
+      release();
+      const res = await stale;
+      assert.equal(res.ok === false && res.code, 'SESSION_NOT_SELECTED');
+      assert.equal((await readLog(store, id)).filter(e => e.type === 'slipstream.task.started.v1').length, 0);
+    }, { identityRealpath: async (p) => {
+      if (hold) { hold = false; entered(); await gate; }
+      return realpath(p);
+    } });
+  });
 });
