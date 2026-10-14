@@ -196,6 +196,27 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
     return true;
   };
 
+  // A replacement may be installed while waiting, so re-check the current worker.
+  const currentReady = (): Promise<void> | undefined => opts.compute ? opts.compute.ready : pool!.ready;
+  const workerReadyWithin = async (first: Promise<void>, ms: number): Promise<boolean> => {
+    const giveUpAt = Date.now() + ms;
+    let ready: Promise<void> | undefined = first;
+    while (ready) {
+      let timer: NodeJS.Timeout | undefined;
+      const remaining = giveUpAt - Date.now();
+      const settled = remaining > 0 && await Promise.race([
+        ready.then(() => true),
+        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), remaining); }),
+      ]);
+      clearTimeout(timer);
+      if (!settled) return false;
+      const current = currentReady();
+      if (current === ready) return true;
+      ready = current;
+    }
+    return true;
+  };
+
   const get = async (req: ClipRequest): Promise<ClipProjection> => {
     if (closed) return transient(req.changeSeq, 'worker-error');
     const key = cacheKey(req);
@@ -209,6 +230,12 @@ export function createClipProjectionService(opts: ClipServiceOptions): ClipProje
       }
       cache.delete(key); // referenced blob GC'd — never serve a stale hit
     }
+
+    // Worker warm-up stays outside the compute deadline, but a request waits on
+    // it for at most one deadline. A still-warming worker is never dispatched
+    // to, so it is not terminated; the request reports a transient timeout.
+    const ready = currentReady();
+    if (ready && !(await workerReadyWithin(ready, deadlineMs))) return transient(req.changeSeq, 'timeout');
 
     // Only the coalescing leader's `run` is ever invoked (the budget calls it
     // once per flight); a coalesced waiter never sees this flip, so only the

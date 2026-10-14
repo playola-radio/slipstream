@@ -3,7 +3,7 @@ import { EVENT_TYPES, buildEnvelope, sourceFor, SPEC_VERSION, DATA_CONTENT_TYPE,
 import type { QuestionContext } from './questions.ts';
 
 export const PUBLIC_EVENT_TYPES = [...EVENT_TYPES, 'slipstream.question.queued.v1', 'slipstream.question.dispatch_attempted.v1',
-  'slipstream.question.answered.v1', 'slipstream.capture.scope.v1'] as const;
+  'slipstream.question.answered.v1', 'slipstream.capture.scope.v1', 'slipstream.agent.connection.v1'] as const;
 export interface QuestionQueuedData {
   session_id: string;
   question_id: string;
@@ -77,18 +77,42 @@ export interface CaptureScopeEvent {
   subject?: undefined;
   data: CaptureScopeData;
 }
+/** Whether the chat bound at attach can take questions. `connected` records one
+ * completed setup round trip (hook delivery and answer return) at event time. */
+export interface AgentConnectionData {
+  session_id: string;
+  state: 'setup_pending' | 'connected';
+  target: { harness: HarnessName; harness_session_id: string };
+}
+export interface AgentConnectionEvent {
+  specversion: typeof SPEC_VERSION;
+  id: string;
+  source: string;
+  type: 'slipstream.agent.connection.v1';
+  datacontenttype: typeof DATA_CONTENT_TYPE;
+  seq: string;
+  time: string;
+  subject?: undefined;
+  data: AgentConnectionData;
+}
 type WithoutSessionId<T> = T extends unknown ? Omit<T, 'session_id'> : never;
 export type CaptureScopeInput = { type: 'slipstream.capture.scope.v1'; occurred_at_ms: number; data: WithoutSessionId<CaptureScopeData> };
-export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent | CaptureScopeEvent;
+export type AgentConnectionInput = { type: 'slipstream.agent.connection.v1'; occurred_at_ms: number; data: Omit<AgentConnectionData, 'session_id'> };
+export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent | CaptureScopeEvent | AgentConnectionEvent;
 export type QuestionQueuedInput = { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
 export type QuestionDispatchAttemptedInput = { type: 'slipstream.question.dispatch_attempted.v1'; occurred_at_ms: number; data: { question_id: string; queued_seq: string; attempted_at_ms: number } };
 export type QuestionAnsweredInput = { type: 'slipstream.question.answered.v1'; occurred_at_ms: number; data: Omit<QuestionAnsweredData, 'session_id'> };
-export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput | CaptureScopeInput;
+export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput | CaptureScopeInput | AgentConnectionInput;
 export function buildPublicEnvelope(input: PublicEventInput, seq: bigint, sessionId: string): PublicEvent {
   if (input.type === 'slipstream.capture.scope.v1') return {
     specversion: SPEC_VERSION, id: seq.toString(), source: sourceFor(sessionId), type: input.type,
     datacontenttype: DATA_CONTENT_TYPE, seq: seq.toString(), time: new Date(input.occurred_at_ms).toISOString(),
     data: { ...input.data, session_id: sessionId } as CaptureScopeData,
+  };
+  if (input.type === 'slipstream.agent.connection.v1') return {
+    specversion: SPEC_VERSION, id: seq.toString(), source: sourceFor(sessionId), type: input.type,
+    datacontenttype: DATA_CONTENT_TYPE, seq: seq.toString(), time: new Date(input.occurred_at_ms).toISOString(),
+    data: { ...input.data, session_id: sessionId },
   };
   if (input.type !== 'slipstream.question.queued.v1' && input.type !== 'slipstream.question.dispatch_attempted.v1'
     && input.type !== 'slipstream.question.answered.v1') return buildEnvelope(input, seq, sessionId);

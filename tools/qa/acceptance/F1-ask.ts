@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { awaitObservedChange, createReaderClient, mkdtempRoot, rmMkdtempRoot, type AnyRecord } from '../../qa-support.ts';
 import { startQaDaemon } from '../harness-proc.ts';
+import { completeSetupCheck } from './setup-check.ts';
 import type { AcceptanceContext, AcceptanceModule } from './types.ts';
 
 const exec = promisify(execFile);
@@ -182,11 +183,17 @@ async function runLive(signal: AbortSignal, live: {
     const { store, worktree, reader } = live;
     await cli(['detach', '--store', store]);
     const harnessSessionId = `f1-${randomUUID()}`;
+    const transcript = join(store, `f1-root-${randomUUID()}.jsonl`);
+    await writeFile(transcript, JSON.stringify({ type: 'session_meta', payload: {
+      session_id: harnessSessionId, cwd: worktree, originator: 'codex_sdk_ts', source: 'exec', cli_version: '0.154.0',
+    } }) + '\n', { mode: 0o600 });
     const attached = await cli([
       'attach', worktree, '--store', store, '--harness', 'codex',
-      '--harness-session-id', harnessSessionId,
+      '--harness-session-id', harnessSessionId, '--root-transcript', transcript,
     ]);
     const sessionId = typeof attached.session_id === 'string' ? attached.session_id : fail('attach did not return a session_id');
+    await completeSetupCheck({ store, harness: 'codex', callback: { hook_event_name: 'PostToolUse',
+      session_id: harnessSessionId, cwd: worktree, transcript_path: transcript, tool_name: 'Bash' } });
     const target: Target = { harness: 'codex', harness_session_id: harnessSessionId, worktree: await realpath(worktree) };
     const path = `F1-ask-${randomUUID()}.swift`;
     const sourcePath = join(worktree, path);

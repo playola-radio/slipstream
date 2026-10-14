@@ -75,4 +75,19 @@ describe('boundary registry', () => {
     assert.equal(reg.get(other)?.boundary.current(), 4n);
   });
 
+
+  it('carries a live capture\'s agent connection until the capture is frozen', () => {
+    const reg = createBoundaryRegistry();
+    reg.reserve(ID);
+    reg.activate(ID, liveBoundary(createHealth(0n)));
+    assert.equal(reg.get(ID)?.agentConnection, undefined);
+    reg.setAgentConnection(ID, 'setup_pending');
+    const ac = new AbortController();
+    reg.addFollower(ID, ac);
+    reg.setAgentConnection(ID, 'connected');
+    assert.equal(reg.get(ID)?.agentConnection, 'connected');
+    assert.equal(ac.signal.aborted, false, 'a connection change is not a boundary transition');
+    reg.freeze(ID, 3n);
+    assert.equal(reg.get(ID)?.agentConnection, undefined);
+  });
 });

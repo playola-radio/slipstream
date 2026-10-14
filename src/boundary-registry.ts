@@ -31,8 +31,13 @@ import { staticBoundary, type BoundarySource } from './reader-runtime.ts';
  * and boundary reads are synchronous, so no await interleaves between reading the
  * current boundary and joining the set that a transition aborts.
  */
+/** A live capture's agent chat readiness; `none` means no chat is bound. */
+export type AgentConnectionState = 'setup_pending' | 'connected' | 'none';
+
 export interface SessionRuntime {
   boundary: BoundarySource;
+  /** Set only while the capture is live; freezing clears it. */
+  agentConnection?: AgentConnectionState;
 }
 
 export interface BoundaryRegistry {
@@ -43,6 +48,8 @@ export interface BoundaryRegistry {
   activate(id: string, boundary: BoundarySource): void;
   /** Pin the boundary at the final durable seq on detach; aborts followers. */
   freeze(id: string, seq: bigint): void;
+  /** Mirror a live capture's durably recorded agent connection; never a transition. */
+  setAgentConnection(id: string, state: AgentConnectionState): void;
   get(id: string): SessionRuntime | undefined;
   /** Create a static entry for a retained session discovered on disk; returns the
    * existing entry unchanged if one is already known (never overwrites live). */
@@ -53,6 +60,7 @@ export interface BoundaryRegistry {
 
 interface Entry {
   boundary: BoundarySource;
+  agentConnection?: AgentConnectionState;
   followers: Set<AbortController>;
 }
 
@@ -87,6 +95,11 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
     freeze(id, seq) {
       transition(id, staticBoundary(seq));
+      delete entries.get(id)!.agentConnection;
+    },
+    setAgentConnection(id, state) {
+      const entry = entries.get(id);
+      if (entry) entry.agentConnection = state;
     },
     get(id) {
       return entries.get(id);
