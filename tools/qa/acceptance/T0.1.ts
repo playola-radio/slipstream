@@ -23,6 +23,8 @@ import {
   type Assertion,
   type ReaderClient,
 } from '../../qa-support.ts';
+import { sendControlRequest } from '../../../src/control-client.ts';
+import { controlSocketPath } from '../../../src/daemon-location.ts';
 import { startQaDaemon } from '../harness-proc.ts';
 import { corpusCasePath, foldToLine, listCorpusCases, parseFoldInput } from '../../display-fold-oracle.ts';
 import type { AcceptanceContext, AcceptanceModule } from './types.ts';
@@ -256,9 +258,12 @@ async function noNewSurfaceClaim(ctx: AcceptanceContext, events: AnyRecord[]): P
   };
 }
 
-/** Start a kept daemon, write files into its worktree, then reuse the root so a
- * FRESH session baselines those files. The runner's own session starts on an
- * empty worktree and so could never show a file.baselined record. */
+/** Start a kept daemon, write files into its worktree, delete the seed's session
+ * through the daemon's public `detach` + `delete_session` control verbs, then reuse
+ * the root so a FRESH session baselines those files. Re-attaching resumes a
+ * workspace's existing session and a resumed session emits no file.baselined, so
+ * the seed session must be removed first; the runner's own session starts on an
+ * empty worktree and so could never show a file.baselined record either. */
 async function withBaselinedSession<T>(signal: AbortSignal, body: (ctx: AcceptanceContext) => Promise<T>): Promise<T> {
   const root = await mkdtempRoot('slipstream-qa-t01-');
   try {
@@ -267,11 +272,22 @@ async function withBaselinedSession<T>(signal: AbortSignal, body: (ctx: Acceptan
       for (const name of ['display-fold-a.txt', 'display-fold-b.txt']) {
         await writeFile(join(seed.env.worktree, name), `${name}\n`);
       }
+      const socketPath = controlSocketPath(seed.env.store);
+      const detached = await sendControlRequest({ socketPath, request: { v: 1, verb: 'detach' } });
+      if (!detached.ok) fail(`could not detach the seed session: ${detached.code} ${detached.message}`);
+      const deleted = await sendControlRequest({
+        socketPath,
+        request: { v: 1, verb: 'delete_session', session_id: seed.env.session_id },
+      });
+      if (!deleted.ok) fail(`could not delete the seed session ${seed.env.session_id}: ${deleted.code} ${deleted.message}`);
     } finally {
       await seed.stop();
     }
     const live = await startQaDaemon({ root, reuse: true });
     try {
+      if (live.env.session_id === seed.env.session_id) {
+        fail(`the reused daemon resumed the deleted seed session ${seed.env.session_id}; a fresh session was required to baseline the files`);
+      }
       const reader = createReaderClient(live.env.url, live.env.token);
       return await body({ worktree: live.env.worktree, sessionId: live.env.session_id, reader, signal });
     } finally {
