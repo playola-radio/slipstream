@@ -133,8 +133,9 @@ claim or accept questions. `slipstream attach <worktree> --store <dir> --harness
 --harness-session-id <root-hook-session-id> --root-transcript <root-hook-transcript-path>`
 sets the binding. Use the root callback's identity, never the first callback that
 arrives after attach. The active `status` response includes `root_transcript`
-when set. The queued event retains the D1 target shape; each fresh capture has
-its own queue, so no old queue is rebound to a new transcript.
+when set. The queued event retains the D1 target shape; a question
+queued before the latest `session.resumed` is never claimable again, so no old
+queue is rebound to a new transcript.
 
 The Codex PostToolUse adapter sends one owner-only control request:
 
@@ -243,9 +244,11 @@ directory before a queued question can be delivered.
 The callback must later match the selected harness, session ID, canonical worktree,
 and root transcript. Both `agent_id` and `agent_type` must be absent. A child,
 other root, wrong worktree, cross-harness claim, stale capture, or partial
-identity gets no question. Changing the chat with `/clear` creates a new
-session; select and attach that new root explicitly if desired. A question
-queued for the old capture is never migrated.
+identity gets no question. Changing the chat with `/clear` gives the workspace a
+new root chat: while the old binding is still active the new chat's attach gets
+`SESSION_ACTIVE`, and after a detach it resumes the same capture `session_id`
+and goes through a fresh setup check; select and attach that new root
+explicitly if desired. A question queued earlier is never migrated.
 
 Configure a Claude Code `PostToolUse` command hook before starting the chat,
 using absolute paths to Node 24, this checkout, and a private store:

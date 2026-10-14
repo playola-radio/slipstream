@@ -661,9 +661,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     if (!nonEmptyString(req.title)) return errFields('INVALID_TITLE', 'begin_task requires a non-empty title');
     if (!nonEmptyString(req.request_id)) return errFields('CAPTURE_NOT_READY', 'begin_task requires a non-empty request_id');
-    // Canonicalize the declared worktree with the SAME realpath policy as attach
-    // (resolveAndStart), so a symlinked or relative declared path matches the
-    // durable root capture actually watches.
+    // Canonicalize the declared worktree with identityRealpath, which defaults to
+    // the same realpath policy attach uses (resolveAndStart), so a symlinked or
+    // relative declared path matches the durable root capture actually watches.
     // The binding is captured before the await and compared by reference after it:
     // a session id can now come back to life (detach, then resume), so an id match
     // does not prove this is still the binding the request was admitted against.
