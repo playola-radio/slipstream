@@ -1430,6 +1430,17 @@ async function follow(daemon: Daemon, id: string, after: string, done: (ids: str
   return ids;
 }
 
+/** Fails (rather than quietly passing) when a follower is not ended promptly by
+ * the resume's freeze/activate abort; well below the follower's own 10s deadline. */
+async function endedPromptly(follower: Promise<string[]>): Promise<string[]> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([follower, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('follower was not aborted by the resume')), 3000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 describe('daemon workspace resume', () => {
   it('resumes with a continuous seq and reconciles edits made while detached', { timeout: 30_000 }, async () => {
     await withResumeDaemon(async ({ store, worktree, call }) => {
@@ -1528,11 +1539,12 @@ describe('daemon workspace resume', () => {
 
 describe('daemon workspace resume fails closed', () => {
   const ID = '55555555-5555-4555-8555-555555555555';
-  async function expectResumeFailed(store: string, daemon: Daemon, call: Call, worktree: string, H?: string): Promise<void> {
+  async function expectResumeFailed(store: string, daemon: Daemon, call: Call, worktree: string, remedy: RegExp, H?: string): Promise<void> {
     const before = await readdir(join(store, 'sessions'));
     const res = await call({ verb: 'attach', worktree, ...IDENTITY });
     assert.equal(res.ok === false && res.code, 'SESSION_RESUME_FAILED');
     assert.match(res.ok === false ? res.message : '', new RegExp(ID));
+    assert.match(res.ok === false ? res.message : '', remedy);
     assert.deepEqual((await readdir(join(store, 'sessions'))).sort(), before.sort(), 'no fallback session may be minted');
     assert.equal(rec(await call({ verb: 'status' })).state, 'detached');
     if (H !== undefined) assert.equal((await sessionsJson(daemon)).find(s => s.id === ID)?.durable_seq, H);
@@ -1548,7 +1560,7 @@ describe('daemon workspace resume fails closed', () => {
       const lines = (await readFile(sessionLogPath(store, ID), 'utf8')).split('\n');
       lines[1] = '{"seq":"2","broken":true}';
       await writeFile(sessionLogPath(store, ID), lines.join('\n'));
-      await expectResumeFailed(store, daemon(), call, worktree, '3');
+      await expectResumeFailed(store, daemon(), call, worktree, /Restore its data/, '3');
     });
   });
 
@@ -1557,14 +1569,14 @@ describe('daemon workspace resume fails closed', () => {
       await seedStartedSession(store, ID, await realpath(worktree));
       await writeFile(sessionLogPath(store, ID), (await readFile(sessionLogPath(store, ID), 'utf8')) + 'garbage\n');
       // The listing reads the same corrupt tail, so its durable_seq is not asserted.
-      await expectResumeFailed(store, daemon(), call, worktree);
+      await expectResumeFailed(store, daemon(), call, worktree, /Restore its data/);
     });
   });
 
   it('on a missing content blob', { timeout: 30_000 }, async () => {
     await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
       await seedStartedSession(store, ID, await realpath(worktree), [change(HEX_DEAD)]);
-      await expectResumeFailed(store, daemon(), call, worktree, '2');
+      await expectResumeFailed(store, daemon(), call, worktree, /Restore its data/, '2');
     });
   });
 
@@ -1572,7 +1584,7 @@ describe('daemon workspace resume fails closed', () => {
     await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
       await seedStartedSession(store, ID, await realpath(worktree));
       await writeFile(join(store, 'sessions', ID, 'owner.lock'), JSON.stringify({ pid: process.pid, nonce: 'someone-else' }));
-      await expectResumeFailed(store, daemon(), call, worktree, '1');
+      await expectResumeFailed(store, daemon(), call, worktree, /Retry attach/, '1');
     });
   });
 
@@ -1582,7 +1594,27 @@ describe('daemon workspace resume fails closed', () => {
       const failing = createFakePlatform();
       failing.watch = async () => { throw new Error('watcher refused'); };
       await restart({ captureDependencies: { platform: failing } });
-      await expectResumeFailed(store, daemon(), call, worktree, '1');
+      await expectResumeFailed(store, daemon(), call, worktree, /Retry attach/, '1');
+    });
+  });
+});
+
+describe('daemon workspace resume fails closed at agent-connection setup', () => {
+  it('returns SESSION_RESUME_FAILED naming the session when the setup record cannot be written', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, restart }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      await call({ verb: 'detach' });
+      const failingLog: typeof createLog = async (o) => {
+        const log = await createLog(o);
+        return { ...log, append: (input) => input.type === 'slipstream.agent.connection.v1'
+          ? Promise.reject(new Error('injected connection append failure')) : log.append(input) };
+      };
+      await restart({ captureDependencies: { platform: createFakePlatform(), createLog: failingLog } });
+      const res = await call({ verb: 'attach', worktree, ...IDENTITY, root_transcript: join(store, 'abc123.jsonl') });
+      assert.equal(res.ok === false && res.code, 'SESSION_RESUME_FAILED');
+      assert.match(res.ok === false ? res.message : '', new RegExp(id));
+      assert.match(res.ok === false ? res.message : '', /Retry attach/);
+      assert.equal(rec(await call({ verb: 'status' })).state, 'detached');
     });
   });
 });
@@ -1596,10 +1628,11 @@ describe('daemon workspace resume and readers', () => {
       let opened!: () => void; const isOpen = new Promise<void>(r => { opened = r; });
       const first = follow(daemon(), id, String(H), () => false, opened);
       await isOpen;
-      await call({ verb: 'attach', worktree, ...IDENTITY });
-      const seen = await first; // ended by the freeze/activate abort
+      assert.equal(rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id, id);
+      const seen = await endedPromptly(first); // ended by the freeze/activate abort
       const last = seen.at(-1) ?? String(H);
       const N = (await readLog(store, id)).length;
+      assert.ok(N > H, 'the resume must have appended records past the follower\'s position');
       const rest = await follow(daemon(), id, last, ids => ids.at(-1) === String(N));
       const all = [...seen, ...rest];
       assert.deepEqual(all, Array.from({ length: N - H }, (_, i) => String(H + 1 + i)));
@@ -1614,30 +1647,38 @@ describe('daemon workspace resume and readers', () => {
       let opened!: () => void; const isOpen = new Promise<void>(r => { opened = r; });
       const first = follow(daemon(), id, String(H), () => false, opened);
       await isOpen;
-      await call({ verb: 'attach', worktree, ...IDENTITY });
-      const seen = await first;
+      assert.equal(rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id, id);
+      const seen = await endedPromptly(first);
       const N = (await readLog(store, id)).length;
+      assert.ok(N > H, 'the resume must have appended records past the follower\'s position');
       const rest = await follow(daemon(), id, seen.at(-1) ?? String(H), ids => ids.at(-1) === String(N));
       assert.deepEqual([...seen, ...rest], Array.from({ length: N - H }, (_, i) => String(H + 1 + i)));
     });
   });
 
   it('a finite read during the resume never goes past the pinned boundary', { timeout: 30_000 }, async () => {
+    let hold = false;
     let release!: () => void; const gate = new Promise<void>(r => { release = r; });
     let entered!: () => void; const entering = new Promise<void>(r => { entered = r; });
-    const failing = { platform: createFakePlatform() };
-    // Hold capture startup inside the watch call: the boundary is already pinned.
-    failing.platform.watch = (orig => async (o: WatchOptions) => { entered(); await gate; return orig(o); })(failing.platform.watch.bind(failing.platform));
+    // Hold inside the reconcile walk: it runs after session.resumed, the restart gap and
+    // the scope record are already on disk, while the registry boundary must still be H.
+    const held = { platform: createFakePlatform(), enumerate: async () => {
+      if (hold) { hold = false; entered(); await gate; }
+    } };
     await withResumeDaemon(async ({ store, worktree, call, daemon, restart }) => {
       const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;
       await call({ verb: 'detach' });
-      const H = String((await readLog(store, id)).length);
-      await restart({ captureDependencies: failing });
+      const H = (await readLog(store, id)).length;
+      await restart({ captureDependencies: held });
+      hold = true;
       const attachP = call({ verb: 'attach', worktree, ...IDENTITY });
-      await entering;
-      assert.equal((await sessionsJson(daemon())).find(s => s.id === id)?.durable_seq, H);
-      release();
-      assert.equal((await attachP).ok, true);
+      try {
+        await entering;
+        assert.ok((await readLog(store, id)).length > H, 'records past H are already on disk');
+        assert.equal((await sessionsJson(daemon())).find(s => s.id === id)?.durable_seq, String(H));
+      } finally { release(); }
+      const res = await attachP;
+      assert.equal(rec(res).session_id, id);
     });
   });
 });

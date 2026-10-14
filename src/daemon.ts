@@ -450,7 +450,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (resume) {
         const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError
           ? corruptRemedy(id)
-          : `Retry attach; if it keeps failing, ${corruptRemedy(id).toLowerCase()}`;
+          : retryRemedy(id);
         return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${(err as Error).message}. ${remedy}`);
       }
       if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
@@ -477,6 +477,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
       registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
       if (state === 'attaching') state = 'detached';
+      if (resume && pendingFailed) {
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: could not record the agent connection. ${retryRemedy(id)}`);
+      }
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
     registry.activate(id, liveBoundary(session.health));
@@ -1043,6 +1046,9 @@ function errFields(code: ControlErrorCode, message: string): ErrorFields {
 /** What to do when a session cannot be read or resumed. */
 function corruptRemedy(id: string): string {
   return `Restore its data, or remove it with \`slipstream delete ${id}\` (this discards that history)`;
+}
+function retryRemedy(id: string): string {
+  return `Retry attach; if it keeps failing, ${corruptRemedy(id).toLowerCase()}`;
 }
 function isErrorFields(v: Record<string, unknown> | ErrorFields): v is ErrorFields {
   return (v as ErrorFields).__error === true;
