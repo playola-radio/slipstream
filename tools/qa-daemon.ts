@@ -19,6 +19,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from '../src/daemon.ts';
 import { sendControlRequest } from '../src/control-client.ts';
+import type { ResponseEnvelope } from '../src/control-protocol.ts';
 import { controlSocketPath } from '../src/daemon-location.ts';
 import { isMainModule } from '../src/entrypoint.ts';
 import {
@@ -62,6 +63,19 @@ export function defaultRoot(home: string = homedir()): string {
 }
 
 export class ArgError extends Error {}
+
+/** The durable position immediately after attach. A stale or absent status reply
+ * must never make a resumed QA session appear ready from an older baseline. */
+export function attachedDurableSeq(status: ResponseEnvelope): bigint {
+  if (!status.ok) {
+    throw new Error(`qa-daemon: attached status failed (${status.code}): ${status.message}`);
+  }
+  const value = (status as Record<string, unknown>).durable_seq;
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error('qa-daemon: attached status has missing or invalid durable_seq');
+  }
+  return BigInt(value);
+}
 
 /** Parse qa-daemon flags. `--root` resolves relative to cwd; the rest are simple
  * toggles / one-value options. Unknown flags are a usage error, never ignored. */
@@ -318,7 +332,7 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     // Attach returns only after startup and reconciliation committed, so on a
     // resumed session this is the position past the resume records.
     const attachedStatus = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'status' } });
-    const attachedThrough = attachedStatus.ok ? BigInt(String((attachedStatus as Record<string, unknown>).durable_seq ?? '0')) : 0n;
+    const attachedThrough = attachedDurableSeq(attachedStatus);
 
     const descriptor = await bootstrapReader(store);
     const descriptorPath = (await readRuntimeDescriptorPath(store)) ?? join(store, 'runtime');

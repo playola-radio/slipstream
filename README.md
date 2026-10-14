@@ -132,8 +132,9 @@ slipstream view --store ~/.slipstream --session <capture-session-id>
 slipstream detach    # stop recording; history is kept
 ```
 
-Running `attach` again in the same workspace, from any chat, continues that
-workspace's recording under the same session ID rather than starting another.
+After a detach, `attach` in the same workspace from any chat resumes the same
+session ID. While it is recording, another chat cannot attach, but can join the
+live stream through its normal agent connection.
 
 Current limits:
 

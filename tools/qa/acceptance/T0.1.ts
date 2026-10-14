@@ -267,22 +267,29 @@ async function noNewSurfaceClaim(ctx: AcceptanceContext, events: AnyRecord[]): P
 async function withBaselinedSession<T>(signal: AbortSignal, body: (ctx: AcceptanceContext) => Promise<T>): Promise<T> {
   const root = await mkdtempRoot('slipstream-qa-t01-');
   try {
+    signal.throwIfAborted();
     const seed = await startQaDaemon({ root, keep: true });
     try {
+      signal.throwIfAborted();
       for (const name of ['display-fold-a.txt', 'display-fold-b.txt']) {
         await writeFile(join(seed.env.worktree, name), `${name}\n`);
       }
       const socketPath = controlSocketPath(seed.env.store);
+      signal.throwIfAborted();
       const detached = await sendControlRequest({ socketPath, request: { v: 1, verb: 'detach' } });
+      signal.throwIfAborted();
       if (!detached.ok) fail(`could not detach the seed session: ${detached.code} ${detached.message}`);
+      signal.throwIfAborted();
       const deleted = await sendControlRequest({
         socketPath,
         request: { v: 1, verb: 'delete_session', session_id: seed.env.session_id },
       });
+      signal.throwIfAborted();
       if (!deleted.ok) fail(`could not delete the seed session ${seed.env.session_id}: ${deleted.code} ${deleted.message}`);
     } finally {
       await seed.stop();
     }
+    signal.throwIfAborted();
     const live = await startQaDaemon({ root, reuse: true });
     try {
       if (live.env.session_id === seed.env.session_id) {

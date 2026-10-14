@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { mkdtemp, rm, chmod, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { parseArgs, curlCommands, probeStoreLiveness, runQaDaemon, markStopped, ArgError } from './qa-daemon.ts';
+import { parseArgs, curlCommands, probeStoreLiveness, attachedDurableSeq, runQaDaemon, markStopped, ArgError } from './qa-daemon.ts';
 import { setImmediate as setImmediateP } from 'node:timers/promises';
 import { prepareRoot } from './qa/safety.ts';
 import { writeQaEnv, readQaEnv, QA_ENV_FORMAT, QA_ENV_NAME, type QaEnv } from './qa-support.ts';
@@ -100,6 +100,16 @@ describe('markStopped run_id guard', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('attachedDurableSeq', () => {
+  it('requires a successful status response with a non-negative integer durable sequence', () => {
+    assert.equal(attachedDurableSeq({ v: 1, ok: true, durable_seq: '42' }), 42n);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: false, code: 'DAEMON_UNAVAILABLE', message: 'closed' }), /status failed/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true }), /missing or invalid durable_seq/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, durable_seq: '-1' }), /missing or invalid durable_seq/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, durable_seq: 'not-a-number' }), /missing or invalid durable_seq/);
   });
 });
 
