@@ -34,11 +34,15 @@ export function blobPath(storeDir: string, hex: string): string {
   return join(storeDir, 'blobs', 'sha256', hex.slice(0, 2), hex);
 }
 
-export async function onDiskHighWater(logPath: string): Promise<bigint> {
+interface FinalRecord { seq: bigint; time: unknown }
+
+/** The last complete record's seq and time; undefined for a missing log or one
+ * with no complete line. Torn trailing bytes are ignored. */
+async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
   let handle;
   try { handle = await open(logPath, 'r'); }
   catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0n;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw err;
   }
   let lastLine: string;
@@ -64,17 +68,21 @@ export async function onDiskHighWater(logPath: string): Promise<bigint> {
       pieces.push(buffer.subarray(start + 1, end));
       if (start >= 0) break;
     }
-    if (!foundEnd) return 0n;
+    if (!foundEnd) return undefined;
     lastLine = Buffer.concat(pieces.reverse()).toString('utf8');
   } finally { await handle.close(); }
   if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
-  let seq: unknown;
-  try { seq = (JSON.parse(lastLine) as { seq?: unknown }).seq; }
+  let parsed: { seq?: unknown; time?: unknown };
+  try { parsed = JSON.parse(lastLine) as { seq?: unknown; time?: unknown }; }
   catch { throw new LogCorruptError('high-water: invalid JSON in final record'); }
-  if (typeof seq !== 'string' || !SEQ_RE.test(seq)) {
+  if (typeof parsed.seq !== 'string' || !SEQ_RE.test(parsed.seq)) {
     throw new LogCorruptError('high-water: final record has no valid decimal-string seq');
   }
-  return BigInt(seq);
+  return { seq: BigInt(parsed.seq), time: parsed.time };
+}
+
+export async function onDiskHighWater(logPath: string): Promise<bigint> {
+  return (await finalRecord(logPath))?.seq ?? 0n;
 }
 
 export async function readTombstone(storeDir: string, id: string): Promise<Tombstone | null> {
@@ -109,6 +117,73 @@ export async function listSessions(storeDir: string): Promise<SessionInfo[]> {
   }
   out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return out;
+}
+
+export interface WorkspaceSessionMatch { id: string; durableSeq: bigint }
+export interface WorkspaceLookup { match: WorkspaceSessionMatch | undefined; skipped: { id: string; reason: string }[] }
+
+/** A session recorded for this workspace whose history cannot be read. Attach
+ * must fail closed on it rather than start a second stream for the workspace. */
+export class WorkspaceLookupError extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string, cause: unknown) {
+    super(`session ${sessionId} records this workspace but its log cannot be read: ${(cause as Error).message}`, { cause });
+    this.name = 'WorkspaceLookupError';
+    this.sessionId = sessionId;
+  }
+}
+
+const FIRST_RECORD_LIMIT = 64 * 1024;
+
+/** The `root` of a log's first record, which must be `session.started`. */
+async function startedRoot(logPath: string): Promise<string> {
+  const handle = await open(logPath, 'r');
+  let line: string;
+  try {
+    const buffer = Buffer.allocUnsafe(FIRST_RECORD_LIMIT);
+    const { bytesRead } = await handle.read(buffer, 0, FIRST_RECORD_LIMIT, 0);
+    const end = buffer.subarray(0, bytesRead).indexOf(0x0a);
+    if (end < 0) throw new LogCorruptError('first record is torn or larger than 64 KiB');
+    line = buffer.subarray(0, end).toString('utf8');
+  } finally { await handle.close(); }
+  let parsed: { type?: unknown; data?: { root?: unknown } | null };
+  try { parsed = JSON.parse(line) as typeof parsed; }
+  catch { throw new LogCorruptError('first record is not valid JSON'); }
+  if (parsed.type !== 'slipstream.session.started.v1' || typeof parsed.data?.root !== 'string') {
+    throw new LogCorruptError('first record is not a session.started record');
+  }
+  return parsed.data.root;
+}
+
+/** The non-removed session recorded for `canonicalRoot`, derived from the logs
+ * alone. Duplicates resolve to the newest last record, then the smallest id. A
+ * session whose first record cannot be read is skipped and reported. */
+export async function findWorkspaceSession(storeDir: string, canonicalRoot: string): Promise<WorkspaceLookup> {
+  let entries: string[];
+  try { entries = await readdir(sessionsDir(storeDir)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { match: undefined, skipped: [] };
+    throw err;
+  }
+  const skipped: { id: string; reason: string }[] = [];
+  let best: (WorkspaceSessionMatch & { ms: number }) | undefined;
+  for (const id of entries.filter(isValidSessionId).sort()) {
+    if ((await readTombstone(storeDir, id)) !== null) continue;
+    const logPath = sessionLogPath(storeDir, id);
+    let root: string;
+    try { root = await startedRoot(logPath); }
+    catch (err) { skipped.push({ id, reason: (err as Error).message }); continue; }
+    if (root !== canonicalRoot) continue;
+    let last: FinalRecord;
+    let ms: number;
+    try {
+      last = (await finalRecord(logPath))!; // the first line is complete, so a final record exists
+      ms = typeof last.time === 'string' ? Date.parse(last.time) : Number.NaN;
+      if (Number.isNaN(ms)) throw new LogCorruptError('final record has no valid time');
+    } catch (err) { throw new WorkspaceLookupError(id, err); }
+    if (!best || ms > best.ms) best = { id, durableSeq: last.seq, ms };
+  }
+  return { match: best && { id: best.id, durableSeq: best.durableSeq }, skipped };
 }
 
 export async function schemaBytes(type: string): Promise<Buffer | null> {
