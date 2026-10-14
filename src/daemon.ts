@@ -467,7 +467,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (resume) {
         const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError
           ? corruptRemedy(id)
-          : retryRemedy(id);
+          : RETRY_REMEDY;
         return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${(err as Error).message}. ${remedy}`);
       }
       if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
@@ -497,7 +497,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (state === 'attaching') state = 'detached';
       if (resume) {
         const cause = pendingFailed ? 'could not record the agent connection' : attachInterruptedCause();
-        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${cause}. ${retryRemedy(id)}`);
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${cause}. ${RETRY_REMEDY}`);
       }
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
@@ -582,7 +582,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       lookup = await workspaceLookup(storeDir, worktree);
     } catch (err) {
       if (err instanceof WorkspaceLookupError) {
-        const remedy = err.corrupt ? corruptRemedy(err.sessionId) : retryRemedy(err.sessionId);
+        const remedy = err.corrupt ? corruptRemedy(err.sessionId) : RETRY_REMEDY;
         return abandon(errFields('SESSION_RESUME_FAILED', `${err.message}. ${remedy}`));
       }
       return abandon(errFields('STORAGE_UNAVAILABLE', `could not look up this workspace's session: ${(err as Error).message}`));
@@ -593,7 +593,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (torn || compromised || sessionCompromised || state !== 'attaching') {
       if (lookup.match) {
         const { id } = lookup.match;
-        return abandon(errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${attachInterruptedCause()}. ${retryRemedy(id)}`));
+        return abandon(errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${attachInterruptedCause()}. ${RETRY_REMEDY}`));
       }
       return abandon(errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach'));
     }
@@ -1072,9 +1072,8 @@ function errFields(code: ControlErrorCode, message: string): ErrorFields {
 function corruptRemedy(id: string): string {
   return `Restore its data, or remove it with \`slipstream delete ${id}\` (this discards that history)`;
 }
-function retryRemedy(id: string): string {
-  return `Retry attach; if it keeps failing, ${corruptRemedy(id).toLowerCase()}`;
-}
+/** A lock, storage or shutdown failure says nothing about the session's data. */
+const RETRY_REMEDY = 'Retry attach';
 function isErrorFields(v: Record<string, unknown> | ErrorFields): v is ErrorFields {
   return (v as ErrorFields).__error === true;
 }

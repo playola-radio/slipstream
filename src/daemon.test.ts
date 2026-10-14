@@ -1537,6 +1537,8 @@ describe('daemon workspace resume', () => {
   });
 });
 
+const RETRY_ONLY = /^(?=[\s\S]*Retry attach)(?![\s\S]*slipstream delete)/;
+
 describe('daemon workspace resume fails closed', () => {
   const ID = '55555555-5555-4555-8555-555555555555';
   async function expectResumeFailed(store: string, daemon: Daemon, call: Call, worktree: string, remedy: RegExp, H?: string): Promise<void> {
@@ -1578,7 +1580,7 @@ describe('daemon workspace resume fails closed', () => {
     const workspaceLookup: typeof findWorkspaceSession = async () => { throw new WorkspaceLookupError(ID, transient); };
     await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
       await seedStartedSession(store, ID, await realpath(worktree));
-      await expectResumeFailed(store, daemon(), call, worktree, /^(?=[\s\S]*Retry attach)(?![\s\S]*Restore its data, or remove)/);
+      await expectResumeFailed(store, daemon(), call, worktree, RETRY_ONLY);
     }, { workspaceLookup });
   });
 
@@ -1593,7 +1595,7 @@ describe('daemon workspace resume fails closed', () => {
     await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
       await seedStartedSession(store, ID, await realpath(worktree));
       await writeFile(join(store, 'sessions', ID, 'owner.lock'), JSON.stringify({ pid: process.pid, nonce: 'someone-else' }));
-      await expectResumeFailed(store, daemon(), call, worktree, /Retry attach/, '1');
+      await expectResumeFailed(store, daemon(), call, worktree, RETRY_ONLY, '1');
     });
   });
 
@@ -1603,7 +1605,7 @@ describe('daemon workspace resume fails closed', () => {
       const failing = createFakePlatform();
       failing.watch = async () => { throw new Error('watcher refused'); };
       await restart({ captureDependencies: { platform: failing } });
-      await expectResumeFailed(store, daemon(), call, worktree, /Retry attach/, '1');
+      await expectResumeFailed(store, daemon(), call, worktree, RETRY_ONLY, '1');
     });
   });
 });
@@ -1622,7 +1624,7 @@ describe('daemon workspace resume fails closed at agent-connection setup', () =>
       const res = await call({ verb: 'attach', worktree, ...IDENTITY, root_transcript: join(store, 'abc123.jsonl') });
       assert.equal(res.ok === false && res.code, 'SESSION_RESUME_FAILED');
       assert.match(res.ok === false ? res.message : '', new RegExp(id));
-      assert.match(res.ok === false ? res.message : '', /Retry attach/);
+      assert.match(res.ok === false ? res.message : '', RETRY_ONLY);
       assert.equal(rec(await call({ verb: 'status' })).state, 'detached');
     });
   });
