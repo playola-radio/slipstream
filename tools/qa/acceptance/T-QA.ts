@@ -27,6 +27,9 @@ import { defaultDaemonStore, controlSocketPath } from '../../../src/daemon-locat
 import { startQaDaemon, runQaDaemonToExit } from '../harness-proc.ts';
 import type { AcceptanceContext, AcceptanceModule } from './types.ts';
 
+const SESSION_RESUMED_TYPE = 'slipstream.session.resumed.v1';
+const CAPTURE_GAP_TYPE = 'slipstream.capture.gap.v1';
+
 function fail(msg: string): never {
   throw new Error(msg);
 }
@@ -264,28 +267,43 @@ async function criterion6(): Promise<Assertion> {
     // --keep retains artifacts after shutdown.
     const a = await startQaDaemon({ root, scenario: 'T-QA', keep: true });
     const sessionA = a.env.session_id;
+    // Capture A's last durable seq while it is still live: the resumed records
+    // must land strictly after it.
+    const highWater = (await createReaderClient(a.env.url, a.env.token).finite(sessionA, 0n)).durableSeq;
     await a.stop();
     if (!(await exists(root))) fail('--keep did not retain the root after shutdown');
 
-    // --reuse starts a fresh daemon + new session while retained history stays readable.
+    // --reuse resumes the workspace's session; its earlier history stays readable.
     const b = await startQaDaemon({ root, reuse: true });
     const sessionB = b.env.session_id;
     try {
-      if (sessionA === sessionB) fail(`--reuse advertised the same session ${sessionA}; a fresh session was expected`);
+      if (sessionA !== sessionB) {
+        fail(`--reuse started a second session ${sessionB} (first was ${sessionA}); the workspace's session was expected to resume`);
+      }
       const reader = createReaderClient(b.env.url, b.env.token);
       const sessions = await reader.sessions();
       const ids = sessions.map((s) => s.id);
-      if (!ids.includes(sessionA)) fail(`retained history for session ${sessionA} was not readable via the reused daemon; saw ${JSON.stringify(ids)}`);
-      if (!ids.includes(sessionB)) fail(`reused daemon did not list its new session ${sessionB}`);
-      // The retained session's events are still publicly served.
-      const retained = await reader.finite(sessionA, 0n);
-      if (!retained.events.some((e) => e.type === FILE_CHANGED_TYPE)) {
-        fail(`retained session ${sessionA} served no file.changed history after reuse`);
-      }
+      const listed = ids.filter((id) => id === sessionA).length;
+      if (listed !== 1) fail(`reused daemon listed session ${sessionA} ${listed} times; expected exactly once in ${JSON.stringify(ids)}`);
+      const all = await reader.finite(sessionA, 0n);
+      const resumed = all.events.find((e) => e.type === SESSION_RESUMED_TYPE && BigInt(e.seq ?? '0') > highWater);
+      if (!resumed) fail(`session ${sessionA} has no ${SESSION_RESUMED_TYPE} after pre-reuse seq ${highWater}`);
+      const gap = all.events.find(
+        (e) => e.type === CAPTURE_GAP_TYPE && e.data?.reason === 'restart' && BigInt(e.seq ?? '0') > highWater,
+      );
+      if (!gap) fail(`session ${sessionA} has no ${CAPTURE_GAP_TYPE} with reason 'restart' after pre-reuse seq ${highWater}`);
+      // The pre-reuse history is still publicly served, on the same session.
+      const retained = all.events.some((e) => e.type === FILE_CHANGED_TYPE && BigInt(e.seq ?? '0') <= highWater);
+      if (!retained) fail(`retained session ${sessionA} served no pre-reuse file.changed history after reuse`);
       return {
         id: 'keep-and-reuse',
-        claim: '--keep retains artifacts; --reuse starts a new session with a refreshed descriptor while retained history stays publicly readable',
-        evidence: { session_a: sessionA, session_b: sessionB, distinct_sessions: true, retained_history_readable: true },
+        claim: '--keep retains artifacts; --reuse resumes the same session (session.resumed + restart gap) with a refreshed descriptor while its earlier history stays publicly readable',
+        evidence: {
+          session_id: sessionA,
+          resumed_seq: String(resumed.seq),
+          gap_seq: String(gap.seq),
+          retained_history_readable: true,
+        },
       };
     } finally {
       await b.stop();
