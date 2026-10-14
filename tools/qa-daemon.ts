@@ -315,6 +315,10 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       return 1;
     }
     const sessionId = attach.session_id as string;
+    // Attach returns only after startup and reconciliation committed, so on a
+    // resumed session this is the position past the resume records.
+    const attachedStatus = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'status' } });
+    const attachedThrough = attachedStatus.ok ? BigInt(String((attachedStatus as Record<string, unknown>).durable_seq ?? '0')) : 0n;
 
     const descriptor = await bootstrapReader(store);
     const descriptorPath = (await readRuntimeDescriptorPath(store)) ?? join(store, 'runtime');
@@ -323,13 +327,13 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     // Ready = the attached session's baseline is durably published.
     const baseline = await awaitEventType(reader, sessionId, BASELINE_COMPLETED_TYPE, 0n);
     if (stopping) return await shutdownComplete!;
-    let readyThroughSeq = baseline.durableSeq;
+    let readyThroughSeq = baseline.durableSeq > attachedThrough ? baseline.durableSeq : attachedThrough;
 
     if (args.scenario !== null) {
       const scenario = getScenario(args.scenario)!;
       io.stderr(`qa-daemon: seeding scenario ${scenario.name}…`);
       readyThroughSeq = await scenario.seed({
-        worktree, sessionId, reader, signal: controller.signal, after: baseline.seq,
+        worktree, sessionId, reader, signal: controller.signal, after: baseline.seq > attachedThrough ? baseline.seq : attachedThrough,
       });
       if (stopping) return await shutdownComplete!;
     }
