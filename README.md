@@ -202,11 +202,14 @@ token. Both the URL and the token are in the `runtime/*.json` file, readable onl
 by you.
 
 ```sh
-DESC=$(node -e "const { readdirSync, statSync } = require('node:fs'); const { join } = require('node:path'); const dir = join(process.env.HOME, '.slipstream', 'runtime'); const files = readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => ({ path: join(dir, name), mtime: statSync(join(dir, name)).mtimeMs })).sort((a, b) => b.mtime - a.mtime); console.log(files[0].path)")
+STORE="$HOME/.slipstream-demo"; export STORE # The quick-start store; use your --store path.
+DESC=$(node -e "const { readdirSync, statSync } = require('node:fs'); const { join } = require('node:path'); const dir = join(process.env.STORE, 'runtime'); const files = readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => ({ path: join(dir, name), mtime: statSync(join(dir, name)).mtimeMs })).sort((a, b) => b.mtime - a.mtime); console.log(files[0].path)")
 URL=$(node -p "require('$DESC').url"); TOKEN=$(node -p "require('$DESC').token")
+CURL_CONFIG=$(mktemp); chmod 600 "$CURL_CONFIG"; trap 'rm -f "$CURL_CONFIG"' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_CONFIG"
 
-curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions"
-curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions/<id>/events?after=0&follow=true"
+curl --config "$CURL_CONFIG" "$URL/v1/sessions"
+curl --config "$CURL_CONFIG" "$URL/v1/sessions/<id>/events?after=0&follow=true"
 ```
 
 | Route | Returns |
