@@ -325,6 +325,22 @@ describe('findWorkspaceSession', () => {
       (err: unknown) => err instanceof WorkspaceLookupError && err.sessionId === A && err.message.includes(A));
   });
 
+  it('marks a corrupt final record as corruption', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + 'garbage\n');
+    await assert.rejects(findWorkspaceSession(dir, '/work'),
+      (err: unknown) => err instanceof WorkspaceLookupError && err.corrupt === true);
+  });
+
+  it('does not call a transient read failure corruption', () => {
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('too many open files'), { code: 'EMFILE' })).corrupt, false);
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('denied'), { code: 'EACCES' })).corrupt, false);
+  });
+
+  it('treats a log that vanished after its first record was read as corruption', () => {
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('gone'), { code: 'ENOENT' })).corrupt, true);
+  });
+
   it('fails closed when a matched session\'s final record has no valid time', async () => {
     const dir = await emptyStore();
     await seed(dir, A, started('/work') + JSON.stringify({ seq: '2', type: 'x', time: 'nope', data: {} }) + '\n');

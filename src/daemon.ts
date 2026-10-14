@@ -562,7 +562,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       lookup = await workspaceLookup(storeDir, worktree);
     } catch (err) {
       if (err instanceof WorkspaceLookupError) {
-        return abandon(errFields('SESSION_RESUME_FAILED', `${err.message}. ${corruptRemedy(err.sessionId)}`));
+        const remedy = err.corrupt ? corruptRemedy(err.sessionId) : retryRemedy(err.sessionId);
+        return abandon(errFields('SESSION_RESUME_FAILED', `${err.message}. ${remedy}`));
       }
       return abandon(errFields('STORAGE_UNAVAILABLE', `could not look up this workspace's session: ${(err as Error).message}`));
     }

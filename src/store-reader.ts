@@ -126,10 +126,14 @@ export interface WorkspaceLookup { match: WorkspaceSessionMatch | undefined; ski
  * must fail closed on it rather than start a second stream for the workspace. */
 export class WorkspaceLookupError extends Error {
   readonly sessionId: string;
+  /** Whether the log itself is damaged (or gone), as opposed to a transient read
+   * failure such as EMFILE; only corruption justifies advising deletion. */
+  readonly corrupt: boolean;
   constructor(sessionId: string, cause: unknown) {
     super(`session ${sessionId} records this workspace but its log cannot be read: ${(cause as Error).message}`, { cause });
     this.name = 'WorkspaceLookupError';
     this.sessionId = sessionId;
+    this.corrupt = cause instanceof LogCorruptError || (cause as NodeJS.ErrnoException).code === 'ENOENT';
   }
 }
 

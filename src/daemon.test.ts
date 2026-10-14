@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFil
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
-import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession } from './store-reader.ts';
+import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
 import { claudePostToolUse } from './question-hook.ts';
@@ -1571,6 +1571,15 @@ describe('daemon workspace resume fails closed', () => {
       // The listing reads the same corrupt tail, so its durable_seq is not asserted.
       await expectResumeFailed(store, daemon(), call, worktree, /Restore its data/);
     });
+  });
+
+  it('with the retry remedy, not the delete remedy, when the lookup hits a transient read failure', { timeout: 30_000 }, async () => {
+    const transient = Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+    const workspaceLookup: typeof findWorkspaceSession = async () => { throw new WorkspaceLookupError(ID, transient); };
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      await seedStartedSession(store, ID, await realpath(worktree));
+      await expectResumeFailed(store, daemon(), call, worktree, /^(?=[\s\S]*Retry attach)(?![\s\S]*Restore its data, or remove)/);
+    }, { workspaceLookup });
   });
 
   it('on a missing content blob', { timeout: 30_000 }, async () => {
