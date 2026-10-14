@@ -587,6 +587,7 @@ test('clip and interface requests draw from one reader-owned admission budget', 
   const released = new Promise<void>(resolve => { release = resolve; });
   const reader = await startReaderServer({ storeDir,
     projectionAdmissionConfig: { C: 1, Q: 0, W: 0, D: 30_000 },
+    interfaceDeadlineMs: 15_000,
     interfaceExtractSwift: async (sides, options) => {
       started();
       await released;
@@ -595,7 +596,12 @@ test('clip and interface requests draw from one reader-owned admission budget', 
   try {
     const headers = { authorization: `Bearer ${reader.token}` };
     const interfacePending = fetch(reader.url + request.slice(4), { headers });
-    await didStart;
+    const interfaceStart = await Promise.race([
+      didStart.then(() => 'started'),
+      interfacePending.then(() => 'responded', () => 'rejected'),
+      new Promise<'timed out'>(resolve => setTimeout(() => resolve('timed out'), 1_000).unref()),
+    ]);
+    assert.equal(interfaceStart, 'started', 'interface request did not begin Swift extraction');
     // A clip request gives up on a still-warming worker with a transient
     // 'timeout' before reaching admission; retry until it reaches the budget.
     let fallbackReason = 'timeout';
