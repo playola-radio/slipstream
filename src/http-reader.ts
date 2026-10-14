@@ -98,9 +98,11 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
   // One resolution path for boundaries. In standalone `serve` mode the caller's
   // `active` session becomes a one-entry registry with a live boundary, so the
   // rest of the server never special-cases it. The daemon passes its own registry.
+  // `serve` never binds an agent chat, so its live capture reports no agent.
   const registry = opts.registry ?? createBoundaryRegistry();
   if (opts.active && !opts.registry) {
     registry.installIfAbsent(opts.active.id, liveBoundary(opts.active.health));
+    registry.setAgentConnection(opts.active.id, 'none');
   }
 
   // The clip projection is computed on demand from the immutable blobs and cached
