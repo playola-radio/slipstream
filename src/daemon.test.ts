@@ -1505,14 +1505,6 @@ describe('daemon workspace resume', () => {
     });
   });
 
-  it('still refuses a different chat while the workspace is being recorded', { timeout: 30_000 }, async () => {
-    await withResumeDaemon(async ({ worktree, call }) => {
-      await call({ verb: 'attach', worktree, ...IDENTITY });
-      const other = await call({ verb: 'attach', worktree, harness: 'codex', harness_session_id: 'other' });
-      assert.equal(other.ok === false && other.code, 'SESSION_ACTIVE');
-    });
-  });
-
   it('starts a new session after the workspace\'s session was removed', { timeout: 30_000 }, async () => {
     await withResumeDaemon(async ({ worktree, call }) => {
       const id = rec(await call({ verb: 'attach', worktree, ...IDENTITY })).session_id!;

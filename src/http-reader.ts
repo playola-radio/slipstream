@@ -12,7 +12,7 @@ import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './l
 import { parseClipSnapshot } from './clip-blob-reader.ts';
 import { createClipProjectionService, type ClipServiceOptions } from './clip-projection-service.ts';
 import { languageForPath } from './clip-language.ts';
-import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
+import { liveBoundary, type BoundarySource } from './reader-runtime.ts';
 import { createBoundaryRegistry, resolveBoundary, type BoundaryRegistry } from './boundary-registry.ts';
 import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
