@@ -392,6 +392,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (state === 'attaching') sessionCompromised = true; // startup aborts below
   }
 
+  /** Why an attach in flight can no longer complete, for a resume that must name it. */
+  function attachInterruptedCause(): string {
+    if (torn) return 'the daemon is shutting down';
+    if (compromised) return 'the daemon lost its store lock';
+    if (sessionCompromised) return 'the session lock was lost while it was starting';
+    return 'the daemon could not complete the attach';
+  }
+
   async function startAndActivate(
     id: string,
     resume: boolean,
@@ -477,8 +485,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
       registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
       if (state === 'attaching') state = 'detached';
-      if (resume && pendingFailed) {
-        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: could not record the agent connection. ${retryRemedy(id)}`);
+      if (resume) {
+        const cause = pendingFailed ? 'could not record the agent connection' : attachInterruptedCause();
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${cause}. ${retryRemedy(id)}`);
       }
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
@@ -571,6 +580,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       console.error(`slipstream daemon: skipped session ${s.id} while looking for ${worktree}'s session: ${s.reason}`);
     }
     if (torn || compromised || sessionCompromised || state !== 'attaching') {
+      if (lookup.match) {
+        const { id } = lookup.match;
+        return abandon(errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${attachInterruptedCause()}. ${retryRemedy(id)}`));
+      }
       return abandon(errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach'));
     }
     const identity = [req.harness as string, req.harness_session_id as string, req.root_transcript as string | undefined] as const;
