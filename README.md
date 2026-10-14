@@ -1,215 +1,330 @@
 # Slipstream
 
-**Review your coding agent's work as it happens, instead of facing a pile of
-files at the end.**
+**Watch your coding agent's work as it happens, instead of facing a pile of
+changed files at the end.**
 
-Slipstream streams the changes an AI coding agent makes to your code, live, so
-you can follow along and review in near-real-time while the agent works. The name
-is the thesis: a slipstream is the low-pressure pocket behind a fast-moving
-object, and riding in it makes following far cheaper than leading.
+Slipstream is a local daemon that watches the folder an AI coding agent (Claude
+Code, Codex, or any other) is working in and records every file change it
+observes into an append-only event log. You can follow that log live in your
+terminal, read it over a local HTTP API, or build your own viewer on top of it.
 
-Status: **pre-implementation.** The architecture is settled and the MVP plan is
-written. No code yet.
+The name is the idea: a slipstream is the low-pressure pocket behind a
+fast-moving object. Following there costs far less than leading. Reviewing an
+agent's changes as they land is easier than reviewing them all at once.
 
-- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — the five-stage MVP plan
-- [`NOTES-architecture.md`](NOTES-architecture.md) — decision record, verified
-  findings, and the Codex adversarial review
+> **Status: early and pre-1.0.** The capture engine, log format, reader API, and
+> agent integrations work and are tested. They are developed and used daily on
+> macOS. The event format may still change between releases. The Linux test
+> suite runs in CI, but live capture on Linux gets far less use.
+
+## What it is honest about
+
+Slipstream makes narrow claims on purpose, and the rest of the design follows
+from them.
+
+- **It records observed states, not every write.** Slipstream watches the
+  filesystem, so it sees what a file looked like when it read it. If a file goes
+  `A → B → C` faster than Slipstream can read it, you see `A → C`. A file that is
+  created and deleted within a fraction of a second may never appear. When
+  Slipstream knows it missed something, it records an explicit gap event.
+- **"Which agent made this change?" is a guess, and labeled as one.** Slipstream
+  can read an agent's local transcript and match file changes to the agent's tool
+  calls by timing. The result is marked `heuristic`, `ambiguous`, `unknown`, or
+  `pending`, and can be revised later. It is never presented as proof of
+  authorship.
+- **Missing content is marked missing.** If a file could not be read (too large,
+  permission denied, removed mid-read), the event says so and gives the reason.
+  It never shows a fake empty file.
 
 ## Install
+
+Requires **Node.js 24 or newer**. Day-to-day use is on **macOS**. Slipstream
+watches files with [`@parcel/watcher`](https://github.com/parcel-bundler/watcher),
+which also supports Linux.
 
 ```sh
 npm install -g @playola-radio/slipstream
 ```
 
-Node.js 24 or newer is required. The published package ships compiled
-JavaScript; developing in this repo still runs the TypeScript sources directly
-(`npm run slipstream`, `npm test`) with no build step. To put a clone on your
-PATH with `npm link`, run `npm run build` first, and again after pulling: the
-linked command runs the compiled `dist/`, not the sources.
+This installs two commands: `slipstream`, and `slipstream-mcp` (the connector
+agents use, see [Group changes by task](#group-changes-by-task)).
 
-## License
+**From a clone:** run `npm ci`, then `npm run slipstream -- <command>`. That
+runs the TypeScript sources directly, with no build step. To put a clone's
+commands on your PATH, run `npm run build && npm link`. Rebuild after pulling,
+because the linked commands run the compiled `dist/`, not the sources.
 
-Apache-2.0. Copyright Playola Radio, Incorporated. See [`LICENSE`](LICENSE).
+## Quick start: watch a folder
 
-## What it promises — and does not
+The fastest way to see Slipstream work is to point it at a folder and follow
+the feed from a second terminal.
 
-> Slipstream streams **a live history of observed filesystem states, with
-> explicit coverage gaps.** It does not claim to be a complete record of every
-> write.
+**Terminal 1** — capture a folder and serve its feed:
 
-Capture is watcher-primary, so it observes states rather than writes. If a file
-goes `A → B → C` faster than it can be read, Slipstream reports `A → C`; an
-`A → B → A` cycle can be invisible entirely. Those gaps are disclosed in the
-event schema and surfaced in the UI rather than papered over.
+```sh
+slipstream serve ~/code/my-project --store ~/.slipstream-demo
+```
 
-Similarly, attribution is revisable inference with an explicit status
-(`pending` / `heuristic` / `ambiguous` / `unknown`), never a verified claim of
-authorship. A timestamp near an agent's tool call is evidence, not proof.
+It prints the new session's ID:
+
+```text
+slipstream: watching /Users/you/code/my-project
+slipstream: session 3a8aee17-d12c-42f0-9798-f72d81819c0e
+...
+```
+
+**Terminal 2** — follow it live:
+
+```sh
+slipstream view --store ~/.slipstream-demo --session <session-id>
+```
+
+```text
+1 · slipstream.session.started.v1 · -
+2 · slipstream.file.baselined.v1 · src/app.ts
+3 · slipstream.capture.baseline.completed.v1 · -
+4 · slipstream.enrichment.configured.v1 · -
+5 · slipstream.file.changed.v1 · src/app.ts · 2751a3a
+```
+
+Add `--changes` to see the changed lines of each file, not just one line per
+event. Edit something in the project, or let an agent work there, and the
+changes appear as they are captured. Press Ctrl-C in terminal 1 to stop. The
+history stays in the store.
+
+> If you create the store folder yourself, make it private first
+> (`mkdir -m 700 <dir>`). Slipstream refuses to use a store that other users on
+> the machine can read, because the store holds copies of your source code.
 
 ## What gets captured
 
-Inside a git work tree, capture follows what git would merge: a path git ignores
-and does not track is out of scope, decided by git itself rather than a
-re-implemented matcher. Outside a git work tree, every path is captured.
+In a git repository, Slipstream records the files git would include in a
+commit. A file that git ignores and doesn't track is skipped. Git itself makes
+that call, so it matches your `.gitignore` exactly. Outside a git repository,
+every file is captured.
 
-You can exclude extra paths with a root **`.slipstreamignore`** file. It uses
-git's own ignore syntax and, unlike `.gitignore`, can also exclude files git
-*tracks* (a committed-but-noisy generated file, say). Its rules are frozen when a
-capture starts, so editing the file takes effect on the next capture, not the
-running one. The file is honored only inside a git work tree; a non-git root
-ignores it. Patterns anchored with a leading slash (`/build`) are relative to the
-git worktree root, as git's own excludes are — so place `.slipstreamignore` at
-the worktree root rather than in a watched subdirectory. Excluded paths are never read or recorded, and the comparison API
-discloses that the layer was active (`inventory.policy_exclusions` lists
-`"slipstream-ignored"`).
-
-## Design constraints
-
-- **The event schema is the public interface.** The on-disk JSONL log plus
-  content-addressed blobs are the source of truth; the HTTP/SSE reader is a thin
-  view over them; the bundled UI is one client among possible many. You must be
-  able to delete the front-end and replace it.
-- **Slipstream does not launch agents.** Conductor stays the launcher.
-  Slipstream rides in through user-level MCP and skill configuration.
-- **Claude Code and Codex CLI from day one**, via a capture path that does not
-  depend on either.
-
-## Architecture
-
-A headless local daemon (TypeScript/Node) captures bytes and writes an
-append-only event log; a browser client (React + Monaco) renders the feed. The
-MCP server is a thin stdio forwarder per agent session — verified necessary,
-since each session spawns its own server process — and the daemon owns the store.
-
+To skip more, add a **`.slipstreamignore`** at the root of the repository. It
+uses `.gitignore` syntax. Unlike `.gitignore`, it can also skip files git
+tracks, such as a committed but noisy generated file. Slipstream reads it when a
+recording starts, so edits apply to the next recording. It only works inside a
+git repository. Skipped files are never read or stored, and reports from the
+reader API say when this filter was active.
 
 ## Connect an agent chat
 
-From inside the Claude Code or Codex chat you want to connect, run (or ask the
-agent to run) one command in the workspace:
+For real work, Slipstream runs as one long-lived daemon that records the
+workspace an agent chat is working in. From inside the Claude Code or Codex
+chat, run this in the workspace (or ask the agent to run it):
 
 ```sh
 slipstream attach
 ```
 
-It finds the chat from the harness's own environment, starts the shared daemon
-if it is not running, installs the question hook and the answer tool for that
-harness in this workspace, and starts recording. Nothing needs copying: no chat
-ID, transcript path, Node path, or checkout path.
-
-- **Attached successfully** means both: the workspace is recording *and* the
-  chat proved it can answer. A first attach always starts as `setup_pending`; the
-  chat confirms through a one-time setup check on its next tool call. Until then
-  the Slipstream app shows Ask Agent as unavailable and questions are refused
-  with `AGENT_NOT_CONNECTED`.
-- If attach had to install the hook or tool, the running chat must reload to see
-  them. Attach prints the exact step: `claude --resume <id>` or
-  `codex resume <id>` in the workspace, then `slipstream attach` again. The
-  conversation is kept. Codex runs the new hook only after you trust it in
-  Codex's own hook review.
-- Running it again in the same chat reports the existing capture; it never starts
-  a second recording or changes the binding.
-- One workspace is recorded at a time. If another workspace or another chat is
-  recorded, attach explains and changes nothing; run `slipstream detach` there
-  first.
-- Attach refuses, recording nothing, when it cannot tell which chat it is in,
-  when the chat's transcript cannot be found, or when the harness version is not
-  one Slipstream has verified. It never falls back to recording without an agent.
-
-Files it writes, merging with what is already there and never duplicating its
-own entry: Claude Code gets a `PostToolUse` hook in `.claude/settings.local.json`
-and a local-scope `slipstream` MCP server (via `claude mcp add --scope local`);
-Codex gets a hook in `.codex/hooks.json` and a `[mcp_servers.slipstream]` table
-in `.codex/config.toml`. Unrelated hooks, servers, and permissions are kept. An
-existing Slipstream entry pointing somewhere else is reported, not replaced,
-and symlinked config is refused rather than followed. These files hold local
-paths, so keep them out of commits; attach does not edit git ignore rules. The
-host's own trust and approval prompts still apply: Codex may ask you to trust
-the hook, and both harnesses ask before the first answer-tool call unless you
-approve it.
-
-Limitations:
-
-- Verified runtimes only: Claude Code 2.1.283 started with `claude -p` and
-  2.1.280 in Conductor; Codex 0.154.0 and 0.155.1 launched through its SDK
-  (`exec` or `vscode` source). Other versions, and interactive `claude` or
-  `codex exec` chats, are refused rather than guessed at. The Claude Code and
-  Codex versions Conductor ships today are outside this set, so Conductor chats
-  are refused for now. See the
-  [acceptance record](docs/ask-agent/attach-acceptance-2026-10-07.md).
-- Codex SDK chats, including Conductor's, never show Codex's hook review. Run
-  `codex` once in the workspace and trust the Slipstream hook there; attach
-  prints this step.
-- A Codex chat in the `workspace-write` sandbox cannot write `.codex/`; attach
-  refuses and says so.
-- A connected chat stays connected until detach; there is no heartbeat, so a
-  chat that has since closed still shows as connected.
-- Conductor has no verified way to reload a running chat's hooks and tools, so a
-  Conductor chat that needed new config stays pending until it confirms.
-- One chat per workspace, no chat picker.
-
-## Queue a question about a captured change
-
-With the shared daemon running (`slipstream start`) and explicitly attached to a
-Claude Code or Codex session, an independent local client can queue a question:
+It works out which chat it is in, starts the daemon if needed, and starts
+recording. It also installs a hook and a tool in that workspace's agent config,
+which let you [ask the agent about a change](#experimental-ask-the-agent-about-a-change).
+If the chat has to reload to pick those up, `attach` prints the exact command.
+Then:
 
 ```sh
-slipstream ask --store /path/to/store --session <capture-uuid> \
-  --request-id <caller-generated-lowercase-uuid> --input question.json
+slipstream status    # what's being recorded, and the reader URL
+slipstream view --store ~/.slipstream --session <capture-session-id>
+slipstream detach    # stop recording; history is kept
 ```
 
-`question.json` contains the question and immutable after-snapshot identity read
-from the public events API (sequence numbers are decimal strings):
+Current limits:
 
-```json
-{
-  "text": "Why is this check needed?",
-  "context": {
-    "change_seq": "42",
-    "path": "src/example.ts",
-    "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "line_start": 3,
-    "line_end": 5
-  }
-}
+- **Only versions Slipstream has verified are accepted.** For Claude Code that
+  is 2.1.283 started with `claude -p`, and 2.1.280 in Conductor. For Codex it is
+  0.154.0 and 0.155.1, launched through its SDK. Anything else is refused and
+  nothing is recorded. The versions Conductor ships today aren't on the list
+  yet, so Conductor chats are refused for now.
+- One workspace and one chat are recorded at a time.
+
+**Recording any chat, without Ask Agent.** If your agent version isn't
+verified, you can still record its workspace by naming the chat yourself:
+
+```sh
+slipstream start &   # or leave it running in another terminal
+slipstream attach ~/code/my-project \
+  --harness claude-code --harness-session-id <chat-session-id>
 ```
 
-A follow-up adds `"reply_to_question_id"` naming the earlier question; its
-`context` must be identical. The example hash is a placeholder: use the actual change's `after.sha256`. The
-daemon validates the durable event and original blob, derives the selected text,
-and copies the explicit attach target. It never reads the current working file
-or accepts client-supplied authorship. Only after-content up to 1 MiB is eligible;
-select at most 200 lines / 16 KiB. Questions are trimmed and capped at 8192 UTF-8
-bytes. `serve` has no attach/control path and does not support `ask`.
+`--harness` is `claude-code` or `codex`. The session ID is the chat
+transcript's file name, which Slipstream reads to estimate which changes came
+from the agent:
 
-Success prints JSON `{v:1,ok:true,session_id,request_id,question_id,seq,
-queued_at_ms,expires_at_ms,duplicate}`. It means **durably queued**, not delivered
-to an agent or answered. Read `slipstream.question.queued.v1` through the existing
-authenticated `GET /v1/sessions/<id>/events` endpoint; its self-contained schema is
-available at `GET /v1/schemas/slipstream.question.queued.v1`.
+- Claude Code: `~/.claude/projects/<project>/<session-id>.jsonl`
+- Codex: `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-<timestamp>-<session-id>.jsonl`
 
-Delivery needs a connected agent chat (see "Connect an agent chat" above).
-[The delivery contract](docs/ask-agent/contract.md#delivery-through-posttooluse)
-documents the control fields and the manual setup that `slipstream attach`
-automates. The public
-`slipstream.question.dispatch_attempted.v1` event means the daemon committed an
-attempt before answering the hook; it does not confirm receipt or an answer.
-Attach Claude shortly after its first root tool call, and keep the chat's
-current directory at the attached worktree when claiming a question.
+Everything about `attach`, including exactly which files it edits:
+[docs/connect-agent-chat.md](docs/connect-agent-chat.md).
 
-Retry with the **same request ID, capture ID and input**. Same-ID/body retries
-return the original result without extending the 30-minute TTL. A changed body
-returns `REQUEST_CONFLICT`; more than 16 unexpired questions returns
-`QUESTION_LIMIT`. Other domain errors are `INVALID_QUESTION`, `INVALID_CONTEXT`,
-`SESSION_NOT_SELECTED`, `AGENT_NOT_CONNECTED`, `CAPTURE_NOT_READY`, and
-`STORAGE_UNAVAILABLE`. Errors
-print structured JSON on stderr (exit 1); local file/syntax errors exit 2.
-`STORAGE_UNAVAILABLE`, or a lost/malformed response after transmission, exits 3:
-the outcome is unknown and the record may already be committed. Preserve the same
-request ID, capture ID and input when retrying. A new capture never resumes an old queue; inspect
-the old public log by `request_id` rather than retargeting a retry.
+## Group changes by task
 
-The control wire request is `{v:1,verb:"ask",session_id,request_id,text,context}`
-over the owner-only `<store>/control.sock` using existing NDJSON framing. No
-harness identity is required from the client. Full details, limits and lifecycle:
-[queue contract](docs/ask-agent/contract.md). Receiving-answer UI remains
-separate work.
+An agent can label its work so the feed groups changes under titles like "Fix
+the pagination off-by-one" instead of by time alone. Slipstream offers this
+through an MCP server, `slipstream-mcp`, which gives the agent a
+`slipstream_begin_task` tool. The included [`SKILL.md`](SKILL.md) tells the
+agent when to call it.
+
+Copy-paste setup for Claude Code and Codex is in
+[docs/mcp-forwarder-config.md](docs/mcp-forwarder-config.md). If the daemon isn't
+running, the tool returns an error the agent is told to ignore. Slipstream never
+blocks the agent's work.
+
+## Build on it: the data is the interface
+
+The bundled terminal viewer is just one client. Everything it shows is available
+to any program you write, through two public routes. The daemon has no private
+channel to its own UI.
+
+**On disk.** The store (`~/.slipstream` by default) is plain files:
+
+```text
+~/.slipstream/
+  sessions/<session-id>/events.jsonl   # append-only log, one JSON event per line
+  blobs/sha256/<ab>/<sha256>           # file contents, stored by hash
+  runtime/<id>.json                    # how to reach the running HTTP reader
+```
+
+Each line of `events.jsonl` is a [CloudEvents](https://cloudevents.io/)-style
+record with a type such as `slipstream.file.changed.v1`. File contents are not
+stored inline. Each change names its before and after content by SHA-256, and
+the bytes live under `blobs/`. Contents are written to disk before any event
+that refers to them, so a crash never leaves an event pointing at missing bytes.
+Every event type has a JSON Schema in [`schemas/`](schemas/).
+
+**Over HTTP.** The reader listens only on `127.0.0.1` and requires a bearer
+token. Both the URL and the token are in the `runtime/*.json` file, readable only
+by you.
+
+```sh
+DESC=$(ls ~/.slipstream/runtime/*.json | head -1)
+URL=$(node -p "require('$DESC').url"); TOKEN=$(node -p "require('$DESC').token")
+
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions"
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions/<id>/events?after=0&follow=true"
+```
+
+| Route | Returns |
+|---|---|
+| `GET /v1/sessions` | Captured sessions |
+| `GET /v1/sessions/:id/events?after=N[&follow=true]` | Events after sequence `N`, streamed live with `follow=true` |
+| `GET /v1/blobs/sha256/:hash` | Raw file contents |
+| `GET /v1/sessions/:id/changes/:seq/clips` | The changed regions of one file change ([CLIP-PROJECTION.md](CLIP-PROJECTION.md)) |
+| `GET /v1/sessions/:id/interfaces` | Functions added, removed, or changed between two points in a session, for TypeScript and Swift ([FUNCTION-CHANGES.md](FUNCTION-CHANGES.md)) |
+| `GET /v1/schemas/:type` | The JSON Schema for an event type |
+
+To show the feed the same way the bundled viewer does, follow
+[DISPLAY-FOLD.md](DISPLAY-FOLD.md). It explains how to turn the event stream
+into what's displayed, and includes test cases a new client can check itself
+against.
+
+## Experimental: ask the agent about a change
+
+From a captured change, you can queue a question about specific lines
+("Why is this check needed?"). Slipstream delivers it to the attached chat the
+next time the agent uses a tool, and the agent's answer is recorded back into
+the log.
+
+```sh
+slipstream ask --store ~/.slipstream --session <capture-id> \
+  --request-id <uuid> --input question.json
+```
+
+This needs a chat connected with the one-command `slipstream attach` above.
+Until the chat confirms it can answer, questions are refused with
+`AGENT_NOT_CONNECTED`. A successful `ask` means the question is safely queued,
+not that the agent has seen it. The input format, limits, retry rules, and error
+codes are in [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+## Privacy and what Slipstream stores
+
+- **Everything stays on your machine.** There is no telemetry and no network
+  access beyond the local reader on `127.0.0.1`.
+- **The store contains real copies of your source files**, including any secrets
+  that pass through the watched folder and aren't excluded by git or
+  `.slipstreamignore`. It is created readable only by you.
+- **Slipstream reads your agents' local transcripts** (under `~/.claude` and
+  `~/.codex`) to estimate which changes came from the agent. It never writes to
+  them.
+- **`slipstream attach` edits the workspace's agent config** (`.claude/` or
+  `.codex/`) to add its hook and tool. Those entries contain local paths, so keep
+  them out of commits.
+- **History is kept until you delete it.** While the daemon is detached,
+  `slipstream delete <session-id>` removes a session and `slipstream gc` removes
+  file contents no remaining session refers to.
+
+## How it works
+
+```text
+ agent edits files ─▶ worktree ─▶ file watcher ─▶ daemon ─▶ blobs/ + events.jsonl
+                                                     │                   │
+ agent's transcript ─(read-only, async)─▶ attribution┘                   ▼
+                                                           HTTP/SSE reader ─▶ any client
+ agent ─▶ slipstream-mcp (stdio, one per chat) ─▶ daemon control socket
+```
+
+- **The file watcher is the only capture source.** Agent transcripts can
+  refine *who probably* made a change, but never create a change event. Each
+  change is therefore recorded once.
+- **Analysis never slows capture.** Transcript matching and code analysis run
+  separately and only add to the log. If a step fails, the view has less
+  detail, but no events are lost.
+- **Slipstream never launches your agent.** It joins through the agent's own
+  MCP and hook configuration. Each chat starts its own small `slipstream-mcp`
+  process, which only relays to the single daemon that owns the store.
+
+The full decision record is in [NOTES-architecture.md](NOTES-architecture.md).
+
+## Command reference
+
+| Command | Does |
+|---|---|
+| `watch [dir] [--store dir]` | Capture a folder into its own store, with no daemon or HTTP |
+| `serve [dir] [--store dir]` | Same as `watch`, plus an HTTP reader |
+| `start [--store dir] [--config file] [...]` | Run the shared daemon |
+| `attach [dir]` | Run inside an agent chat: connect it and start recording |
+| `attach [dir] --harness h --harness-session-id id` | Record a worktree for a chat you name yourself |
+| `status` / `detach` | Show or stop the active recording |
+| `view --store dir [--session id] [--changes] [--context N] [--full] [--disk]` | List sessions, or follow one live in the terminal |
+| `ask --store dir --session id --request-id uuid --input file` | Queue a question for the agent (experimental) |
+| `hook <codex\|claude-code> post-tool-use` | The hook command agents run to receive questions |
+| `delete <session-id>` / `gc` | Remove a session / unused file contents (daemon detached) |
+
+Run `slipstream` with no arguments for every option. The daemon commands accept
+`--store <dir>`, which defaults to `~/.slipstream`; `view` needs it spelled out.
+The daemon, the CLI, and `slipstream-mcp` must all use the same store.
+
+## Contributing
+
+Pull requests go to `develop`. Read [CLAUDE.md](CLAUDE.md) first. It lists the
+rules that keep Slipstream honest, and the product decisions that need
+discussion before a change.
+
+```sh
+npm run typecheck
+npm test            # fast, deterministic tier; runs in CI on macOS and Linux
+npm run test:os     # real-filesystem tier; needs macOS FSEvents
+npm run test:tools
+```
+
+[TESTING.md](TESTING.md) covers the test layout and the fake filesystem the fast
+tier uses.
+
+### Design documents
+
+| Document | Covers |
+|---|---|
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Staged plan, success criteria, and status |
+| [NOTES-architecture.md](NOTES-architecture.md) | Architecture decisions and the evidence behind them |
+| [DISPLAY-FOLD.md](DISPLAY-FOLD.md) | How a client turns events into a display |
+| [CLIP-PROJECTION.md](CLIP-PROJECTION.md), [FUNCTION-CHANGES.md](FUNCTION-CHANGES.md), [INTERFACE-PROJECTION.md](INTERFACE-PROJECTION.md) | Derived views: changed regions and function-level changes |
+| [SWIFT-INTERFACE.md](SWIFT-INTERFACE.md), [INTERFACE-V2-TYPESCRIPT.md](INTERFACE-V2-TYPESCRIPT.md) | Language support for function-level changes |
+| [STAGE-1-REPORT.md](STAGE-1-REPORT.md), [B2-MEASUREMENT-REPORT.md](B2-MEASUREMENT-REPORT.md) | Measured capture latency and loss |
+| [docs/](docs/) | Agent setup, the ask-agent feature, reader API notes |
+
+## License
+
+Apache-2.0. Copyright Playola Radio, Incorporated. See [`LICENSE`](LICENSE).
