@@ -76,6 +76,17 @@ describe('http-reader core', () => {
     } finally { await live.close(); }
   });
 
+  it('reports a standalone serve capture as live with no agent, not ended', async () => {
+    const serve = await startReaderServer({
+      storeDir: dir, active: { id: UUID, health: createHealth(2n), logPath: join(dir, 'sessions', UUID, 'events.jsonl') },
+    });
+    try {
+      const body = await (await GET(serve, '/v1/sessions')).json();
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false,
+        agent_connection: { state: 'disconnected', reason: 'no_agent' } }]);
+    } finally { await serve.close(); }
+  });
+
   it('rejects a missing bearer with 401', async () => {
     const res = await fetch(`${srv.url}/v1/sessions`, { headers: { host: `127.0.0.1:${srv.port}` } });
     assert.equal(res.status, 401);
@@ -177,7 +188,8 @@ describe('http-reader corruption honesty', () => {
     });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false,
+        agent_connection: { state: 'disconnected', reason: 'no_agent' } }]);
     } finally { await srv.close(); }
   });
 
