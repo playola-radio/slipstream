@@ -56,6 +56,7 @@
           "$ref": "#/$defs/scope"
         },
         "reason": {
+          "$comment": "restart: the daemon did not watch this session for an unknown interval — a daemon restart, or a re-attach after a detach. Reconciliation afterwards reports observed states, not the edits in between.",
           "enum": [
             "coalesced",
             "baseline-unreadable",

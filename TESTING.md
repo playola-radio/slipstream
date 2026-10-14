@@ -93,7 +93,7 @@ descriptor bootstrap.
 npm run qa:daemon -- --scenario T-QA     # seed a real create+modify, then idle for curling
 npm run qa:daemon -- --root ./sandbox    # override the root
 npm run qa:daemon -- --keep              # retain the root after Ctrl-C
-npm run qa:daemon -- --reuse             # reuse a harness-owned root; new session, retained history
+npm run qa:daemon -- --reuse             # reuse a harness-owned root; resumes its session
 ```
 
 Flags: `--root <dir>`, `--scenario <name>`, `--keep`, `--reuse`. Default mode

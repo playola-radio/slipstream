@@ -12,8 +12,8 @@ import { parseCursor, openLogCursor, LogCorruptError, type LogCursor } from './l
 import { parseClipSnapshot } from './clip-blob-reader.ts';
 import { createClipProjectionService, type ClipServiceOptions } from './clip-projection-service.ts';
 import { languageForPath } from './clip-language.ts';
-import { liveBoundary, staticBoundary, type BoundarySource } from './reader-runtime.ts';
-import { createBoundaryRegistry, type BoundaryRegistry } from './boundary-registry.ts';
+import { liveBoundary, type BoundarySource } from './reader-runtime.ts';
+import { createBoundaryRegistry, resolveBoundary, type BoundaryRegistry } from './boundary-registry.ts';
 import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
 import { createInterfaceService, type InterfaceServiceOptions } from './interface-service.ts';
@@ -267,9 +267,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     // The registry is authoritative for every session the daemon has touched
     // this run. Disk high-water is the fallback ONLY for daemon-unknown sessions
     // (retained from a prior run, immutable now) — never for one mid-write.
-    const runtime = registry.get(id);
-    if (runtime) return runtime.boundary;
-    return staticBoundary(await onDiskHighWater(sessionLogPath(opts.storeDir, id)));
+    return resolveBoundary(registry, id, () => onDiskHighWater(sessionLogPath(opts.storeDir, id)));
   }
 
   async function handleClips(res: ServerResponse, id: string, seqStr: string,

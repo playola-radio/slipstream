@@ -23,13 +23,14 @@ import { staticBoundary, type BoundarySource } from './reader-runtime.ts';
  * they complete against the high-water they captured, so a transition never turns
  * a valid response into a partial download.
  *
- * Race-freedom rests on one invariant enforced by the daemon: attach ALWAYS
- * mints a NEW session UUID (it never reactivates a retained session — roots
- * recur, identity is the UUID). So any session that can transition to active is
- * registry-known before it is disk-listable; a session found on disk but absent
- * from the registry is retained and can never transition. Follower registration
- * and boundary reads are synchronous, so no await interleaves between reading the
- * current boundary and joining the set that a transition aborts.
+ * Race-freedom rests on one invariant enforced by the daemon: before any session
+ * log can grow, its registry boundary is installed — `reserve` (0) for a fresh
+ * session, `freeze` at the durable high-water for one being resumed — and the
+ * registry is authoritative over disk from then on. A disk fallback re-checks the
+ * registry after its async read ({@link resolveBoundary}), so a read that started
+ * before a resume pinned the boundary cannot install a stale one. Follower
+ * registration and boundary reads are synchronous, so no await interleaves
+ * between reading the current boundary and joining the set a transition aborts.
  */
 /** A live capture's agent chat readiness; `none` means no chat is bound. */
 export type AgentConnectionState = 'setup_pending' | 'connected' | 'none';
@@ -115,4 +116,22 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       entries.get(id)?.followers.delete(ac);
     },
   };
+}
+
+/** A session's boundary: the registry's if it knows the id, else the disk
+ * high-water. The registry is re-checked after the async disk read (and on its
+ * failure), so a boundary pinned meanwhile is never replaced by a stale read. */
+export async function resolveBoundary(
+  registry: BoundaryRegistry, id: string, readDisk: () => Promise<bigint>,
+): Promise<BoundarySource> {
+  const known = registry.get(id);
+  if (known) return known.boundary;
+  let seq: bigint;
+  try { seq = await readDisk(); }
+  catch (err) {
+    const late = registry.get(id);
+    if (late) return late.boundary;
+    throw err;
+  }
+  return registry.get(id)?.boundary ?? staticBoundary(seq);
 }

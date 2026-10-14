@@ -22,7 +22,10 @@ Each declaration marks the start of its own group; a second task is never a
 retry of the first.
 
 Do **not** call it for every individual edit, and do not re-call it to "resume"
-a task you already declared — one declaration per task is enough.
+a task you already declared — one declaration per task is enough. The one
+exception: after `slipstream attach` runs again following a detach, declare
+your current task again. A resumed attach starts with no current task; an
+attach that reports `already_active` changes nothing and does not reset it.
 
 ## How to use it
 

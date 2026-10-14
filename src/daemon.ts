@@ -11,7 +11,9 @@ import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
-import { isValidSessionId, listSessions } from './store-reader.ts';
+import { isValidSessionId, listSessions, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
+import { CorruptLogError } from './recovery.ts';
+import { LogCorruptError } from './log-reader.ts';
 import {
   publishTombstone,
   removeSessionHistory,
@@ -56,6 +58,8 @@ export interface DaemonOptions {
   captureDependencies?: Parameters<typeof startCapture>[1];
   /** Allows an identity-path resolution race to be exercised deterministically. */
   identityRealpath?: (path: string) => Promise<string>;
+  /** Allows an attach's workspace lookup to be held deterministically. */
+  workspaceLookup?: typeof findWorkspaceSession;
   /** The resolved enrichment + transcript config (Fork 4). Absent means built-in
    * defaults: no harness is `configured`, so no transcript is read. */
   config?: ResolvedConfig;
@@ -179,6 +183,7 @@ async function bindControl(server: Server, socketPath: string): Promise<void> {
 export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const storeDir = opts.storeDir;
   const identityRealpath = opts.identityRealpath ?? realpath;
+  const workspaceLookup = opts.workspaceLookup ?? findWorkspaceSession;
   const socketPath = join(storeDir, 'control.sock');
 
   await mkdirpDurable(storeDir);
@@ -209,6 +214,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string;
         agent?: AgentCheck }
     | undefined;
+  /** One start of a capture. `phase` tells a lock-loss callback whether the attach
+   * that created it is still starting, is live, or is over. */
+  type Activation = { session?: CaptureSession; phase: 'starting' | 'active' | 'over' };
   const inflightTasks = new Set<Promise<unknown>>();
   const connections = new Set<Socket>();
   let attachInFlight: Promise<unknown> | undefined;
@@ -377,31 +385,39 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** The active session lost its own lock. Stop presenting healthy, preserve the
    * boundary at the last durable seq, and refuse further mutations (decision 9).
    * `current` is retained so teardown can still stop the wedged session. */
-  function handleSessionCompromise(id: string, reason: string): void {
+  function handleSessionCompromise(id: string, reason: string, activation: Activation): void {
     console.error(`slipstream daemon: session ${id} lost its lock: ${reason}`);
-    if (current?.id === id && state === 'active') {
+    // Ids are reused across activations, so the callback is matched to the capture
+    // that registered it, never to the id: a late callback from an earlier
+    // activation must not wedge or abort a later one.
+    if (activation.session && current?.session === activation.session && state === 'active') {
       registry.freeze(id, BigInt(current.session.health.snapshot().durable_seq));
       state = 'wedged';
       return;
     }
-    if (state === 'attaching') sessionCompromised = true; // startup aborts below
+    if (activation.phase === 'starting' && state === 'attaching') sessionCompromised = true; // startup aborts below
+  }
+
+  /** Why an attach in flight can no longer complete, for a resume that must name it. */
+  function attachInterruptedCause(): string {
+    if (torn) return 'the daemon is shutting down';
+    if (compromised) return 'the daemon lost its store lock';
+    if (sessionCompromised) return 'the session lock was lost while it was starting';
+    return 'the daemon could not complete the attach';
   }
 
   async function startAndActivate(
     id: string,
-    worktree: string,
+    resume: boolean,
+    resolvedWorktree: string,
     harness: string,
     harnessSessionId: string,
     rootTranscript?: string,
   ): Promise<Record<string, unknown> | ErrorFields> {
     let session: CaptureSession;
-    let resolvedWorktree: string;
     let resolvedTranscript: string | undefined;
+    const activation: Activation = { phase: 'starting' };
     try {
-      // Canonicalize before binding: capture resolves the root with realpath, so a
-      // symlinked or relative declared path must report the same durable root in
-      // status rather than the caller's raw string (locked design, decision 5).
-      resolvedWorktree = await realpath(worktree);
       if (rootTranscript !== undefined) {
         if (harness !== 'codex' && harness !== 'claude-code') {
           throw new RootIdentityError('root_transcript requires a supported harness');
@@ -432,20 +448,29 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         {
           root: resolvedWorktree,
           storeDir,
-          sessionId: id,
-          onCompromised: (reason) => handleSessionCompromise(id, reason),
+          ...(resume ? { resumeSessionId: id } : { sessionId: id }),
+          onCompromised: (reason) => handleSessionCompromise(id, reason, activation),
           ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
           ...(transcript ? { transcript } : {}),
         },
         opts.captureDependencies,
       );
+      activation.session = session;
     } catch (err) {
-      // Freeze at boundary 0 (capture never activated); never delete the entry,
-      // which would let the reader fall back to disk for a half-written session.
-      registry.freeze(id, 0n);
+      activation.phase = 'over';
+      // A fresh session never activated: freeze at 0, never delete the entry, so
+      // the reader cannot fall back to disk for a half-written log. A resumed
+      // session keeps the boundary pinned at its pre-resume high-water.
+      if (!resume) registry.freeze(id, 0n);
       if (state === 'attaching') state = 'detached';
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
       if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
+      if (resume) {
+        const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError
+          ? corruptRemedy(id)
+          : RETRY_REMEDY;
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${(err as Error).message}. ${remedy}`);
+      }
+      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
       return errFields('CAPTURE_NOT_READY', (err as Error).message);
     }
     // A verified root chat starts setup-pending; anything else has no agent to ask.
@@ -468,9 +493,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         abortStopError ??= err;
       }
       registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
+      activation.phase = 'over';
       if (state === 'attaching') state = 'detached';
+      if (resume) {
+        const cause = pendingFailed ? 'could not record the agent connection' : attachInterruptedCause();
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${cause}. ${RETRY_REMEDY}`);
+      }
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
+    activation.phase = 'active';
     registry.activate(id, liveBoundary(session.health));
     registry.setAgentConnection(id, agent?.state ?? 'none');
     current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript, agent };
@@ -521,18 +552,65 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // Set attaching BEFORE the first await so a concurrent attach is refused.
     state = 'attaching';
     sessionCompromised = false;
-    const id = randomUUID();
-    // Reserve the registry entry (boundary 0) before startCapture creates the log
-    // dir on disk, so the reader never over-publishes an uncommitted record from a
-    // session that momentarily appears on disk mid-startup.
-    registry.reserve(id);
-    const p = startAndActivate(id, req.worktree, req.harness, req.harness_session_id, req.root_transcript as string | undefined);
+    const p = resolveAndStart(req);
     attachInFlight = p;
     try {
       return await p;
     } finally {
       if (attachInFlight === p) attachInFlight = undefined;
     }
+  }
+
+  /** Canonicalize the worktree, find its existing session, and start or resume
+   * capture. Runs entirely inside `attachInFlight`, so shutdown and maintenance
+   * wait for the lookup as well as the startup. */
+  async function resolveAndStart(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    const abandon = (fields: ErrorFields): ErrorFields => {
+      if (state === 'attaching') state = 'detached';
+      return fields;
+    };
+    let worktree: string;
+    try {
+      // Canonicalize before binding and before lookup: capture resolves the root
+      // with realpath, so a symlinked or relative path must name the same root.
+      worktree = await realpath(req.worktree as string);
+    } catch (err) {
+      return abandon(errFields('CAPTURE_NOT_READY', (err as Error).message));
+    }
+    let lookup;
+    try {
+      lookup = await workspaceLookup(storeDir, worktree);
+    } catch (err) {
+      if (err instanceof WorkspaceLookupError) {
+        const remedy = err.corrupt ? corruptRemedy(err.sessionId) : RETRY_REMEDY;
+        return abandon(errFields('SESSION_RESUME_FAILED', `${err.message}. ${remedy}`));
+      }
+      return abandon(errFields('STORAGE_UNAVAILABLE', `could not look up this workspace's session: ${(err as Error).message}`));
+    }
+    for (const s of lookup.skipped) {
+      console.error(`slipstream daemon: skipped session ${s.id} while looking for ${worktree}'s session: ${s.reason}`);
+    }
+    if (torn || compromised || sessionCompromised || state !== 'attaching') {
+      if (lookup.match) {
+        const { id } = lookup.match;
+        return abandon(errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${attachInterruptedCause()}. ${RETRY_REMEDY}`));
+      }
+      return abandon(errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach'));
+    }
+    const identity = [req.harness as string, req.harness_session_id as string, req.root_transcript as string | undefined] as const;
+    if (lookup.match) {
+      const { id, durableSeq } = lookup.match;
+      // Pin the boundary at the durable high-water BEFORE the log can grow, and
+      // hold it until activation: readers never see past it mid-resume.
+      registry.freeze(id, registry.get(id)?.boundary.current() ?? durableSeq);
+      return startAndActivate(id, true, worktree, ...identity);
+    }
+    const id = randomUUID();
+    // Reserve the registry entry (boundary 0) before startCapture creates the log
+    // dir on disk, so the reader never over-publishes an uncommitted record from a
+    // session that momentarily appears on disk mid-startup.
+    registry.reserve(id);
+    return startAndActivate(id, false, worktree, ...identity);
   }
 
   async function detach(): Promise<Record<string, unknown> | ErrorFields> {
@@ -583,12 +661,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     if (!nonEmptyString(req.title)) return errFields('INVALID_TITLE', 'begin_task requires a non-empty title');
     if (!nonEmptyString(req.request_id)) return errFields('CAPTURE_NOT_READY', 'begin_task requires a non-empty request_id');
-    // Canonicalize the declared worktree with the SAME realpath policy as attach
-    // (startAndActivate), so a symlinked or relative declared path matches the
-    // durable root capture actually watches.
+    // Canonicalize the declared worktree with identityRealpath, which defaults to
+    // the same realpath policy attach uses (resolveAndStart), so a symlinked or
+    // relative declared path matches the durable root capture actually watches.
+    // The binding is captured before the await and compared by reference after it:
+    // a session id can now come back to life (detach, then resume), so an id match
+    // does not prove this is still the binding the request was admitted against.
+    const binding = current;
     let declaredWorktree: string;
     try {
-      declaredWorktree = await realpath(req.worktree);
+      declaredWorktree = await identityRealpath(req.worktree);
     } catch {
       declaredWorktree = req.worktree; // an unresolvable path cannot match the canonical root
     }
@@ -603,7 +685,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (compromised || torn) {
       return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     }
-    if (state !== 'active' || !current) {
+    if (state !== 'active' || !current || current !== binding) {
       return errFields('SESSION_NOT_SELECTED', 'the selected session changed before the declaration committed');
     }
     // Re-apply the optional session_id target guard after the await, exactly like
@@ -986,6 +1068,12 @@ function controlFailure(err: unknown): ErrorFields {
 function errFields(code: ControlErrorCode, message: string): ErrorFields {
   return { __error: true, code, message };
 }
+/** What to do when a session cannot be read or resumed. */
+function corruptRemedy(id: string): string {
+  return `Restore its data, or remove it with \`slipstream delete ${id}\` (this discards that history)`;
+}
+/** A lock, storage or shutdown failure says nothing about the session's data. */
+const RETRY_REMEDY = 'Retry attach';
 function isErrorFields(v: Record<string, unknown> | ErrorFields): v is ErrorFields {
   return (v as ErrorFields).__error === true;
 }

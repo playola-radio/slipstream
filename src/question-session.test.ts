@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile, realpath } from 'node:fs/promises';
+import { appendFile, mkdir, writeFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startCapture } from './session.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
@@ -166,5 +166,56 @@ it('queues a follow-up only for a question in this capture with the same source 
     assert.equal(queued.length, 2);
     assert.equal('reply_to_question_id' in queued[0]!.data, false);
     assert.equal((queued[1]!.data as { reply_to_question_id?: string }).reply_to_question_id, first.question_id);
+  });
+});
+
+it('does not make a pre-resume question claimable, even after storage recovery, and keeps a post-resume task', async () => {
+  await withTempDir(async base => {
+    const rawRoot = join(base, 'work'); await mkdir(rawRoot);
+    const root = await realpath(rawRoot);
+    const storeDir = join(base, 'store');
+    const now = () => 1000;
+    let platform = createFakePlatform();
+    const s1 = await startCapture({ root, storeDir, now }, { platform });
+    await writeFile(join(root, 'a.ts'), 'one\n'); platform.observe('a.ts');
+    const ev = (await waitForRecords(s1.logPath, r => r.some(e => e.type === 'slipstream.file.changed.v1')))
+      .find(e => e.type === 'slipstream.file.changed.v1')!;
+    assert.equal(ev.type, 'slipstream.file.changed.v1'); assert.equal(ev.data.after.kind, 'content');
+    while (BigInt(s1.health.snapshot().durable_seq) < BigInt(ev.seq)) await new Promise(r => setTimeout(r, 5));
+    await s1.askQuestion({ session_id: s1.sessionId, request_id: randomUUID(), text: 'Why?',
+      context: { change_seq: ev.seq, path: 'a.ts', snapshot_sha256: ev.data.after.sha256, line_start: 1, line_end: 1 } }, target);
+    await s1.stop();
+
+    let failNextChange = false;
+    platform = createFakePlatform();
+    const s2 = await startCapture({ root, storeDir, now, resumeSessionId: s1.sessionId }, { platform, createLog: async opts => {
+      const log = await createLog(opts);
+      return { ...log, append: async input => {
+        if (input.type === 'slipstream.file.changed.v1' && failNextChange) {
+          failNextChange = false;
+          await appendFile(opts.filePath, '{"type":"slipstream.file.changed.v1","data":');
+          throw new StorageError('append', new Error('torn write'));
+        }
+        return log.append(input);
+      } };
+    } });
+    try {
+      assert.equal(await s2.claimQuestion(target), null, 'a pre-resume question must not be claimable');
+      const t2 = await s2.beginTask({ title: 'After resume', requestId: 'r-after' });
+      failNextChange = true;
+      await writeFile(join(root, 'a.ts'), 'two\n'); platform.observe('a.ts');
+      const deadline = Date.now() + 5000;
+      // Wait for storage recovery to finish and for its reconciliation to record the change.
+      let changes: { data: { task_hint_id?: string } }[] = [];
+      while (true) {
+        assert.ok(Date.now() < deadline, 'storage recovery did not reconcile a.ts');
+        changes = (await readRecords(s2.logPath)).filter(e => e.type === 'slipstream.file.changed.v1' && e.data.path === 'a.ts')
+          .slice(1) as typeof changes;
+        if (s2.health.snapshot().state === 'healthy' && changes.length > 0) break;
+        await new Promise(r => setTimeout(r, 10));
+      }
+      assert.equal(changes.at(-1)!.data.task_hint_id, t2.task_id, 'storage recovery keeps the post-resume task current');
+      assert.equal(await s2.claimQuestion(target), null, 'storage recovery must not resurrect a pre-resume question');
+    } finally { await s2.stop(); }
   });
 });

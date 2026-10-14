@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.session.resumed.v1.json",
   "title": "slipstream.session.resumed.v1",
-  "$comment": "Recorded on restart at recovered_through_seq + 1. Self-contained; unknown fields permitted for forward compatibility.",
+  "$comment": "Recorded at recovered_through_seq + 1 when capture of an existing session resumes (daemon restart or re-attach). It resets live state: there is no current task until a new task.started, questions queued before it are never claimable again, and any earlier agent.connection record is stale. Self-contained; unknown fields permitted for forward compatibility.",
   "type": "object",
   "required": [
     "specversion",

@@ -1,11 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, utimes, chmod, symlink } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   listSessions, readTombstone, isValidSessionId, isValidHex,
   schemaBytes, onDiskHighWater, blobPath, sessionLogPath, readRuntimeDescriptor,
+  findWorkspaceSession, WorkspaceLookupError, tombstonePath,
 } from './store-reader.ts';
 import { LogCorruptError } from './log-reader.ts';
 
@@ -73,6 +75,12 @@ describe('store-reader', () => {
       const dir = await store();
       const log = sessionLogPath(dir, UUID);
       await writeFile(log, '{"seq":"1"}\n{}\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
+    });
+    it('throws on a final record that is JSON null', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":"1"}\nnull\n', 'utf8');
       await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
     });
     it('throws on a numeric (non-string) seq', async () => {
@@ -230,4 +238,124 @@ it('finds a large log high-water without a whole-file read', async () => {
     assert.equal(await onDiskHighWater(log), 4000n);
     assert.equal(spy.mock.callCount(), 0, 'high-water must not buffer the whole log');
   } finally { spy.mock.restore(); syncBuiltinESMExports(); }
+});
+
+describe('findWorkspaceSession', () => {
+  const A = '11111111-1111-4111-8111-111111111111';
+  const B = '22222222-2222-4222-8222-222222222222';
+  const C = '33333333-3333-4333-8333-333333333333';
+  const line = (seq: number, type: string, data: unknown, time = '2026-10-14T10:00:00.000Z') =>
+    JSON.stringify({ seq: String(seq), type, time, data }) + '\n';
+  const started = (root: string, time?: string) => line(1, 'slipstream.session.started.v1', { root, max_bytes: 1 }, time);
+  async function seed(dir: string, id: string, body: string): Promise<void> {
+    await mkdir(join(dir, 'sessions', id), { recursive: true });
+    await writeFile(sessionLogPath(dir, id), body);
+  }
+  async function emptyStore(): Promise<string> { return mkdtemp(join(tmpdir(), 'slip-ws-')); }
+
+  it('finds the session whose started root matches and reports its durable seq', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + line(2, 'slipstream.capture.scope.v1', {}));
+    await seed(dir, B, started('/elsewhere'));
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.deepEqual(found.match, { id: A, durableSeq: 2n });
+    assert.deepEqual(found.skipped, []);
+  });
+
+  it('returns no match for an empty or missing store', async () => {
+    const dir = await emptyStore();
+    assert.deepEqual(await findWorkspaceSession(dir, '/work'), { match: undefined, skipped: [] });
+    assert.deepEqual(await findWorkspaceSession(join(dir, 'nope'), '/work'), { match: undefined, skipped: [] });
+  });
+
+  it('never returns a tombstoned session, even with a residual log', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work'));
+    await writeFile(tombstonePath(dir, A), JSON.stringify({ version: 1 }));
+    assert.equal((await findWorkspaceSession(dir, '/work')).match, undefined);
+  });
+
+  it('skips, with a reason, a session whose first record is torn, invalid, missing, or not session.started', async () => {
+    const dir = await emptyStore();
+    const D = '44444444-4444-4444-8444-444444444444';
+    await seed(dir, A, '{"seq":"1","type":"slipstream.session.st');
+    await seed(dir, B, 'not json\n');
+    await seed(dir, C, line(1, 'slipstream.capture.scope.v1', {}));
+    await mkdir(join(dir, 'sessions', D), { recursive: true }); // no log at all
+    await mkdir(join(dir, 'sessions', 'not-a-uuid'), { recursive: true });
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.equal(found.match, undefined);
+    assert.deepEqual(found.skipped.map(s => s.id).sort(), [A, B, C, D]);
+    assert.ok(found.skipped.every(s => s.reason.length > 0));
+  });
+
+  it('skips a session whose first record is null or has null data', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, 'null\n');
+    await seed(dir, B, line(1, 'slipstream.session.started.v1', null));
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.equal(found.match, undefined);
+    assert.deepEqual(found.skipped.map(s => s.id).sort(), [A, B]);
+  });
+
+  it('rethrows an unreadable log that is not corruption or missing instead of skipping it', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work'));
+    await chmod(sessionLogPath(dir, A), 0o000);
+    await assert.rejects(findWorkspaceSession(dir, '/work'),
+      (err: unknown) => !(err instanceof WorkspaceLookupError) && (err as NodeJS.ErrnoException).code === 'EACCES');
+  });
+
+  it('picks the duplicate whose last record is newest', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + line(2, 'x', {}, '2026-10-14T12:00:00.000Z'));
+    await seed(dir, B, started('/work') + line(2, 'x', {}, '2026-10-14T11:00:00.000Z'));
+    assert.equal((await findWorkspaceSession(dir, '/work')).match?.id, A);
+  });
+
+  it('breaks a last-record time tie by the smallest session id', async () => {
+    const dir = await emptyStore();
+    await seed(dir, B, started('/work'));
+    await seed(dir, A, started('/work'));
+    assert.equal((await findWorkspaceSession(dir, '/work')).match?.id, A);
+  });
+
+  it('ignores a torn tail when reading the matched session\'s last record', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + '{"seq":"2","ty');
+    assert.deepEqual((await findWorkspaceSession(dir, '/work')).match, { id: A, durableSeq: 1n });
+  });
+
+  it('fails closed, naming the session, when a matched session\'s final record is unreadable', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + 'garbage\n');
+    await assert.rejects(findWorkspaceSession(dir, '/work'),
+      (err: unknown) => err instanceof WorkspaceLookupError && err.sessionId === A && err.message.includes(A)
+        && err.corrupt === true);
+  });
+
+  it('skips, without blocking, a session whose log is not a regular file', { timeout: 5_000 }, async () => {
+    const dir = await emptyStore();
+    await mkdir(join(dir, 'sessions', A), { recursive: true });
+    execFileSync('mkfifo', [join(dir, 'sessions', A, 'events.jsonl')]);
+    await seed(dir, B, started('/work'));
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.equal(found.match?.id, B);
+    assert.deepEqual(found.skipped.map(s => s.id), [A]);
+  });
+
+  it('does not call a transient read failure corruption', () => {
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('too many open files'), { code: 'EMFILE' })).corrupt, false);
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('denied'), { code: 'EACCES' })).corrupt, false);
+  });
+
+  it('treats a log that vanished after its first record was read as corruption', () => {
+    assert.equal(new WorkspaceLookupError(A, Object.assign(new Error('gone'), { code: 'ENOENT' })).corrupt, true);
+  });
+
+  it('fails closed when a matched session\'s final record has no valid time', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, started('/work') + JSON.stringify({ seq: '2', type: 'x', time: 'nope', data: {} }) + '\n');
+    await assert.rejects(findWorkspaceSession(dir, '/work'), WorkspaceLookupError);
+  });
 });

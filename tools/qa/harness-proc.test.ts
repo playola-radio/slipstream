@@ -62,8 +62,10 @@ describe('startQaDaemon keep → stop → reuse', () => {
         // validation can prove ownership without weakening the fresh-nonce
         // readiness handshake.
         assert.equal(reuse.env.owner_run_id, keep.env.owner_run_id);
-        // --reuse starts a fresh session against the retained store.
-        assert.notEqual(reuse.env.session_id, sessionA);
+        // --reuse resumes the workspace's retained session (one stream per workspace).
+        assert.equal(reuse.env.session_id, sessionA);
+        assert.ok(BigInt(reuse.env.ready_through_seq) > BigInt(keep.env.ready_through_seq),
+          'a resumed run is ready only past its resume records');
       } finally {
         await reuse.stop();
       }

@@ -710,7 +710,7 @@ describe('session', () => {
       );
     });
 
-    it('rebuilds the dedup index and current task across a resume', async () => {
+    it('rebuilds the dedup index across a resume but starts with no current task', async () => {
       await withTempPair(async (root, store) => {
         const platform = createFakePlatform();
         const s1 = await startCapture({ root, storeDir: store }, { platform });
@@ -721,21 +721,23 @@ describe('session', () => {
         const s2 = await startCapture({ root, storeDir: store, resumeSessionId: sessionId }, { platform });
         try {
           // Dedup index rebuilt: a replayed duplicate returns the original result
-          // and appends nothing.
+          // and appends nothing — and does NOT make that task current again.
           const replay = await s2.beginTask({ title: 'Persisted', requestId: 'req-1' });
           assert.deepEqual(replay, original);
-          assert.equal(
-            declarations(await readRecords(s2.logPath)).length,
-            1,
-            'a replayed declaration must not re-append after resume',
-          );
+          assert.equal(declarations(await readRecords(s2.logPath)).length, 1,
+            'a replayed declaration must not re-append after resume');
 
-          // Current task pointer rebuilt: a change observed after resume groups
-          // under the recovered task without a fresh declaration.
           await writeFile(join(root, 'c.ts'), 'v1');
           platform.observe('c.ts');
-          const recs = await waitForRecords(s2.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
-          assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, original.task_id);
+          let recs = await waitForRecords(s2.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
+          assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, undefined);
+
+          // A fresh declaration after the resume groups later changes again.
+          const next = await s2.beginTask({ title: 'After resume', requestId: 'req-2' });
+          await writeFile(join(root, 'c.ts'), 'v2');
+          platform.observe('c.ts');
+          recs = await waitForRecords(s2.logPath, (r) => changesFor(r, 'c.ts').length >= 2);
+          assert.equal(changesFor(recs, 'c.ts')[1]!.data.task_hint_id, next.task_id);
         } finally {
           await s2.stop();
         }

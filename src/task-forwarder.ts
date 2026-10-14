@@ -15,16 +15,16 @@
  *     {@link shouldAutoResend}); a generic ambiguous request is never blindly
  *     retried.
  *
- *     KNOWN LIMIT (at-least-once): the forwarder omits session_id (it never
+ *     KNOWN LIMIT: the forwarder omits session_id (it never
  *     attaches, so it cannot know the capture UUID), so idempotency is scoped to
  *     the selected capture session. If the SAME identity triple is detached and
- *     reattached between the first send and the resend, the resend lands in a NEW
- *     capture session whose `committedTasks` does not yet hold this request_id,
- *     and the task is recorded a second time (in the new session). The success we
- *     then report is truthful — a task WAS declared — but the intent is recorded
- *     twice across the two sessions. This is the accepted cost of the locked
- *     at-least-once auto-resend; closing it needs store-level request_id dedup
- *     (P3 idempotency scope), which is a design decision, not a forwarder fix.
+ *     reattached between the first send and the resend, re-attaching resumes the
+ *     SAME session and rebuilds its request_id index from the log, so the resend
+ *     replays the first send's result instead of recording the task twice. But
+ *     a resume deliberately clears the current task (spec D1), and a replay does
+ *     not reactivate it: the success we report is truthful (the task WAS
+ *     declared), yet later changes stay ungrouped until the agent declares a
+ *     task again under a new request_id.
  *
  *  2. When the resend cannot definitively resolve the first send, we must not
  *     imply "nothing committed." A structurally-rejected resend (INVALID_TITLE /

@@ -17,7 +17,10 @@
  * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask;
  * `SESSION_ACTIVE` refuses a second attach while one session is already active
  * (this PR carries exactly one active capture); `SESSION_NOT_FOUND` refuses a
- * delete of a well-formed session id that names no session on disk. */
+ * delete of a well-formed session id that names no session on disk.
+ * `SESSION_RESUME_FAILED`: attach found the workspace's existing session but could
+ * not resume it; the message names the session and whether to retry or
+ * restore/delete it. Attach never falls back to a new session. */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
   | 'SESSION_NOT_SELECTED'
@@ -35,6 +38,7 @@ export type ControlErrorCode =
   | 'QUESTION_NOT_FOUND'
   | 'ANSWER_CONFLICT'
   | 'AGENT_NOT_CONNECTED'
+  | 'SESSION_RESUME_FAILED'
   | 'PROTOCOL';
 
 export interface RequestEnvelope {

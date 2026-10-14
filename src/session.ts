@@ -273,7 +273,8 @@ export async function startCapture(
     unattemptedQuestions.clear();
     for (const event of rec.questions) {
       committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
-      unattemptedQuestions.set(event.data.question_id, event);
+      // Questions queued before the latest resume stay history only (D2).
+      if (BigInt(event.seq) > rec.latestResumedSeq) unattemptedQuestions.set(event.data.question_id, event);
     }
     for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
     questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
@@ -308,6 +309,8 @@ export async function startCapture(
       };
     },
     onCommitted: (event) => {
+      // A resume starts without a current task or claimable questions (D1/D2).
+      if (event.type === 'slipstream.session.resumed.v1') { currentTaskId = undefined; unattemptedQuestions.clear(); }
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') {

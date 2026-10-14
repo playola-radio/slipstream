@@ -364,3 +364,39 @@ describe('recovery', () => {
     });
   });
 });
+
+const resumed: EventInput = {
+  type: 'slipstream.session.resumed.v1',
+  occurred_at_ms: 7,
+  data: { recovered_through_seq: '1', discarded_tail_bytes: 0 },
+};
+
+describe('recovery across a resume', () => {
+  it('clears the current task at a resume but keeps the dedup index', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, task('t1', 'r1'), resumed]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.equal(rec.currentTaskId, undefined);
+      assert.deepEqual([...rec.taskDeclarations.keys()], ['r1']);
+      assert.equal(rec.latestResumedSeq, 3n);
+    });
+  });
+
+  it('keeps a task declared after the latest resume current', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, task('t1', 'r1'), resumed, task('t2', 'r2')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.equal(rec.currentTaskId, 't2');
+    });
+  });
+
+  it('reports latestResumedSeq 0 for a log that was never resumed', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const rec = await recoverSession(await seedLog(dir, [started]), SESSION, cas);
+      assert.equal(rec.latestResumedSeq, 0n);
+    });
+  });
+});

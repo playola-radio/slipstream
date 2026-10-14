@@ -36,9 +36,12 @@ export interface RecoveredSession {
   /** Seq of the disclosing gap for each recovered storage outage episode, so a
    * retried recovery reuses the surviving gap instead of appending a duplicate. */
   storageGapSeqByEpisode: Map<string, string>;
-  /** The `task_id` of the last committed task declaration; undefined if none. New
-   * changes after recovery group under this task until a fresh declaration. */
+  /** The `task_id` of the last task declaration after the latest `session.resumed`;
+   * undefined if none. A resume starts with no current task. */
   currentTaskId: string | undefined;
+  /** Seq of the latest `session.resumed` record; 0n if never resumed. Questions
+   * queued at or before it are history only and are never claimable again. */
+  latestResumedSeq: bigint;
   /** Committed task declarations keyed by their idempotency `request_id`, so the
    * session rebuilds its dedup index: a replayed duplicate must not re-append. A
    * torn trailing declaration is discarded with the tail, so it never appears. */
@@ -135,6 +138,7 @@ export async function recoverSession(
   let maxBytes: number | undefined;
   let baselineCompleted = false;
   let currentTaskId: string | undefined;
+  let latestResumedSeq = 0n;
   let seq = 0n;
 
   const verifyBlob = async (snap: Snapshot, where: string): Promise<void> => {
@@ -149,8 +153,14 @@ export async function recoverSession(
     let bytes: Buffer;
     try {
       bytes = await cas.read(snap.sha256);
-    } catch {
-      throw new CorruptLogError(`${where}: referenced blob ${snap.sha256} is missing`);
+    } catch (err) {
+      // A missing content-addressed path proves this history cannot be replayed.
+      // Other read errors (EACCES, EIO, EMFILE) only describe the store's current
+      // availability, so keep them retryable rather than recommending deletion.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new CorruptLogError(`${where}: referenced blob ${snap.sha256} is missing`);
+      }
+      throw err;
     }
     if (bytes.length !== snap.size) {
       throw new CorruptLogError(`${where}: blob ${snap.sha256} size ${bytes.length} != ${snap.size}`);
@@ -305,6 +315,8 @@ export async function recoverSession(
         break;
       }
       case 'slipstream.session.resumed.v1':
+        currentTaskId = undefined;
+        latestResumedSeq = BigInt(event.seq);
         break;
     }
   }
@@ -344,6 +356,7 @@ export async function recoverSession(
     baselineUnknownDirs,
     storageGapSeqByEpisode,
     currentTaskId,
+    latestResumedSeq,
     taskDeclarations,
     attributionEvents,
     questions,
