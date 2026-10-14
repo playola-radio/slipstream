@@ -1685,6 +1685,14 @@ describe('daemon workspace resume and readers', () => {
         await entering;
         assert.ok((await readLog(store, id)).length > H, 'records past H are already on disk');
         assert.equal((await sessionsJson(daemon())).find(s => s.id === id)?.durable_seq, String(H));
+        const finite = await fetch(`${daemon().readerUrl}/v1/sessions/${id}/events?after=0`,
+          { headers: { authorization: `Bearer ${daemon().readerToken}` } });
+        assert.equal(finite.status, 200);
+        assert.equal(finite.headers.get('slipstream-durable-seq'), String(H));
+        const seqs = (await finite.text()).split('\n').filter(l => l !== '').map(l => BigInt((JSON.parse(l) as { seq: string }).seq));
+        assert.ok(seqs.length > 0, 'the finite read must serve the pre-resume history');
+        assert.ok(seqs.every(q => q <= BigInt(H)), `a finite read must stay at or below ${H}, saw ${seqs.at(-1)}`);
+        assert.equal(seqs.at(-1), BigInt(H));
       } finally { release(); }
       const res = await attachP;
       assert.equal(rec(res).session_id, id);
