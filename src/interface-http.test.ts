@@ -581,17 +581,33 @@ test('reader shutdown aborts in-flight isolated Swift work before closing', asyn
 
 test('clip and interface requests draw from one reader-owned admission budget', async () => {
   const { storeDir, request } = await fixture('swift-parameter-change');
+  let started!: () => void;
+  const didStart = new Promise<void>(resolve => { started = resolve; });
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
   const reader = await startReaderServer({ storeDir,
-    projectionAdmissionConfig: { C: 1, Q: 0, W: 0, D: 30_000 } });
+    projectionAdmissionConfig: { C: 1, Q: 0, W: 0, D: 30_000 },
+    interfaceExtractSwift: async (sides, options) => {
+      started();
+      await released;
+      return extractSwiftSides(sides, options);
+    } });
   try {
     const headers = { authorization: `Bearer ${reader.token}` };
     const interfacePending = fetch(reader.url + request.slice(4), { headers });
-    await delay(35);
-    const clip = await fetch(`${reader.url}/v1/sessions/11111111-1111-4111-8111-111111111111/changes/4/clips`, { headers });
-    assert.equal(clip.status, 200);
-    assert.equal((await clip.json() as { fallback_reason: string }).fallback_reason, 'overloaded');
+    await didStart;
+    // A clip request gives up on a still-warming worker with a transient
+    // 'timeout' before reaching admission; retry until it reaches the budget.
+    let fallbackReason = 'timeout';
+    for (let attempt = 0; fallbackReason === 'timeout' && attempt < 100; attempt++) {
+      const clip = await fetch(`${reader.url}/v1/sessions/11111111-1111-4111-8111-111111111111/changes/4/clips`, { headers });
+      assert.equal(clip.status, 200);
+      fallbackReason = (await clip.json() as { fallback_reason: string }).fallback_reason;
+    }
+    assert.equal(fallbackReason, 'overloaded');
+    release();
     assert.equal((await interfacePending).status, 200);
-  } finally { await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
+  } finally { release(); await reader.close(); await rm(storeDir, { recursive: true, force: true }); }
 });
 
 async function serviceRequest(name: string) {
