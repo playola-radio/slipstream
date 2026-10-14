@@ -281,7 +281,11 @@ async function storeWithChange(path = 'x.txt', beforeText = 'a\nb\nc\n', afterTe
 }
 
 describe('http-reader clip projection', () => {
-  it('optional HTTP clip barrier exposes real coalesced W pressure', { timeout: 15_000 }, async () => {
+  it('optional HTTP clip barrier exposes real coalesced W pressure', { timeout: 15_000 }, async t => {
+    // Without the mock, a worker still warming past the service's 100ms
+    // deadline answers the leader with a transient timeout and never reaches
+    // the barrier, so the test would wait on it forever.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { dir } = await storeWithChange('x.ts', 'function f() { return 1; }\n', 'function f() { return 2; }\n');
     const events: ProjectionTraceEvent[] = [];
     let entered!: () => void, release!: () => void;
@@ -291,24 +295,25 @@ describe('http-reader clip projection', () => {
       projectionAdmissionConfig: { C: 1, Q: 8, W: 2, D: 500 },
       projectionTrace: event => events.push(event),
       clipDispatchBarrier: () => { entered(); return barrier; } });
-    try {
-      const path = `/v1/sessions/${UUID}/changes/2/clips`;
-      const leader = GET(srv, path);
-      await barrierEntered;
-      const waiters = Array.from({ length: 4 }, () => GET(srv, path));
-      const admitted = async () => {
-        const until = Date.now() + 200;
-        while (events.filter(event => event.kind === 'admission').length < 5 && Date.now() < until)
-          await new Promise(resolve => setTimeout(resolve, 1));
-      };
-      await admitted();
-      assert.deepEqual(events.filter(event => event.kind === 'admission').map(event => event.disposition),
-        ['running', 'waiting', 'waiting', 'overloaded', 'overloaded']);
-      release();
-      const responses = await Promise.all([leader, ...waiters]);
-      assert.ok(responses.every(response => response.status === 200));
-      assert.equal(events.filter(event => event.kind === 'parser-request').length, 1);
-    } finally { release(); await srv.close(); await rm(dir, { recursive: true, force: true }); }
+    // An after hook still runs when the test times out; a finally behind a
+    // stuck await does not, and the open server would keep the process alive.
+    t.after(async () => { release(); await srv.close(); await rm(dir, { recursive: true, force: true }); });
+    const path = `/v1/sessions/${UUID}/changes/2/clips`;
+    const leader = GET(srv, path);
+    await barrierEntered;
+    const waiters = Array.from({ length: 4 }, () => GET(srv, path));
+    const admitted = async () => {
+      const until = Date.now() + 5_000;
+      while (events.filter(event => event.kind === 'admission').length < 5 && Date.now() < until)
+        await new Promise(resolve => setImmediate(resolve));
+    };
+    await admitted();
+    assert.deepEqual(events.filter(event => event.kind === 'admission').map(event => event.disposition),
+      ['running', 'waiting', 'waiting', 'overloaded', 'overloaded']);
+    release();
+    const responses = await Promise.all([leader, ...waiters]);
+    assert.ok(responses.every(response => response.status === 200));
+    assert.equal(events.filter(event => event.kind === 'parser-request').length, 1);
   });
 
   it('serves the same function projection as a direct-disk client without appending to the log', { timeout: 15_000 }, async t => {
