@@ -1,13 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';
-import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, readdir, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, readdir, utimes, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
 import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
+import { createCas } from './cas.ts';
 import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
@@ -1582,6 +1583,17 @@ describe('daemon workspace resume fails closed', () => {
     await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
       await seedStartedSession(store, ID, await realpath(worktree), [change(HEX_DEAD)]);
       await expectResumeFailed(store, daemon(), call, worktree, /Restore its data/, '2');
+    });
+  });
+
+  it('with the retry remedy when an existing blob cannot be read temporarily', { timeout: 30_000 }, async () => {
+    await withResumeDaemon(async ({ store, worktree, call, daemon }) => {
+      const blob = await (await createCas(join(store, 'blobs'))).put(Buffer.from('xyz'));
+      await seedStartedSession(store, ID, await realpath(worktree), [change(blob.sha256)]);
+      // The blob is present and intact, but an external permission change makes
+      // this read fail now. That is retryable, not proof of corrupt history.
+      await chmod(blobPath(store, blob.sha256), 0o000);
+      await expectResumeFailed(store, daemon(), call, worktree, RETRY_ONLY, '2');
     });
   });
 

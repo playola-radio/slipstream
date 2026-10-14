@@ -153,8 +153,14 @@ export async function recoverSession(
     let bytes: Buffer;
     try {
       bytes = await cas.read(snap.sha256);
-    } catch {
-      throw new CorruptLogError(`${where}: referenced blob ${snap.sha256} is missing`);
+    } catch (err) {
+      // A missing content-addressed path proves this history cannot be replayed.
+      // Other read errors (EACCES, EIO, EMFILE) only describe the store's current
+      // availability, so keep them retryable rather than recommending deletion.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new CorruptLogError(`${where}: referenced blob ${snap.sha256} is missing`);
+      }
+      throw err;
     }
     if (bytes.length !== snap.size) {
       throw new CorruptLogError(`${where}: blob ${snap.sha256} size ${bytes.length} != ${snap.size}`);
