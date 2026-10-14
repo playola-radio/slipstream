@@ -214,6 +214,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string;
         agent?: AgentCheck }
     | undefined;
+  /** One start of a capture. `phase` tells a lock-loss callback whether the attach
+   * that created it is still starting, is live, or is over. */
+  type Activation = { session?: CaptureSession; phase: 'starting' | 'active' | 'over' };
   const inflightTasks = new Set<Promise<unknown>>();
   const connections = new Set<Socket>();
   let attachInFlight: Promise<unknown> | undefined;
@@ -382,14 +385,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** The active session lost its own lock. Stop presenting healthy, preserve the
    * boundary at the last durable seq, and refuse further mutations (decision 9).
    * `current` is retained so teardown can still stop the wedged session. */
-  function handleSessionCompromise(id: string, reason: string): void {
+  function handleSessionCompromise(id: string, reason: string, activation: Activation): void {
     console.error(`slipstream daemon: session ${id} lost its lock: ${reason}`);
-    if (current?.id === id && state === 'active') {
+    // Ids are reused across activations, so the callback is matched to the capture
+    // that registered it, never to the id: a late callback from an earlier
+    // activation must not wedge or abort a later one.
+    if (activation.session && current?.session === activation.session && state === 'active') {
       registry.freeze(id, BigInt(current.session.health.snapshot().durable_seq));
       state = 'wedged';
       return;
     }
-    if (state === 'attaching') sessionCompromised = true; // startup aborts below
+    if (activation.phase === 'starting' && state === 'attaching') sessionCompromised = true; // startup aborts below
   }
 
   /** Why an attach in flight can no longer complete, for a resume that must name it. */
@@ -410,6 +416,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   ): Promise<Record<string, unknown> | ErrorFields> {
     let session: CaptureSession;
     let resolvedTranscript: string | undefined;
+    const activation: Activation = { phase: 'starting' };
     try {
       if (rootTranscript !== undefined) {
         if (harness !== 'codex' && harness !== 'claude-code') {
@@ -442,13 +449,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           root: resolvedWorktree,
           storeDir,
           ...(resume ? { resumeSessionId: id } : { sessionId: id }),
-          onCompromised: (reason) => handleSessionCompromise(id, reason),
+          onCompromised: (reason) => handleSessionCompromise(id, reason, activation),
           ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
           ...(transcript ? { transcript } : {}),
         },
         opts.captureDependencies,
       );
+      activation.session = session;
     } catch (err) {
+      activation.phase = 'over';
       // A fresh session never activated: freeze at 0, never delete the entry, so
       // the reader cannot fall back to disk for a half-written log. A resumed
       // session keeps the boundary pinned at its pre-resume high-water.
@@ -484,6 +493,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         abortStopError ??= err;
       }
       registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
+      activation.phase = 'over';
       if (state === 'attaching') state = 'detached';
       if (resume) {
         const cause = pendingFailed ? 'could not record the agent connection' : attachInterruptedCause();
@@ -491,6 +501,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
       return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
     }
+    activation.phase = 'active';
     registry.activate(id, liveBoundary(session.health));
     registry.setAgentConnection(id, agent?.state ?? 'none');
     current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript, agent };
