@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBoundaryRegistry } from './boundary-registry.ts';
+import { createBoundaryRegistry, resolveBoundary } from './boundary-registry.ts';
 import { liveBoundary, staticBoundary } from './reader-runtime.ts';
 import { createHealth } from './health.ts';
 
@@ -89,5 +89,29 @@ describe('boundary registry', () => {
     assert.equal(ac.signal.aborted, false, 'a connection change is not a boundary transition');
     reg.freeze(ID, 3n);
     assert.equal(reg.get(ID)?.agentConnection, undefined);
+  });
+
+  it('resolveBoundary prefers an entry installed while the disk read was pending', async () => {
+    const registry = createBoundaryRegistry();
+    let finish!: (seq: bigint) => void;
+    const pending = resolveBoundary(registry, ID, () => new Promise<bigint>(r => { finish = r; }));
+    registry.freeze(ID, 7n); // a resume pins the boundary meanwhile
+    finish(3n);              // the stale disk read lands afterwards
+    assert.equal((await pending).current(), 7n);
+  });
+
+  it('resolveBoundary prefers a late registry entry over a failed disk read', async () => {
+    const registry = createBoundaryRegistry();
+    let fail!: (err: Error) => void;
+    const pending = resolveBoundary(registry, ID, () => new Promise<bigint>((_, reject) => { fail = reject; }));
+    registry.freeze(ID, 7n);
+    fail(new Error('torn'));
+    assert.equal((await pending).current(), 7n);
+  });
+
+  it('resolveBoundary falls back to disk, or its error, when the registry never learns the id', async () => {
+    const registry = createBoundaryRegistry();
+    assert.equal((await resolveBoundary(registry, ID, async () => 4n)).current(), 4n);
+    await assert.rejects(resolveBoundary(registry, ID, async () => { throw new Error('torn'); }), /torn/);
   });
 });
