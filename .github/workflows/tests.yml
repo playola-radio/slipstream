@@ -19,6 +19,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A healthy job finishes well under 10 minutes on either platform. The test
+    # suite occasionally hangs (a test child process fails to exit after passing),
+    # which otherwise occupies a runner silently for the full 6-hour default.
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
