@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.capture.scope.v1.json",
   "title": "slipstream.capture.scope.v1",
-  "$comment": "Which paths capture follows from this point on. policy git: paths git would not merge (ignored and untracked) are not captured; status unavailable means git could not be asked, so affected observations were dropped and their prior state is unknown. policy filesystem: the root is not a git work tree and every path is captured. Self-contained; unknown fields permitted for forward compatibility.",
+  "$comment": "Which paths capture follows from this point on. policy git: paths git would not merge (ignored and untracked) are not captured; status unavailable means git could not be asked, so affected observations were dropped and their prior state is unknown. slipstream_ignore active (git only): a root .slipstreamignore was frozen at capture start and excludes extra paths, including tracked ones git would keep. policy filesystem: the root is not a git work tree and every path is captured. Self-contained; unknown fields permitted for forward compatibility.",
   "type": "object",
   "required": [
     "specversion",
@@ -58,7 +58,8 @@
           "required": ["policy", "status"],
           "properties": {
             "policy": { "const": "git" },
-            "status": { "const": "active" }
+            "status": { "const": "active" },
+            "slipstream_ignore": { "const": "active" }
           }
         },
         {
@@ -66,7 +67,8 @@
           "required": ["policy", "status"],
           "properties": {
             "policy": { "const": "git" },
-            "status": { "const": "unavailable" }
+            "status": { "const": "unavailable" },
+            "slipstream_ignore": { "const": "active" }
           }
         },
         {

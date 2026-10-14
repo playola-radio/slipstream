@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { sendControlRequest } from '../../../src/control-client.ts';
 import { awaitObservedChange, createReaderClient, mkdtempRoot, rmMkdtempRoot } from '../../qa-support.ts';
 import { startQaDaemon } from '../harness-proc.ts';
+import { completeSetupCheck } from './setup-check.ts';
 import type { AcceptanceModule } from './types.ts';
 
 async function cli(args: string[], input?: unknown): Promise<{ stdout: string; stderr: string; code: number | null }> {
@@ -46,6 +47,8 @@ export const f2Delivery: AcceptanceModule = {
       if (attached.code !== 0) throw new Error(`Codex attach failed: ${attached.stderr}`);
       const sessionId = field(attached.stdout, 'session_id');
       if (!sessionId) throw new Error('Codex attach omitted capture session id');
+      await completeSetupCheck({ store, harness: 'codex', callback: { hook_event_name: 'PostToolUse',
+        session_id: harnessSessionId, cwd: worktree, transcript_path: transcript, tool_name: 'Bash' } });
       const path = `F2-${randomUUID()}.ts`;
       const bytes = Buffer.from('const nonce = "' + randomUUID() + '";\n');
       const sourcePath = join(worktree, path);

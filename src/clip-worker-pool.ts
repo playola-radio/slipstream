@@ -15,9 +15,19 @@ import type { ClipWorkerRequest, ClipWorkerResponse } from './clip-projection-wo
 import { emitProjectionPhase, emitProjectionTrace, traceProcessId, type ProjectionTraceObserver } from './projection-trace.ts';
 
 export interface ClipComputeHandle { promise: Promise<ClipProjection>; cancel: () => void }
-export type ClipCompute = (job: ClipJob, traceUnitId?: number) => ClipComputeHandle;
+export interface ClipCompute {
+  (job: ClipJob, traceUnitId?: number): ClipComputeHandle;
+  /** Resolves once this compute's worker has loaded its parser indexes. */
+  readonly ready?: Promise<void>;
+}
 
-export interface ClipWorkerPool { run: ClipCompute; close: () => Promise<void> }
+export interface ClipWorkerPool { run: ClipCompute; readonly ready: Promise<void>; close: () => Promise<void> }
+
+type ClipWorkerMessage = ClipWorkerResponse | { kind: 'ready' };
+
+function isReadyMessage(message: ClipWorkerMessage): message is { kind: 'ready' } {
+  return 'kind' in message && message.kind === 'ready';
+}
 
 const WORKER_URL = siblingModuleUrl('clip-projection-worker', import.meta.url);
 
@@ -44,6 +54,7 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
   // CPU-heavy worker is still mid-terminate.
   const pendingTerminations = new Set<Promise<unknown>>();
   const identities = new WeakMap<Worker, number>();
+  let workerReady = Promise.resolve();
 
   const trackTermination = (w: Worker, traceUnitId?: number): void => {
     const processId = identities.get(w);
@@ -55,6 +66,8 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
   };
 
   const spawn = (): Worker => {
+    let resolveReady!: () => void;
+    workerReady = new Promise<void>(resolve => { resolveReady = resolve; });
     const startedAtNs = trace ? process.hrtime.bigint() : undefined;
     const w = new Worker(WORKER_URL);
     const processId = trace ? traceProcessId() : undefined;
@@ -65,7 +78,11 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
       w.on('exit', code => emitProjectionTrace(trace,
         { kind: 'process-exit', processId, code, atNs: process.hrtime.bigint() }));
     }
-    w.on('message', (resp: ClipWorkerResponse) => {
+    w.on('message', (resp: ClipWorkerMessage) => {
+      if (isReadyMessage(resp)) {
+        resolveReady();
+        return;
+      }
       const cur = current;
       if (!cur || cur.id !== resp.id) return; // stale message from before a cancel
       current = null;
@@ -77,12 +94,14 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
       cur.resolve(resp.ok ? resp.result : workerErrorResult());
     });
     w.on('error', () => {
+      resolveReady();
       const cur = current;
       current = null;
       trackTermination(w, cur?.traceUnitId);
       if (!closed) worker = spawn();
       if (cur) cur.resolve(workerErrorResult());
     });
+    w.once('exit', () => resolveReady());
     return w;
   };
 
@@ -123,5 +142,5 @@ export function createClipWorkerPool(trace?: ProjectionTraceObserver): ClipWorke
     await Promise.all(pendingTerminations);
   };
 
-  return { run, close };
+  return { run, get ready() { return workerReady; }, close };
 }

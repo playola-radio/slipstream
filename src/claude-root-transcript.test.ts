@@ -38,6 +38,21 @@ it('verifies the measured Conductor attachment as the first complete identity re
   });
 });
 
+it('accepts the observed Claude 2.1.284 Conductor root without widening its identity rules', async () => {
+  await withFixture(async ({ root, path }) => {
+    const current = { ...identity(root, '2.1.284', 'sdk-ts'), type: 'attachment' };
+    const check = async (records: unknown[], expected: Awaited<ReturnType<typeof verifyClaudeRootTranscript>>) => {
+      await writeFile(path, records.map(line).join(''));
+      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), expected);
+    };
+    await check([preamble(), current, { ...current, type: 'user' }], { ok: true });
+    await check([{ ...current, entrypoint: 'sdk-cli' }], { ok: false, reason: 'mismatch' });
+    await check([{ ...current, isSidechain: true }], { ok: false, reason: 'mismatch' });
+    await check([current, { ...current, version: '2.1.280' }], { ok: false, reason: 'mismatch' });
+    await check([{ ...current, version: '2.1.285' }], { ok: false, reason: 'unsupported-version' });
+  });
+});
+
 it('accepts a completed matching tail and leaves bytes after the bounded 64 records unread', async () => {
   await withFixture(async ({ root, path }) => {
     await writeFile(path, line(preamble()) + line(identity(root)) + line(preamble()));

@@ -51,7 +51,7 @@ describe('interface.v2 contract fixtures', () => {
     const out: string[] = [];
     const code = await main({ argv: ['interface-v2-contract'], stdout: (l) => out.push(l), stderr: () => {}, cwd: process.cwd() });
     const report = JSON.parse(out[0] ?? '{}');
-    assert.equal(report.cases, 73);
+    assert.equal(report.cases, 74);
     assert.deepEqual(report.failures, []);
     assert.equal(report.negative_control_rejected, true);
     assert.equal(code, EXIT.PASS);

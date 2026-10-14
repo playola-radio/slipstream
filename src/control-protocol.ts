@@ -34,6 +34,7 @@ export type ControlErrorCode =
   | 'INVALID_ANSWER'
   | 'QUESTION_NOT_FOUND'
   | 'ANSWER_CONFLICT'
+  | 'AGENT_NOT_CONNECTED'
   | 'PROTOCOL';
 
 export interface RequestEnvelope {

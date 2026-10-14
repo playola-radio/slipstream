@@ -14,8 +14,8 @@ export interface FunctionIndex {
   reason?: string;
 }
 
-// Computing callers prepare only the requested grammar. Initialization remains
-// inside the existing job/deadline; unused grammars do not tax cold requests.
+// Computing callers prepare only the requested grammar. A clip worker also warms
+// every grammar when it starts, so cold startup is off the request deadline.
 const require = createRequire(import.meta.url);
 let initialization: Promise<void> | undefined;
 const grammars = new Map<string, Promise<Language>>();
@@ -36,6 +36,13 @@ export async function createFunctionIndexer(language: ClipLanguage): Promise<(te
   }
   const grammar = await pending;
   return text => indexFunctions(text, grammar);
+}
+/** Load and first-parse each grammar ahead of any request. A failed load is not
+ *  retained, so the request path retries it and reports its own failure. */
+export async function warmFunctionIndexers(): Promise<void> {
+  await Promise.all((['typescript', 'tsx', 'javascript'] as const).map(async language => {
+    (await createFunctionIndexer(language))('function f() {}\n');
+  }));
 }
 const FUNCTION_TYPES = new Set([
   'function_declaration', 'function_expression', 'generator_function_declaration',

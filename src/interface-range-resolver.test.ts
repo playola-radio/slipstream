@@ -105,7 +105,7 @@ test('an unavailable observation remains the endpoint and never equals another u
   });
 });
 
-test('all 69 successful fixture histories replay through the production resolver', async () => {
+test('all 70 successful fixture histories replay through the production resolver', async () => {
   let resolvedCases = 0;
   let errorCases = 0;
   for (const name of (await readdir(casesDir)).sort()) {
@@ -192,7 +192,7 @@ test('all 69 successful fixture histories replay through the production resolver
         expected.files.map((f) => f.path), `${name}: expected row order`);
     });
   }
-  assert.equal(resolvedCases, 69);
+  assert.equal(resolvedCases, 70);
   assert.equal(errorCases, 4);
 });
 
@@ -381,9 +381,32 @@ test('a filesystem capture scope keeps the static exclusions and records no gap'
   });
 });
 
+test('a git scope with the slipstream layer active adds slipstream-ignored to the exclusions', async () => {
+  await withLog([event(1, 'session.started'),
+    event(2, 'capture.scope', { policy: 'git', status: 'active', slipstream_ignore: 'active' })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 2n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.inventory.policyExclusions,
+      ['store-directory', '.git', 'symlinks', 'git-ignored', 'slipstream-ignored']);
+  });
+});
+
+test('a git scope without the slipstream layer keeps only git-ignored', async () => {
+  await withLog([event(1, 'session.started'),
+    event(2, 'capture.scope', { policy: 'git', status: 'active' })], async (logPath) => {
+    const result = await resolveRecordedRange(options(logPath, 0n, 2n));
+    assert.equal(result.kind, 'resolved');
+    if (result.kind !== 'resolved') return;
+    assert.deepEqual(result.inventory.policyExclusions,
+      ['store-directory', '.git', 'symlinks', 'git-ignored']);
+  });
+});
+
 test('a capture scope that misstates its policy is corrupt history', async () => {
   for (const data of [{ policy: 'filesystem', status: 'unavailable' }, { policy: 'git' },
-    { policy: 'slipignore', status: 'active' }]) {
+    { policy: 'slipignore', status: 'active' },
+    { policy: 'git', status: 'active', slipstream_ignore: 'yes' }]) {
     await withLog([event(1, 'session.started'), event(2, 'capture.scope', data)], async (logPath) => {
       await assert.rejects(resolveRecordedRange(options(logPath, 0n, 2n)), /bad capture scope/, JSON.stringify(data));
     });

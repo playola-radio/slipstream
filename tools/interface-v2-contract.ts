@@ -642,7 +642,10 @@ function checkEnvelope(body: Obj, req: Request, history: History, errors: string
       extraKeys(inventory, ['scope', 'baseline_completed_seq', 'unknown_scopes', 'unknown_scopes_complete', 'policy_exclusions'], 'expected.inventory', errors);
       if (inventory.baseline_completed_seq !== (completed?.seq ?? null)) errors.push('expected.inventory.baseline_completed_seq: does not match the history');
       const gitScoped = history.events.some((e) => e.type === SCOPE && (e.data as Obj).policy === 'git' && BigInt(e.seq as string) <= req.after);
-      const exclusions = gitScoped ? [...POLICY_EXCLUSIONS, 'git-ignored'] : POLICY_EXCLUSIONS;
+      const slipstreamScoped = history.events.some((e) => e.type === SCOPE && (e.data as Obj).policy === 'git'
+        && (e.data as Obj).slipstream_ignore === 'active' && BigInt(e.seq as string) <= req.after);
+      const exclusions = [...POLICY_EXCLUSIONS,
+        ...(gitScoped ? ['git-ignored'] : []), ...(slipstreamScoped ? ['slipstream-ignored'] : [])];
       if (!isDeepStrictEqual(inventory.policy_exclusions, exclusions)) errors.push(`expected.inventory.policy_exclusions: must be ${JSON.stringify(exclusions)}`);
       const scopes = [...((completed?.data as Obj | undefined)?.unknown_scopes as string[] | undefined ?? [])].sort();
       checkMetadataList(inventory.unknown_scopes as unknown[], inventory.unknown_scopes_complete, scopes, harness.noMetadataBudget, 'expected.inventory.unknown_scopes', errors);

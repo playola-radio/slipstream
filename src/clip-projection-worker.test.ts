@@ -31,7 +31,8 @@ test('worker computes a projection off-thread from on-disk blobs', async () => {
     assert.notEqual(worker.threadId, 0); // a real, distinct thread
 
     const result = await new Promise<ClipWorkerResponse>((resolve, reject) => {
-      worker.once('message', resolve);
+      // The worker also announces parser readiness; only the job reply counts.
+      worker.on('message', (msg: ClipWorkerResponse | { kind: 'ready' }) => { if ('id' in msg) resolve(msg); });
       worker.once('error', reject);
       const req: ClipWorkerRequest = { id: 1, job: { storeDir, before, after, opts: { changeSeq: '3' } } };
       worker.postMessage(req);

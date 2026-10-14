@@ -174,7 +174,12 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
         // disk for every session it knows (see the reserved/active-window note).
         const runtime = registry.get(s.id);
         const durableSeq = s.removed ? 0n : (runtime ? runtime.boundary.current() : s.durableSeq);
-        return { id: s.id, durable_seq: durableSeq.toString(), removed: s.removed };
+        // Readiness is a property of a live capture only: a retained or removed
+        // session has no agent connection, whatever its log last recorded.
+        const agent = s.removed ? undefined : runtime?.agentConnection;
+        const agentConnection = agent === undefined ? { state: 'disconnected', reason: 'capture_not_live' }
+          : agent === 'none' ? { state: 'disconnected', reason: 'no_agent' } : { state: agent };
+        return { id: s.id, durable_seq: durableSeq.toString(), removed: s.removed, agent_connection: agentConnection };
       }));
       return;
     }

@@ -1,11 +1,12 @@
-import { access, lstat, readdir, realpath } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { createCas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
-import { detectCaptureScope, type DetectCaptureScope } from './capture-scope.ts';
+import { detectCaptureScope, type CaptureScope, type DetectCaptureScope } from './capture-scope.ts';
 import { createHealth, type Health, type HealthFailure } from './health.ts';
 import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
@@ -20,7 +21,7 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
+import type { AgentConnectionEvent, AgentConnectionInput, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
@@ -119,6 +120,8 @@ export interface CaptureSession {
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
+  /** Durably record the bound agent chat's connection state; never attribution. */
+  recordAgentConnection(data: AgentConnectionInput['data'], assertOwnership?: () => void): Promise<AgentConnectionEvent>;
   stop(): Promise<void>;
 }
 
@@ -149,6 +152,34 @@ function isUnder(child: string, parent: string): boolean {
   return !escapesBase(relative(parent, child));
 }
 
+/** A frozen copy of the root `.slipstreamignore`, handed to git as its
+ * lowest-precedence excludes file so capture can drop extra paths — including
+ * tracked ones git would merge. Copied once so a mid-capture edit does not
+ * change this capture's scope; a later restart re-reads it, matching how git's
+ * own rule changes take effect. Returns undefined when the file is absent or
+ * empty. A file that exists but cannot be read rejects rather than silently
+ * widening scope to paths the user meant to exclude. Only consulted inside a
+ * git work tree; a non-git root ignores the file. */
+async function freezeSlipstreamIgnore(root: string): Promise<{ dir: string; file: string } | undefined> {
+  const path = join(root, '.slipstreamignore');
+  // Stat (which follows symlinks but never blocks) before opening: a named pipe
+  // or other non-regular file would otherwise hang the read and stall startup.
+  let info;
+  try {
+    info = await stat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+  if (!info.isFile()) throw new Error(`.slipstreamignore is not a regular file`);
+  const content = await readFile(path, 'utf8');
+  if (content.trim() === '') return undefined;
+  const dir = await mkdtemp(join(tmpdir(), 'slip-ignore-'));
+  const file = join(dir, 'excludes');
+  await writeFile(file, content);
+  return { dir, file };
+}
+
 interface ReconcileState {
   committed: Map<string, Snapshot>;
   baselineUnknownDirs: Set<string>;
@@ -170,15 +201,33 @@ export async function startCapture(
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
-  // Decided before anything is written: a git root git cannot read rejects here
-  // rather than silently capturing what git would not merge.
-  const scope = await deps.detectScope(root);
+  // Validate the store before freezing anything, so a bad store directory fails
+  // without leaving a frozen copy of the ignore rules behind.
   await mkdirpDurable(opts.storeDir);
   const storeDir = await realpath(opts.storeDir);
   await assertOwnerOnly(storeDir, 'dir');
   if (isUnder(root, storeDir)) {
     throw new Error('store directory must not equal or contain the watched root');
   }
+  // Decided before anything is written: a git root git cannot read rejects here
+  // rather than silently capturing what git would not merge.
+  const baseScope = await deps.detectScope(root);
+  // Only a git work tree honors .slipstreamignore; a non-git root never reads it
+  // (so an unreadable file there does not block capture). Frozen before
+  // classification so a mid-capture edit does not change this capture's scope;
+  // cleaned up on a failed start, in the catches below, and in stop().
+  let frozenSlip: { dir: string; file: string } | undefined;
+  let scope: CaptureScope = baseScope;
+  if (baseScope.policy === 'git') {
+    try {
+      frozenSlip = await freezeSlipstreamIgnore(root);
+      if (frozenSlip) scope = await deps.detectScope(root, frozenSlip.file);
+    } catch (err) {
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    }
+  }
+  const slipstreamApplied = frozenSlip !== undefined;
 
   const resuming = opts.resumeSessionId !== undefined;
   const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
@@ -273,7 +322,8 @@ export async function startCapture(
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
       if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
-        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1') producer?.noteCommitted(event);
+        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1'
+        && event.type !== 'slipstream.agent.connection.v1') producer?.noteCommitted(event);
     },
   };
 
@@ -303,6 +353,7 @@ export async function startCapture(
     const logExists = await access(logPath).then(() => true, () => false);
     if (logExists) {
       await lock.release();
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
       throw new Error(
         `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
       );
@@ -325,6 +376,7 @@ export async function startCapture(
       seedTaskState(recovered); // rebuild the dedup index + current task before appends
     } catch (err) {
       await lock.release(); // a failed resume must not leave the session locked
+      if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
       throw err;
     }
   }
@@ -344,6 +396,7 @@ export async function startCapture(
     });
   } catch (err) {
     await lock.release();
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
 
@@ -379,6 +432,7 @@ export async function startCapture(
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
+  function appendEvent(input: AgentConnectionInput): Promise<AgentConnectionEvent>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -470,7 +524,7 @@ export async function startCapture(
     type: 'slipstream.capture.scope.v1',
     occurred_at_ms: Date.now(),
     data: scope.policy === 'git'
-      ? { policy: 'git', status: 'active' }
+      ? (slipstreamApplied ? { policy: 'git', status: 'active', slipstream_ignore: 'active' } : { policy: 'git', status: 'active' })
       : { policy: 'filesystem', status: 'active' },
   });
 
@@ -511,7 +565,9 @@ export async function startCapture(
             await appendEvent({
               type: 'slipstream.capture.scope.v1',
               occurred_at_ms: Date.now(),
-              data: { policy: 'git', status: 'unavailable' },
+              data: slipstreamApplied
+                ? { policy: 'git', status: 'unavailable', slipstream_ignore: 'active' }
+                : { policy: 'git', status: 'unavailable' },
             }).then(() => { scopeAvailable = false; }, () => {});
           }
           continue;
@@ -840,6 +896,7 @@ export async function startCapture(
     await engine.drain().catch(() => {});
     await underlying.close().catch(() => {});
     await lock.release();
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
 
@@ -1059,6 +1116,15 @@ export async function startCapture(
     finally { inflightAnswers.delete(id); }
   };
 
+  const recordAgentConnection = async (data: AgentConnectionInput['data'], assertOwnership: () => void = () => {}): Promise<AgentConnectionEvent> => {
+    assertOwnership();
+    questionReady();
+    const event = await appendEvent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: now(), data });
+    if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+    assertOwnership();
+    return event;
+  };
+
   const doStop = async (): Promise<void> => {
     stopped = true;
     // Stop feeding the engine immediately: if the watcher unsubscribe below
@@ -1089,6 +1155,7 @@ export async function startCapture(
     await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
     await underlying.close().catch(record);
     await lock.release().catch(record);
+    if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(record);
     if (firstError !== undefined) throw firstError;
   };
   // Memoized so an overlapping detach + daemon shutdown (both hold the same
@@ -1105,6 +1172,7 @@ export async function startCapture(
     askQuestion,
     claimQuestion,
     answerQuestion,
+    recordAgentConnection,
     ingestEvidence,
     stop: () => (stopPromise ??= doStop()),
   };

@@ -79,9 +79,12 @@ JavaScript also handles JSX. The WASM binding replaces the native binding whose
 worker cancellation could abort the host process; this grammar/runtime change
 bumps the algorithm from `clip.v2` to `clip.v3`. Parser indices are UTF-16; the
 projection uses row positions and its own raw-byte line index, preserving UTF-8,
-BOM and CRLF bytes. Each tree and parser is freed after indexing; grammars are
-loaded on demand per worker (JS/JSX share one). Unsupported or wholly missing
-content does not initialize WASM. Failed grammar loads are not retained.
+BOM and CRLF bytes. Each tree and parser is freed after indexing. Each clip
+worker loads and first-parses its grammars (JS/JSX share one) in the background
+as it starts, so a fresh or replacement worker does not spend its first job's
+deadline on parser startup. A direct, non-worker computation still loads only the
+grammar it needs, and unsupported or wholly missing content does not initialize
+WASM there. Failed grammar loads are not retained.
 
 Declarations, expressions, generators, arrow functions and methods qualify when
 the node has no syntax errors and is not inside an ERROR/missing node. The

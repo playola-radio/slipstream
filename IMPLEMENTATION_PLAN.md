@@ -963,9 +963,15 @@ path has been shown to reach them.
 D3 adds bounded Claude root transcript verification at attach and a Claude
 Code `PostToolUse` command using the D2 claim/attempt contract. Supported
 observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
-`2.1.280`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
+`2.1.280`/`sdk-ts` or `2.1.284`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
 capture source, Swift UI, launcher, hook installer or automatic hook trust is
 added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+Compatibility follow-up (2026-10-03): the Conductor `2.1.284`/`sdk-ts` root
+identity was observed and its real transcript passed read-only verification.
+The existing root-only, single-claim daemon test now covers all three supported
+pairs. This does not extend the historical live-delivery proof to `2.1.284`;
+Terminal `2.1.284`/`sdk-cli` remains unsupported.
 
 ## D4: Answer return (2026-09-26)
 
@@ -1040,3 +1046,86 @@ now. Design settled through a Codex consult (two rounds).
   files that git does not ignore.
 
 **Status**: Complete.
+
+## G2: A root `.slipstreamignore` for extra exclusions (2026-10-06)
+
+**Decision (Brian, 2026-10-06):** G1 deferred `.slipignore`; this adds it. A
+root `.slipstreamignore` lets the user exclude extra paths from capture — unlike
+`.gitignore`, including files git *tracks* (a committed-but-noisy generated
+file). Single canonical filename (`.slipstreamignore`), root-only, git work tree
+only for now; a non-git root ignores it.
+
+- **Git still decides.** No re-implemented matcher: the file is frozen at
+  capture start and handed to git as its lowest-precedence excludes source
+  (`-c core.excludesFile=<frozen copy>`). `scope.ignored` unions git's own
+  `check-ignore` result with a second `check-ignore --no-index --verbose` pass
+  whose matches are credited to the frozen file. Lowest precedence means the
+  file may only *add* exclusions, never un-ignore what git keeps; `--no-index`
+  means it can exclude tracked files too.
+- **Frozen per capture.** A mid-capture edit does not change the running
+  capture's scope; a restart re-reads the file, matching how git's own rule
+  changes take effect. A file that exists but cannot be read refuses to start
+  (never silently widens scope).
+- **Disclosed in the log.** The `slipstream.capture.scope.v1` event carries
+  `slipstream_ignore: "active"` when the layer is in effect; the interface
+  reader adds a distinct `slipstream-ignored` to `policy_exclusions`, separate
+  from `git-ignored` so a consumer knows why a path was dropped.
+- **Not in scope:** nested `.slipstreamignore` files; honoring the file outside
+  a git work tree; a `.slipignore` alias.
+
+**Status**: Complete.
+
+## A5: One-command `slipstream attach` (2026-10-07)
+
+**Goal:** `slipstream attach`, run from inside a Claude Code or Codex chat,
+starts the shared daemon if needed, configures that workspace for that chat,
+starts recording, and proves question delivery and answer return with one live
+round trip. Repeating it reports the existing capture. Design settled through
+a Codex consult; contract in [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+
+- **The chat names itself.** The agent's own environment
+  (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) selects the chat; the root
+  transcript is found automatically and verified as before. No agent identity,
+  or both, refuses without starting a capture. There is no picker and no
+  first-callback guessing.
+- **Connected means a verified round trip.** After attach, the next root hook
+  callback receives a one-time setup check, and the agent returns it through
+  `slipstream_answer_question`. Until then the capture is `setup_pending`, with the
+  exact reload step. The daemon refuses new questions unless the capture is
+  connected. Connection state is a public event
+  (`slipstream.agent.connection.v1`) and is projected on `/v1/sessions`.
+- **Idempotent.** Same workspace and chat: report the existing capture and
+  re-arm a pending check. Same workspace, other chat: refuse and keep the
+  binding. Another workspace: refuse, naming it.
+- **Workspace-scoped config** for the selected harness only, merged without
+  duplicates, using the installed Slipstream command paths. Host trust and
+  approval are never written.
+- **Not in scope:** auto-capture, multiple chats per directory, hook backfill,
+  connection expiry/heartbeat, version-policy changes beyond exact tuples
+  validated live.
+
+### Stage A5.1: Daemon readiness and idempotent attach
+**Success Criteria**: repeated/other-chat/other-workspace attach outcomes; setup
+check delivered only to the bound root and verified only through its answer
+path; `ask` refused until connected; connection event durable and on
+`/v1/sessions`.
+**Status**: Complete
+
+### Stage A5.2: CLI orchestration and config install
+**Success Criteria**: no-arg attach detects the chat, starts the daemon, merges
+config idempotently (unrelated entries preserved), and prints connected /
+pending-with-step / refusal honestly.
+**Status**: Complete
+
+### Stage A5.3: Swift client gate
+**Success Criteria**: Ask Agent disabled with an explanation unless the selected
+capture is connected; drafts stay with their capture.
+**Status**: Complete (client repo PR; covered by model tests)
+
+### Stage A5.4: Live acceptance
+**Success Criteria**: disposable stores, real agents; validated Terminal/Conductor
+× Claude/Codex paths recorded.
+**Status**: In Progress — Terminal Claude (`claude -p`) and Codex SDK/TUI pass;
+both Conductor paths blocked because every runtime Conductor ships is outside
+the verified set (version policy, PR #48). See
+`docs/ask-agent/attach-acceptance-2026-10-07.md`.
