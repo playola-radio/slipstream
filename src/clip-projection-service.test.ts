@@ -205,7 +205,9 @@ test('clip deadline includes the optional barrier and prevents late compute', as
 });
 
 test('worker readiness completes before the clip deadline starts', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  // The warm-up wait arms its timer from Date.now(); a real clock would let a
+  // stalled runner arm it short of the deadline, so mock both.
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   let releaseReady!: () => void;
   const ready = new Promise<void>(resolve => { releaseReady = resolve; });
   let computes = 0;
