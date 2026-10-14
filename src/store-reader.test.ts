@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, utimes, chmod, symlink } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -74,6 +75,12 @@ describe('store-reader', () => {
       const dir = await store();
       const log = sessionLogPath(dir, UUID);
       await writeFile(log, '{"seq":"1"}\n{}\n', 'utf8');
+      await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
+    });
+    it('throws on a final record that is JSON null', async () => {
+      const dir = await store();
+      const log = sessionLogPath(dir, UUID);
+      await writeFile(log, '{"seq":"1"}\nnull\n', 'utf8');
       await assert.rejects(() => onDiskHighWater(log), LogCorruptError);
     });
     it('throws on a numeric (non-string) seq', async () => {
@@ -293,9 +300,10 @@ describe('findWorkspaceSession', () => {
 
   it('rethrows an unreadable log that is not corruption or missing instead of skipping it', async () => {
     const dir = await emptyStore();
-    await mkdir(sessionLogPath(dir, A), { recursive: true }); // events.jsonl as a directory: EISDIR
+    await seed(dir, A, started('/work'));
+    await chmod(sessionLogPath(dir, A), 0o000);
     await assert.rejects(findWorkspaceSession(dir, '/work'),
-      (err: unknown) => !(err instanceof WorkspaceLookupError) && (err as NodeJS.ErrnoException).code === 'EISDIR');
+      (err: unknown) => !(err instanceof WorkspaceLookupError) && (err as NodeJS.ErrnoException).code === 'EACCES');
   });
 
   it('picks the duplicate whose last record is newest', async () => {
@@ -322,14 +330,18 @@ describe('findWorkspaceSession', () => {
     const dir = await emptyStore();
     await seed(dir, A, started('/work') + 'garbage\n');
     await assert.rejects(findWorkspaceSession(dir, '/work'),
-      (err: unknown) => err instanceof WorkspaceLookupError && err.sessionId === A && err.message.includes(A));
+      (err: unknown) => err instanceof WorkspaceLookupError && err.sessionId === A && err.message.includes(A)
+        && err.corrupt === true);
   });
 
-  it('marks a corrupt final record as corruption', async () => {
+  it('skips, without blocking, a session whose log is not a regular file', { timeout: 5_000 }, async () => {
     const dir = await emptyStore();
-    await seed(dir, A, started('/work') + 'garbage\n');
-    await assert.rejects(findWorkspaceSession(dir, '/work'),
-      (err: unknown) => err instanceof WorkspaceLookupError && err.corrupt === true);
+    await mkdir(join(dir, 'sessions', A), { recursive: true });
+    execFileSync('mkfifo', [join(dir, 'sessions', A, 'events.jsonl')]);
+    await seed(dir, B, started('/work'));
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.equal(found.match?.id, B);
+    assert.deepEqual(found.skipped.map(s => s.id), [A]);
   });
 
   it('does not call a transient read failure corruption', () => {

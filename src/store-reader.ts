@@ -72,9 +72,12 @@ async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
     lastLine = Buffer.concat(pieces.reverse()).toString('utf8');
   } finally { await handle.close(); }
   if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
-  let parsed: { seq?: unknown; time?: unknown };
-  try { parsed = JSON.parse(lastLine) as { seq?: unknown; time?: unknown }; }
+  let parsed: { seq?: unknown; time?: unknown } | null;
+  try { parsed = JSON.parse(lastLine) as { seq?: unknown; time?: unknown } | null; }
   catch { throw new LogCorruptError('high-water: invalid JSON in final record'); }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new LogCorruptError('high-water: final record is not an object');
+  }
   if (typeof parsed.seq !== 'string' || !SEQ_RE.test(parsed.seq)) {
     throw new LogCorruptError('high-water: final record has no valid decimal-string seq');
   }
@@ -141,9 +144,11 @@ const FIRST_RECORD_LIMIT = 64 * 1024;
 
 /** The `root` of a log's first record, which must be `session.started`. */
 async function startedRoot(logPath: string): Promise<string> {
-  const handle = await open(logPath, 'r');
+  // Lookup opens every session's log on every attach; one FIFO must not wedge it.
+  const handle = await open(logPath, constants.O_RDONLY | constants.O_NONBLOCK);
   let line: string;
   try {
+    if (!(await handle.stat()).isFile()) throw new LogCorruptError('log is not a regular file');
     const buffer = Buffer.allocUnsafe(FIRST_RECORD_LIMIT);
     const { bytesRead } = await handle.read(buffer, 0, FIRST_RECORD_LIMIT, 0);
     const end = buffer.subarray(0, bytesRead).indexOf(0x0a);
