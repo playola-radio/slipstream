@@ -145,14 +145,16 @@ Current limits:
 verified, you can still record its workspace by naming the chat yourself:
 
 ```sh
-slipstream start &   # or leave it running in another terminal
+slipstream start --enable claude-code &   # use --enable codex for a Codex chat
+# Wait until it prints "slipstream: reader ..." before attaching.
 slipstream attach ~/code/my-project \
   --harness claude-code --harness-session-id <chat-session-id>
 ```
 
 `--harness` is `claude-code` or `codex`. The session ID is the chat
-transcript's file name, which Slipstream reads to estimate which changes came
-from the agent:
+transcript's file name. `--enable` tells the daemon to read that harness's
+transcripts and estimate which changes possibly came from the agent; without it,
+Slipstream still records filesystem states but leaves that attribution unavailable:
 
 - Claude Code: `~/.claude/projects/<project>/<session-id>.jsonl`
 - Codex: `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-<timestamp>-<session-id>.jsonl`
@@ -200,7 +202,7 @@ token. Both the URL and the token are in the `runtime/*.json` file, readable onl
 by you.
 
 ```sh
-DESC=$(ls ~/.slipstream/runtime/*.json | head -1)
+DESC=$(node -e "const { readdirSync, statSync } = require('node:fs'); const { join } = require('node:path'); const dir = join(process.env.HOME, '.slipstream', 'runtime'); const files = readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => ({ path: join(dir, name), mtime: statSync(join(dir, name)).mtimeMs })).sort((a, b) => b.mtime - a.mtime); console.log(files[0].path)")
 URL=$(node -p "require('$DESC').url"); TOKEN=$(node -p "require('$DESC').token")
 
 curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions"
@@ -213,7 +215,7 @@ curl -H "Authorization: Bearer $TOKEN" "$URL/v1/sessions/<id>/events?after=0&fol
 | `GET /v1/sessions/:id/events?after=N[&follow=true]` | Events after sequence `N`, streamed live with `follow=true` |
 | `GET /v1/blobs/sha256/:hash` | Raw file contents |
 | `GET /v1/sessions/:id/changes/:seq/clips` | The changed regions of one file change ([CLIP-PROJECTION.md](CLIP-PROJECTION.md)) |
-| `GET /v1/sessions/:id/interfaces` | Functions added, removed, or changed between two points in a session, for TypeScript and Swift ([FUNCTION-CHANGES.md](FUNCTION-CHANGES.md)) |
+| `GET /v1/sessions/:id/interfaces?before_seq=B&after_seq=A` | Functions added, removed, or changed from sequence `B` through `A` in a session, for TypeScript and Swift ([FUNCTION-CHANGES.md](FUNCTION-CHANGES.md)) |
 | `GET /v1/schemas/:type` | The JSON Schema for an event type |
 
 To show the feed the same way the bundled viewer does, follow
