@@ -101,8 +101,8 @@ Use the existing single append/durability boundary; never append straight to eve
 - One idempotency key is `(capture session_id, request_id)`. Canonical body is the fixed-order fields of normalized text + context. Same key/same body replays the original result with `duplicate:true`, including original timestamps; different body returns `REQUEST_CONFLICT`. Register/coalesce in-flight duplicates synchronously before the first await that could create competing work.
 - TTL is 1,800,000 ms from the server's queued timestamp, using an injected clock. At most 16 unexpired, not-attempted questions are eligible. Count/reserve concurrent admissions so 17 simultaneous callers cannot exceed the limit. A duplicate does not consume a slot. Failed admission releases its reservation.
 - Preserve the original result for a duplicate even after expiry; never extend TTL. There is no new expiry event, sweeper or timer. Expiry is a derived eligibility check (`now < expires_at_ms`); a late claim gets no question.
-- Rebuild the question index from the valid durable prefix during the existing **in-process storage recovery** in `session.ts:tryStorageRecovery`, just as `seedTaskState` rebuilds task declarations. Reconstruct original IDs/timestamps/body fingerprints. A torn tail must not be treated as committed. Recovery occurs within a capture even though daemon restart creates a new capture; omitting this distinction can duplicate durable questions.
-- A full daemon restart/detach/new attach makes the old queue ineligible. Never resume or migrate it to the new capture. A retry addressed to the old session returns `SESSION_NOT_SELECTED`; retain uncertainty about whether the old log contains a commit. The public reader can inspect the old log by request_id, but this slice adds no dedicated lookup endpoint or UI.
+- Rebuild the question index from the valid durable prefix during the existing **in-process storage recovery** in `session.ts:tryStorageRecovery`, just as `seedTaskState` rebuilds task declarations. Reconstruct original IDs/timestamps/body fingerprints. A torn tail must not be treated as committed. Recovery occurs within a capture and never makes a question queued before the latest `session.resumed` claimable; omitting this distinction can duplicate durable questions.
+- A detach, daemon restart or new attach makes the queue ineligible. Re-attaching the same workspace resumes the same capture `session_id`, but questions queued before the resume are never claimable again (`session.resumed` resets eligibility); nothing is migrated and no dispatch attempt is fabricated. A retry of a pre-resume `request_id` on the resumed capture replays its original acceptance with `duplicate: true`, but that question will not be delivered; ask again with a new `request_id`. Until the attaching chat completes setup, that retry gets `AGENT_NOT_CONNECTED` instead. A retry addressed to a capture that is no longer selected returns `SESSION_NOT_SELECTED`.
 - Pre-transmission transport failure means unavailable. Any timeout/drop/malformed reply after transmission is outcome unknown. The client preserves the same request ID and draft for retry; it never silently creates a fresh request to resolve uncertainty.
 
 ## Delivery through PostToolUse
@@ -369,8 +369,7 @@ that does not name that question's attempt, or a second answer for a question as
 a corrupt log. Answers are not filesystem changes or attribution evidence. The
 reader and SSE carry them in seq order, and in-process recovery rebuilds the
 answer index from the durable prefix, so a resend after recovery replays. A
-detach, daemon restart or new attach ends the capture; a late answer to an old
-question gets `SESSION_NOT_SELECTED` and the old log stays readable.
+detach or daemon restart ends the capture; an answer sent while no capture is selected gets `SESSION_NOT_SELECTED`. If the same chat re-attaches the same workspace, the capture resumes and an answer to a question already delivered to that chat is still recorded.
 
 ### Follow-up questions
 
@@ -408,6 +407,7 @@ one real round trip through the same path a question takes.
   with the answer-ack shape; a resend replays it with `duplicate: true`.
 - Until then, `ask` returns `AGENT_NOT_CONNECTED`. A capture-only attach never
   becomes connected.
+- A resumed capture never inherits a connection. Its `session.resumed` record makes every earlier `slipstream.agent.connection.v1` record stale, and a log consumer must treat connection state from before the latest `session.resumed` as unknown. The attaching chat, which may differ from the earlier one, goes through a fresh setup check.
 - Every `status` reply lists `attach_features: ["agent-connection-v1"]`. A
   daemon without it predates the setup check, so `slipstream attach` refuses
   rather than install config that daemon would never confirm.
@@ -423,8 +423,8 @@ type AgentConnection =
   | { state: 'disconnected'; reason: 'capture_not_live' | 'no_agent' };
 ```
 
-`capture_not_live` covers detached, replaced, removed and pre-readiness
-recordings; old logs stay readable and their questions stay bound to them.
+`capture_not_live` covers detached, removed and pre-readiness
+recordings; their logs stay readable.
 
 `attach` is idempotent for the active binding. The same worktree (after
 canonicalization), harness and chat returns the same `session_id` with
@@ -432,4 +432,6 @@ canonicalization), harness and chat returns the same `session_id` with
 re-armed so the next root callback delivers it again. Another chat in the same
 worktree, or any other worktree, returns `SESSION_ACTIVE` naming what is being
 recorded, and the existing binding is unchanged.
+
+`attach` from a detached daemon resumes the workspace's existing session: the newest non-removed session whose `session.started` root equals the canonical worktree. The `session_id` is unchanged and `seq` continues after a `session.resumed` record and a `capture.gap` with reason `restart`. A new session is created only when the workspace has none. A session whose first record cannot be read is skipped with a daemon-log warning. If the selected session cannot be resumed (its lock is held, storage fails, or its history is corrupt), attach returns `SESSION_RESUME_FAILED` naming the session and never starts a second one. Retry for a lock or storage problem; restore the data, or `slipstream delete <session-id>` to discard that history, for corruption. A resumed capture has no current task until the agent calls `begin_task` again.
 

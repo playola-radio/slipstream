@@ -1123,3 +1123,14 @@ capture is connected; drafts stay with their capture.
 both Conductor paths blocked because every runtime Conductor ships is outside
 the verified set (version policy, PR #48). See
 `docs/ask-agent/attach-acceptance-2026-10-07.md`.
+
+## W1: One stream per workspace (2026-10-14)
+
+**Goal:** `attach` resumes the workspace's existing non-removed session (same
+id, continuous `seq`) instead of minting a new one. A fresh session is created
+only when the workspace has none.
+Spec: `docs/superpowers/specs/2026-10-14-workspace-stream-resume-design.md`.
+Plan: `docs/superpowers/plans/2026-10-14-workspace-stream-resume.md`.
+
+**Status**: In Progress — implementation complete on
+`briankeane/daemon-workspace-stream-resume`; awaiting review.
