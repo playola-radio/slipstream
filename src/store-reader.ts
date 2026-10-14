@@ -146,10 +146,11 @@ async function startedRoot(logPath: string): Promise<string> {
     if (end < 0) throw new LogCorruptError('first record is torn or larger than 64 KiB');
     line = buffer.subarray(0, end).toString('utf8');
   } finally { await handle.close(); }
-  let parsed: { type?: unknown; data?: { root?: unknown } | null };
+  let parsed: { type?: unknown; data?: { root?: unknown } | null } | null;
   try { parsed = JSON.parse(line) as typeof parsed; }
   catch { throw new LogCorruptError('first record is not valid JSON'); }
-  if (parsed.type !== 'slipstream.session.started.v1' || typeof parsed.data?.root !== 'string') {
+  if (typeof parsed !== 'object' || parsed === null
+    || parsed.type !== 'slipstream.session.started.v1' || typeof parsed.data?.root !== 'string') {
     throw new LogCorruptError('first record is not a session.started record');
   }
   return parsed.data.root;
@@ -172,12 +173,19 @@ export async function findWorkspaceSession(storeDir: string, canonicalRoot: stri
     const logPath = sessionLogPath(storeDir, id);
     let root: string;
     try { root = await startedRoot(logPath); }
-    catch (err) { skipped.push({ id, reason: (err as Error).message }); continue; }
+    catch (err) {
+      const unreadable = err instanceof LogCorruptError || (err as NodeJS.ErrnoException).code === 'ENOENT';
+      if (!unreadable) throw err;
+      skipped.push({ id, reason: (err as Error).message });
+      continue;
+    }
     if (root !== canonicalRoot) continue;
     let last: FinalRecord;
     let ms: number;
     try {
-      last = (await finalRecord(logPath))!; // the first line is complete, so a final record exists
+      const final = await finalRecord(logPath);
+      if (!final) throw new LogCorruptError('log has no complete record');
+      last = final;
       ms = typeof last.time === 'string' ? Date.parse(last.time) : Number.NaN;
       if (Number.isNaN(ms)) throw new LogCorruptError('final record has no valid time');
     } catch (err) { throw new WorkspaceLookupError(id, err); }

@@ -282,6 +282,22 @@ describe('findWorkspaceSession', () => {
     assert.ok(found.skipped.every(s => s.reason.length > 0));
   });
 
+  it('skips a session whose first record is null or has null data', async () => {
+    const dir = await emptyStore();
+    await seed(dir, A, 'null\n');
+    await seed(dir, B, line(1, 'slipstream.session.started.v1', null));
+    const found = await findWorkspaceSession(dir, '/work');
+    assert.equal(found.match, undefined);
+    assert.deepEqual(found.skipped.map(s => s.id).sort(), [A, B]);
+  });
+
+  it('rethrows an unreadable log that is not corruption or missing instead of skipping it', async () => {
+    const dir = await emptyStore();
+    await mkdir(sessionLogPath(dir, A), { recursive: true }); // events.jsonl as a directory: EISDIR
+    await assert.rejects(findWorkspaceSession(dir, '/work'),
+      (err: unknown) => !(err instanceof WorkspaceLookupError) && (err as NodeJS.ErrnoException).code === 'EISDIR');
+  });
+
   it('picks the duplicate whose last record is newest', async () => {
     const dir = await emptyStore();
     await seed(dir, A, started('/work') + line(2, 'x', {}, '2026-10-14T12:00:00.000Z'));
