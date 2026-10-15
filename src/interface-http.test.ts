@@ -932,37 +932,49 @@ test('a late Swift result cannot change a timed-out page or populate its cache',
   }
 });
 
-test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async () => {
+test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinished cursor', async t => {
   const { storeDir, request, expected } = await fixture('range-lookahead-timeout');
   const continuationDir = join(CASES, 'range-lookahead-empty-continuation');
   const continuationRequest = (await readFile(join(continuationDir, 'request.txt'), 'utf8')).trim();
   const continuationExpected = JSON.parse(await readFile(join(continuationDir, 'expected.json'), 'utf8')) as unknown;
-  let sawLookahead = false;
+  const realSetTimeout = globalThis.setTimeout;
+  let reachLookahead = () => {};
+  const reachedLookahead = new Promise<void>(resolve => { reachLookahead = resolve; });
   let releaseLookahead = () => {};
   const holdLookahead = new Promise<void>(resolve => { releaseLookahead = resolve; });
+  const trace: ProjectionTraceEvent[] = [];
   const deadlineMs = 1500;
   const reader = await startReaderServer({ storeDir, projectionAdmissionConfig: FIXTURE_BUDGET,
-    interfaceDeadlineMs: deadlineMs,
+    interfaceDeadlineMs: deadlineMs, projectionTrace: event => trace.push(event),
     interfaceOnRetentionCheck: (path, phase) => {
       if (path === 'src/b.ts' && phase === 'lookahead') {
-        sawLookahead = true;
-        return holdLookahead;
+        // Outlast the deadline in wall-clock time before the look-ahead is reached,
+        // as a slow runner does; only the mocked clock below may end the page.
+        return new Promise(resolve => realSetTimeout(resolve, deadlineMs + 200))
+          .then(() => { reachLookahead(); return holdLookahead; });
       }
     } });
+  const timedOut = () => trace.some(event => event.kind === 'settle' && event.outcome === 'timeout');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const started = performance.now();
-    const response = await fetch(reader.url + request.slice(4), {
+    const responding = fetch(reader.url + request.slice(4), {
       headers: { authorization: `Bearer ${reader.token}` },
     });
+    const first = await Promise.race([reachedLookahead.then(() => 'lookahead'), responding.then(() => 'response')]);
+    assert.equal(first, 'lookahead', 'deadline fired before the retention look-ahead');
+    t.mock.timers.tick(deadlineMs - 1);
+    assert.equal(timedOut(), false, 'deadline fired before its configured duration');
+    t.mock.timers.tick(1);
+    assert.equal(timedOut(), true, 'the admission deadline did not end the page');
+    const response = await responding;
     assert.equal(response.status, 200);
-    assert.equal(sawLookahead, true, 'deadline fired before the retention look-ahead');
-    assert.ok(performance.now() - started >= deadlineMs - 100, 'response did not await the admission deadline');
     assert.deepEqual(await response.json(), expected);
     const next = await fetch(reader.url + continuationRequest.slice(4),
       { headers: { authorization: `Bearer ${reader.token}` } });
     assert.equal(next.status, 200);
     assert.deepEqual(await next.json(), continuationExpected);
   } finally {
+    t.mock.timers.reset();
     releaseLookahead();
     await reader.close();
     await rm(storeDir, { recursive: true, force: true });
