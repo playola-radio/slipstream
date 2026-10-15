@@ -30,6 +30,23 @@ it('verifies the explicitly selected Terminal root after bounded preamble record
   });
 });
 
+it('verifies a root whose later records moved into a directory inside the worktree', async () => {
+  await withFixture(async ({ root, path }) => {
+    await writeFile(path, line(preamble()) + line(identity(root))
+      + line(identity(join(root, 'server', 'src'))) + line(identity(root)));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
+  });
+});
+
+it('rejects a root whose later records moved outside the worktree', async () => {
+  await withFixture(async ({ dir, root, path }) => {
+    for (const cwd of [dir, join(dir, 'work-sibling'), join(root, '..', 'elsewhere')]) {
+      await writeFile(path, line(preamble()) + line(identity(root)) + line(identity(cwd)));
+      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' }, cwd);
+    }
+  });
+});
+
 it('verifies the measured Conductor attachment as the first complete identity record', async () => {
   await withFixture(async ({ root, path }) => {
     await writeFile(path, line(preamble()) + line(preamble())
