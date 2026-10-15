@@ -32,8 +32,36 @@ it('verifies the explicitly selected Terminal root after bounded preamble record
 
 it('verifies a root whose later records moved into a directory inside the worktree', async () => {
   await withFixture(async ({ root, path }) => {
+    await mkdir(join(root, 'server', 'src'), { recursive: true });
     await writeFile(path, line(preamble()) + line(identity(root))
       + line(identity(join(root, 'server', 'src'))) + line(identity(root)));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
+  });
+});
+
+it('rejects a later cwd symlink inside the worktree that resolves outside it', async () => {
+  await withFixture(async ({ dir, root, path }) => {
+    const cwd = join(root, 'outside');
+    await symlink(dir, cwd);
+    await writeFile(path, line(preamble()) + line(identity(root)) + line(identity(cwd)));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' });
+  });
+});
+
+it('rejects a later cwd that cannot be resolved', async () => {
+  await withFixture(async ({ root, path }) => {
+    await writeFile(path, line(preamble()) + line(identity(root)) + line(identity(join(root, 'gone'))));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' });
+  });
+});
+
+it('accepts a later cwd symlink inside the worktree that resolves inside it', async () => {
+  await withFixture(async ({ root, path }) => {
+    const target = join(root, 'server');
+    const cwd = join(root, 'server-link');
+    await mkdir(target);
+    await symlink(target, cwd);
+    await writeFile(path, line(preamble()) + line(identity(root)) + line(identity(cwd)));
     assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
   });
 });

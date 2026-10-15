@@ -73,10 +73,17 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
         rootCwd = parsed.cwd as string;
       } else if ((Object.hasOwn(parsed, 'version') && parsed.version !== version)
         || (Object.hasOwn(parsed, 'entrypoint') && parsed.entrypoint !== entrypoint)
-        || (Object.hasOwn(parsed, 'cwd') && (typeof parsed.cwd !== 'string' || !isWithinRoot(rootCwd!, parsed.cwd)))
         || (Object.hasOwn(parsed, 'userType') && parsed.userType !== 'external')
         || (Object.hasOwn(parsed, 'isSidechain') && parsed.isSidechain !== false)) {
         return { ok: false, reason: 'mismatch' };
+      } else if (Object.hasOwn(parsed, 'cwd')) {
+        if (typeof parsed.cwd !== 'string') return { ok: false, reason: 'mismatch' };
+        if (parsed.cwd !== rootCwd) {
+          let cwd: string;
+          try { cwd = await realpath(parsed.cwd); }
+          catch { return { ok: false, reason: 'mismatch' }; }
+          if (!isWithinRoot(worktree, cwd)) return { ok: false, reason: 'mismatch' };
+        }
       }
     }
     if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
