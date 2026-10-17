@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.capture.ready.v1.json",
+  "title": "slipstream.capture.ready.v1",
+  "$comment": "Appended once per activation, after the watcher is installed, the baseline (on start) or reconciliation (on resume) is complete, and every earlier record is durable. An activation (its opening session.started or session.resumed) with no capture.ready has not finished its baseline or reconciliation; events before it are real observations, not yet a complete picture. Whether the activation started or resumed is in that opening event; when it became ready is the envelope time. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.capture.ready.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

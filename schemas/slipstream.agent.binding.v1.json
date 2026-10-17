@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.agent.binding.v1.json",
+  "title": "slipstream.agent.binding.v1",
+  "$comment": "A chat was durably linked to this capture for question delivery: a slot was reserved, the chat's identity was verified against its transcript, and binding intent was persisted. A link is a question-delivery relationship only; it never credits file changes to the chat. binding_generation is a per-store decimal counter, never reused; agent.connection and agent.unlinked records carry it so a stale handshake can be told apart. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.agent.binding.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "binding_generation",
+        "target",
+        "verified_transcript_path"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "binding_generation": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "target": {
+          "type": "object",
+          "required": [
+            "harness",
+            "harness_session_id",
+            "worktree"
+          ],
+          "properties": {
+            "harness": {
+              "enum": [
+                "claude-code",
+                "codex"
+              ]
+            },
+            "harness_session_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "worktree": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "verified_transcript_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

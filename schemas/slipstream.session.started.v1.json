@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.session.started.v1.json",
   "title": "slipstream.session.started.v1",
-  "$comment": "CloudEvents 1.0 envelope. Self-contained by design: GET /v1/schemas/{type} returns everything needed to validate one event type. Unknown fields are permitted deliberately (forward compatibility is a contract).",
+  "$comment": "CloudEvents 1.0 envelope. Self-contained by design: GET /v1/schemas/{type} returns everything needed to validate one event type. capture_mode watch-only means this activation was started without a chat (attach --watch-only, or recovery of such a capture); absent means a chat attach started it, and watch-only is never inferred from absence. A later chat link never rewrites it. Unknown fields are permitted deliberately (forward compatibility is a contract).",
   "type": "object",
   "required": [
     "specversion",
@@ -62,6 +62,9 @@
         "started_at_ms": {
           "type": "integer",
           "minimum": 0
+        },
+        "capture_mode": {
+          "const": "watch-only"
         }
       }
     }
