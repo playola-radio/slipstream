@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
 import { open, realpath } from 'node:fs/promises';
+import { isWithinRoot } from './transcript/discovery.ts';
 import { HEAD_LINE_CAP, HEAD_SCAN_BYTES, HEAD_SCAN_LINES } from './transcript/fs-io.ts';
 
 export type ClaudeRootResult = { ok: true } | { ok: false; reason: 'unavailable' | 'not-yet' | 'gap' | 'mismatch' | 'unsupported-version' };
@@ -22,6 +23,7 @@ function record(value: unknown): Record<string, unknown> | null {
  * record, and may still be writing the last line while attach reads. Every
  * complete bounded line is parsed; the first identity record fixes the root
  * cwd and identity, while later records must not conflict with the binding.
+ * A later cwd may move inside the root (the chat ran `cd`) but not out of it.
  */
 export async function verifyClaudeRootTranscript(path: string, sessionId: string, worktree: string): Promise<ClaudeRootResult> {
   let handle;
@@ -71,10 +73,17 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
         rootCwd = parsed.cwd as string;
       } else if ((Object.hasOwn(parsed, 'version') && parsed.version !== version)
         || (Object.hasOwn(parsed, 'entrypoint') && parsed.entrypoint !== entrypoint)
-        || (Object.hasOwn(parsed, 'cwd') && parsed.cwd !== rootCwd)
         || (Object.hasOwn(parsed, 'userType') && parsed.userType !== 'external')
         || (Object.hasOwn(parsed, 'isSidechain') && parsed.isSidechain !== false)) {
         return { ok: false, reason: 'mismatch' };
+      } else if (Object.hasOwn(parsed, 'cwd')) {
+        if (typeof parsed.cwd !== 'string') return { ok: false, reason: 'mismatch' };
+        if (parsed.cwd !== rootCwd) {
+          let cwd: string;
+          try { cwd = await realpath(parsed.cwd); }
+          catch { return { ok: false, reason: 'mismatch' }; }
+          if (!isWithinRoot(worktree, cwd)) return { ok: false, reason: 'mismatch' };
+        }
       }
     }
     if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
