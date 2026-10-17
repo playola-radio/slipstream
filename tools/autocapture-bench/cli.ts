@@ -34,7 +34,7 @@ const { values: args } = parseArgs({
     out: { type: 'string', default: join(REPO, 'docs', 'autocapture', 'raw') },
     'idle-seconds': { type: 'string', default: '600' },
     'diag-idle-seconds': { type: 'string', default: '120' },
-    'baseline-reps': { type: 'string', default: '30' },
+    'baseline-reps': { type: 'string', default: '10' },
     'latency-seconds': { type: 'string', default: '120' },
     phases: { type: 'string', default: 'gated,diag,baseline,latency,install' },
     seed: { type: 'string', default: '20261017' },
@@ -162,7 +162,7 @@ class Subject {
       child.once('exit', (code) => reject(new Error(`subject exited early (${code})`)));
     });
     const s = new Subject(child, child.pid!);
-    await s.call({ op: 'init', storeDir, roots: { worktrees: join(ws.tmp, 'worktrees'), store: storeDir, transcripts: join(ws.tmp, 'homes') } });
+    await s.call({ op: 'init', storeDir, roots: { worktrees: join(ws.tmp, 'worktrees'), store: ws.storesDir, transcripts: join(ws.tmp, 'homes') } });
     return s;
   }
 
@@ -336,54 +336,62 @@ async function measureWindow(s: Subject, seconds: number, label: string, ws: Wor
 
 // ---------------------------------------------------------------- scenarios
 
-async function idleScenario(ws: Workspace, name: string, n: number, chats: number, idleS: number) {
-  log(`scenario ${name}: N=${n}, emulated chats=${chats}, idle ${idleS}s`);
+/** One subject with N captures, the first `chats` carrying the emulated linked
+ * chat. Several measurements run on the same set, so 57 captures are started
+ * once per configuration rather than once per measurement. */
+interface Fleet {
+  s: Subject; chats: number; store: string; storeAtStart: Awaited<ReturnType<typeof storeBytes>>;
+  started: Started[]; failures: string[]; startupMs: ReturnType<typeof latencyStats>;
+}
+
+async function withFleet<T>(ws: Workspace, label: string, n: number, chats: number, body: (f: Fleet) => Promise<T>): Promise<T> {
+  log(`fleet ${label}: N=${n}, emulated chats=${chats}`);
   const store = ws.store;
   const storeAtStart = await storeBytes(store);
   const s = await Subject.start(ws, store);
   try {
-    const { started, failures } = await startCaptures(s, ws, ws.worktrees.slice(0, n), chats);
-    const startup = latencyStats(started.map((x) => x.ms));
-    const settled = await settle(s);
-    log(`  started ${started.length} (${failures.length} failed), settled=${settled.settled} after ${settled.ms}ms`);
-    const idle = await measureWindow(s, idleS, name, ws, store);
+    const result = await body({ s, chats, store, storeAtStart, ...(await startFleet(s, ws, n, chats)) });
     await s.shutdown();
-    return { n, chats, storeAtStart, failures, startupMs: startup, settle: settled, idle, log: await logStats(started) };
+    return result;
   } finally {
     s.kill();
   }
 }
 
-async function baselineScenario(ws: Workspace, chats: number) {
-  const name = `baseline-c${chats}`;
-  log(`scenario ${name}: ${BASELINE_REPS} cold+warm 4,200-file baselines beside ${N} captures`);
-  const store = ws.store;
-  const storeAtStart = await storeBytes(store);
-  const s = await Subject.start(ws, store);
-  try {
-    const { started, failures } = await startCaptures(s, ws, ws.worktrees.slice(0, N), chats);
-    const settled = await settle(s);
-    const cold: number[] = [];
-    const warm: number[] = [];
-    await s.call({ op: 'eld', on: true });
-    for (let i = 0; i < BASELINE_REPS; i++) {
-      // Cold CAS: a store that has never held these bytes. Warm: the same store
-      // again under a new session. OS page cache stays warm (purging needs sudo).
-      const repStore = await freshStore(ws, `${name}-rep${i}`);
-      for (const into of [cold, warm]) {
-        const sessionId = randomUUID();
-        const r = await s.call<{ ms: number }>({ op: 'start', root: ws.big, sessionId, storeDir: repStore });
-        into.push(r.ms);
-        await s.call({ op: 'stopSession', sessionId });
-      }
-      await rm(repStore, { recursive: true, force: true });
+async function startFleet(s: Subject, ws: Workspace, n: number, chats: number) {
+  const { started, failures } = await startCaptures(s, ws, ws.worktrees.slice(0, n), chats);
+  const startupMs = latencyStats(started.map((x) => x.ms));
+  log(`  started ${started.length} (${failures.length} failed), startup p50 ${startupMs.p50?.toFixed(0)} ms`);
+  return { started, failures, startupMs };
+}
+
+async function idle(f: Fleet, ws: Workspace, name: string, idleS: number) {
+  const settled = await settle(f.s);
+  log(`  ${name}: settled=${settled.settled} after ${settled.ms}ms, idle ${idleS}s`);
+  const window = await measureWindow(f.s, idleS, name, ws, f.store);
+  return { n: f.started.length, chats: f.chats, storeAtStart: f.storeAtStart, failures: f.failures, startupMs: f.startupMs, settle: settled, idle: window, log: await logStats(f.started) };
+}
+
+async function baselines(f: Fleet, ws: Workspace, name: string) {
+  const settled = await settle(f.s);
+  log(`  ${name}: ${BASELINE_REPS} cold+warm 4,200-file baselines beside ${f.started.length} captures`);
+  const cold: number[] = [];
+  const warm: number[] = [];
+  await f.s.call({ op: 'eld', on: true });
+  for (let i = 0; i < BASELINE_REPS; i++) {
+    // Cold CAS: a store that has never held these bytes. Warm: the same store
+    // again under a new session. OS page cache stays warm (purging needs sudo).
+    const repStore = await freshStore(ws, `${name}-rep${i}`);
+    for (const into of [cold, warm]) {
+      const sessionId = randomUUID();
+      const r = await f.s.call<{ ms: number }>({ op: 'start', root: ws.big, sessionId, storeDir: repStore });
+      into.push(r.ms);
+      await f.s.call({ op: 'stopSession', sessionId });
     }
-    const eld = await s.call({ op: 'eld', on: false });
-    await s.shutdown();
-    return { chats, storeAtStart, failures, settle: settled, coldMs: latencyStats(cold), warmMs: latencyStats(warm), cold, warm, eventLoopDelay: eld, log: await logStats(started) };
-  } finally {
-    s.kill();
+    await rm(repStore, { recursive: true, force: true });
   }
+  const eld = await f.s.call({ op: 'eld', on: false });
+  return { chats: f.chats, settle: settled, coldMs: latencyStats(cold), warmMs: latencyStats(warm), cold, warm, eventLoopDelay: eld };
 }
 
 interface WriteRecord { sessionId: string; sha256: string; writtenNs: bigint }
@@ -403,84 +411,71 @@ async function writeLoad(targets: Started[], seconds: number, arm: string): Prom
   return out;
 }
 
-async function latencyScenario(ws: Workspace, chats: number) {
-  const name = `latency-c${chats}`;
-  log(`scenario ${name}: write latency on 8 of ${N} captures, with and without a concurrent baseline`);
-  const store = ws.store;
-  const storeAtStart = await storeBytes(store);
-  const s = await Subject.start(ws, store);
-  try {
-    const { started, failures } = await startCaptures(s, ws, ws.worktrees.slice(0, N), chats);
-    const settled = await settle(s);
-    const targets = started.slice(chats, chats + 8);
-    await s.call({ op: 'track', sessionIds: targets.map((t) => t.sessionId) });
-    const arms: Record<string, { writes: WriteRecord[]; eld: unknown; baselines?: unknown }> = {};
-    for (const arm of ['A1', 'B', 'A2']) {
-      await s.call({ op: 'eld', on: true });
-      if (arm === 'B') await s.call({ op: 'baselineLoop', roots: [ws.big, ...ws.worktrees.slice(N)] });
-      const writes = await writeLoad(targets, LATENCY_S, arm);
-      const baselines = arm === 'B' ? await s.call({ op: 'stopBaselineLoop' }) : undefined;
-      arms[arm] = { writes, eld: await s.call({ op: 'eld', on: false }), ...(baselines ? { baselines } : {}) };
-      await sleep(5_000);
-    }
-    const timeline = (await s.call<{ sessionId: string; seq: string; ns: string }[]>({ op: 'timeline' }))
-      .map((t) => ({ sessionId: t.sessionId, seq: BigInt(t.seq), ns: BigInt(t.ns) }));
-    await s.shutdown();
-    const changes: { sessionId: string; seq: bigint; sha256: string }[] = [];
-    for (const t of targets) {
-      for (const e of await readEvents(t.logPath)) {
-        const after = e.data.after as { kind?: string; sha256?: string } | undefined;
-        if (e.type === 'slipstream.file.changed.v1' && after?.kind === 'content') changes.push({ sessionId: t.sessionId, seq: BigInt(e.seq), sha256: after.sha256! });
-      }
-    }
-    const result = (writes: WriteRecord[]) => {
-      const j = joinLatencies({ writes, changes, timeline });
-      const worstP99 = Math.max(...Object.values(j.perSessionMs).map((v) => latencyStats(v).p99 ?? 0));
-      return { writes: writes.length, missing: j.missing, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
-    };
-    const a = result([...arms.A1!.writes, ...arms.A2!.writes]);
-    const b = result(arms.B!.writes);
-    const baselineRuns = arms.B!.baselines as { root: string; ms: number }[];
-    return {
-      chats, storeAtStart, failures, settle: settled,
-      armA: { ...a, eldA1: arms.A1!.eld, eldA2: arms.A2!.eld },
-      armB: { ...b, eld: arms.B!.eld, baselines: baselineRuns,
-        baselineCoverage: baselineRuns.reduce((x, r) => x + r.ms, 0) / (LATENCY_S * 1000) },
-      armA1: result(arms.A1!.writes), armA2: result(arms.A2!.writes),
-      p99Regression: a.all.p99 && b.all.p99 ? b.all.p99 / a.all.p99 - 1 : null,
-      worstCaptureP99Regression: a.worstCaptureP99Ms ? b.worstCaptureP99Ms / a.worstCaptureP99Ms - 1 : null,
-    };
-  } finally {
-    s.kill();
+async function latency(f: Fleet, ws: Workspace, name: string) {
+  const settled = await settle(f.s);
+  log(`  ${name}: write latency on 8 of ${f.started.length} captures, with and without a concurrent baseline`);
+  const targets = f.started.slice(f.chats, f.chats + 8);
+  await f.s.call({ op: 'track', sessionIds: targets.map((t) => t.sessionId) });
+  const arms: Record<string, { writes: WriteRecord[]; eld: unknown; baselines?: unknown }> = {};
+  for (const arm of ['A1', 'B', 'A2']) {
+    await f.s.call({ op: 'eld', on: true });
+    if (arm === 'B') await f.s.call({ op: 'baselineLoop', roots: [ws.big, ...ws.worktrees.slice(N)] });
+    const writes = await writeLoad(targets, LATENCY_S, arm);
+    const runs = arm === 'B' ? await f.s.call({ op: 'stopBaselineLoop' }) : undefined;
+    arms[arm] = { writes, eld: await f.s.call({ op: 'eld', on: false }), ...(runs ? { baselines: runs } : {}) };
+    await sleep(5_000);
   }
+  const timeline = (await f.s.call<{ sessionId: string; seq: string; ns: string }[]>({ op: 'timeline' }))
+    .map((t) => ({ sessionId: t.sessionId, seq: BigInt(t.seq), ns: BigInt(t.ns) }));
+  const changes: { sessionId: string; seq: bigint; sha256: string }[] = [];
+  for (const t of targets) {
+    for (const e of await readEvents(t.logPath)) {
+      const after = e.data.after as { kind?: string; sha256?: string } | undefined;
+      if (e.type === 'slipstream.file.changed.v1' && after?.kind === 'content') changes.push({ sessionId: t.sessionId, seq: BigInt(e.seq), sha256: after.sha256! });
+    }
+  }
+  const result = (writes: WriteRecord[]) => {
+    const j = joinLatencies({ writes, changes, timeline });
+    const worstP99 = Math.max(...Object.values(j.perSessionMs).map((v) => latencyStats(v).p99 ?? 0));
+    return { writes: writes.length, missing: j.missing, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
+  };
+  const a = result([...arms.A1!.writes, ...arms.A2!.writes]);
+  const b = result(arms.B!.writes);
+  const baselineRuns = arms.B!.baselines as { root: string; ms: number }[];
+  return {
+    chats: f.chats, settle: settled,
+    armA: { ...a, eldA1: arms.A1!.eld, eldA2: arms.A2!.eld },
+    armB: { ...b, eld: arms.B!.eld, baselines: baselineRuns,
+      // The loop starts with the arm and its last baseline outlives it, so the arm is
+      // fully covered whenever the summed baselines reach the arm length.
+      baselineCoverage: Math.min(1, baselineRuns.reduce((x, r) => x + r.ms, 0) / (LATENCY_S * 1000)) },
+    armA1: result(arms.A1!.writes), armA2: result(arms.A2!.writes),
+    p99Regression: a.all.p99 && b.all.p99 ? b.all.p99 / a.all.p99 - 1 : null,
+    worstCaptureP99Regression: a.worstCaptureP99Ms ? b.worstCaptureP99Ms / a.worstCaptureP99Ms - 1 : null,
+  };
 }
 
-async function installScenario(ws: Workspace) {
-  log(`scenario install: npm ci into an ignored node_modules inside one of ${N} watched worktrees`);
-  const store = ws.store;
-  const storeAtStart = await storeBytes(store);
-  const s = await Subject.start(ws, store);
-  try {
-    const { started, failures } = await startCaptures(s, ws, ws.worktrees.slice(0, N), 0);
-    const settled = await settle(s);
-    const target = ws.worktrees[0]!;
-    const window = await measureWindow(s, 240, 'install', ws, store, async () => {
-      const t0 = Date.now();
-      try {
-        await run('npm', ['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: target, maxBuffer: 64 * MiB });
-        return { method: 'npm ci --offline --ignore-scripts', ms: Date.now() - t0 };
-      } catch (err) {
-        // Offline cache incomplete: fall back to copying this repo's tree, and say so.
-        await run('cp', ['-R', join(REPO, 'node_modules'), join(target, 'node_modules')]);
-        return { method: `copy of repo node_modules (npm ci failed: ${(err as Error).message.split('\n')[0]})`, ms: Date.now() - t0 };
-      }
-    });
-    const files = Number((await run('sh', ['-c', `find '${join(target, 'node_modules')}' -type f | wc -l`])).stdout.trim());
-    await s.shutdown();
-    return { storeAtStart, failures, settle: settled, installedFiles: files, window, log: await logStats(started) };
-  } finally {
-    s.kill();
-  }
+async function install(f: Fleet, ws: Workspace) {
+  const settled = await settle(f.s);
+  log(`  install: npm ci into an ignored node_modules inside one of ${f.started.length} watched worktrees`);
+  const target = ws.worktrees[0]!;
+  const before = await logStats(f.started);
+  const window = await measureWindow(f.s, 240, 'install', ws, f.store, async () => {
+    const t0 = Date.now();
+    try {
+      await run('npm', ['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: target, maxBuffer: 64 * MiB });
+      return { method: 'npm ci --offline --ignore-scripts', ms: Date.now() - t0 };
+    } catch (err) {
+      // Offline cache incomplete: fall back to copying this repo's tree, and say so.
+      await run('cp', ['-R', join(REPO, 'node_modules'), join(target, 'node_modules')]);
+      return { method: `copy of repo node_modules (npm ci failed: ${(err as Error).message.split('\n')[0]})`, ms: Date.now() - t0 };
+    }
+  });
+  const files = Number((await run('sh', ['-c', `find '${join(target, 'node_modules')}' -type f | wc -l`])).stdout.trim());
+  const logAfter = await logStats(f.started);
+  // Later fleets watch this worktree too; leave it as generated.
+  await rm(join(target, 'node_modules'), { recursive: true, force: true });
+  return { settle: settled, installedFiles: files, window, logBefore: before, logAfter };
 }
 
 // ---------------------------------------------------------------- gates
@@ -559,14 +554,24 @@ async function main(): Promise<void> {
   const cleanup = () => rm(ws.tmp, { recursive: true, force: true });
   for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => { void cleanup().then(() => process.exit(130)); });
   try {
-    if (PHASES.has('gated')) for (const c of [0, 1, 10]) record(`n${N}-c${c}`, await idleScenario(ws, `n${N}-c${c}`, N, c, IDLE_S));
-    if (PHASES.has('baseline')) for (const c of [0, 10]) record(`baseline-c${c}`, await baselineScenario(ws, c));
-    if (PHASES.has('latency')) for (const c of [0, 10]) record(`latency-c${c}`, await latencyScenario(ws, c));
-    if (PHASES.has('install')) record('install', await installScenario(ws));
+    for (const c of [0, 1, 10]) {
+      const steps = {
+        idle: PHASES.has('gated'),
+        baseline: c !== 1 && PHASES.has('baseline'),
+        latency: c !== 1 && PHASES.has('latency'),
+        install: c === 0 && PHASES.has('install'),
+      };
+      if (!Object.values(steps).some(Boolean)) continue;
+      await withFleet(ws, `n${N}-c${c}`, N, c, async (f) => {
+        if (steps.idle) record(`n${N}-c${c}`, await idle(f, ws, `n${N}-c${c}`, IDLE_S));
+        if (steps.baseline) record(`baseline-c${c}`, await baselines(f, ws, `baseline-c${c}`));
+        if (steps.latency) record(`latency-c${c}`, await latency(f, ws, `latency-c${c}`));
+        if (steps.install) record('install', await install(f, ws));
+      });
+    }
     if (PHASES.has('diag')) {
-      for (const [n, c] of [[0, 0], [1, 0], [10, 0], [N, N], [136, 0], [136, 10]] as const) {
-        const name = n === N && c === N ? `n${N}-enriched-all` : `n${n}-c${c}`;
-        record(name, await idleScenario(ws, name, n, c, DIAG_IDLE_S));
+      for (const n of [0, 1, 10, 136]) {
+        await withFleet(ws, `n${n}-c0`, n, 0, async (f) => record(`n${n}-c0`, await idle(f, ws, `n${n}-c0`, DIAG_IDLE_S)));
       }
     }
   } finally {
