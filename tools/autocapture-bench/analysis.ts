@@ -48,19 +48,19 @@ export interface TopSummary {
 
 /** CPU drops the first sample (no interval behind it); cumulative counters use
  * every sample, since their first reading is a valid starting point. */
-export function summarizeTop(all: TopSample[], intervalSeconds: number): TopSummary {
+export function summarizeTop(all: TopSample[], elapsedSeconds: number): TopSummary {
   if (all.length < 2) throw new Error(`need at least two top samples, got ${all.length}`);
   const cpu = all.slice(1).map((s) => s.cpuPercent);
   const first = all[0]!;
   const last = all[all.length - 1]!;
-  const elapsed = (all.length - 1) * intervalSeconds;
+  if (elapsedSeconds <= 0) throw new Error(`elapsed seconds must be positive, got ${elapsedSeconds}`);
   return {
     samples: cpu.length,
     cpuMeanPercent: cpu.reduce((a, b) => a + b, 0) / cpu.length,
     cpuP95Percent: percentile([...cpu].sort((a, b) => a - b), 95),
     maxMemBytes: Math.max(...all.map((s) => s.memBytes)),
     maxThreads: Math.max(...all.map((s) => s.threads)),
-    idleWakeupsPerSecond: (last.idleWakeups - first.idleWakeups) / elapsed,
+    idleWakeupsPerSecond: (last.idleWakeups - first.idleWakeups) / elapsedSeconds,
   };
 }
 

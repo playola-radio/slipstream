@@ -74,7 +74,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
 | Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery and Claude delivery D3 merged, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
-| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree. **Amended again 2026-10-17 (Brian):** every workspace is captured, watch-only by default, up to 16 recording at once (later the same day, D10; beyond that a workspace is visibly NOT recording and starts when a slot frees); up to 10 agent chats may be linked at once, one linked chat per capture, replaced only by explicit unlink; see "Future: several simultaneous captures" below |
+| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree. **Amended again 2026-10-17 (Brian):** every workspace is captured, watch-only by default, up to 16 recording at once (later the same day, D10; beyond that a workspace is visibly NOT recording and starts when a slot frees); up to 10 agent chats may be linked at once, one linked chat per capture, replaced only by explicit unlink; see "Current MVP scope: several simultaneous captures" below |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
 | Q6 | MCP topology | stdio thin forwarder → one long-running daemon (verified necessary) |
 | Q7 | Event envelope | CloudEvents structured JSON; minimal effort spent on it |
@@ -105,7 +105,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
   identities. A transcript record may *update attribution*; it may never
   *create* a filesystem-change event. This avoids double-capture structurally.
 
-### Future: several simultaneous captures (not built; Q4 amended 2026-10-05, again 2026-10-17)
+### Current MVP scope: several simultaneous captures (Q4 amended 2026-10-05, again 2026-10-17)
 
 **Amendment (Brian, 2026-10-05).** Q4 is lifted so every new Conductor
 workspace can be captured automatically.
@@ -140,11 +140,10 @@ explicit selection, detach-before-switch and no competing auto-start carry
 explicit dated amendment notes below; identity verification and watcher-primary
 capture are unchanged. The text below predates the amendments.
 
-Capturing several worktrees at once, and later auto-connecting new Conductor
-workspaces, is the intended direction after the MVP. It is not built, and Q4
-and the Stage 3 success criteria are unchanged. The log, blob store, reader,
-boundary registry and `CaptureSession` are already multi-session; single-active
-lives only in the daemon control plane (`src/daemon.ts` `state` / `current`).
+Capturing several worktrees at once and auto-connecting new Conductor workspaces
+are current MVP scope under amended Q4. The legacy single-active Stage 3 wording
+below is superseded where it conflicts with this amendment; the log, blob store,
+reader, boundary registry and `CaptureSession` are already multi-session.
 
 Rules that keep the expansion additive:
 - Every control verb that acts on a particular capture names its target

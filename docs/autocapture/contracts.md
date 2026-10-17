@@ -237,13 +237,13 @@ New codes join `ControlErrorCode`:
 - `CAPTURE_LIMIT_REACHED`: 16 capture intents already hold slots (spec D10).
   Exact text from the spec:
 
-  > `CAPTURE_LIMIT_REACHED: 16/16 workspaces recording. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
+  > `CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
 
   The waiting intent is durable; the CLI exits non-zero (setup scripts report it
   per D1). A slot is any capture intent that is `running`, whatever its lifecycle
   state, including `not_recording` with a retry pending.
 - `ROOT_OVERLAP`: the requested root is an ancestor or descendant (by path
-  components) of a queued, baselining, or recording capture's root. Sibling git
+  components) of a waiting, queued, baselining, or recording capture's root. Sibling git
   worktrees sharing repository metadata are not overlaps.
 - `TARGET_NOT_FOUND`: a targeted verb names no known capture.
 - `STALE_BINDING`: a chat-facing verb carries a generation or activation that is
@@ -288,14 +288,18 @@ heartbeat (7), in this precedence:
    {stop-unconfirmed}`. Never `stopped`, never `recording`.
 3. Intent `waiting`: `not_recording{capture-limit-reached}`. Waiting intents never
    have an activation.
-4. Intent `running`, heartbeat not live: `not_recording` with the recorded
-   `last_failure` reason, else `daemon-unavailable`.
-5. Intent `running`, heartbeat live, no activation yet: `queued`.
-6. Heartbeat live, current activation has `capture.ready`: `recording`; without
+4. Intent `running` with a recorded `last_failure`: `not_recording` with that
+   reason, whether or not its heartbeat is fresh. A storage failure therefore
+   never reads as `recording`; when the store cannot accept another event, the
+   reader uses the durable intent record's `last_failure`.
+5. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
+   with that event's reason. `maintenance` additionally carries the running
+   intent, so it resumes later; `watcher-failed` does too when recovery is
+   scheduled. Neither stop is hidden by a fresh heartbeat.
+6. Intent `running`, heartbeat not live: `not_recording{daemon-unavailable}`.
+7. Intent `running`, heartbeat live, no activation yet: `queued`.
+8. Heartbeat live, current activation has `capture.ready`: `recording`; without
    it: `baselining`.
-7. Last activation ends in `capture.stopped{maintenance}` with intent `running`:
-   `not_recording{daemon-unavailable}` until resumed (the stop is real; the
-   intent says it should come back).
 
 Binding state is a fold of binding intent plus binding events; revoked intent
 wins over a missing `agent.unlinked` event. `unavailable` comes only from intent.

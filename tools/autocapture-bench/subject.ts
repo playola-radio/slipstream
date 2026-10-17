@@ -43,7 +43,7 @@ let defaultStore = '';
 let tracked = new Set<string>();
 let timeline: { sessionId: string; seq: string; ns: string }[] = [];
 let eld: IntervalHistogram | undefined;
-type BaselineRun = { root: string; ms: number; startNs: string; endNs: string };
+type BaselineRun = { sessionId: string; root: string; logPath: string; ms: number; startNs: string; endNs: string };
 let loop: { state: { stop: boolean }; done: Promise<{ runs: BaselineRun[]; error?: string }> } | undefined;
 
 async function start(req: Extract<Request, { op: 'start' }>): Promise<{ ms: number; logPath: string }> {
@@ -87,10 +87,10 @@ async function baselineLoop(roots: string[], state: { stop: boolean }): Promise<
       const root = roots[i % roots.length]!;
       const sessionId = crypto.randomUUID();
       const startNs = process.hrtime.bigint();
-      const { ms } = await start({ op: 'start', root, sessionId });
+      const { ms, logPath } = await start({ op: 'start', root, sessionId });
       const endNs = process.hrtime.bigint();
       await stopSession(sessionId);
-      runs.push({ root, ms, startNs: startNs.toString(), endNs: endNs.toString() });
+      runs.push({ sessionId, root, logPath, ms, startNs: startNs.toString(), endNs: endNs.toString() });
     }
     return { runs };
   } catch (err) {

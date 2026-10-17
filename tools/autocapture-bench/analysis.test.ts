@@ -40,17 +40,23 @@ test('memory sizes carry binary units', () => {
 });
 
 test('the first top sample is dropped because its CPU column has no interval behind it', () => {
-  const summary = summarizeTop(parseTopLog(TOP_LOG, 90371), 1);
+  const summary = summarizeTop(parseTopLog(TOP_LOG, 90371), 2);
   assert.equal(summary.samples, 2);
   assert.equal(summary.cpuMeanPercent, 1);
   assert.equal(summary.cpuP95Percent, 1.5);
 });
 
 test('wakeup rates come from cumulative counter deltas over the sampled interval', () => {
-  const summary = summarizeTop(parseTopLog(TOP_LOG, 90371), 1);
+  const summary = summarizeTop(parseTopLog(TOP_LOG, 90371), 2);
   assert.equal(summary.idleWakeupsPerSecond, 1.5);
   assert.equal(summary.maxMemBytes, 1.5 * 2 ** 30);
   assert.equal(summary.maxThreads, 9);
+});
+
+test('wakeup rates use the measured time between the first and last sample', () => {
+  const samples = parseTopLog(TOP_LOG, 90371);
+  const summary = summarizeTop(samples, 5);
+  assert.equal(summary.idleWakeupsPerSecond, 0.6);
 });
 
 test('latency stats use nearest rank and report sample count', () => {

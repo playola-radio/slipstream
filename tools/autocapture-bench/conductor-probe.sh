@@ -16,11 +16,13 @@
 set -u
 
 label=${1:-unlabeled}
+safe_label=$(printf '%s' "$label" | tr -cs '[:alnum:]._-' '_')
 sleep_s=${2:-60}
 status=${3:-0}
 dir="$HOME/slipstream-conductor-probe"
+umask 077
 mkdir -p "$dir"
-log="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$label-$$.log"
+log="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$safe_label-$$.log"
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
 
@@ -31,9 +33,9 @@ stamp() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
   echo "pwd=$(pwd -P)"
   echo "sleep_s=$sleep_s exit_status=$status"
   echo "--- CONDUCTOR_* values"
-  env | grep '^CONDUCTOR_' | sort
+  awk 'BEGIN { for (key in ENVIRON) if (key ~ /^CONDUCTOR_/) { value = ENVIRON[key]; gsub(/\n/, "\\\\n", value); gsub(/\r/, "\\\\r", value); print key "=" value } }' | sort
   echo "--- all variable names"
-  env | sed 's/=.*//' | sort | tr '\n' ' '
+  awk 'BEGIN { for (key in ENVIRON) print key }' | sort | tr '\n' ' '
   echo
 } >"$log"
 

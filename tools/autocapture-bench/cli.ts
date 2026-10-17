@@ -9,10 +9,11 @@
  */
 import { execFile, execFileSync, fork, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, closeSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { cpus, loadavg, tmpdir, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parseArgs } from 'node:util';
 import { DEFAULT_ENRICHMENT_POLICY } from '../../src/attribution-producer.ts';
@@ -24,7 +25,7 @@ import { createRng, layoutPaths, sampleFileSize, sampleWorktreeFileCounts } from
 import type { Request, Snapshot } from './subject.ts';
 
 const GENERATOR_VERSION = 1;
-const REPO = join(dirname(new URL(import.meta.url).pathname), '..', '..');
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const execFileP = promisify(execFile);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MiB = 2 ** 20;
@@ -50,7 +51,11 @@ const IDLE_S = positiveInt('idle-seconds');
 const DIAG_IDLE_S = positiveInt('diag-idle-seconds');
 const BASELINE_REPS = positiveInt('baseline-reps');
 const LATENCY_S = positiveInt('latency-seconds');
+const VALID_PHASES = new Set(['gated', 'diag', 'baseline', 'latency', 'install']);
 const PHASES = new Set(args.phases!.split(','));
+for (const phase of PHASES) {
+  if (!VALID_PHASES.has(phase)) throw new Error(`--phases contains an unknown phase ${JSON.stringify(phase)}`);
+}
 const SEED = positiveInt('seed');
 const N = positiveInt('captures');
 /** Recordings beyond the cap of 16, reported as headroom only. */
@@ -92,7 +97,7 @@ function checkStopping(): void {
 interface Workspace { tmp: string; worktrees: string[]; big: string; homes: { claude: string; codex: string }; storesDir: string; store: string }
 
 async function gitCommit(dir: string): Promise<void> {
-  const git = ['-c', 'core.compression=0', '-c', 'gc.auto=0', '-c', 'core.fsmonitor=false', '-C', dir];
+  const git = ['-c', 'core.compression=0', '-c', 'gc.auto=0', '-c', 'core.fsmonitor=false', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=', '-C', dir];
   await run('git', ['init', '-q', dir]);
   await run('git', [...git, 'add', '-A'], { maxBuffer: 64 * MiB });
   await run('git', [...git, '-c', 'user.name=bench', '-c', 'user.email=bench@example.invalid', 'commit', '-q', '-m', 'synthetic'],
@@ -101,12 +106,12 @@ async function gitCommit(dir: string): Promise<void> {
 
 /** Distinct bytes per file (a unique header plus a slice of one seeded random
  * buffer), so CAS dedup never makes a cold baseline look warm. */
-function writeWorktree(dir: string, fileCount: number, rng: () => number, pool: Buffer): number {
+function writeWorktree(dir: string, identity: string, fileCount: number, rng: () => number, pool: Buffer): number {
   let bytes = 0;
   writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
-  for (const rel of layoutPaths(fileCount)) {
+  for (const [index, rel] of layoutPaths(fileCount).entries()) {
     const size = sampleFileSize(rng);
-    const header = Buffer.from(`${dir}/${rel}\n`);
+    const header = Buffer.from(`${createHash('sha256').update(`${SEED}:${identity}:${index}:${rel}`).digest('hex')}\n`);
     const offset = Math.floor(rng() * (pool.length - size));
     const body = size <= header.length ? header.subarray(0, size)
       : Buffer.concat([header, pool.subarray(offset, offset + size - header.length)]);
@@ -129,7 +134,7 @@ async function generate(real: string): Promise<{ ws: Workspace; meta: Record<str
     checkStopping();
     const dir = join(real, 'worktrees', `w${String(i).padStart(3, '0')}`);
     mkdirSync(dir, { recursive: true });
-    bytes += writeWorktree(dir, count, rng, pool);
+    bytes += writeWorktree(dir, `w${i}`, count, rng, pool);
     if (i === 0) for (const f of ['package.json', 'package-lock.json']) copyFileSync(join(REPO, f), join(dir, f));
     worktrees.push(dir);
     jobs.push(gitCommit(dir));
@@ -137,7 +142,7 @@ async function generate(real: string): Promise<{ ws: Workspace; meta: Record<str
   }
   const big = join(real, 'worktrees', 'big4200');
   mkdirSync(big, { recursive: true });
-  bytes += writeWorktree(big, 4200, rng, pool);
+  bytes += writeWorktree(big, 'big4200', 4200, rng, pool);
   jobs.push(gitCommit(big));
   await Promise.all(jobs);
 
@@ -328,7 +333,9 @@ async function readEvents(logPath: string): Promise<LogEvent[]> {
   return text.split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogEvent);
 }
 
-async function logStats(started: Started[]) {
+interface LogStats { byType: Record<string, number>; gapsByReason: Record<string, number>; ignoredPathChanges: number }
+
+async function logStats(started: Started[]): Promise<LogStats> {
   const byType: Record<string, number> = {};
   const gapsByReason: Record<string, number> = {};
   let ignoredPathChanges = 0;
@@ -341,6 +348,16 @@ async function logStats(started: Started[]) {
     }
   }
   return { byType, gapsByReason, ignoredPathChanges };
+}
+
+function mergeLogStats(stats: LogStats[]): LogStats {
+  const merged: LogStats = { byType: {}, gapsByReason: {}, ignoredPathChanges: 0 };
+  for (const stat of stats) {
+    for (const [type, count] of Object.entries(stat.byType)) merged.byType[type] = (merged.byType[type] ?? 0) + count;
+    for (const [reason, count] of Object.entries(stat.gapsByReason)) merged.gapsByReason[reason] = (merged.gapsByReason[reason] ?? 0) + count;
+    merged.ignoredPathChanges += stat.ignoredPathChanges;
+  }
+  return merged;
 }
 
 function fsyncs(c: Snapshot['counters']): number {
@@ -365,7 +382,7 @@ async function measureWindow(s: Subject, seconds: number, label: string, ws: Wor
   const lockOps = b.counters.calls.lock;
   return {
     seconds: wallS,
-    top: summarizeTop(samples, 1),
+    top: summarizeTop(samples, wallS),
     topSamples: samples.map((x) => [x.cpuPercent, x.memBytes]),
     processCpuMeanPercent: (cpuS / wallS) * 100,
     timerWakeupsPerSecond: b.counters.timerWakeups / wallS,
@@ -397,6 +414,11 @@ async function measureWindow(s: Subject, seconds: number, label: string, ws: Wor
 interface Fleet {
   s: Subject; chats: number; store: string; storeAtStart: Awaited<ReturnType<typeof storeBytes>>;
   started: Started[]; failures: string[]; startupMs: ReturnType<typeof latencyStats>;
+  completedLogs: LogStats[]; additionalLogs: Started[];
+}
+
+async function fleetLogStats(f: Fleet): Promise<LogStats> {
+  return mergeLogStats([...f.completedLogs, await logStats([...f.started, ...f.additionalLogs])]);
 }
 
 async function withFleet<T>(ws: Workspace, label: string, n: number, chats: number, body: (f: Fleet) => Promise<T>): Promise<T> {
@@ -405,7 +427,7 @@ async function withFleet<T>(ws: Workspace, label: string, n: number, chats: numb
   const storeAtStart = await storeBytes(store);
   const s = await Subject.start(ws, store);
   try {
-    const result = await body({ s, chats, store, storeAtStart, ...(await startFleet(s, ws, n, chats)) });
+    const result = await body({ s, chats, store, storeAtStart, completedLogs: [], additionalLogs: [], ...(await startFleet(s, ws, n, chats)) });
     await s.shutdown();
     return result;
   } finally {
@@ -439,9 +461,10 @@ async function baselines(f: Fleet, ws: Workspace, name: string) {
     const repStore = await freshStore(ws, `${name}-rep${i}`);
     for (const into of [cold, warm]) {
       const sessionId = randomUUID();
-      const r = await f.s.call<{ ms: number }>({ op: 'start', root: ws.big, sessionId, storeDir: repStore });
+      const r = await f.s.call<{ ms: number; logPath: string }>({ op: 'start', root: ws.big, sessionId, storeDir: repStore });
       into.push(r.ms);
       await f.s.call({ op: 'stopSession', sessionId });
+      f.completedLogs.push(await logStats([{ sessionId, root: ws.big, ...r }]));
     }
     await rm(repStore, { recursive: true, force: true });
   }
@@ -450,7 +473,7 @@ async function baselines(f: Fleet, ws: Workspace, name: string) {
 }
 
 interface WriteRecord { sessionId: string; sha256: string; writtenNs: bigint }
-interface BaselineLoopResult { runs: { root: string; ms: number; startNs: string; endNs: string }[]; error?: string }
+interface BaselineLoopResult { runs: { sessionId: string; root: string; logPath: string; ms: number; startNs: string; endNs: string }[]; error?: string }
 
 /** One write every 200 ms, round-robin across the target captures, each a
  * unique payload so its change record can be found by hash. */
@@ -480,6 +503,7 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
     const writes = await writeLoad(targets, LATENCY_S, arm);
     const loop = arm === 'B' ? await f.s.call<BaselineLoopResult>({ op: 'stopBaselineLoop' }) : undefined;
     if (loop?.error) log(`  ${name}: baseline loop stopped early: ${loop.error}`);
+    if (loop) f.additionalLogs.push(...loop.runs.map(({ sessionId, root, logPath, ms }) => ({ sessionId, root, logPath, ms })));
     arms[arm] = { writes, eld: await f.s.call({ op: 'eld', on: false }), ...(loop ? { baselines: loop } : {}) };
     await sleep(5_000);
   }
@@ -495,7 +519,8 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
   const result = (writes: WriteRecord[]) => {
     const j = joinLatencies({ writes, changes, timeline });
     const worstP99 = Math.max(...Object.values(j.perSessionMs).map((v) => latencyStats(v).p99 ?? 0));
-    return { writes: writes.length, missing: j.missing, latenciesMs: j.latenciesMs, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
+    return { writes: writes.length, missing: j.missing, latenciesMs: j.latenciesMs, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99,
+      perCaptureP99Ms: Object.fromEntries(Object.entries(j.perSessionMs).map(([sessionId, values]) => [sessionId, latencyStats(values).p99 ?? 0])) };
   };
   const a = result([...arms.A1!.writes, ...arms.A2!.writes]);
   const b = result(arms.B!.writes);
@@ -508,7 +533,12 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
       baselineCoverage: coveredFraction(arms.B!.writes.map((w) => w.writtenNs), intervals) },
     armA1: result(arms.A1!.writes), armA2: result(arms.A2!.writes),
     p99Regression: a.all.p99 && b.all.p99 ? b.all.p99 / a.all.p99 - 1 : null,
-    worstCaptureP99Regression: a.worstCaptureP99Ms ? b.worstCaptureP99Ms / a.worstCaptureP99Ms - 1 : null,
+    worstCaptureP99Regression: (() => {
+      const ratios = Object.entries(b.perCaptureP99Ms)
+        .map(([sessionId, bP99]) => a.perCaptureP99Ms[sessionId] ? bP99 / a.perCaptureP99Ms[sessionId]! - 1 : null)
+        .filter((ratio): ratio is number => ratio !== null);
+      return ratios.length === 0 ? null : Math.max(...ratios);
+    })(),
   };
 }
 
@@ -525,6 +555,7 @@ async function install(f: Fleet, ws: Workspace) {
     } catch (err) {
       checkStopping();
       // Offline cache incomplete: fall back to copying this repo's tree, and say so.
+      await rm(join(target, 'node_modules'), { recursive: true, force: true });
       await run('cp', ['-R', join(REPO, 'node_modules'), join(target, 'node_modules')]);
       return { method: `copy of repo node_modules (npm ci failed: ${(err as Error).message.split('\n')[0]})`, ms: Date.now() - t0 };
     }
@@ -563,8 +594,8 @@ function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
     const firstRow = rows.length;
     rows.push({ gate: 'idle CPU mean', scenario: name, threshold: '<= 1%', measured: `${pct(i.top.cpuMeanPercent)} (process cpuUsage ${pct(i.processCpuMeanPercent)})`, verdict: evaluateGate({ threshold: 1, measured: Math.max(i.top.cpuMeanPercent, i.processCpuMeanPercent) }) });
     rows.push({ gate: 'idle CPU p95 of 1-s samples', scenario: name, threshold: '<= 3%', measured: pct(i.top.cpuP95Percent), verdict: evaluateGate({ threshold: 3, measured: i.top.cpuP95Percent }) });
-    const lower = Math.max(i.top.idleWakeupsPerSecond, i.timerWakeupsPerSecond);
-    rows.push({ gate: 'process wakeups/s', scenario: name, threshold: '<= 10/s', measured: `>= ${lower.toFixed(1)}/s (lower bound: top IDLEW ${i.top.idleWakeupsPerSecond.toFixed(1)}, main-thread timer wakeups ${i.timerWakeupsPerSecond.toFixed(1)}); upper bound unmeasured`, verdict: evaluateGate({ threshold: 10, lower, upper: Infinity }) });
+    const lower = i.top.idleWakeupsPerSecond;
+    rows.push({ gate: 'process wakeups/s', scenario: name, threshold: '<= 10/s', measured: `>= ${lower.toFixed(1)}/s (lower bound: top IDLEW ${i.top.idleWakeupsPerSecond.toFixed(1)}; main-thread timer callbacks ${i.timerWakeupsPerSecond.toFixed(1)}/s are diagnostic only); upper bound unmeasured`, verdict: evaluateGate({ threshold: 10, lower, upper: Infinity }) });
     rows.push({ gate: 'physical footprint', scenario: name, threshold: '<= 512 MiB', measured: `${(i.top.maxMemBytes / MiB).toFixed(0)} MiB max`, verdict: evaluateGate({ threshold: 512 * MiB, measured: i.top.maxMemBytes }) });
     const wt = i.worktreeCalls as Record<string, number>;
     const reads = worktreeReads(wt) + i.spawns;
@@ -621,6 +652,9 @@ async function machine() {
 async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
   const out = join(args.out!, startedAt.slice(0, 10));
+  if (existsSync(join(out, 'results.json')) || existsSync(join(out, 'gates.md'))) {
+    throw new Error(`refusing to overwrite existing benchmark evidence in ${out}; choose a new --out directory`);
+  }
   await mkdir(out, { recursive: true });
   const host = await machine();
   // The temp dir and the stop handlers exist before generation, so a stop at any
@@ -660,10 +694,18 @@ async function main(): Promise<void> {
       };
       if (!Object.values(steps).some(Boolean)) continue;
       await withFleet(ws, `n${N}-c${c}`, N, c, async (f) => {
-        if (steps.idle) record(`n${N}-c${c}`, await idle(f, ws, `n${N}-c${c}`, IDLE_S));
-        if (steps.baseline) record(`baseline-c${c}`, await baselines(f, ws, `baseline-c${c}`));
-        if (steps.latency) record(`latency-c${c}`, await latency(f, ws, `latency-c${c}`));
-        if (steps.install) record('install', await install(f, ws));
+        const idleResult = steps.idle ? await idle(f, ws, `n${N}-c${c}`, IDLE_S) : undefined;
+        const baselineResult = steps.baseline ? await baselines(f, ws, `baseline-c${c}`) : undefined;
+        const latencyResult = steps.latency ? await latency(f, ws, `latency-c${c}`) : undefined;
+        const installResult = steps.install ? await install(f, ws) : undefined;
+        if (idleResult) {
+          idleResult.log = await fleetLogStats(f);
+          idleResult.idle.compromised = (await f.s.snapshot()).compromised;
+          record(`n${N}-c${c}`, idleResult);
+        }
+        if (baselineResult) record(`baseline-c${c}`, baselineResult);
+        if (latencyResult) record(`latency-c${c}`, latencyResult);
+        if (installResult) record('install', installResult);
       });
     }
     if (PHASES.has('diag')) {

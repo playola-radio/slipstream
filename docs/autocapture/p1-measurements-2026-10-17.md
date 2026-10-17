@@ -6,7 +6,8 @@
 >   scenarios. The same test passed with no chats, and nothing traced where the
 >   slow writes waited. Under D6 an unattributed miss stops the feature.
 > - **Ruling 2:** total idle wakeups with no chats, a watcher-intrinsic gate, are
->   INCONCLUSIVE. Only a lower bound (7.1/s against 10/s) can be taken without
+>   INCONCLUSIVE. Only a lower bound (the corrected `top` IDLEW rate, 0.01/s
+>   against 10/s for c0) can be taken without
 >   sudo.
 >
 > This is not the D8 verdict; that is judged at P6 on the finished system.
@@ -44,10 +45,10 @@ cause, and a miss that cannot be attributed stops the feature.
 | memory | 142 MiB footprint at 16 (81 MiB with none; 165 MiB at 32), limit 512 MiB |
 | idle CPU | 0.59% mean / 0.90% p95 at 16 (0.02% with none, 0.83% at 32), limits 1% / 3% |
 | recurring worktree reads after settling | 0 listings, stats, reads or git spawns in the window |
-| wakeups | INCONCLUSIVE: lower bound 7.1/s against 10/s; the total is not measured |
+| wakeups | INCONCLUSIVE: corrected `top` IDLEW lower bound 0.01/s against 10/s for c0; the total is not measured |
 
 No watcher-intrinsic failure was shown by anything measured. Total wakeups with no
-chats are unknown: a 7.1/s lower bound neither proves nor disproves the 10/s limit.
+chats are unknown: a 0.01/s corrected `top` IDLEW lower bound neither proves nor disproves the 10/s limit.
 Whether P2 may start before that is measured is **Ruling 2**. Measuring it needs
 `sudo powermetrics` on the subject; see "Wakeups".
 
@@ -193,7 +194,7 @@ chats) run idle windows only, of `--diag-idle-seconds` (120 s).
 | Metric | Source | Notes |
 |---|---|---|
 | CPU mean / p95 | `top -l N -s 1 -pid P` 1-s samples, first sample dropped | Mean cross-checked against `process.cpuUsage()` over the window; the gate uses the larger. |
-| wakeups/s | lower bound only: max(`top` IDLEW, main-thread timer callbacks more than 1 ms apart) | Interrupt wakeups need `proc_pid_rusage` (native code) or `powermetrics` (sudo). Upper bound UNMEASURED, so this gate can only be FAIL or INCONCLUSIVE. |
+| wakeups/s | lower bound only: `top` IDLEW; main-thread timer callbacks more than 1 ms apart are diagnostic only | Timer callbacks do not prove a thread slept and woke between callbacks. Interrupt wakeups need `proc_pid_rusage` (native code) or `powermetrics` (sudo). Upper bound UNMEASURED, so this gate can only be FAIL or INCONCLUSIVE. |
 | footprint | `top` MEM (phys_footprint), max over the window | |
 | heap, RSS | `process.memoryUsage()` at the window's end | |
 | threads | `top` TH, max | |
@@ -242,17 +243,25 @@ This run does not establish what a quieter machine would show.
 "window" is the elapsed time. The harness asks `top` for 120 or 600 one-second
 samples, but on this loaded machine each sample took about 1.9 s, so windows ran
 about twice their nominal length. The c1 and c10 windows ran 1,097 s and 1,067 s.
-Rates are per elapsed second, so a longer window measures the same thing for
-longer. The maximum thread count in any idle window was 13–15. No idle window
-wrote to the store, fsynced, or grew a log.
+CPU and timer-callback rates are per elapsed second. **Correction (no re-run):**
+the published raw `top` IDLEW rates divided cumulative counter deltas by nominal
+one-second intervals, not elapsed time. From `results.json`, the c0 derivation
+is `0.02 × 599 / 1,148.698358625 = 0.0104/s`; c1 is
+`0.7 × 599 / 1,097.074961 = 0.3824/s`; c10 is
+`0.4233333333 × 599 / 1,067.400387 = 0.2377/s`. The raw evidence and generated
+gate table are preserved unchanged; the harness now divides by measured elapsed
+time for future runs. Timer callbacks are a diagnostic rate, not a wakeup lower
+bound, so neither correction changes the published INCONCLUSIVE verdicts. The
+maximum thread count in any idle window was 13–15. No idle window wrote to the
+store, fsynced, or grew a log.
 
 ### Wakeups
 
 Every capture holds its own `owner.lock` with a 2-second heartbeat (a `readFile`
 plus a `utimes`), and the store holds one more: 0.5/s per lock, 8.5/s at 16
-captures, 16.5/s at 32. The timer-wakeup lower bound follows them: 7.1/s at 16
-(71% of the 10/s limit) and 12.9/s at 32, over the limit at twice the cap. The
-true total is at least this and is not measured; see Ruling 2. P2 builds the
+captures, 16.5/s at 32. Timer callbacks were 7.1/s at 16 and 12.9/s at 32, but
+they are not process-wakeup lower bounds. The corrected `top` IDLEW observations
+are lower bounds only; the true total is not measured; see Ruling 2. P2 builds the
 capture table that owns these locks, so it is the natural place to keep this from
 growing with every capture. The total needs `sudo powermetrics`, and P6 needs it
 for the D8 verdict.
@@ -302,7 +311,8 @@ files and fsynced nothing. It spawned git 4 times. No gaps.
 ## Not measured
 
 - **Interrupt and total wakeups**: no-sudo tools only. `powermetrics` needs sudo
-  and was not run. Only lower bounds are reported.
+  and was not run. Only the corrected `top` IDLEW lower bound is reported; timer
+  callbacks are diagnostic only.
 - **Kernel disk bytes**: no-sudo tools give block operation counts
   (`resourceUsage`), not bytes. Bytes are the JS-visible reads and writes.
 - **Native watcher and worker-thread I/O**: not traced (see the metric table).
@@ -318,7 +328,7 @@ From the same Architect consult recorded in `contracts.md` (objections 18 to 31)
 
 | # | Objection | Resolution |
 |---|---|---|
-| 18 | `top` IDLEW is not total wakeups. | Reported as a lower bound with the timer count; the gate is INCONCLUSIVE unless the lower bound already fails. |
+| 18 | `top` IDLEW is not total wakeups. | Reported as the only lower bound; timer callbacks are diagnostic only. The gate is INCONCLUSIVE unless that lower bound already fails. |
 | 19 | A bare `CaptureSession` loop misses the daemon's shared reader. | The subject runs the real reader with the daemon's registry wiring. The control server is omitted and disclosed. |
 | 20 | "No recurring reads" needs evidence, not CPU. | fs and spawn probes classify every main-thread call by path; scope disclosed. |
 | 21 | Gate on the supported (binding-only) configuration; emulation is a diagnostic. | Both are reported. c0 is the reference for the supported configuration (watch-only, no transcript runtime); c1 and c10 are the brief's emulated chats. See "Viability verdict". |

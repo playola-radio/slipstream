@@ -116,7 +116,7 @@ Replace the single `state`/`current` slot with:
 
 - `capturesBySessionId`: lifecycle, canonical root, activation generation, session
   handle, optional binding, and per-capture in-flight operations.
-- `sessionIdByCanonicalRoot`: includes queued and starting captures.
+- `sessionIdByCanonicalRoot`: includes waiting, queued, and starting captures.
 - `bindingsBySessionId` (unit 2). There is **no daemon-wide selected-binding
   slot**.
 - One store-wide ownership/shutdown state and one baseline queue.
@@ -132,13 +132,13 @@ Targeting and admission:
 
 - Canonicalize the path first, then atomically reserve the root. Concurrent
   requests for the same root share one activation.
-- Ancestor and descendant roots are rejected by path components, including queued
+- Ancestor and descendant roots are rejected by path components, including waiting and queued
   roots. Sibling git worktrees that share repository metadata are allowed.
 - **Capture limit (D10).** A new root while 16 captures hold slots is not
   admitted. Its intent is kept as waiting, public status is NOT recording with
   reason `capture-limit-reached`, and the caller gets:
 
-  > `CAPTURE_LIMIT_REACHED: 16/16 workspaces recording. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
+  > `CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
 
   When a capture stops for archive or detach, the oldest waiting intent is
   admitted automatically through the normal queue. Maintenance and restart keep

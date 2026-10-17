@@ -21,8 +21,8 @@ export interface ProbeCounters {
   bytesRead: Record<PathClass, number>;
   bytesWritten: Record<PathClass, number>;
   spawns: number;
-  /** Timer callbacks more than 1 ms after the previous one: a lower bound on
-   * main-thread timer wakeups (coalesced firings count once). */
+  /** Timer callbacks more than 1 ms after the previous callback. This is a
+   * callback rate, not a lower bound on process wakeups. */
   timerWakeups: number;
 }
 
@@ -97,10 +97,21 @@ function account(cls: PathClass, op: string, result: unknown, args: unknown[]): 
 
 type AnyFn = (...args: unknown[]) => unknown;
 
+/** Keep Node's function metadata (including symbol properties) visible through
+ * instrumentation wrappers. */
+function preserve<F extends AnyFn>(wrapped: F, original: AnyFn): F {
+  for (const key of Reflect.ownKeys(original)) {
+    if (key === 'length' || key === 'name' || key === 'prototype') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(original, key);
+    if (descriptor) Object.defineProperty(wrapped, key, descriptor);
+  }
+  return wrapped;
+}
+
 function wrapPromiseApi(target: Record<string, unknown>, name: string): void {
   const original = target[name];
   if (typeof original !== 'function' || /^[A-Z]/.test(name)) return;
-  target[name] = function wrapped(this: unknown, ...args: unknown[]) {
+  target[name] = preserve(function wrapped(this: unknown, ...args: unknown[]) {
     const path = pathOf(args[0]);
     const cls = note(path, name);
     const out = (original as AnyFn).apply(this, args);
@@ -112,13 +123,13 @@ function wrapPromiseApi(target: Record<string, unknown>, name: string): void {
       });
     }
     return out;
-  };
+  }, original as AnyFn);
 }
 
 function wrapSyncOrCallbackApi(target: Record<string, unknown>, name: string): void {
   const original = target[name];
   if (typeof original !== 'function' || /^[A-Z]/.test(name) || name === 'promises') return;
-  target[name] = function wrapped(this: unknown, ...args: unknown[]) {
+  target[name] = preserve(function wrapped(this: unknown, ...args: unknown[]) {
     const path = pathOf(args[0]);
     const cls = note(path, name);
     const last = args[args.length - 1];
@@ -139,7 +150,7 @@ function wrapSyncOrCallbackApi(target: Record<string, unknown>, name: string): v
       account(cls, name, result, args);
     }
     return result;
-  };
+  }, original as AnyFn);
 }
 
 function wrapFileHandle(proto: Record<string, unknown>): void {
@@ -147,19 +158,19 @@ function wrapFileHandle(proto: Record<string, unknown>): void {
     const desc = Object.getOwnPropertyDescriptor(proto, name);
     if (!desc || typeof desc.value !== 'function' || name === 'constructor') continue;
     const original = desc.value as AnyFn;
-    proto[name] = function wrapped(this: object, ...args: unknown[]) {
+    proto[name] = preserve(function wrapped(this: object, ...args: unknown[]) {
       const cls = note(handlePaths.get(this), `fh.${name}`);
       const out = original.apply(this, args);
       // A handle method has no path argument, so its data sits one slot earlier than in fs.writeFile(path, data).
       if (out instanceof Promise) return out.then((result) => { account(cls, name, result, [undefined, ...args]); return result; });
       return out;
-    };
+    }, original);
   }
 }
 
 function wrapTimer(target: Record<string, unknown>, name: 'setTimeout' | 'setInterval'): void {
   const original = target[name] as AnyFn;
-  target[name] = function wrapped(this: unknown, callback: unknown, ...rest: unknown[]) {
+  target[name] = preserve(function wrapped(this: unknown, callback: unknown, ...rest: unknown[]) {
     if (typeof callback !== 'function') return original.call(this, callback, ...rest);
     const fire = function (this: unknown, ...cbArgs: unknown[]) {
       const now = process.hrtime.bigint();
@@ -168,7 +179,7 @@ function wrapTimer(target: Record<string, unknown>, name: 'setTimeout' | 'setInt
       return (callback as AnyFn).apply(this, cbArgs);
     };
     return original.call(this, fire, ...rest);
-  };
+  }, original);
 }
 
 export async function installProbes(): Promise<void> {
@@ -183,10 +194,10 @@ export async function installProbes(): Promise<void> {
   const cp = childProcess as unknown as Record<string, unknown>;
   for (const name of ['spawn', 'execFile', 'exec', 'fork', 'spawnSync', 'execFileSync', 'execSync']) {
     const original = cp[name] as AnyFn;
-    cp[name] = function wrapped(this: unknown, ...args: unknown[]) {
+    cp[name] = preserve(function wrapped(this: unknown, ...args: unknown[]) {
       counters.spawns++;
       return original.apply(this, args);
-    };
+    }, original);
   }
 
   for (const target of [globalThis as unknown as Record<string, unknown>, timers as unknown as Record<string, unknown>]) {
