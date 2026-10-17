@@ -456,6 +456,7 @@ interface BaselineLoopResult { runs: { root: string; ms: number; startNs: string
  * unique payload so its change record can be found by hash. */
 async function writeLoad(targets: Started[], seconds: number, arm: string): Promise<WriteRecord[]> {
   const out: WriteRecord[] = [];
+  if (targets.length === 0) return out;
   const t0 = Date.now();
   for (let i = 0; Date.now() - t0 < seconds * 1000; i++) {
     const t = targets[i % targets.length]!;
@@ -469,8 +470,8 @@ async function writeLoad(targets: Started[], seconds: number, arm: string): Prom
 
 async function latency(f: Fleet, ws: Workspace, name: string) {
   const settled = await settle(f.s);
-  log(`  ${name}: write latency on 8 of ${f.started.length} captures, with and without a concurrent baseline`);
   const targets = f.started.slice(f.chats, f.chats + 8);
+  log(`  ${name}: write latency on ${targets.length} of ${f.started.length} captures, with and without a concurrent baseline`);
   await f.s.call({ op: 'track', sessionIds: targets.map((t) => t.sessionId) });
   const arms: Record<string, { writes: WriteRecord[]; eld: unknown; baselines?: unknown }> = {};
   for (const arm of ['A1', 'B', 'A2']) {
