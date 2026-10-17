@@ -1,7 +1,7 @@
 /**
  * The Slipstream daemon control protocol: newline-delimited JSON over an
  * owner-only `node:net` unix socket. This is a PRIVATE CONTROL channel — its
- * verbs (attach / detach / status / begin_task / delete_session / gc) WRITE
+ * verbs (attach / detach / unlink / status / begin_task / delete_session / gc) WRITE
  * public events or maintain the store and never read or serve the feed. Readers
  * keep serving the public HTTP/disk view; there is no privileged back channel
  * for reading.
@@ -15,12 +15,14 @@
 
 /** Client-facing control error codes (the subset this PR owns). `DAEMON_UNAVAILABLE`
  * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask;
- * `SESSION_ACTIVE` refuses a second attach while one session is already active
- * (this PR carries exactly one active capture); `SESSION_NOT_FOUND` refuses a
+ * `SESSION_ACTIVE` refuses delete or gc while a capture is live; `SESSION_NOT_FOUND` refuses a
  * delete of a well-formed session id that names no session on disk.
  * `SESSION_RESUME_FAILED`: attach found the workspace's existing session but could
  * not resume it; the message names the session and whether to retry or
- * restore/delete it. Attach never falls back to a new session. */
+ * restore/delete it. Attach never falls back to a new session. The capture-table
+ * codes (`BINDING_EXISTS`, `BINDING_LIMIT_REACHED`, `CAPTURE_LIMIT_REACHED`,
+ * `ROOT_OVERLAP`, `TARGET_NOT_FOUND`, `STALE_BINDING`) are defined in
+ * docs/autocapture/contracts.md §5. */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
   | 'SESSION_NOT_SELECTED'
@@ -39,6 +41,12 @@ export type ControlErrorCode =
   | 'ANSWER_CONFLICT'
   | 'AGENT_NOT_CONNECTED'
   | 'SESSION_RESUME_FAILED'
+  | 'BINDING_EXISTS'
+  | 'BINDING_LIMIT_REACHED'
+  | 'CAPTURE_LIMIT_REACHED'
+  | 'ROOT_OVERLAP'
+  | 'TARGET_NOT_FOUND'
+  | 'STALE_BINDING'
   | 'PROTOCOL';
 
 export interface RequestEnvelope {
