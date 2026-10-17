@@ -141,6 +141,8 @@ async function generate(): Promise<{ ws: Workspace; meta: Record<string, unknown
 
 // ---------------------------------------------------------------- subject
 
+const liveChildren = new Set<ChildProcess>();
+
 class Subject {
   private seq = 0;
   private pending = new Map<number, (m: { ok: boolean; result?: unknown; error?: string }) => void>();
@@ -157,6 +159,8 @@ class Subject {
 
   static async start(ws: Workspace, storeDir: string): Promise<Subject> {
     const child = fork(join(REPO, 'tools', 'autocapture-bench', 'subject.ts'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+    liveChildren.add(child);
+    child.once('exit', () => liveChildren.delete(child));
     await new Promise<void>((resolve, reject) => {
       child.once('message', () => resolve());
       child.once('exit', (code) => reject(new Error(`subject exited early (${code})`)));
@@ -551,8 +555,15 @@ async function main(): Promise<void> {
     order.push(name);
     writeFileSync(join(out, 'results.json'), JSON.stringify({ startedAt, generatorVersion: GENERATOR_VERSION, seed: SEED, args, host, workload: meta, order, results }, null, 2));
   };
-  const cleanup = () => rm(ws.tmp, { recursive: true, force: true });
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => { void cleanup().then(() => process.exit(130)); });
+  const cleanup = () => rm(ws.tmp, { recursive: true, force: true, maxRetries: 5 });
+  const killChildren = () => Promise.all([...liveChildren].map((c) => {
+    const exited = new Promise((r) => c.once('exit', r));
+    c.kill('SIGKILL');
+    return exited;
+  }));
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(sig, () => { void killChildren().then(cleanup).then(() => process.exit(130)); });
+  }
   try {
     for (const c of [0, 1, 10]) {
       const steps = {
