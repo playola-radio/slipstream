@@ -129,9 +129,11 @@ workspace can be captured automatically.
 - Restart recovery (durable capture and binding intent, user LaunchAgent) is in
   the MVP; bindings return as pending and reconnect only by a fresh live round
   trip.
-- The overhead gates (D8, thresholds unchanged) are measured at 16 captures. P1 is
-  a one-run viability check that gates P2; the D8 verdict is judged at P6 on the
-  finished system (gate split, 2026-10-17; see the spec).
+- Overhead (D8 amended by Brian, 2026-10-17): P1's one run showed the watcher
+  holds 16 captures cheaply. Known costs (re-saving stored files on start,
+  per-chat transcript scans) are fixed in P2 and P5 with counting tests. The
+  verdict is a real-use check at P6: idle CPU, memory and no lost changes. No
+  benchmark run gates a PR (see the spec's "Overhead").
 
 Design, owner-decisions table and PR graph (P1 to P6):
 `docs/superpowers/specs/2026-10-05-workspace-auto-capture-design.md` (status:

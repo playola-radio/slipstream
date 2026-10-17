@@ -1,6 +1,6 @@
 # Workspace auto-capture — design
 
-Date: 2026-10-05, revised 2026-10-17 (16-capture limit and gate split added the
+Date: 2026-10-05, revised 2026-10-17 (16-capture limit and overhead checks added the
 same day). Owner: Brian. Status: **spec in review** (no product code yet).
 Architecture via two Codex consult rounds (2026-10-05, 2026-10-17); this document
 is the settled result.
@@ -26,16 +26,16 @@ one in force.
 | # | Decision | Ruling 2026-10-05 | Ruling 2026-10-17 (Brian) |
 |---|---|---|---|
 | Q4 | Session scope | One active capture daemon-wide. **Lifted:** several captures at once, one per worktree. | **Lifted further.** Every workspace is captured, watch-only by default; capped at **16 recordings** (D10; about 57 workspaces are open today, but Brian expects to keep 12-16). Up to **10 agent chats** linked at once, **one linked chat per capture**. Never two chats on one capture; replacing a chat needs an explicit unlink. Flipping between workspaces in the native app and asking each agent is "extremely important". |
-| D1 | Capture cannot become ready | ~~Setup fails visibly; the agent never starts on an uncaptured workspace.~~ **Superseded.** | **Revised.** Strict launch blocking is not required. Setup that cannot make capture ready exits non-zero with a readable reason. The workspace shows as **NOT recording** with that reason in public status and reader projections, even if no session log exists. Recovery and enrollment retry transient failures with backoff. Capture becoming ready after an agent already edited is honest: the first baseline is the first observed state, never a claim of the original state. P1 probes Conductor's real launch behavior only to document it. |
+| D1 | Capture cannot become ready | ~~Setup fails visibly; the agent never starts on an uncaptured workspace.~~ **Superseded.** | **Revised.** Strict launch blocking is not required. Setup that cannot make capture ready exits non-zero with a readable reason. The workspace shows as **NOT recording** with that reason in public status and reader projections, even if no session log exists. Recovery and enrollment retry transient failures with backoff. Capture becoming ready after an agent already edited is honest: the first baseline is the first observed state, never a claim of the original state. P3 documents Conductor's real launch behavior when it writes the setup scripts. |
 | D2 | Dependency/build output | ~~A fixed, ratified exclusion list.~~ **Superseded.** | Superseded by the shipped git-driven capture scope (PR #50, PR #54): `.gitignore` plus `.slipstreamignore`, disclosed by `slipstream.capture.scope.v1`. No fixed directory list. |
 | D3 | Trigger | Personal Conductor setup/archive scripts across projects, not daemon folder discovery. | Unchanged. Chained into repo-level overrides via `.conductor/settings.local.toml`. |
 | D4 | Storage | Retain history until explicitly deleted. | Unchanged. |
 | D5 | Agent binding | ~~Watch-only now; verified binding is a separate later step.~~ **Changed.** | Capture is watch-only until a chat runs `slipstream attach`, which binds that chat **in place** onto the live capture: same `session_id`, no new baseline, no resume event, no fabricated gap. Earlier changes are never credited to the chat. |
-| D6 | Order | Measure first, then the minimal slice, then recovery and maintenance. | Unchanged in spirit, gate split (orchestrator, 2026-10-17, under Brian's instruction to proceed without plan sign-off; confirm): P1 is a **viability check** that gates P2; the full D8 gates are judged once, at P6, on the finished system. See "Overhead measurement and gates". |
+| D6 | Order | Measure first, then the minimal slice, then recovery and maintenance. | **Revised (Brian, 2026-10-17).** P1 measured once and answered the question that could stop the feature: the watcher holds 16 captures cheaply. No further benchmark runs gate any PR. Known costs are fixed as code changes with counting tests; overhead is judged once, at P6, in real use. See "Overhead". |
 | D7 | Install | ~~Global install from a dedicated clone plus launcher.~~ **Superseded.** | Install is the published npm package `@playola-radio/slipstream`. Setup scripts and the LaunchAgent use the absolute Node 24 path and the real `dist/cli.js` path, recorded at install time. No nvm sourcing. |
-| D8 | Overhead gates | Proposed, not ratified. | **Ratified** as written in "Overhead measurement and gates" (thresholds unchanged), measured at **16** captures (D10) with 0, 1 and 10 linked chats; 32 is reported as headroom. Judged at P6 on the finished system; a failed gate there is report-and-stop. |
+| D8 | Overhead gates | Proposed, not ratified. | **Amended (Brian, 2026-10-17).** The bar is idle CPU, memory and no lost changes, judged in real use at 16 captures (see "Overhead"); a miss there is report-and-stop. The wakeup, baseline-seconds and latency-regression gates are dropped: wakeups cannot be measured without sudo, and stopwatch numbers on a loaded laptop kept producing failures that told us nothing new. |
 | D9 | GC | New. | **Ratified.** `slipstream gc` may quiesce all captures (a disclosed maintenance gap via stop events plus the existing resume gap), then automatically resume them and re-handshake bindings. Fully concurrent GC is deferred. |
-| D10 | Capture cap | New. | **Ratified 2026-10-17.** At most **16** workspaces record at once. Beyond that a workspace is visibly **NOT recording** (`capture-limit-reached`) and starts automatically, oldest request first, when a slot frees. No eviction. The limit is one constant; raising it later is that change plus a re-run of the overhead bench. |
+| D10 | Capture cap | New. | **Ratified 2026-10-17.** At most **16** workspaces record at once. Beyond that a workspace is visibly **NOT recording** (`capture-limit-reached`) and starts automatically, oldest request first, when a slot frees. No eviction. The limit is one constant; raising it later is that change plus the P6 real-use check at the new number. |
 | R | Restart recovery | Later unit. | **In the MVP.** Durable capture and binding intent, a user LaunchAgent, reuse of PR #64's resume. Bindings are restored as `setup_pending` and upgraded to `connected` only by a fresh live round trip. |
 
 Stage 3 criteria amended by Q4 and D5 (one active capture daemon-wide, explicit
@@ -101,8 +101,8 @@ are unchanged.
   and legacy `conductor.json`). These need a per-repo local override that runs
   Slipstream *and* the repo's own script.
 - **Unverified, and no longer load-bearing:** whether Conductor blocks agent start
-  until setup succeeds. D1 (revised) does not depend on it. P1 probes it to
-  document the behavior.
+  until setup succeeds. D1 (revised) does not depend on it. P3 documents the
+  behavior when it writes the setup scripts.
 - Live workspace count: 46 ready + 11 sleeping = **57** (1,050 archived). With the
   cap of 16 (D10), most of these wait until Brian archives down; see enrollment.
 
@@ -407,63 +407,62 @@ until a live round trip.
 - Binding failures never stop capture; they surface as binding states with
   reasons.
 
-## Overhead measurement and gates
+## Overhead
 
-Measured on Brian's Mac by a harness that starts N `CaptureSession`s in one process
-against one store (the library is already multi-session). N = 0 / 1 / 16 / 32,
-watch-only, with 0, 1 and 10 linked chats, with enrichment off and explicitly
-configured, cold/warm CAS, plus a dependency install inside a watched worktree
-(ignored files still produce native notifications). Collect CPU, RSS/physical
-footprint, heap, threads, FDs, wakeups, fsyncs, bytes read/written, baseline
-duration, event-loop delay, capture latency, log/CAS growth. At 16 captures there
-are 17 locks refreshed every 2 s; measure that I/O, do not assume a wakeup count.
+**What P1 found (one run, 2026-10-17, Brian's loaded M1 Max).** Sixteen
+watch-only captures in one process: 0 watcher failures, 33 file descriptors,
+142 MiB footprint, 0.6% of one core idle, and no recurring worktree reads after
+settling. The watcher scales to the cap. The run also confirmed two costs that
+were already visible in today's code. They are code to change, not open
+questions:
 
-Gates (D8, **ratified 2026-10-17**) at N = 16 captures (D10) with 0, 1 and 10 linked
-chats, in the supported configuration. 32 is reported as headroom, not gated;
-many enriched captures stay diagnostic headroom:
+- **Restarting a capture re-saves every file.** `createCas` runs once per
+  session and `put` republishes, with fsyncs, every blob that session has not
+  yet written, even when the blob is already on disk. A 4,200-file start took
+  about 90 s whether the store was warm or cold. P2 owns this.
+- **Each linked chat rescans transcripts on its own.** With one emulated chat,
+  idle CPU was 22% (about 850 transcript file opens/s); with ten, 112%. P5's
+  shared discovery owns this.
 
-- 10-minute idle mean <= 1% of one core; p95 1-s sample <= 3%; <= 10 process
-  wakeups/s.
-- Total footprint <= 512 MiB; no sustained growth over a 24 h unchanged soak.
-- No recurring worktree enumeration or content reads after settling.
-- 4,200-file baseline p95 <= 5 s warm CAS, <= 15 s cold CAS.
-- Existing captures: <= 20% p99 latency regression while another baselines.
-- Zero watcher subscription failures; FDs < 50% of the soft limit.
+The benchmark tool is parked on the branch `briankeane/autocapture-bench-parked`.
+It is not maintained and gates nothing.
 
-**When the gates are judged (D6 split, 2026-10-17).** Measuring today's code
-against finished-product gates mixes two questions: can one daemon hold 16
-watchers at all, and is today's code already efficient. Only the first should
-stop work before P2; P2 and P5 are what answer the second. So:
+**Counting tests (CI, deterministic).** These replace stopwatch gates for the
+known costs. They count operations, so they give the same answer on any machine:
 
-- **P1 viability check (gates P2).** One run of the bench at N = 16. Every gate
-  is measured and reported. A miss in the watcher itself (subscription failures,
-  FDs, per-watcher memory or idle cost with no chats) stops the feature: it is an
-  architecture question for Brian. Every other miss must be attributed, with
-  numbers, to a named component that a planned PR changes; it becomes that PR's
-  acceptance item and does not stop P2. A miss nobody can attribute stops the
-  feature. P1 is one run: re-running is allowed only for a broken measurement
-  (crash, unreadable value), and only for that scenario.
-- **P6 acceptance (the D8 verdict).** All gates, on the finished system, with real
-  linked chats, plus the 24 h soak. A failed gate there is written up with numbers
-  and stops the work (CLAUDE.md).
+- Starting a capture over files already in the store publishes no new blobs
+  and fsyncs no blob files (P2).
+- After settling, an idle capture makes no worktree listings, content reads or
+  git spawns (P2).
+- Writes made to live captures while another capture baselines all appear as
+  changes; none are lost (P2).
+- With several linked chats, one discovery cycle enumerates each transcript
+  directory once, not once per chat (P5).
 
-No gate is ever met by quietly narrowing capture, lowering the capture limit below
-D10, trading CPU for fidelity, or weakening a gate.
+**Real-use check (P6, the D8 verdict).** Sixteen workspaces recording, with
+linked chats, for a working day of normal use: the daemon's idle CPU stays at or
+under 1% of one core on average, its memory stays at or under 512 MiB with no
+sustained growth, and no change is lost (no unexplained gap, zero watcher
+subscription failures). A miss is written up with numbers and stops the work
+(CLAUDE.md).
+
+No check is ever met by quietly narrowing capture, lowering the capture limit
+below D10, or trading CPU for fidelity.
 
 ## PR graph
 
-P1's viability check gates P2. P3 and P4 can proceed in parallel once their intent contract is
+P1 is complete. P3 and P4 can proceed in parallel once their intent contract is
 locked; P5 is independent after P2; native-client work can begin against P2's
 published contracts. Durable binding belongs in P3, not a later enhancement.
 
 | PR | Depends on | Review boundary | Shared behavior |
 |---|---|---|---|
-| **P1 Measurements and amended contracts** | none | Viability check at 16 captures with 0/1/10 emulated chats and every miss attributed to an owning PR; D10 cap and gate split; Conductor launch-behavior probe (documentation only); event and control contract design | No runtime changes |
-| **P2 Concurrent captures and linked chats** | P1 viability check passes | Capture table, admission and `--wait`, 16-capture limit with visible waiting, targeting, in-place binding, 10-slot cap, unlink, generation fencing, public lifecycle and binding projections; plus the baseline and idle-cost items P1 attributes to it | **Yes:** daemon, session, hooks, forwarders, readers |
-| **P3 Durable recovery and Conductor enrollment** | P2 | Capture and binding intent, fresh recovery handshake, LaunchAgent, absolute npm paths, scripts and overrides, existing-workspace enrollment, visible failures and retries | **Yes:** recovery, registry, attach orchestration |
+| **P1 Measurements and amended contracts** | none | One overhead run at 16 captures (result above); D10 cap; event and control contract design | No runtime changes |
+| **P2 Concurrent captures and linked chats** | P1 | Capture table, admission and `--wait`, 16-capture limit with visible waiting, targeting, in-place binding, 10-slot cap, unlink, generation fencing, public lifecycle and binding projections; no re-save of stored blobs on start; P2's counting tests | **Yes:** daemon, session, hooks, forwarders, readers |
+| **P3 Durable recovery and Conductor enrollment** | P2 | Capture and binding intent, fresh recovery handshake, LaunchAgent, absolute npm paths, scripts and overrides (documenting Conductor's real launch behavior), existing-workspace enrollment, visible failures and retries | **Yes:** recovery, registry, attach orchestration |
 | **P4 Maintenance without manual detachment** | P2; P3 intent contract | Inactive deletion, disclosed GC quiescence, automatic capture resume and binding re-handshake | **Yes:** lifecycle, storage, maintenance |
-| **P5 Shared transcript discovery** | P2; P1 measurements | Shared scheduling and discovery with unchanged per-root eligibility, evidence and coverage semantics; plus the linked-chat cost items P1 attributes to it | **Yes:** transcript and enrichment suites |
-| **P6 Native app and release acceptance** | P3-P5 | Per-capture recording and connection states, failure reasons, independent Ask Agent behavior, restart/GC recovery, scale and soak, reader parity | **Yes** if client changes are needed |
+| **P5 Shared transcript discovery** | P2 | Shared scheduling and discovery with unchanged per-root eligibility, evidence and coverage semantics; P5's counting test | **Yes:** transcript and enrichment suites |
+| **P6 Native app and release acceptance** | P3-P5 | Per-capture recording and connection states, failure reasons, independent Ask Agent behavior, restart/GC recovery, the real-use overhead check, reader parity | **Yes** if client changes are needed |
 
 No clone-install PR and no exclusions PR. Every shared-behavior PR runs the full
 affected pre-existing suites (touched-area rule).
@@ -481,8 +480,8 @@ Acceptance requirements (P6 unless a PR owns the test):
   recovery, and lost setup-check responses.
 - Failed setup stays visible; later readiness baselines current bytes without
   presenting earlier edits as captured history.
-- Public-reader and native parity, and the ratified 16-capture / 10-binding
-  overhead gates (the D8 verdict).
+- Public-reader and native parity, and the real-use overhead check at 16
+  captures with linked chats (the D8 verdict).
 - The 17th workspace is visibly NOT recording (`capture-limit-reached`) and starts
   automatically when a slot frees.
 - Trace CLI -> control -> session/log -> reader -> Ask Agent end to end; exercise
@@ -500,7 +499,8 @@ Acceptance requirements (P6 unless a PR owns the test):
   tool and answer routing by identity including cross-chat answers and subagents,
   setup-check scope to capture/generation/activation, `--wait` outliving the 15 s
   control timeout, `capture.stopped` reasons, independent readers see each
-  session. Full pre-existing daemon/session/control/reader suites.
+  session, and the P2 counting tests under "Overhead". Full pre-existing
+  daemon/session/control/reader suites.
 - P3: crash at each lifecycle transition, missing or replaced root on resume,
   archive racing restart and archive with the daemon down, reserve-all before
   reader exposure, binding restore as `setup_pending`, re-offered check after a
@@ -509,7 +509,7 @@ Acceptance requirements (P6 unless a PR owns the test):
   ordering, waiting intents surviving restart, absolute paths after an upgrade.
 - P4: inactive delete beside running captures, publication/reuse/sweep races,
   disk-full, store-lock loss, quiesce-then-resume with binding re-handshake.
-- P5: one enumeration for N captures, per-root eligibility and disclosure
+- P5: one enumeration for N captures (the P5 counting test), per-root eligibility and disclosure
   unchanged, evidence preserved from other chats in the worktree, scan-limit
   disclosure.
 - P6: the acceptance list above.

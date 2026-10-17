@@ -443,5 +443,6 @@ draft: "not ready". Every material objection was accepted; none was overruled.
 | 16 | `BINDING_EXISTS` wording labeled exact without spec backing. | Labeled contract-owned (5). |
 | 17 | Slot counts repeated per row. | `binding_slots` once at the top of the projection (9). |
 
-Codex's measurement objections (18 to 31) are dispositioned in the measurement
-report, `p1-measurements-2026-10-17.md`.
+Codex's measurement objections (18 to 31) applied to the P1 benchmark, which is
+now parked on the branch `briankeane/autocapture-bench-parked` (see the spec's
+"Overhead").
