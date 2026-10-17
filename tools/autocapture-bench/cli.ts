@@ -5,7 +5,7 @@
  * results plus a gate summary. Temp worktrees and stores are always deleted.
  *
  *   npm run bench:autocapture -- [--out <dir>] [--idle-seconds 600]
- *     [--diag-idle-seconds 120] [--baseline-reps 30] [--phases gated,diag,baseline,latency,install]
+ *     [--diag-idle-seconds 120] [--baseline-reps 10] [--captures 16] [--phases gated,diag,baseline,latency,install]
  */
 import { execFile, execFileSync, fork, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -38,7 +38,7 @@ const { values: args } = parseArgs({
     'latency-seconds': { type: 'string', default: '120' },
     phases: { type: 'string', default: 'gated,diag,baseline,latency,install' },
     seed: { type: 'string', default: '20261017' },
-    captures: { type: 'string', default: '57' },
+    captures: { type: 'string', default: '16' },
   },
 });
 const IDLE_S = Number(args['idle-seconds']);
@@ -48,7 +48,9 @@ const LATENCY_S = Number(args['latency-seconds']);
 const PHASES = new Set(args.phases!.split(','));
 const SEED = Number(args.seed);
 const N = Number(args.captures);
-const POOL = PHASES.has('diag') ? Math.max(136, N) : N;
+/** Recordings beyond the cap of 16, reported as headroom only. */
+const HEADROOM_N = 32;
+const POOL = PHASES.has('diag') ? Math.max(HEADROOM_N, N) : N;
 
 function log(msg: string): void {
   console.error(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
@@ -84,9 +86,7 @@ function writeWorktree(dir: string, fileCount: number, rng: () => number, pool: 
   return bytes;
 }
 
-async function generate(): Promise<{ ws: Workspace; meta: Record<string, unknown> }> {
-  const tmp = await mkdtemp(join(tmpdir(), 'slip-autocapture-'));
-  const real = execFileSync('realpath', [tmp]).toString().trim();
+async function generate(real: string): Promise<{ ws: Workspace; meta: Record<string, unknown> }> {
   const rng = createRng(SEED);
   const pool = Buffer.alloc(2 ** 26 + 4096);
   for (let i = 0; i < pool.length; i += 4) pool.writeUInt32LE(Math.floor(rng() * 2 ** 32), i);
@@ -341,7 +341,7 @@ async function measureWindow(s: Subject, seconds: number, label: string, ws: Wor
 // ---------------------------------------------------------------- scenarios
 
 /** One subject with N captures, the first `chats` carrying the emulated linked
- * chat. Several measurements run on the same set, so 57 captures are started
+ * chat. Several measurements run on the same set, so the fleet is started
  * once per configuration rather than once per measurement. */
 interface Fleet {
   s: Subject; chats: number; store: string; storeAtStart: Awaited<ReturnType<typeof storeBytes>>;
@@ -546,16 +546,18 @@ async function main(): Promise<void> {
   const out = join(args.out!, startedAt.slice(0, 10));
   await mkdir(out, { recursive: true });
   const host = await machine();
-  log(`generating synthetic worktrees (pool ${POOL}) in ${tmpdir()}`);
-  const { ws, meta } = await generate();
+  // The temp dir and the stop handlers exist before generation, so a stop at any
+  // point removes every synthetic byte.
+  const tmp = execFileSync('realpath', [await mkdtemp(join(tmpdir(), 'slip-autocapture-'))]).toString().trim();
+  let workload: Record<string, unknown> = {};
   const results: Record<string, unknown> = {};
   const order: string[] = [];
   const record = (name: string, value: unknown) => {
     results[name] = value;
     order.push(name);
-    writeFileSync(join(out, 'results.json'), JSON.stringify({ startedAt, generatorVersion: GENERATOR_VERSION, seed: SEED, args, host, workload: meta, order, results }, null, 2));
+    writeFileSync(join(out, 'results.json'), JSON.stringify({ startedAt, generatorVersion: GENERATOR_VERSION, seed: SEED, args, host, workload, order, results }, null, 2));
   };
-  const cleanup = () => rm(ws.tmp, { recursive: true, force: true, maxRetries: 5 });
+  const cleanup = () => rm(tmp, { recursive: true, force: true, maxRetries: 5 });
   const killChildren = () => Promise.all([...liveChildren].map((c) => {
     const exited = new Promise((r) => c.once('exit', r));
     c.kill('SIGKILL');
@@ -565,6 +567,9 @@ async function main(): Promise<void> {
     process.once(sig, () => { void killChildren().then(cleanup).then(() => process.exit(130)); });
   }
   try {
+    log(`generating synthetic worktrees (pool ${POOL}) in ${tmp}`);
+    const { ws, meta } = await generate(tmp);
+    workload = meta;
     for (const c of [0, 1, 10]) {
       const steps = {
         idle: PHASES.has('gated'),
@@ -581,19 +586,19 @@ async function main(): Promise<void> {
       });
     }
     if (PHASES.has('diag')) {
-      for (const n of [0, 1, 10, 136]) {
+      for (const n of [0, 1, HEADROOM_N]) {
         await withFleet(ws, `n${n}-c0`, n, 0, async (f) => record(`n${n}-c0`, await idle(f, ws, `n${n}-c0`, DIAG_IDLE_S)));
       }
     }
   } finally {
     await cleanup();
-    log(`removed ${ws.tmp}`);
+    log(`removed ${tmp}`);
   }
   const rows = gates(results, host.fdSoftLimit);
   const table = ['| Gate | Scenario | Threshold | Measured | Verdict |', '|---|---|---|---|---|',
     ...rows.map((r) => `| ${r.gate}${r.note ? ` (${r.note})` : ''} | ${r.scenario} | ${r.threshold} | ${r.measured} | ${r.verdict} |`)].join('\n');
   writeFileSync(join(out, 'gates.md'), `${table}\n`);
-  writeFileSync(join(out, 'results.json'), JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), generatorVersion: GENERATOR_VERSION, seed: SEED, args, host: { ...host, loadAvgEnd: loadavg() }, workload: meta, order, results, gates: rows }, null, 2));
+  writeFileSync(join(out, 'results.json'), JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), generatorVersion: GENERATOR_VERSION, seed: SEED, args, host: { ...host, loadAvgEnd: loadavg() }, workload, order, results, gates: rows }, null, 2));
   console.log(table);
   log(`raw results: ${out}`);
 }
