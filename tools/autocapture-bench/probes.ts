@@ -151,7 +151,8 @@ function wrapFileHandle(proto: Record<string, unknown>): void {
     proto[name] = function wrapped(this: object, ...args: unknown[]) {
       const cls = note(handlePaths.get(this), `fh.${name}`);
       const out = original.apply(this, args);
-      if (out instanceof Promise) return out.then((result) => { account(cls, name, result, args); return result; });
+      // A handle method has no path argument, so its data sits one slot earlier than in fs.writeFile(path, data).
+      if (out instanceof Promise) return out.then((result) => { account(cls, name, result, [undefined, ...args]); return result; });
       return out;
     };
   }

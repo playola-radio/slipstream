@@ -43,7 +43,8 @@ let defaultStore = '';
 let tracked = new Set<string>();
 let timeline: { sessionId: string; seq: string; ns: string }[] = [];
 let eld: IntervalHistogram | undefined;
-let loop: { state: { stop: boolean }; done: Promise<{ root: string; ms: number }[]> } | undefined;
+type BaselineRun = { root: string; ms: number; startNs: string; endNs: string };
+let loop: { state: { stop: boolean }; done: Promise<{ runs: BaselineRun[]; error?: string }> } | undefined;
 
 async function start(req: Extract<Request, { op: 'start' }>): Promise<{ ms: number; logPath: string }> {
   registry.reserve(req.sessionId);
@@ -75,16 +76,24 @@ async function stopSession(id: string): Promise<void> {
   registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
 }
 
-async function baselineLoop(roots: string[], state: { stop: boolean }): Promise<{ root: string; ms: number }[]> {
-  const runs: { root: string; ms: number }[] = [];
-  for (let i = 0; !state.stop; i++) {
-    const root = roots[i % roots.length]!;
-    const sessionId = crypto.randomUUID();
-    const { ms } = await start({ op: 'start', root, sessionId });
-    runs.push({ root, ms });
-    await stopSession(sessionId);
+/** Each run spans start through stop, so the parent can test which of its
+ * writes landed while a baseline was in flight. A failure ends the loop and is
+ * reported with the runs so far rather than thrown into the void. */
+async function baselineLoop(roots: string[], state: { stop: boolean }): Promise<{ runs: BaselineRun[]; error?: string }> {
+  const runs: BaselineRun[] = [];
+  try {
+    for (let i = 0; !state.stop; i++) {
+      const root = roots[i % roots.length]!;
+      const sessionId = crypto.randomUUID();
+      const startNs = process.hrtime.bigint();
+      const { ms } = await start({ op: 'start', root, sessionId });
+      await stopSession(sessionId);
+      runs.push({ root, ms, startNs: startNs.toString(), endNs: process.hrtime.bigint().toString() });
+    }
+    return { runs };
+  } catch (err) {
+    return { runs, error: `${(err as Error).name}: ${(err as Error).message}` };
   }
-  return runs;
 }
 
 function snapshot() {
@@ -138,9 +147,9 @@ async function handle(req: Request): Promise<unknown> {
     case 'stopBaselineLoop': {
       if (!loop) throw new Error('no baseline loop running');
       loop.state.stop = true;
-      const runs = await loop.done;
+      const result = await loop.done;
       loop = undefined;
-      return runs;
+      return result;
     }
     case 'shutdown':
       for (const id of [...sessions.keys()]) await stopSession(id);

@@ -18,14 +18,14 @@ import { parseArgs } from 'node:util';
 import { DEFAULT_ENRICHMENT_POLICY } from '../../src/attribution-producer.ts';
 import { DEFAULT_CODEX_SCAN_LIMIT } from '../../src/config.ts';
 import { claudeSlug } from '../../src/transcript/discovery.ts';
-import { evaluateGate, joinLatencies, latencyStats, parseTopLog, summarizeTop, type GateVerdict, type TopSample } from './analysis.ts';
+import { coveredFraction, evaluateGate, joinLatencies, latencyStats, latencyVerdict, parseTopLog, settledVerdict, summarizeTop, type GateVerdict, type TopSample } from './analysis.ts';
 import { isMetadataOp } from './probe-model.ts';
 import { createRng, layoutPaths, sampleFileSize, sampleWorktreeFileCounts } from './plan.ts';
 import type { Request, Snapshot } from './subject.ts';
 
 const GENERATOR_VERSION = 1;
 const REPO = join(dirname(new URL(import.meta.url).pathname), '..', '..');
-const run = promisify(execFile);
+const execFileP = promisify(execFile);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MiB = 2 ** 20;
 
@@ -41,19 +41,48 @@ const { values: args } = parseArgs({
     captures: { type: 'string', default: '16' },
   },
 });
-const IDLE_S = Number(args['idle-seconds']);
-const DIAG_IDLE_S = Number(args['diag-idle-seconds']);
-const BASELINE_REPS = Number(args['baseline-reps']);
-const LATENCY_S = Number(args['latency-seconds']);
+function positiveInt(name: keyof typeof args): number {
+  const v = Number(args[name]);
+  if (!Number.isInteger(v) || v < 1) throw new Error(`--${name} must be a positive integer, got ${JSON.stringify(args[name])}`);
+  return v;
+}
+const IDLE_S = positiveInt('idle-seconds');
+const DIAG_IDLE_S = positiveInt('diag-idle-seconds');
+const BASELINE_REPS = positiveInt('baseline-reps');
+const LATENCY_S = positiveInt('latency-seconds');
 const PHASES = new Set(args.phases!.split(','));
-const SEED = Number(args.seed);
-const N = Number(args.captures);
+const SEED = positiveInt('seed');
+const N = positiveInt('captures');
 /** Recordings beyond the cap of 16, reported as headroom only. */
 const HEADROOM_N = 32;
 const POOL = PHASES.has('diag') ? Math.max(HEADROOM_N, N) : N;
 
 function log(msg: string): void {
   console.error(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
+}
+
+// ---------------------------------------------------------------- children
+
+/** Every child the bench starts, so a stop can kill and await all of them
+ * before the temp dir goes. Once stopping, nothing new starts. */
+const liveChildren = new Set<ChildProcess>();
+let stopping = false;
+
+function track(child: ChildProcess): ChildProcess {
+  if (stopping) { child.kill('SIGKILL'); throw new Error('bench is stopping'); }
+  liveChildren.add(child);
+  child.once('exit', () => liveChildren.delete(child));
+  return child;
+}
+
+function run(cmd: string, argv: string[], opts: Parameters<typeof execFile>[2] = {}): Promise<{ stdout: string; stderr: string }> {
+  const p = execFileP(cmd, argv, { ...opts, encoding: 'utf8' });
+  track(p.child);
+  return p;
+}
+
+function checkStopping(): void {
+  if (stopping) throw new Error('bench is stopping');
 }
 
 // ---------------------------------------------------------------- generation
@@ -95,6 +124,7 @@ async function generate(real: string): Promise<{ ws: Workspace; meta: Record<str
   let bytes = 0;
   const jobs: Promise<void>[] = [];
   for (const [i, count] of counts.entries()) {
+    checkStopping();
     const dir = join(real, 'worktrees', `w${String(i).padStart(3, '0')}`);
     mkdirSync(dir, { recursive: true });
     bytes += writeWorktree(dir, count, rng, pool);
@@ -112,6 +142,7 @@ async function generate(real: string): Promise<{ ws: Workspace; meta: Record<str
   // Synthetic Codex home sized like the real one (3,498 rollouts on 2026-10-17):
   // every rollout belongs to some other cwd, so discovery scans them all and binds none.
   const codex = join(real, 'homes', 'codex');
+  checkStopping();
   for (let i = 0; i < 3500; i++) {
     const day = join(codex, 'sessions', '2026', String(1 + (i % 10)).padStart(2, '0'), String(1 + (i % 28)).padStart(2, '0'));
     mkdirSync(day, { recursive: true });
@@ -141,7 +172,9 @@ async function generate(real: string): Promise<{ ws: Workspace; meta: Record<str
 
 // ---------------------------------------------------------------- subject
 
-const liveChildren = new Set<ChildProcess>();
+/** Longest any single request may take: a cold 4,200-file baseline beside 16
+ * captures has measured ~70 s, so this only catches a wedged subject. */
+const CALL_TIMEOUT_MS = 15 * 60_000;
 
 class Subject {
   private seq = 0;
@@ -155,25 +188,40 @@ class Subject {
       this.pending.get(m.id)?.(m);
       this.pending.delete(m.id);
     });
+    child.once('exit', (code, signal) => {
+      for (const settle of this.pending.values()) settle({ ok: false, error: `subject exited (${code ?? signal}) with a request pending` });
+      this.pending.clear();
+    });
   }
 
   static async start(ws: Workspace, storeDir: string): Promise<Subject> {
-    const child = fork(join(REPO, 'tools', 'autocapture-bench', 'subject.ts'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
-    liveChildren.add(child);
-    child.once('exit', () => liveChildren.delete(child));
-    await new Promise<void>((resolve, reject) => {
-      child.once('message', () => resolve());
-      child.once('exit', (code) => reject(new Error(`subject exited early (${code})`)));
-    });
-    const s = new Subject(child, child.pid!);
-    await s.call({ op: 'init', storeDir, roots: { worktrees: join(ws.tmp, 'worktrees'), store: ws.storesDir, transcripts: join(ws.tmp, 'homes') } });
-    return s;
+    const child = track(fork(join(REPO, 'tools', 'autocapture-bench', 'subject.ts'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] }));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once('message', () => resolve());
+        child.once('exit', (code) => reject(new Error(`subject exited early (${code})`)));
+      });
+      const s = new Subject(child, child.pid!);
+      await s.call({ op: 'init', storeDir, roots: { worktrees: join(ws.tmp, 'worktrees'), store: ws.storesDir, transcripts: join(ws.tmp, 'homes') } });
+      return s;
+    } catch (err) {
+      child.kill('SIGKILL');
+      throw err;
+    }
   }
 
   call<T = unknown>(req: Request): Promise<T> {
     const id = ++this.seq;
+    if (this.child.exitCode !== null || this.child.signalCode !== null) return Promise.reject(new Error(`subject already exited; cannot ${req.op}`));
     return new Promise((resolve, reject) => {
-      this.pending.set(id, (m) => (m.ok ? resolve(m.result as T) : reject(new Error(m.error))));
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`subject did not answer ${req.op} within ${CALL_TIMEOUT_MS / 60_000} min`));
+      }, CALL_TIMEOUT_MS);
+      this.pending.set(id, (m) => {
+        clearTimeout(timer);
+        if (m.ok) resolve(m.result as T); else reject(new Error(m.error));
+      });
       this.child.send({ id, req });
     });
   }
@@ -247,8 +295,8 @@ async function settle(s: Subject): Promise<{ settled: boolean; ms: number }> {
 
 async function sampleTop(pid: number, seconds: number, file: string): Promise<TopSample[]> {
   const fd = openSync(file, 'w');
-  const child = spawn('top', ['-l', String(seconds + 1), '-s', '1', '-n', '1000', '-pid', String(pid), '-stats', 'pid,cpu,th,mem,idlew,csw'],
-    { stdio: ['ignore', fd, 'inherit'] });
+  const child = track(spawn('top', ['-l', String(seconds + 1), '-s', '1', '-n', '1000', '-pid', String(pid), '-stats', 'pid,cpu,th,mem,idlew,csw'],
+    { stdio: ['ignore', fd, 'inherit'] }));
   await new Promise((r) => child.once('exit', r));
   closeSync(fd);
   return parseTopLog(await readFile(file, 'utf8'), pid);
@@ -399,6 +447,7 @@ async function baselines(f: Fleet, ws: Workspace, name: string) {
 }
 
 interface WriteRecord { sessionId: string; sha256: string; writtenNs: bigint }
+interface BaselineLoopResult { runs: { root: string; ms: number; startNs: string; endNs: string }[]; error?: string }
 
 /** One write every 200 ms, round-robin across the target captures, each a
  * unique payload so its change record can be found by hash. */
@@ -425,8 +474,9 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
     await f.s.call({ op: 'eld', on: true });
     if (arm === 'B') await f.s.call({ op: 'baselineLoop', roots: [ws.big, ...ws.worktrees.slice(N)] });
     const writes = await writeLoad(targets, LATENCY_S, arm);
-    const runs = arm === 'B' ? await f.s.call({ op: 'stopBaselineLoop' }) : undefined;
-    arms[arm] = { writes, eld: await f.s.call({ op: 'eld', on: false }), ...(runs ? { baselines: runs } : {}) };
+    const loop = arm === 'B' ? await f.s.call<BaselineLoopResult>({ op: 'stopBaselineLoop' }) : undefined;
+    if (loop?.error) log(`  ${name}: baseline loop stopped early: ${loop.error}`);
+    arms[arm] = { writes, eld: await f.s.call({ op: 'eld', on: false }), ...(loop ? { baselines: loop } : {}) };
     await sleep(5_000);
   }
   const timeline = (await f.s.call<{ sessionId: string; seq: string; ns: string }[]>({ op: 'timeline' }))
@@ -441,18 +491,17 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
   const result = (writes: WriteRecord[]) => {
     const j = joinLatencies({ writes, changes, timeline });
     const worstP99 = Math.max(...Object.values(j.perSessionMs).map((v) => latencyStats(v).p99 ?? 0));
-    return { writes: writes.length, missing: j.missing, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
+    return { writes: writes.length, missing: j.missing, missingFraction: writes.length ? j.missing / writes.length : 1, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
   };
   const a = result([...arms.A1!.writes, ...arms.A2!.writes]);
   const b = result(arms.B!.writes);
-  const baselineRuns = arms.B!.baselines as { root: string; ms: number }[];
+  const loop = arms.B!.baselines as BaselineLoopResult;
+  const intervals = loop.runs.map((r) => ({ startNs: BigInt(r.startNs), endNs: BigInt(r.endNs) }));
   return {
     chats: f.chats, settle: settled,
     armA: { ...a, eldA1: arms.A1!.eld, eldA2: arms.A2!.eld },
-    armB: { ...b, eld: arms.B!.eld, baselines: baselineRuns,
-      // The loop starts with the arm and its last baseline outlives it, so the arm is
-      // fully covered whenever the summed baselines reach the arm length.
-      baselineCoverage: Math.min(1, baselineRuns.reduce((x, r) => x + r.ms, 0) / (LATENCY_S * 1000)) },
+    armB: { ...b, eld: arms.B!.eld, baselines: loop.runs, baselineLoopError: loop.error ?? null,
+      baselineCoverage: coveredFraction(arms.B!.writes.map((w) => w.writtenNs), intervals) },
     armA1: result(arms.A1!.writes), armA2: result(arms.A2!.writes),
     p99Regression: a.all.p99 && b.all.p99 ? b.all.p99 / a.all.p99 - 1 : null,
     worstCaptureP99Regression: a.worstCaptureP99Ms ? b.worstCaptureP99Ms / a.worstCaptureP99Ms - 1 : null,
@@ -484,6 +533,19 @@ async function install(f: Fleet, ws: Workspace) {
 
 // ---------------------------------------------------------------- gates
 
+const seconds = (ms: number | null) => (ms === null ? 'n/a' : `${(ms / 1000).toFixed(2)} s`);
+
+/** Downgrade rows measured after settle() gave up (see settledVerdict). */
+function unsettled(rows: GateRow[], settle: { settled: boolean; ms: number }, costOnly: boolean): void {
+  if (settle.settled) return;
+  for (const row of rows) {
+    const verdict = settledVerdict(row.verdict, { settled: false, costOnly });
+    const why = `not settled after ${(settle.ms / 1000).toFixed(0)} s`;
+    row.note = [row.note, verdict === row.verdict ? `${why}; a pass still holds` : `${why}; ${row.verdict} not trusted`].filter(Boolean).join('; ');
+    row.verdict = verdict;
+  }
+}
+
 interface GateRow { gate: string; scenario: string; threshold: string; measured: string; verdict: GateVerdict; note?: string }
 
 function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
@@ -493,6 +555,7 @@ function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
     const r = results[name];
     if (!r) continue;
     const i = r.idle;
+    const firstRow = rows.length;
     rows.push({ gate: 'idle CPU mean', scenario: name, threshold: '<= 1%', measured: `${pct(i.top.cpuMeanPercent)} (process cpuUsage ${pct(i.processCpuMeanPercent)})`, verdict: evaluateGate({ threshold: 1, measured: Math.max(i.top.cpuMeanPercent, i.processCpuMeanPercent) }) });
     rows.push({ gate: 'idle CPU p95 of 1-s samples', scenario: name, threshold: '<= 3%', measured: pct(i.top.cpuP95Percent), verdict: evaluateGate({ threshold: 3, measured: i.top.cpuP95Percent }) });
     const lower = Math.max(i.top.idleWakeupsPerSecond, i.timerWakeupsPerSecond);
@@ -505,18 +568,26 @@ function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
     const failures = r.failures.length + (r.log.gapsByReason['watcher-error'] ?? 0) + i.compromised.length;
     rows.push({ gate: 'watcher subscription failures', scenario: name, threshold: '0', measured: String(failures), verdict: evaluateGate({ threshold: 0, measured: failures }) });
     rows.push({ gate: 'FDs vs soft limit', scenario: name, threshold: `< 50% of ${fdSoftLimit}`, measured: `${i.fds}`, verdict: evaluateGate({ threshold: fdSoftLimit / 2 - 1, measured: i.fds }) });
+    unsettled(rows.slice(firstRow), r.settle, true);
   }
   for (const name of ['baseline-c0', 'baseline-c10']) {
     const r = results[name];
     if (!r) continue;
-    rows.push({ gate: '4,200-file baseline p95, warm CAS', scenario: name, threshold: '<= 5 s', measured: `${(r.warmMs.p95 / 1000).toFixed(2)} s (n=${r.warmMs.n})`, verdict: evaluateGate({ threshold: 5000, measured: r.warmMs.p95 }) });
-    rows.push({ gate: '4,200-file baseline p95, cold CAS', scenario: name, threshold: '<= 15 s', measured: `${(r.coldMs.p95 / 1000).toFixed(2)} s (n=${r.coldMs.n})`, verdict: evaluateGate({ threshold: 15000, measured: r.coldMs.p95 }) });
+    const firstRow = rows.length;
+    rows.push({ gate: '4,200-file baseline p95, warm CAS', scenario: name, threshold: '<= 5 s', measured: `${seconds(r.warmMs.p95)} (n=${r.warmMs.n})`, verdict: evaluateGate({ threshold: 5000, measured: r.warmMs.p95 }) });
+    rows.push({ gate: '4,200-file baseline p95, cold CAS', scenario: name, threshold: '<= 15 s', measured: `${seconds(r.coldMs.p95)} (n=${r.coldMs.n})`, verdict: evaluateGate({ threshold: 15000, measured: r.coldMs.p95 }) });
+    unsettled(rows.slice(firstRow), r.settle, true);
   }
   for (const name of ['latency-c0', 'latency-c10']) {
     const r = results[name];
     if (!r) continue;
     const m = r.p99Regression;
-    rows.push({ gate: 'p99 latency regression while another baselines', scenario: name, threshold: '<= 20%', measured: m === null ? 'n/a' : `${(m * 100).toFixed(1)}% (p99 ${r.armA.all.p99?.toFixed(0)} -> ${r.armB.all.p99?.toFixed(0)} ms)`, verdict: m === null ? 'UNMEASURED' : evaluateGate({ threshold: 0.2, measured: m }) });
+    const v = latencyVerdict({ regression: m, missingFractionA: r.armA.missingFraction, missingFractionB: r.armB.missingFraction, coverage: r.armB.baselineCoverage });
+    const row: GateRow = { gate: 'p99 latency regression while another baselines', scenario: name, threshold: '<= 20%',
+      measured: `${m === null ? 'n/a' : `${(m * 100).toFixed(1)}% (p99 ${r.armA.all.p99?.toFixed(0)} -> ${r.armB.all.p99?.toFixed(0)} ms)`}; missing A ${r.armA.missing}/${r.armA.writes}, B ${r.armB.missing}/${r.armB.writes}; arm B under a baseline ${(r.armB.baselineCoverage * 100).toFixed(1)}%`,
+      verdict: v.verdict, ...(v.note ? { note: v.note } : {}) };
+    rows.push(row);
+    unsettled([row], r.settle, false);
   }
   return rows;
 }
@@ -559,12 +630,16 @@ async function main(): Promise<void> {
   };
   const cleanup = () => rm(tmp, { recursive: true, force: true, maxRetries: 5 });
   const killChildren = () => Promise.all([...liveChildren].map((c) => {
+    if (c.exitCode !== null || c.signalCode !== null) return undefined;
     const exited = new Promise((r) => c.once('exit', r));
     c.kill('SIGKILL');
     return exited;
   }));
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(sig, () => { void killChildren().then(cleanup).then(() => process.exit(130)); });
+    process.once(sig, () => {
+      stopping = true;
+      void killChildren().then(cleanup).then(() => process.exit(130));
+    });
   }
   try {
     log(`generating synthetic worktrees (pool ${POOL}) in ${tmp}`);
@@ -591,6 +666,8 @@ async function main(): Promise<void> {
       }
     }
   } finally {
+    stopping = true;
+    await killChildren();
     await cleanup();
     log(`removed ${tmp}`);
   }

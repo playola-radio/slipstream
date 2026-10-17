@@ -82,12 +82,40 @@ export type GateVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'UNMEASURED';
 /** A point measurement, or a [lower, upper] bracket from two imperfect sources.
  * A bracket passes only if its upper bound passes and fails only if its lower
  * bound fails; anything between is inconclusive, never rounded to a pass. */
-export function evaluateGate(m: { threshold: number; measured?: number; lower?: number; upper?: number }): GateVerdict {
+export function evaluateGate(m: { threshold: number; measured?: number | null; lower?: number; upper?: number }): GateVerdict {
+  if (m.measured === null || (m.measured !== undefined && !Number.isFinite(m.measured))) return 'UNMEASURED';
   if (m.measured !== undefined) return m.measured <= m.threshold ? 'PASS' : 'FAIL';
   if (m.lower === undefined || m.upper === undefined) return 'UNMEASURED';
   if (m.upper <= m.threshold) return 'PASS';
   if (m.lower > m.threshold) return 'FAIL';
   return 'INCONCLUSIVE';
+}
+
+/** Startup residue in an unsettled window only adds cost, so it can confirm a
+ * pass on a cost gate but not a failure; a comparison gate is invalid either way. */
+export function settledVerdict(verdict: GateVerdict, m: { settled: boolean; costOnly: boolean }): GateVerdict {
+  if (m.settled) return verdict;
+  return m.costOnly && verdict === 'PASS' ? 'PASS' : 'INCONCLUSIVE';
+}
+
+/** Share of writes (hrtime ns) that landed inside some interval. */
+export function coveredFraction(writesNs: bigint[], intervals: { startNs: bigint; endNs: bigint }[]): number {
+  if (writesNs.length === 0) return 0;
+  const inside = writesNs.filter((w) => intervals.some((i) => w >= i.startNs && w <= i.endNs)).length;
+  return inside / writesNs.length;
+}
+
+/** Lost writes or uncovered arm-B writes would let a clean-looking surviving p99 stand in for the whole arm. */
+export const MAX_MISSING_FRACTION = 0.01;
+export const MIN_BASELINE_COVERAGE = 0.95;
+
+export function latencyVerdict(m: { regression: number | null; missingFractionA: number; missingFractionB: number; coverage: number }): { verdict: GateVerdict; note?: string } {
+  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  for (const [arm, f] of [['A', m.missingFractionA], ['B', m.missingFractionB]] as const) {
+    if (f > MAX_MISSING_FRACTION) return { verdict: 'INCONCLUSIVE', note: `${pct(f)} of arm ${arm} writes never became durable (limit ${pct(MAX_MISSING_FRACTION)})` };
+  }
+  if (m.coverage < MIN_BASELINE_COVERAGE) return { verdict: 'INCONCLUSIVE', note: `only ${pct(m.coverage)} of arm B writes ran beside a baseline (need ${pct(MIN_BASELINE_COVERAGE)})` };
+  return { verdict: evaluateGate({ threshold: 0.2, measured: m.regression }) };
 }
 
 export interface LatencyJoinInput {
