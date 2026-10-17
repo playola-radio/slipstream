@@ -74,7 +74,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
 | Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery and Claude delivery D3 merged, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
-| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree. **Amended again 2026-10-17 (Brian):** every workspace is captured, watch-only by default, with no product cap on captures; up to 10 agent chats may be linked at once, one linked chat per capture, replaced only by explicit unlink; see "Future: several simultaneous captures" below |
+| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree. **Amended again 2026-10-17 (Brian):** every workspace is captured, watch-only by default, up to 16 recording at once (later the same day, D10; beyond that a workspace is visibly NOT recording and starts when a slot frees); up to 10 agent chats may be linked at once, one linked chat per capture, replaced only by explicit unlink; see "Future: several simultaneous captures" below |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
 | Q6 | MCP topology | stdio thin forwarder → one long-running daemon (verified necessary) |
 | Q7 | Event envelope | CloudEvents structured JSON; minimal effort spent on it |
@@ -112,8 +112,10 @@ workspace can be captured automatically.
 
 **Amendment (Brian, 2026-10-17).** Q4 is lifted further:
 
-- Every workspace is captured, watch-only by default. There is no product cap on
-  captures (about 57 workspaces today).
+- Every workspace is captured, watch-only by default. *Later the same day
+  (Brian, D10):* at most 16 workspaces record at once; beyond that a workspace is
+  visibly NOT recording (`capture-limit-reached`) and starts automatically,
+  oldest request first, when a slot frees. No eviction.
 - Up to 10 agent chats may be linked at once, **one linked chat per capture**.
   Never two chats on one capture; replacing a chat on a workspace needs an
   explicit unlink. A chat is linked by `slipstream attach`, which binds it in
@@ -127,6 +129,9 @@ workspace can be captured automatically.
 - Restart recovery (durable capture and binding intent, user LaunchAgent) is in
   the MVP; bindings return as pending and reconnect only by a fresh live round
   trip.
+- The overhead gates (D8, thresholds unchanged) are measured at 16 captures. P1 is
+  a one-run viability check that gates P2; the D8 verdict is judged at P6 on the
+  finished system (gate split, 2026-10-17; see the spec).
 
 Design, owner-decisions table and PR graph (P1 to P6):
 `docs/superpowers/specs/2026-10-05-workspace-auto-capture-design.md` (status:

@@ -184,8 +184,8 @@ daemon always carries it. `--store` selects the daemon, never the chat.
 
 | CLI | Wire request | Result |
 |---|---|---|
-| `slipstream attach --watch-only <root> [--wait]` | `{verb:"attach", mode:"watch-only", worktree}` | Admission ack before any baseline work: `{session_id, state, created}`. The `session_id` is allocated and persisted at admission. Same root while queued/baselining joins the same capture (no duplicate). Ancestor/descendant roots refused (`ROOT_OVERLAP`). |
-| `slipstream attach` (from a chat) | `{verb:"attach", harness, harness_session_id, worktree, root_transcript}` | If the workspace's capture is `recording`: binds in place (same `session_id`, no new baseline, no resume event, no gap). If it is `queued`/`baselining`: returns the admission state immediately without binding; the CLI polls `status <session_id>` and resubmits the same attach once `recording`, which is idempotent. If no capture exists: admits a watch-only capture first, then the same path. |
+| `slipstream attach --watch-only <root> [--wait]` | `{verb:"attach", mode:"watch-only", worktree}` | Admission ack before any baseline work: `{session_id, state, created}`. The `session_id` is allocated and persisted at admission. Same root while queued/baselining joins the same capture (no duplicate). Ancestor/descendant roots refused (`ROOT_OVERLAP`). With 16 running capture intents already (spec D10), the intent is written as `waiting` under a fresh `session_id` and the reply is `CAPTURE_LIMIT_REACHED`; nothing is captured until a slot frees. |
+| `slipstream attach` (from a chat) | `{verb:"attach", harness, harness_session_id, worktree, root_transcript}` | If the workspace's capture is `recording`: binds in place (same `session_id`, no new baseline, no resume event, no gap). If it is `queued`/`baselining`: returns the admission state immediately without binding; the CLI polls `status <session_id>` and resubmits the same attach once `recording`, which is idempotent. If no capture exists: admits a watch-only capture first, then the same path. If the workspace is `waiting` for a slot, or admission finds the limit full: `CAPTURE_LIMIT_REACHED`, no binding intent written. |
 | `slipstream status [<target>]` | `{verb:"status"}` or `{verb:"status", target}` | No target: list every capture with lifecycle and binding state. With target: that one capture. |
 | `slipstream detach <target>` | `{verb:"detach", target}` | Withdraws capture and binding intent durably, then stops the capture (`agent.unlinked{detached}` if bound, then `capture.stopped{detached}`). |
 | `slipstream unlink --session <id>` | `{verb:"unlink", session_id}` | Revokes binding intent; invalidates outstanding setup checks; clears task selection and claim eligibility; capture keeps running. |
@@ -231,6 +231,14 @@ New codes join `ControlErrorCode`:
   > `BINDING_LIMIT_REACHED: 10/10 chats linked. This workspace is still recording without a linked chat. Unlink another chat to connect this one.`
 
   The capture is unaffected and keeps recording.
+- `CAPTURE_LIMIT_REACHED`: 16 capture intents already hold slots (spec D10).
+  Exact text from the spec:
+
+  > `CAPTURE_LIMIT_REACHED: 16/16 workspaces recording. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
+
+  The waiting intent is durable; the CLI exits non-zero (setup scripts report it
+  per D1). A slot is any capture intent that is `running`, whatever its lifecycle
+  state, including `not_recording` with a retry pending.
 - `ROOT_OVERLAP`: the requested root is an ancestor or descendant (by path
   components) of a queued, baselining, or recording capture's root. Sibling git
   worktrees sharing repository metadata are not overlaps.
@@ -257,7 +265,8 @@ Public capture state:
 `not_recording` reasons (closed set for v1, each with a human message):
 `daemon-unavailable`, `root-overlap`, `root-missing`, `baseline-failed`,
 `storage-unavailable`, `watcher-failed`, `resume-failed`, `resource-limit`,
-`stop-unconfirmed` (intent withdrawn but no durable `capture.stopped`). Retry is
+`stop-unconfirmed` (intent withdrawn but no durable `capture.stopped`),
+`capture-limit-reached` (intent `waiting` for one of the 16 slots). Retry is
 separate from the reason: a row may also carry `retry: {next_attempt_at_ms}` when
 recovery has scheduled another attempt.
 
@@ -274,12 +283,14 @@ heartbeat (7), in this precedence:
    `stopped`.
 2. Intent `withdrawn` and no durable `capture.stopped`: `not_recording
    {stop-unconfirmed}`. Never `stopped`, never `recording`.
-3. Intent `running`, heartbeat not live: `not_recording` with the recorded
+3. Intent `waiting`: `not_recording{capture-limit-reached}`. Waiting intents never
+   have an activation.
+4. Intent `running`, heartbeat not live: `not_recording` with the recorded
    `last_failure` reason, else `daemon-unavailable`.
-4. Intent `running`, heartbeat live, no activation yet: `queued`.
-5. Heartbeat live, current activation has `capture.ready`: `recording`; without
+5. Intent `running`, heartbeat live, no activation yet: `queued`.
+6. Heartbeat live, current activation has `capture.ready`: `recording`; without
    it: `baselining`.
-6. Last activation ends in `capture.stopped{maintenance}` with intent `running`:
+7. Last activation ends in `capture.stopped{maintenance}` with intent `running`:
    `not_recording{daemon-unavailable}` until resumed (the stop is real; the
    intent says it should come back).
 
@@ -324,7 +335,7 @@ any acknowledgement it backs.
     "session_id": "<uuid>",                    // allocated at admission, never null
     "root": "/canonical/root",
     "root_identity": { "dev": "16777230", "ino": "123456" } | null,  // decimal strings; null if the root could not be read at admission
-    "intent": "running" | "withdrawn",
+    "intent": "running" | "waiting" | "withdrawn",   // waiting = beyond the 16-capture limit
     "withdrawn_reason": "detached" | "archived" | null,
     "capture_mode": "watch-only",
     "last_failure": null | { "reason": "…", "message": "…", "at_ms": 0, "next_attempt_at_ms": 0 | null }
@@ -347,6 +358,12 @@ Rules:
 - Slot count = bindings with `intent: "linked"` plus in-flight reservations held
   in memory under the same mutex as the file write. At most 10. Restored bindings
   keep their slot; nothing is evicted for inactivity.
+- Capture slots = capture entries with `intent: "running"` plus in-flight
+  admissions, under the same mutex. At most 16 (spec D10). `waiting` entries keep
+  their array order, which is admission order: when a `running` entry is withdrawn,
+  the first `waiting` entry becomes `running` in the same write and is queued.
+  Archiving or detaching a `waiting` entry withdraws it without a slot change.
+  Restart and maintenance never change which entries are `running`.
 - `(harness, harness_session_id)` is unique among linked bindings (4).
 - Connection state is **not** persisted. Recovery restores every linked binding
   as `setup_pending`; only a fresh round trip makes it `connected`.
