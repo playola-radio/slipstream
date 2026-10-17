@@ -243,7 +243,8 @@ New codes join `ControlErrorCode`:
   per D1). A slot is any capture intent that is `running`, whatever its lifecycle
   state, including `not_recording` with a retry pending.
 - `ROOT_OVERLAP`: the requested root is an ancestor or descendant (by path
-  components) of a waiting, queued, baselining, or recording capture's root. Sibling git
+  components) of a waiting, queued, baselining, or recording capture's root, or
+  of a running `not_recording` capture with a scheduled retry. Sibling git
   worktrees sharing repository metadata are not overlaps.
 - `TARGET_NOT_FOUND`: a targeted verb names no known capture.
 - `STALE_BINDING`: a chat-facing verb carries a generation or activation that is
@@ -288,14 +289,14 @@ heartbeat (7), in this precedence:
    {stop-unconfirmed}`. Never `stopped`, never `recording`.
 3. Intent `waiting`: `not_recording{capture-limit-reached}`. Waiting intents never
    have an activation.
-4. Intent `running` with a recorded `last_failure`: `not_recording` with that
+4. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
+   with that event's reason. `maintenance` additionally carries the running
+   intent, so it resumes later; `watcher-failed` does too when recovery is
+   scheduled. Neither stop is hidden by a fresh heartbeat or `last_failure`.
+5. Intent `running` with a recorded `last_failure`: `not_recording` with that
    reason, whether or not its heartbeat is fresh. A storage failure therefore
    never reads as `recording`; when the store cannot accept another event, the
    reader uses the durable intent record's `last_failure`.
-5. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
-   with that event's reason. `maintenance` additionally carries the running
-   intent, so it resumes later; `watcher-failed` does too when recovery is
-   scheduled. Neither stop is hidden by a fresh heartbeat.
 6. Intent `running`, heartbeat not live: `not_recording{daemon-unavailable}`.
 7. Intent `running`, heartbeat live, no activation yet: `queued`.
 8. Heartbeat live, current activation has `capture.ready`: `recording`; without

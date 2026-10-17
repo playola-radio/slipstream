@@ -132,8 +132,8 @@ Targeting and admission:
 
 - Canonicalize the path first, then atomically reserve the root. Concurrent
   requests for the same root share one activation.
-- Ancestor and descendant roots are rejected by path components, including waiting and queued
-  roots. Sibling git worktrees that share repository metadata are allowed.
+- Ancestor and descendant roots are rejected by path components, including waiting, queued,
+  and failed-retrying roots. Sibling git worktrees that share repository metadata are allowed.
 - **Capture limit (D10).** A new root while 16 captures hold slots is not
   admitted. Its intent is kept as waiting, public status is NOT recording with
   reason `capture-limit-reached`, and the caller gets:
@@ -264,7 +264,9 @@ client never needs private control status:
 
 - Capture: queued, baselining, recording, stopped (with reason), and **NOT
   recording** with a readable failure reason, including when setup failed and no
-  session log was created.
+  session log was created. A running capture awaiting a scheduled retry remains
+  NOT recording, while a clean stop event keeps its stop reason visible even if
+  that running intent will later resume.
 - Binding: `setup_pending`, `connected`, unavailable (with reason), unlinked.
 
 A historical start without a stop is not proof that capture is live. Today's
