@@ -1,10 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createCas, StorageError } from './cas.ts';
-import { withCas } from './test/helpers.ts';
+import { withCas, withTempDir } from './test/helpers.ts';
 
 describe('cas', () => {
   describe('put', () => {
@@ -48,6 +48,26 @@ describe('cas', () => {
         const stored = await readFile(cas.pathFor(ref.sha256));
         assert.deepEqual(stored, Buffer.from('hello'));
         assert.ok(cas.pathFor(ref.sha256).includes(`/2c/${ref.sha256}`));
+      });
+    });
+    it('trusts a blob another instance already stored instead of rewriting it', async () => {
+      await withTempDir(async (dir) => {
+        const ref = await (await createCas(dir)).put(Buffer.from('kept'));
+        const before = (await stat((await createCas(dir)).pathFor(ref.sha256))).ino;
+        const again = await createCas(dir);
+        await again.put(Buffer.from('kept'));
+        assert.equal((await stat(again.pathFor(ref.sha256))).ino, before);
+      });
+    });
+
+    it('rewrites a stored blob whose size does not match its content', async () => {
+      await withTempDir(async (dir) => {
+        const first = await createCas(dir);
+        const ref = await first.put(Buffer.from('whole'));
+        await writeFile(first.pathFor(ref.sha256), 'who');
+        const again = await createCas(dir);
+        await again.put(Buffer.from('whole'));
+        assert.deepEqual(await again.read(ref.sha256), Buffer.from('whole'));
       });
     });
   });
