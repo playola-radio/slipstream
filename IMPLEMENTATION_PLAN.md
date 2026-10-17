@@ -74,7 +74,7 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 | Q1 | Feed granularity | Whole-function clips via tree-sitter, **as async enrichment**; raw bytes + ranges publish first |
 | Q2 | Question/comment loop | Additive durable ask submission approved 2026-09-25 (D1 below); Codex delivery and Claude delivery D3 merged, answer UI deferred |
 | Q3 | Front-end-agnostic interface | On-disk JSONL + CAS blobs = truth; HTTP/SSE thin reader over it |
-| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree — see "Future: several simultaneous captures" below |
+| Q4 | Session scope | One active capture session daemon-wide, bound to one harness session ID + one canonical worktree. **Amended 2026-10-05 (Brian):** several watch-only captures may run at once, one per worktree. **Amended again 2026-10-17 (Brian):** every workspace is captured, watch-only by default, with no product cap on captures; up to 10 agent chats may be linked at once, one linked chat per capture, replaced only by explicit unlink; see "Future: several simultaneous captures" below |
 | Q5 | Harnesses | Claude Code + Codex from day one, watcher-primary capture |
 | Q6 | MCP topology | stdio thin forwarder → one long-running daemon (verified necessary) |
 | Q7 | Event envelope | CloudEvents structured JSON; minimal effort spent on it |
@@ -105,15 +105,35 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
   identities. A transcript record may *update attribution*; it may never
   *create* a filesystem-change event. This avoids double-capture structurally.
 
-### Future: several simultaneous captures (not built; Q4 amended 2026-10-05)
+### Future: several simultaneous captures (not built; Q4 amended 2026-10-05, again 2026-10-17)
 
 **Amendment (Brian, 2026-10-05).** Q4 is lifted so every new Conductor
-workspace can be captured automatically. Design and PR graph:
+workspace can be captured automatically.
+
+**Amendment (Brian, 2026-10-17).** Q4 is lifted further:
+
+- Every workspace is captured, watch-only by default. There is no product cap on
+  captures (about 57 workspaces today).
+- Up to 10 agent chats may be linked at once, **one linked chat per capture**.
+  Never two chats on one capture; replacing a chat on a workspace needs an
+  explicit unlink. A chat is linked by `slipstream attach`, which binds it in
+  place onto the live capture (same `session_id`, no new baseline, no fabricated
+  gap; earlier changes are never credited to the chat).
+- D1 is revised: strict launch blocking is not required. Setup that cannot make
+  capture ready exits non-zero with a readable reason, the workspace shows as
+  NOT recording with that reason in public projections, and recovery retries
+  transient failures. The first baseline is the first observed state, never a
+  claim of the original state.
+- Restart recovery (durable capture and binding intent, user LaunchAgent) is in
+  the MVP; bindings return as pending and reconnect only by a fresh live round
+  trip.
+
+Design, owner-decisions table and PR graph (P1 to P6):
 `docs/superpowers/specs/2026-10-05-workspace-auto-capture-design.md` (status:
-spec in review). The amendment covers watch-only auto-captures only; the Stage 3
-manual-start, explicit-selection and detach-before-switch criteria still govern
-harness-bound captures, and identity verification and watcher-primary capture
-are unchanged. The text below predates the amendment and still applies.
+spec in review, revised 2026-10-17). The Stage 3 criteria on one active capture,
+explicit selection, detach-before-switch and no competing auto-start carry
+explicit dated amendment notes below; identity verification and watcher-primary
+capture are unchanged. The text below predates the amendments.
 
 Capturing several worktrees at once, and later auto-connecting new Conductor
 workspaces, is the intended direction after the MVP. It is not built, and Q4
@@ -310,9 +330,18 @@ MCP tool `slipstream_begin_task`.
 **Success Criteria**
 - One active capture session daemon-wide, bound to one exact harness session ID
   and one canonical worktree. Retained sessions remain readable.
+  *Amended 2026-10-17 (Brian): this criterion is relaxed for auto-captures only.
+  Every workspace is captured watch-only, and up to 10 chats may be linked at
+  once, one per capture. Each linked chat is still bound to one exact harness
+  session ID and one canonical worktree. See the workspace auto-capture spec.*
 - Explicit CLI attachment selects the session. Forwarders in non-selected
   sessions return `SESSION_NOT_SELECTED` and **never steal ownership**. Switching
   requires detach then attach.
+  *Amended 2026-10-17 (Brian): selection is per capture, not daemon-wide. A
+  non-linked chat still never steals ownership, and a second chat on a linked
+  capture is refused (`BINDING_EXISTS`). Replacing a chat requires an explicit
+  `unlink --session <id>`; switching the app's selected workspace never changes
+  a binding.*
 - Identity binding uses verified harness session context; CWD alone is
   insufficient. Ambiguous identity **fails attachment rather than guessing**.
 - Two agents writing in the selected worktree are both captured, with attribution
@@ -328,6 +357,9 @@ MCP tool `slipstream_begin_task`.
   is no task-completed claim in this MVP.
 - Manually started daemon; forwarders fail fast if it is unavailable. No
   competing auto-start.
+  *Amended 2026-10-17 (Brian): a user LaunchAgent and the Conductor setup script
+  may start the one daemon that owns the store; ensure-running stays idempotent,
+  so there is still no competing second daemon. Forwarders still fail fast.*
 - CLI documented for start, attach, status, detach, session deletion, GC.
 
 **Tests**
@@ -1105,6 +1137,9 @@ a Codex consult; contract in [docs/ask-agent/contract.md](docs/ask-agent/contrac
 - **Idempotent.** Same workspace and chat: report the existing capture and
   re-arm a pending check. Same workspace, other chat: refuse and keep the
   binding. Another workspace: refuse, naming it.
+  *Amended 2026-10-17 (Brian): attach in another workspace no longer refuses
+  because a different workspace is recorded; the preflight is workspace-targeted
+  and up to 10 chats may be linked, one per capture.*
 - **Workspace-scoped config** for the selected harness only, merged without
   duplicates, using the installed Slipstream command paths. Host trust and
   approval are never written.
