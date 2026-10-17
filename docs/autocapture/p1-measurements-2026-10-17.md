@@ -6,9 +6,11 @@
 >   scenarios. The same test passed with no chats, and nothing traced where the
 >   slow writes waited. Under D6 an unattributed miss stops the feature.
 > - **Ruling 2:** total idle wakeups with no chats, a watcher-intrinsic gate, are
->   INCONCLUSIVE. Only a lower bound (the corrected `top` IDLEW rate, 0.01/s
->   against 10/s for c0) can be taken without
->   sudo.
+>   INCONCLUSIVE. The only proven lower bound without sudo, `top` IDLEW, is
+>   0.01/s at 16 captures, far below 10/s. But the main thread ran 7.1 timer
+>   callbacks/s at 16 (12.9/s at 32), driven by 2-s lock heartbeats. In an
+>   idle process each is probably a wakeup; that is not proven, so it is not a
+>   bound.
 >
 > This is not the D8 verdict; that is judged at P6 on the finished system.
 
@@ -45,10 +47,12 @@ cause, and a miss that cannot be attributed stops the feature.
 | memory | 142 MiB footprint at 16 (81 MiB with none; 165 MiB at 32), limit 512 MiB |
 | idle CPU | 0.59% mean / 0.90% p95 at 16 (0.02% with none, 0.83% at 32), limits 1% / 3% |
 | recurring worktree reads after settling | 0 listings, stats, reads or git spawns in the window |
-| wakeups | INCONCLUSIVE: corrected `top` IDLEW lower bound 0.01/s against 10/s for c0; the total is not measured |
+| wakeups | INCONCLUSIVE: proven lower bound (`top` IDLEW) 0.01/s at 16 against 10/s; timer callbacks 7.1/s at 16 (12.9/s at 32) are likely but unproven wakeups; the total is not measured |
 
 No watcher-intrinsic failure was shown by anything measured. Total wakeups with no
-chats are unknown: a 0.01/s corrected `top` IDLEW lower bound neither proves nor disproves the 10/s limit.
+chats are unknown: the 0.01/s `top` IDLEW lower bound neither proves nor disproves the
+10/s limit, and the 7.1/s timer-callback rate suggests the total is closer to the
+limit than that bound implies.
 Whether P2 may start before that is measured is **Ruling 2**. Measuring it needs
 `sudo powermetrics` on the subject; see "Wakeups".
 
@@ -59,7 +63,7 @@ Whether P2 may start before that is measured is **Ruling 2**. Measuring it needs
 | 4,200-file baseline p95, warm ≤ 5 s and cold ≤ 15 s (c0 and c10) | 93.8 s warm / 91.3 s cold (c0); 81.9 / 81.1 s (c10) | `createCas` runs once per capture session (`src/session.ts:241`). Its `put` (`src/cas.ts:97`) republishes every blob missing from that session's in-memory `durable` set, with a temp write, file fsync, rename and shard-directory fsync, even when the blob is already on disk. So warm and cold starts both rewrite every blob, which matches their near-equal times. Component times were not recorded: a baseline also enumerates, reads, hashes, and appends one durable log record per file. The ~20 ms per file (4,200 files in ~90 s; the one-capture fleet's 2,574-file worktree in 49 s) is total amortized start time, not measured CAS time. | **P2** (owns concurrent captures and the shared store) |
 | idle CPU mean and p95 with 1 emulated chat (`n16-c1`) | 22.4% / 35.3% | Each emulated chat runs today's per-capture transcript runtime, which re-scans the Codex rollout directory (3,500 files, none matching). Transcript file opens rose from 0/s (c0) to 849/s. No CPU profile was taken, so the share of CPU this explains is inferred, not measured. | **P5** (shared transcript discovery) |
 | idle CPU mean and p95 with 10 emulated chats (`n16-c10`) | 111.7% / 221.4% | Transcript opens 5,383/s (about 538 per chat). CPU follows the chat count, not the capture count: c0 is 0.59% with the same 16 captures. Same inference caveat. | **P5** |
-| p99 write latency regression while another capture baselines, with 10 emulated chats (`latency-c10`) | +30.5% (p99 216 → 281 ms; worst capture +33%); 0 of 1,800 writes lost; 100% of arm-B writes beside a baseline | The same baseline loop cost +5.6% with no chats (`latency-c0`, PASS). The emulated chats are the designed difference between the two scenarios, but they ran an hour apart on a changing host, with different target captures (8 vs 6), and nothing traced where writes waited. Event-loop delay in arm B: p99 12 ms, max 79 ms. **This attribution is a hypothesis, not a measurement (Ruling 1).** | **P5 with P2**, if Brian accepts the attribution |
+| p99 write latency regression while another capture baselines, with 10 emulated chats (`latency-c10`) | +30.5% (p99 216 → 281 ms; the slowest capture's p99, arm B over arm A, +33%); 0 of 1,800 writes lost; 100% of arm-B writes beside a baseline | The same baseline loop cost +5.6% with no chats (`latency-c0`, PASS). The emulated chats are the designed difference between the two scenarios, but they ran an hour apart on a changing host, with different target captures (8 vs 6), and nothing traced where writes waited. Event-loop delay in arm B: p99 12 ms, max 79 ms. **This attribution is a hypothesis, not a measurement (Ruling 1).** | **P5 with P2**, if Brian accepts the attribution |
 
 c0 runs watch-only captures with no transcript runtime. It is the closest
 reference for the intended binding-only linked chat, but it does not measure the
