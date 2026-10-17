@@ -2,9 +2,8 @@
 
 Date: 2026-10-05, revised 2026-10-17. Owner: Brian. Status: **spec in review**
 (revised 2026-10-17; no code yet).
-Architecture via two Codex consult rounds (session in `.context/codex-session-id`;
-round 1 `.context/codex-arch-consult.md`, round 2
-`.context/codex-arch-consult-2.md`). Round 2 supersedes round 1 where they differ.
+Architecture via two Codex consult rounds (2026-10-05, 2026-10-17); this document
+is the settled result.
 
 ## Goal
 
