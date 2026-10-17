@@ -938,6 +938,7 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
   const continuationRequest = (await readFile(join(continuationDir, 'request.txt'), 'utf8')).trim();
   const continuationExpected = JSON.parse(await readFile(join(continuationDir, 'expected.json'), 'utf8')) as unknown;
   const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
   let reachLookahead = () => {};
   const reachedLookahead = new Promise<void>(resolve => { reachLookahead = resolve; });
   let releaseLookahead = () => {};
@@ -960,7 +961,14 @@ test('authenticated HTTP exposes a look-ahead timeout as ready with an unfinishe
     const responding = fetch(reader.url + request.slice(4), {
       headers: { authorization: `Bearer ${reader.token}` },
     });
-    const first = await Promise.race([reachedLookahead.then(() => 'lookahead'), responding.then(() => 'response')]);
+    let clearWatchdog = () => {};
+    const watchdog = new Promise<never>((_resolve, reject) => {
+      const timer = realSetTimeout(() => reject(new Error('look-ahead was not reached within 30 seconds')), 30_000);
+      clearWatchdog = () => realClearTimeout(timer);
+    });
+    const first = await Promise.race([
+      reachedLookahead.then(() => 'lookahead'), responding.then(() => 'response'), watchdog,
+    ]).finally(clearWatchdog);
     assert.equal(first, 'lookahead', 'deadline fired before the retention look-ahead');
     t.mock.timers.tick(deadlineMs - 1);
     assert.equal(timedOut(), false, 'deadline fired before its configured duration');
