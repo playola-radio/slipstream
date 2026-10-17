@@ -2,7 +2,7 @@ import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFil
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { createCas } from './cas.ts';
+import { createCas, type Cas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
@@ -69,8 +69,13 @@ export interface CaptureOptions {
   enrichmentPolicy?: EnrichmentPolicy;
   /** Transcript-reading settings. When present with configured harnesses, the
    * session runs a coverage watcher that reads those harnesses' transcripts for
-   * this worktree, ingesting evidence and disclosing coverage. */
+   * this worktree, ingesting evidence and disclosing coverage. A capture started
+   * without it can begin reading later with {@link CaptureSession.startTranscripts}. */
   transcript?: TranscriptRuntime;
+  /** The store's blob store. A process running several captures over one store
+   * must share one instance: it is what makes a blob another capture is still
+   * publishing safe to trust. Absent means a private instance. */
+  cas?: Cas;
   /** Server clock for question TTL; no timers or expiry records. */
   now?: () => number;
 }
@@ -139,6 +144,9 @@ export interface CaptureSession {
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
   recordAgent<I extends AgentInput>(input: I, assertOwnership?: () => void): Promise<AgentEventFor<I>>;
+  /** Start reading transcripts for this worktree if it is not already; a no-op
+   * once stopped, or when no harness is configured. */
+  startTranscripts(runtime: TranscriptRuntime): void;
   stop(opts?: StopOptions): Promise<void>;
 }
 
@@ -256,7 +264,7 @@ export async function startCapture(
   await assertOwnerOnly(sessionDir, 'dir'); // blobsDir perms are checked by createCas
   const logPath = join(sessionDir, 'events.jsonl');
 
-  const cas = await createCas(blobsDir);
+  const cas = opts.cas ?? await createCas(blobsDir);
 
   // Durable task boundaries (Stage 3). `currentTaskId` is the latest committed
   // declaration in shared append order — the grouping hint stamped onto changes.
@@ -934,8 +942,8 @@ export async function startCapture(
   // re-read (including a late transcript after a restart) revises without
   // duplicating. Runs only when a harness is actually configured.
   let coverageRunner: CoverageRunner | undefined;
-  const tc = opts.transcript;
-  if (tc && tc.harnesses.length > 0) {
+  const startTranscripts = (tc: TranscriptRuntime): void => {
+    if (coverageRunner || stopped || tc.harnesses.length === 0) return;
     coverageRunner = createCoverageRunner({
       harnesses: tc.harnesses,
       homes: tc.homes,
@@ -951,7 +959,8 @@ export async function startCapture(
       onError: (err) => console.error(`slipstream: transcript watcher error: ${(err as Error).message}`),
     });
     coverageRunner.start();
-  }
+  };
+  if (opts.transcript) startTranscripts(opts.transcript);
 
   const beginTask = async ({ title, requestId }: BeginTaskInput): Promise<BeginTaskResult> => {
     // Readiness: only a live, healthy, still-owned session may declare a task.
@@ -1208,6 +1217,7 @@ export async function startCapture(
     claimQuestion,
     answerQuestion,
     recordAgent,
+    startTranscripts,
     ingestEvidence,
     stop: (opts) => (stopPromise ??= doStop(opts)),
   };

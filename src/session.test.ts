@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { startCapture, InvalidTitleError } from './session.ts';
+import { startCapture, InvalidTitleError, type TranscriptRuntime } from './session.ts';
+import { createCas, type Cas } from './cas.ts';
 import { createLog, type Log } from './log.ts';
 import { StorageError } from './storage.ts';
 import { CorruptLogError } from './recovery.ts';
@@ -847,6 +848,51 @@ describe('session', () => {
         } finally {
           await s.stop();
         }
+      });
+    });
+
+    it('reads no transcripts until startTranscripts, then reads them, and never after stop', async () => {
+      await withTempPair(async (root, store) => {
+        let listings = 0;
+        const runtime: TranscriptRuntime = {
+          harnesses: ['claude-code'], homes: { 'claude-code': '/fake/.claude', codex: '/fake/.codex' },
+          codexScanLimit: 10, pollIntervalMs: 10,
+          discoveryIO: {
+            listDir: async () => { listings += 1; return { ok: false, reason: 'missing' }; },
+            listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
+            readFirstLine: async () => ({ ok: false, reason: 'empty' }),
+            readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+            realpath: async (p) => p,
+            probe: async () => ({ kind: 'absent' }),
+          },
+        };
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        try {
+          await new Promise((r) => setTimeout(r, 50));
+          assert.equal(listings, 0);
+          s.startTranscripts(runtime);
+          s.startTranscripts(runtime);
+          await waitForRecords(s.logPath, (recs) => recs.some((r) => r.type === 'slipstream.enrichment.coverage.v1'));
+          assert.ok(listings > 0);
+        } finally {
+          await s.stop();
+        }
+        const after = listings;
+        s.startTranscripts(runtime);
+        await new Promise((r) => setTimeout(r, 50));
+        assert.equal(listings, after);
+      });
+    });
+
+    it('publishes blobs through a shared blob store when one is given', async () => {
+      await withTempPair(async (root, store) => {
+        await writeFile(join(root, 'a.ts'), 'shared');
+        const real = await createCas(join(store, 'blobs'));
+        let puts = 0;
+        const cas: Cas = { ...real, put: (bytes) => { puts += 1; return real.put(bytes); } };
+        const s = await startCapture({ root, storeDir: store, cas }, { platform: createFakePlatform() });
+        await s.stop();
+        assert.ok(puts > 0);
       });
     });
   });
