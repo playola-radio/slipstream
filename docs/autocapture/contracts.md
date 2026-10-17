@@ -32,8 +32,12 @@ appends `session.resumed`, a gap, the scope, and zero or more changes, and nothi
 marks reconciliation complete.
 
 ```jsonc
-"data": { "session_id": "<uuid>", "activation": "started" | "resumed", "ready_at_ms": 1792252567000 }
+"data": { "session_id": "<uuid>" }
 ```
+
+Whether the activation started or resumed, and when it became ready, are already
+in the log: the activation's opening `session.started`/`session.resumed` event and
+the envelope's `time`.
 
 An activation with `session.started`/`session.resumed` but no `capture.ready` is
 `baselining` (if its owner is live) or `not_recording{reason: "baseline-failed" |
@@ -47,8 +51,7 @@ Appended as the last record of an activation that stopped cleanly.
 ```jsonc
 "data": {
   "session_id": "<uuid>",
-  "reason": "detached" | "archived" | "maintenance" | "root-missing" | "watcher-failed",
-  "stopped_at_ms": 1792252567000
+  "reason": "detached" | "archived" | "maintenance" | "root-missing" | "watcher-failed"
 }
 ```
 
@@ -331,8 +334,7 @@ any acknowledgement it backs.
   "version": 1,
   "next_binding_generation": "4",
   "captures": [{
-    "intent_id": "<uuid>",                     // stable across history; never the path
-    "session_id": "<uuid>",                    // allocated at admission, never null
+    "session_id": "<uuid>",                    // allocated at admission, never null; stable across history, never the path
     "root": "/canonical/root",
     "root_identity": { "dev": "16777230", "ino": "123456" } | null,  // decimal strings; null if the root could not be read at admission
     "intent": "running" | "waiting" | "withdrawn",   // waiting = beyond the 16-capture limit
@@ -367,7 +369,7 @@ Rules:
 - `(harness, harness_session_id)` is unique among linked bindings (4).
 - Connection state is **not** persisted. Recovery restores every linked binding
   as `setup_pending`; only a fresh round trip makes it `connected`.
-- A recreated root at a retained path gets a new `intent_id` and `session_id`; the
+- A recreated root at a retained path gets a new `session_id`; the
   old entry's identity mismatch keeps them apart.
 - Withdrawal (detach, archive, unlink) is written durably even when the daemon is
   down (the CLI writes the file under the store lock if no daemon holds it). A
@@ -424,7 +426,7 @@ draft: "not ready". Every material objection was accepted; none was overruled.
 | 3 | Intent/event crash ordering undefined; withdrawn intent without a stop would show `stopped`. | Crash-point table and fold precedence (6); `not_recording{stop-unconfirmed}`. |
 | 4 | "Unlinked is log-reproducible" contradicts revocation without an event. | Binding state is the fold of intent plus events; revoked intent wins (6). |
 | 5 | Nullable `session_id` breaks stable admission targeting. | `session_id` allocated and persisted at admission, never null (5, 8). |
-| 6 | Root identity: unrepresentable before start, unsafe integers, ambiguous after recreation. | Decimal-string `dev`/`ino`, nullable identity, durable `intent_id` (8). |
+| 6 | Root identity: unrepresentable before start, unsafe integers, ambiguous after recreation. | Decimal-string `dev`/`ino`, nullable identity; the durable `session_id` allocated at admission is the stable key (8). |
 | 7 | Initial verification failure contradicts the spec's two rules. | Initial failure creates no binding and releases the reservation; later invalidation keeps intent and slot (4). |
 | 8 | `config-missing` is a pending reason in the spec, not unavailable. | Moved to a reason on `setup_pending` (4, 6). |
 | 9 | One chat identity could be linked to two captures, making routing ambiguous. | Store-wide uniqueness of `(harness, harness_session_id)`; refusal is `BINDING_EXISTS` (4). |

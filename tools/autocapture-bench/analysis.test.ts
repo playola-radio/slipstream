@@ -6,25 +6,25 @@ const TOP_LOG = `Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 2026/10/17 11:00:29
 Load Avg: 4.00, 4.69, 4.98
 
-PID    %CPU #TH MEM IDLEW CSW
-90371  0.0  7   11M 2     325
+PID    %CPU #TH MEM IDLEW
+90371  0.0  7   11M 2
 Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 2026/10/17 11:00:30
 
-PID    %CPU #TH MEM IDLEW CSW
-90371  1.5  9/1 11M+ 2     395+
+PID    %CPU #TH MEM IDLEW
+90371  1.5  9/1 11M+ 2
 Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 
-PID    %CPU #TH MEM IDLEW CSW
-90371  0.5  9   1.5G- 5+    465+
-PID    %CPU #TH MEM IDLEW CSW
+PID    %CPU #TH MEM IDLEW
+90371  0.5  9   1.5G- 5+
+PID    %CPU #TH MEM IDLEW
 `;
 
 test('top log rows parse into samples, ignoring header blocks and empty trailing samples', () => {
   assert.deepEqual(parseTopLog(TOP_LOG, 90371), [
-    { cpuPercent: 0, threads: 7, memBytes: 11 * 2 ** 20, idleWakeups: 2, contextSwitches: 325 },
-    { cpuPercent: 1.5, threads: 9, memBytes: 11 * 2 ** 20, idleWakeups: 2, contextSwitches: 395 },
-    { cpuPercent: 0.5, threads: 9, memBytes: 1.5 * 2 ** 30, idleWakeups: 5, contextSwitches: 465 },
+    { cpuPercent: 0, threads: 7, memBytes: 11 * 2 ** 20, idleWakeups: 2 },
+    { cpuPercent: 1.5, threads: 9, memBytes: 11 * 2 ** 20, idleWakeups: 2 },
+    { cpuPercent: 0.5, threads: 9, memBytes: 1.5 * 2 ** 30, idleWakeups: 5 },
   ]);
 });
 
@@ -48,7 +48,6 @@ test('the first top sample is dropped because its CPU column has no interval beh
 
 test('wakeup rates come from cumulative counter deltas over the sampled interval', () => {
   const summary = summarizeTop(parseTopLog(TOP_LOG, 90371), 1);
-  assert.equal(summary.contextSwitchesPerSecond, 70);
   assert.equal(summary.idleWakeupsPerSecond, 1.5);
   assert.equal(summary.maxMemBytes, 1.5 * 2 ** 30);
   assert.equal(summary.maxThreads, 9);
@@ -99,22 +98,36 @@ test('coverage of no writes is zero, not a full pass', () => {
   assert.equal(coveredFraction([], [{ startNs: 0n, endNs: 10n }]), 0);
 });
 
-test('latency regression is judged only when both arms observed their writes and the baseline covered arm B', () => {
-  const ok = { regression: 0.1, missingFractionA: 0, missingFractionB: 0.005, coverage: 0.99 };
-  assert.deepEqual(latencyVerdict(ok), { verdict: 'PASS' });
-  assert.deepEqual(latencyVerdict({ ...ok, regression: 0.3 }), { verdict: 'FAIL' });
+const fast = (n: number) => Array.from({ length: n }, () => 100);
+
+test('latency regression is a point verdict when no write was lost', () => {
+  const a = { latenciesMs: fast(600), missing: 0 };
+  assert.equal(latencyVerdict({ a, b: { latenciesMs: fast(600), missing: 0 }, coverage: 1 }).verdict, 'PASS');
+  assert.equal(latencyVerdict({ a, b: { latenciesMs: [...fast(590), ...Array(10).fill(1000)], missing: 0 }, coverage: 1 }).verdict, 'FAIL');
 });
 
-test('latency regression with lost writes is inconclusive, however good the surviving p99', () => {
-  const r = latencyVerdict({ regression: 0, missingFractionA: 0, missingFractionB: 0.5, coverage: 1 });
+test('lost writes count as unboundedly slow for the pass bound, so survivors alone cannot pass', () => {
+  const b = { latenciesMs: [...fast(589), ...Array(5).fill(1000)], missing: 6 };
+  const r = latencyVerdict({ a: { latenciesMs: fast(600), missing: 0 }, b, coverage: 1 });
   assert.equal(r.verdict, 'INCONCLUSIVE');
-  assert.match(r.note!, /50\.0% of arm B writes/);
+  assert.match(r.note!, /6 lost writes/);
+});
+
+test('a few lost writes that cannot reach the p99 rank still allow a pass', () => {
+  const b = { latenciesMs: fast(598), missing: 2 };
+  assert.equal(latencyVerdict({ a: { latenciesMs: fast(600), missing: 0 }, b, coverage: 1 }).verdict, 'PASS');
 });
 
 test('latency regression with arm B only partly under a baseline is inconclusive', () => {
-  const r = latencyVerdict({ regression: 0, missingFractionA: 0, missingFractionB: 0, coverage: 0.1 });
+  const arm = { latenciesMs: fast(600), missing: 0 };
+  const r = latencyVerdict({ a: arm, b: arm, coverage: 0.1 });
   assert.equal(r.verdict, 'INCONCLUSIVE');
   assert.match(r.note!, /10\.0% of arm B writes/);
+});
+
+test('latency regression with no observed writes is unmeasured', () => {
+  const none = { latenciesMs: [], missing: 0 };
+  assert.equal(latencyVerdict({ a: none, b: none, coverage: 1 }).verdict, 'UNMEASURED');
 });
 
 test('capture latency joins each write to its change record and the first durable advance covering it', () => {

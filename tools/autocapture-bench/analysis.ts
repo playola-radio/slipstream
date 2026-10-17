@@ -8,8 +8,6 @@ export interface TopSample {
   memBytes: number;
   /** Cumulative package idle wakeups (Activity Monitor "Idle Wake Ups"). */
   idleWakeups: number;
-  /** Cumulative context switches, every thread, voluntary or not. */
-  contextSwitches: number;
 }
 
 const UNITS: Record<string, number> = { B: 1, K: 2 ** 10, M: 2 ** 20, G: 2 ** 30, T: 2 ** 40 };
@@ -23,17 +21,17 @@ export function parseMemSize(text: string): number {
 /** `top` marks a changed value with a trailing `+` or `-`. */
 const strip = (field: string): string => field.replace(/[+-]$/, '');
 
-/** Parse `top -l N -s 1 -n 1000 -pid P -stats pid,cpu,th,mem,idlew,csw` output. #TH reads
+/** Parse `top -l N -s 1 -n 1000 -pid P -stats pid,cpu,th,mem,idlew` output. #TH reads
  * `total/running` while a thread runs. */
 export function parseTopLog(text: string, pid: number): TopSample[] {
   const samples: TopSample[] = [];
   for (const line of text.split('\n')) {
     const fields = line.trim().split(/\s+/);
-    if (fields.length !== 6 || fields[0] !== String(pid)) continue;
-    const [, cpu, th, mem, idlew, csw] = fields.map(strip);
+    if (fields.length !== 5 || fields[0] !== String(pid)) continue;
+    const [, cpu, th, mem, idlew] = fields.map(strip);
     samples.push({
       cpuPercent: Number(cpu), threads: Number(th!.split('/')[0]), memBytes: parseMemSize(mem!),
-      idleWakeups: Number(idlew), contextSwitches: Number(csw),
+      idleWakeups: Number(idlew),
     });
   }
   return samples;
@@ -46,7 +44,6 @@ export interface TopSummary {
   maxMemBytes: number;
   maxThreads: number;
   idleWakeupsPerSecond: number;
-  contextSwitchesPerSecond: number;
 }
 
 /** CPU drops the first sample (no interval behind it); cumulative counters use
@@ -64,7 +61,6 @@ export function summarizeTop(all: TopSample[], intervalSeconds: number): TopSumm
     maxMemBytes: Math.max(...all.map((s) => s.memBytes)),
     maxThreads: Math.max(...all.map((s) => s.threads)),
     idleWakeupsPerSecond: (last.idleWakeups - first.idleWakeups) / elapsed,
-    contextSwitchesPerSecond: (last.contextSwitches - first.contextSwitches) / elapsed,
   };
 }
 
@@ -105,17 +101,26 @@ export function coveredFraction(writesNs: bigint[], intervals: { startNs: bigint
   return inside / writesNs.length;
 }
 
-/** Lost writes or uncovered arm-B writes would let a clean-looking surviving p99 stand in for the whole arm. */
-export const MAX_MISSING_FRACTION = 0.01;
 export const MIN_BASELINE_COVERAGE = 0.95;
 
-export function latencyVerdict(m: { regression: number | null; missingFractionA: number; missingFractionB: number; coverage: number }): { verdict: GateVerdict; note?: string } {
-  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
-  for (const [arm, f] of [['A', m.missingFractionA], ['B', m.missingFractionB]] as const) {
-    if (f > MAX_MISSING_FRACTION) return { verdict: 'INCONCLUSIVE', note: `${pct(f)} of arm ${arm} writes never became durable (limit ${pct(MAX_MISSING_FRACTION)})` };
+interface Arm { latenciesMs: number[]; missing: number }
+
+/** p99 with each lost write standing in at `as` ms. */
+const p99With = (arm: Arm, as: number) => latencyStats([...arm.latenciesMs, ...Array<number>(arm.missing).fill(as)]).p99;
+
+/** A lost write's latency is unknown, so it brackets the regression: the pass
+ * bound counts arm B's lost writes as unboundedly slow and arm A's as instant,
+ * the fail bound the reverse. With nothing lost the bracket is a point. */
+export function latencyVerdict(m: { a: Arm; b: Arm; coverage: number }): { verdict: GateVerdict; note?: string } {
+  if (m.a.latenciesMs.length === 0 || m.b.latenciesMs.length === 0) return { verdict: 'UNMEASURED' };
+  if (m.coverage < MIN_BASELINE_COVERAGE) {
+    return { verdict: 'INCONCLUSIVE', note: `only ${(m.coverage * 100).toFixed(1)}% of arm B writes ran beside a baseline (need ${MIN_BASELINE_COVERAGE * 100}%)` };
   }
-  if (m.coverage < MIN_BASELINE_COVERAGE) return { verdict: 'INCONCLUSIVE', note: `only ${pct(m.coverage)} of arm B writes ran beside a baseline (need ${pct(MIN_BASELINE_COVERAGE)})` };
-  return { verdict: evaluateGate({ threshold: 0.2, measured: m.regression }) };
+  const upper = p99With(m.b, Infinity)! / p99With(m.a, 0)! - 1;
+  const lower = p99With(m.b, 0)! / p99With(m.a, Infinity)! - 1;
+  const verdict = evaluateGate({ threshold: 0.2, lower, upper });
+  const lost = m.a.missing + m.b.missing;
+  return lost === 0 ? { verdict } : { verdict, note: `${lost} lost writes (A ${m.a.missing}, B ${m.b.missing}) bracket the regression` };
 }
 
 export interface LatencyJoinInput {

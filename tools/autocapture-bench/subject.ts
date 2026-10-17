@@ -76,7 +76,8 @@ async function stopSession(id: string): Promise<void> {
   registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
 }
 
-/** Each run spans start through stop, so the parent can test which of its
+/** Each run spans the baseline itself (start until startCapture resolves; the
+ * stop afterwards is not baselining), so the parent can test which of its
  * writes landed while a baseline was in flight. A failure ends the loop and is
  * reported with the runs so far rather than thrown into the void. */
 async function baselineLoop(roots: string[], state: { stop: boolean }): Promise<{ runs: BaselineRun[]; error?: string }> {
@@ -87,8 +88,9 @@ async function baselineLoop(roots: string[], state: { stop: boolean }): Promise<
       const sessionId = crypto.randomUUID();
       const startNs = process.hrtime.bigint();
       const { ms } = await start({ op: 'start', root, sessionId });
+      const endNs = process.hrtime.bigint();
       await stopSession(sessionId);
-      runs.push({ root, ms, startNs: startNs.toString(), endNs: process.hrtime.bigint().toString() });
+      runs.push({ root, ms, startNs: startNs.toString(), endNs: endNs.toString() });
     }
     return { runs };
   } catch (err) {
@@ -111,7 +113,6 @@ function snapshot() {
     cpu: process.cpuUsage(),
     resource: process.resourceUsage(),
     fds: readdirSync('/dev/fd').length,
-    sessions: sessions.size,
     health,
     durableSeqTotal: durableSeqTotal.toString(),
     compromised: [...compromised],
@@ -126,7 +127,7 @@ async function handle(req: Request): Promise<unknown> {
       configureProbeRoots(req.roots);
       storeLock = await acquireSessionLock(req.storeDir, { onCompromised: (r) => compromised.push(`store: ${r}`) });
       reader = await startReaderServer({ storeDir: req.storeDir, registry });
-      return { pid: process.pid };
+      return {};
     case 'start': return start(req);
     case 'stopSession': await stopSession(req.sessionId); return {};
     case 'track': tracked = new Set(req.sessionIds); timeline = []; return {};

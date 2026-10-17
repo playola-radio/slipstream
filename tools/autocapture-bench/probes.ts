@@ -24,7 +24,6 @@ export interface ProbeCounters {
   /** Timer callbacks more than 1 ms after the previous one: a lower bound on
    * main-thread timer wakeups (coalesced firings count once). */
   timerWakeups: number;
-  timerCallbacks: number;
 }
 
 const CLASSES: readonly PathClass[] = ['worktree', 'store', 'lock', 'transcript', 'other'];
@@ -33,7 +32,7 @@ function emptyCounters(): ProbeCounters {
   const perClass = <T>(make: () => T) => Object.fromEntries(CLASSES.map((c) => [c, make()])) as Record<PathClass, T>;
   return {
     calls: perClass(() => ({})), bytesRead: perClass(() => 0), bytesWritten: perClass(() => 0),
-    spawns: 0, timerWakeups: 0, timerCallbacks: 0,
+    spawns: 0, timerWakeups: 0,
   };
 }
 
@@ -164,7 +163,6 @@ function wrapTimer(target: Record<string, unknown>, name: 'setTimeout' | 'setInt
     if (typeof callback !== 'function') return original.call(this, callback, ...rest);
     const fire = function (this: unknown, ...cbArgs: unknown[]) {
       const now = process.hrtime.bigint();
-      counters.timerCallbacks++;
       if (now - lastTimerFireNs > 1_000_000n) counters.timerWakeups++;
       lastTimerFireNs = now;
       return (callback as AnyFn).apply(this, cbArgs);

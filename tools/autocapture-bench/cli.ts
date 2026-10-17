@@ -68,14 +68,16 @@ function log(msg: string): void {
 const liveChildren = new Set<ChildProcess>();
 let stopping = false;
 
+/** Call checkStopping() before creating the child, so a stop never abandons a
+ * child's promise. */
 function track(child: ChildProcess): ChildProcess {
-  if (stopping) { child.kill('SIGKILL'); throw new Error('bench is stopping'); }
   liveChildren.add(child);
   child.once('exit', () => liveChildren.delete(child));
   return child;
 }
 
 function run(cmd: string, argv: string[], opts: Parameters<typeof execFile>[2] = {}): Promise<{ stdout: string; stderr: string }> {
+  checkStopping();
   const p = execFileP(cmd, argv, { ...opts, encoding: 'utf8' });
   track(p.child);
   return p;
@@ -195,6 +197,7 @@ class Subject {
   }
 
   static async start(ws: Workspace, storeDir: string): Promise<Subject> {
+    checkStopping();
     const child = track(fork(join(REPO, 'tools', 'autocapture-bench', 'subject.ts'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] }));
     try {
       await new Promise<void>((resolve, reject) => {
@@ -294,8 +297,9 @@ async function settle(s: Subject): Promise<{ settled: boolean; ms: number }> {
 }
 
 async function sampleTop(pid: number, seconds: number, file: string): Promise<TopSample[]> {
+  checkStopping();
   const fd = openSync(file, 'w');
-  const child = track(spawn('top', ['-l', String(seconds + 1), '-s', '1', '-n', '1000', '-pid', String(pid), '-stats', 'pid,cpu,th,mem,idlew,csw'],
+  const child = track(spawn('top', ['-l', String(seconds + 1), '-s', '1', '-n', '1000', '-pid', String(pid), '-stats', 'pid,cpu,th,mem,idlew'],
     { stdio: ['ignore', fd, 'inherit'] }));
   await new Promise((r) => child.once('exit', r));
   closeSync(fd);
@@ -365,7 +369,6 @@ async function measureWindow(s: Subject, seconds: number, label: string, ws: Wor
     topSamples: samples.map((x) => [x.cpuPercent, x.memBytes]),
     processCpuMeanPercent: (cpuS / wallS) * 100,
     timerWakeupsPerSecond: b.counters.timerWakeups / wallS,
-    timerCallbacksPerSecond: b.counters.timerCallbacks / wallS,
     lockHeartbeatsPerSecond: ((lockOps.readFile ?? 0)) / wallS,
     lockUtimesPerSecond: ((lockOps.utimes ?? 0)) / wallS,
     worktreeCalls: b.counters.calls.worktree,
@@ -491,7 +494,7 @@ async function latency(f: Fleet, ws: Workspace, name: string) {
   const result = (writes: WriteRecord[]) => {
     const j = joinLatencies({ writes, changes, timeline });
     const worstP99 = Math.max(...Object.values(j.perSessionMs).map((v) => latencyStats(v).p99 ?? 0));
-    return { writes: writes.length, missing: j.missing, missingFraction: writes.length ? j.missing / writes.length : 1, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
+    return { writes: writes.length, missing: j.missing, latenciesMs: j.latenciesMs, all: latencyStats(j.latenciesMs), worstCaptureP99Ms: worstP99 };
   };
   const a = result([...arms.A1!.writes, ...arms.A2!.writes]);
   const b = result(arms.B!.writes);
@@ -519,6 +522,7 @@ async function install(f: Fleet, ws: Workspace) {
       await run('npm', ['ci', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: target, maxBuffer: 64 * MiB });
       return { method: 'npm ci --offline --ignore-scripts', ms: Date.now() - t0 };
     } catch (err) {
+      checkStopping();
       // Offline cache incomplete: fall back to copying this repo's tree, and say so.
       await run('cp', ['-R', join(REPO, 'node_modules'), join(target, 'node_modules')]);
       return { method: `copy of repo node_modules (npm ci failed: ${(err as Error).message.split('\n')[0]})`, ms: Date.now() - t0 };
@@ -565,10 +569,11 @@ function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
     const reads = worktreeReads(wt) + i.spawns;
     const metadata = Object.values(wt).reduce((a, b) => a + b, 0) - worktreeReads(wt);
     rows.push({ gate: 'no recurring worktree enumeration/reads after settling', scenario: name, threshold: '0 calls', measured: `${reads} worktree listings/stats/reads + git spawns (plus ${metadata} path resolutions)`, verdict: evaluateGate({ threshold: 0, measured: reads }), note: 'main-thread JS scope; native watcher I/O untraced' });
-    const failures = r.failures.length + (r.log.gapsByReason['watcher-error'] ?? 0) + i.compromised.length;
-    rows.push({ gate: 'watcher subscription failures', scenario: name, threshold: '0', measured: String(failures), verdict: evaluateGate({ threshold: 0, measured: failures }) });
     rows.push({ gate: 'FDs vs soft limit', scenario: name, threshold: `< 50% of ${fdSoftLimit}`, measured: `${i.fds}`, verdict: evaluateGate({ threshold: fdSoftLimit / 2 - 1, measured: i.fds }) });
     unsettled(rows.slice(firstRow), r.settle, true);
+    // An observed failure is a fact whether or not the fleet settled.
+    const failures = r.failures.length + (r.log.gapsByReason['watcher-error'] ?? 0) + i.compromised.length;
+    rows.push({ gate: 'watcher subscription failures', scenario: name, threshold: '0', measured: String(failures), verdict: evaluateGate({ threshold: 0, measured: failures }) });
   }
   for (const name of ['baseline-c0', 'baseline-c10']) {
     const r = results[name];
@@ -582,7 +587,7 @@ function gates(results: Record<string, any>, fdSoftLimit: number): GateRow[] {
     const r = results[name];
     if (!r) continue;
     const m = r.p99Regression;
-    const v = latencyVerdict({ regression: m, missingFractionA: r.armA.missingFraction, missingFractionB: r.armB.missingFraction, coverage: r.armB.baselineCoverage });
+    const v = latencyVerdict({ a: r.armA, b: r.armB, coverage: r.armB.baselineCoverage });
     const row: GateRow = { gate: 'p99 latency regression while another baselines', scenario: name, threshold: '<= 20%',
       measured: `${m === null ? 'n/a' : `${(m * 100).toFixed(1)}% (p99 ${r.armA.all.p99?.toFixed(0)} -> ${r.armB.all.p99?.toFixed(0)} ms)`}; missing A ${r.armA.missing}/${r.armA.writes}, B ${r.armB.missing}/${r.armB.writes}; arm B under a baseline ${(r.armB.baselineCoverage * 100).toFixed(1)}%`,
       verdict: v.verdict, ...(v.note ? { note: v.note } : {}) };
