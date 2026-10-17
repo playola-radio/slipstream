@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { evaluateGate, latencyStats, parseMemSize, parseTopLog, summarizeTop } from './analysis.ts';
+import { evaluateGate, joinLatencies, latencyStats, parseMemSize, parseTopLog, summarizeTop } from './analysis.ts';
 
 const TOP_LOG = `Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 2026/10/17 11:00:29
@@ -12,7 +12,7 @@ Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 2026/10/17 11:00:30
 
 PID    %CPU #TH MEM IDLEW CSW
-90371  1.5  9   11M+ 2     395+
+90371  1.5  9/1 11M+ 2     395+
 Processes: 1452 total, 4 running, 1448 sleeping, 8002 threads
 
 PID    %CPU #TH MEM IDLEW CSW
@@ -73,4 +73,33 @@ test('a bracketed measurement is inconclusive when the threshold sits inside the
 
 test('a gate with no measurement is unmeasured, never a pass', () => {
   assert.equal(evaluateGate({ threshold: 10 }), 'UNMEASURED');
+});
+
+test('capture latency joins each write to its change record and the first durable advance covering it', () => {
+  const r = joinLatencies({
+    writes: [
+      { sessionId: 'a', sha256: 'h1', writtenNs: 1_000_000_000n },
+      { sessionId: 'b', sha256: 'h2', writtenNs: 1_000_000_000n },
+      { sessionId: 'a', sha256: 'h3', writtenNs: 2_000_000_000n },
+    ],
+    changes: [{ sessionId: 'a', seq: 5n, sha256: 'h1' }, { sessionId: 'b', seq: 9n, sha256: 'h2' }],
+    timeline: [
+      { sessionId: 'a', seq: 4n, ns: 1_010_000_000n },
+      { sessionId: 'a', seq: 6n, ns: 1_050_000_000n },
+      { sessionId: 'b', seq: 9n, ns: 1_200_000_000n },
+    ],
+  });
+  assert.deepEqual(r.latenciesMs, [50, 200]);
+  assert.deepEqual(r.perSessionMs, { a: [50], b: [200] });
+  assert.equal(r.missing, 1, 'h3 never got its own change record (coalesced or not observed)');
+});
+
+test('a change whose durable advance was not recorded counts as missing, never as zero latency', () => {
+  const r = joinLatencies({
+    writes: [{ sessionId: 'a', sha256: 'h1', writtenNs: 10n }],
+    changes: [{ sessionId: 'a', seq: 5n, sha256: 'h1' }],
+    timeline: [],
+  });
+  assert.deepEqual(r.latenciesMs, []);
+  assert.equal(r.missing, 1);
 });

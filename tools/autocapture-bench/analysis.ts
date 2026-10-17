@@ -23,7 +23,8 @@ export function parseMemSize(text: string): number {
 /** `top` marks a changed value with a trailing `+` or `-`. */
 const strip = (field: string): string => field.replace(/[+-]$/, '');
 
-/** Parse `top -l N -s 1 -n 1000 -pid P -stats pid,cpu,th,mem,idlew,csw` output. */
+/** Parse `top -l N -s 1 -n 1000 -pid P -stats pid,cpu,th,mem,idlew,csw` output. #TH reads
+ * `total/running` while a thread runs. */
 export function parseTopLog(text: string, pid: number): TopSample[] {
   const samples: TopSample[] = [];
   for (const line of text.split('\n')) {
@@ -31,7 +32,7 @@ export function parseTopLog(text: string, pid: number): TopSample[] {
     if (fields.length !== 6 || fields[0] !== String(pid)) continue;
     const [, cpu, th, mem, idlew, csw] = fields.map(strip);
     samples.push({
-      cpuPercent: Number(cpu), threads: Number(th), memBytes: parseMemSize(mem!),
+      cpuPercent: Number(cpu), threads: Number(th!.split('/')[0]), memBytes: parseMemSize(mem!),
       idleWakeups: Number(idlew), contextSwitches: Number(csw),
     });
   }
@@ -87,4 +88,37 @@ export function evaluateGate(m: { threshold: number; measured?: number; lower?: 
   if (m.upper <= m.threshold) return 'PASS';
   if (m.lower > m.threshold) return 'FAIL';
   return 'INCONCLUSIVE';
+}
+
+export interface LatencyJoinInput {
+  /** One write per unique payload, stamped with process.hrtime after it completed. */
+  writes: { sessionId: string; sha256: string; writtenNs: bigint }[];
+  /** file.changed records read back from each session's log (after.sha256). */
+  changes: { sessionId: string; seq: bigint; sha256: string }[];
+  /** Durable-seq advances seen by the subject, in hrtime (same monotonic clock). */
+  timeline: { sessionId: string; seq: bigint; ns: bigint }[];
+}
+
+/** Write -> durable latency per write. A write with no change record of its own,
+ * or no recorded durable advance covering it, is counted as missing. */
+export function joinLatencies(input: LatencyJoinInput): { latenciesMs: number[]; perSessionMs: Record<string, number[]>; missing: number } {
+  const seqBySha = new Map(input.changes.map((c) => [`${c.sessionId}\0${c.sha256}`, c.seq]));
+  const timelines = new Map<string, { seq: bigint; ns: bigint }[]>();
+  for (const t of input.timeline) {
+    const list = timelines.get(t.sessionId) ?? [];
+    list.push(t);
+    timelines.set(t.sessionId, list);
+  }
+  const latenciesMs: number[] = [];
+  const perSessionMs: Record<string, number[]> = {};
+  let missing = 0;
+  for (const w of input.writes) {
+    const seq = seqBySha.get(`${w.sessionId}\0${w.sha256}`);
+    const durable = seq === undefined ? undefined : timelines.get(w.sessionId)?.find((t) => t.seq >= seq);
+    if (!durable) { missing++; continue; }
+    const ms = Number(durable.ns - w.writtenNs) / 1e6;
+    latenciesMs.push(ms);
+    (perSessionMs[w.sessionId] ??= []).push(ms);
+  }
+  return { latenciesMs, perSessionMs, missing };
 }
