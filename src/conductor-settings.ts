@@ -48,8 +48,20 @@ function parseValue(raw: string, path: string, line: number): string {
 
 interface Located { scripts: Scripts; lines: string[]; header?: number; at: Partial<Record<ScriptKind, number>> }
 
-function opensMultilineString(line: string): boolean {
-  return /^\s*[^#=]+\s*=\s*(?:"""|''')/.test(line);
+function usesMultilineString(line: string): boolean {
+  let quote: '"' | "'" | undefined;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i]!;
+    if (!quote) {
+      if (char === '#') return false;
+      if ((char === '"' || char === "'") && line.slice(i, i + 3) === char.repeat(3)) return true;
+      if (char === '"' || char === "'") quote = char;
+      continue;
+    }
+    if (quote === '"' && char === '\\') { i += 1; continue; }
+    if (char === quote) quote = undefined;
+  }
+  return false;
 }
 
 function locate(text: string, path: string): Located {
@@ -59,7 +71,7 @@ function locate(text: string, path: string): Located {
   let table: string | null = '';
   let found: number | undefined;
   for (const [i, line] of lines.entries()) {
-    if (opensMultilineString(line)) throw unsupported(path, i + 1, 'uses a multi-line string');
+    if (usesMultilineString(line)) throw unsupported(path, i + 1, 'uses a multi-line string');
     if (ARRAY_HEADER.test(line)) { table = null; continue; }
     const header = HEADER.exec(line);
     if (header) {

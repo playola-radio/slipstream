@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
+import { createLog } from './log.ts';
 import { admitCapture, emptyIntent } from './capture-intent.ts';
 import { loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
 import { publishTombstone } from './maintenance.ts';
@@ -429,6 +430,9 @@ describe('linked chats across a daemon restart', () => {
       await rm(join(store, 'chat-a.jsonl'));
       ({ call } = await start());
       await waitForRow(call, id, (row) => (row.binding as Record<string, unknown>).state === 'unavailable');
+      for (let i = 0; i < 300 && (await loadIntent(store)).bindings[0]?.unavailable?.reason !== 'transcript-missing'; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       assert.equal((await bindingState(call, id)).reason, 'transcript-missing');
       assert.equal((await loadIntent(store)).bindings[0]?.unavailable?.reason, 'transcript-missing');
       assert.deepEqual(rec(await call({ verb: 'status' })).binding_slots, { used: 1, limit: 10 });
@@ -456,6 +460,53 @@ describe('linked chats across a daemon restart', () => {
       await waitForRow(call, id, (row) => (row.binding as Record<string, unknown>).state === 'setup_pending');
       await connect(call, store, 'chat-a', a!);
       assert.equal((await bindingState(call, id)).state, 'connected');
+    });
+  });
+
+  it('unlinks while a failed recovery rearm is waiting to retry', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      await stop();
+      const fake = createRootsPlatform();
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredAppend = new Promise<void>((resolve) => { entered = resolve; });
+      const releaseAppend = new Promise<void>((resolve) => { release = resolve; });
+      ({ call } = await start({
+        retryBackoff: { baseMs: 300, maxMs: 300 },
+        captureDependencies: {
+          platform: fake.platform,
+          enumerate: async () => {},
+          readQuestionContext: async () => 'selected',
+          createLog: async (options) => {
+            const log = await createLog(options);
+            return {
+              ...log,
+              append: async (input) => {
+                if (input.type === 'slipstream.agent.connection.v1') {
+                  entered();
+                  await releaseAppend;
+                }
+                return log.append(input);
+              },
+            };
+          },
+        },
+      }));
+      await enteredAppend;
+      const unlink = call({ verb: 'unlink', session_id: id });
+      await Promise.race([
+        (async () => {
+          while ((await loadIntent(store)).bindings[0]?.intent !== 'revoked') await new Promise((resolve) => setTimeout(resolve, 5));
+        })(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('unlink waited for rearm publication')), 100)),
+      ]);
+      release();
+      const result = await unlink;
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal((await loadIntent(store)).bindings[0]?.intent, 'revoked');
     });
   });
 });
@@ -506,6 +557,7 @@ describe('a capture whose root or watcher goes away', () => {
       await rm(a!, { recursive: true });
       fake.observe(a!, '');
       await waitForLog(store, id, (l) => stoppedFor(l) === 'root-missing');
+      await waitForRow(call, id, (row) => row.state === 'stopped');
       await mkdir(join(a!, 'inner'), { recursive: true });
       const inner = await call({ verb: 'attach', mode: 'watch-only', worktree: join(a!, 'inner') });
       assert.equal(inner.ok, true, JSON.stringify(inner));

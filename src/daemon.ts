@@ -242,6 +242,8 @@ interface Binding {
   unavailable?: boolean;
   /** Failed revalidations in this activation; the next retry backs off by it. */
   revalidations?: number;
+  rearmTimer?: NodeJS.Timeout;
+  cancelRearmDelay?: () => void;
 }
 
 /** One start of a capture. A lock-loss callback acts only on the activation that
@@ -400,7 +402,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function doTeardown(): Promise<void> {
     torn = true;
-    for (const c of captures.values()) clearTimeout(c.retryTimer);
+    for (const c of captures.values()) {
+      clearTimeout(c.retryTimer);
+      if (c.binding) cancelRearm(c.binding);
+    }
     // Drop live control connections so server.close() cannot block on an idle or
     // half-sent request.
     for (const sock of connections) sock.destroy();
@@ -995,16 +1000,35 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         if (!failed) return;
         const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
         b.revalidations = (b.revalidations ?? 0) + 1;
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (!await waitForRearmDelay(b, delay)) return;
         if (c.binding !== b || c.session !== session || c.lifecycle !== 'recording' || torn || compromised) return;
       }
     })();
     b.publishing = rearm;
-    c.inflight.add(rearm);
     void rearm.finally(() => {
-      c.inflight.delete(rearm);
       if (b.publishing === rearm) b.publishing = undefined;
     });
+  }
+
+  function waitForRearmDelay(b: Binding, delay: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (b.cancelRearmDelay === cancel) b.cancelRearmDelay = undefined;
+        resolve(true);
+      }, delay);
+      const cancel = () => {
+        clearTimeout(timer);
+        if (b.cancelRearmDelay === cancel) b.cancelRearmDelay = undefined;
+        resolve(false);
+      };
+      b.cancelRearmDelay = cancel;
+    });
+  }
+
+  function cancelRearm(b: Binding): void {
+    clearTimeout(b.rearmTimer);
+    b.rearmTimer = undefined;
+    b.cancelRearmDelay?.();
   }
 
   /** Revalidate a linked chat's transcript in a new activation, then publish it
@@ -1026,11 +1050,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // this binding is still the capture's in this activation.
       const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
       b.revalidations = (b.revalidations ?? 0) + 1;
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        if (b.rearmTimer === timer) b.rearmTimer = undefined;
         if (c.binding === b && b.unavailable && c.session === session && c.lifecycle === 'recording' && !torn && !compromised) {
           startRearm(c, b, session);
         }
-      }, delay).unref();
+      }, delay);
+      b.rearmTimer = timer;
+      timer.unref();
       return undefined;
     }
     b.unavailable = false;
@@ -1382,6 +1409,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // Detach already revoked the binding's intent with the withdrawal.
     const b = c.binding;
     c.binding = undefined;
+    if (b) cancelRearm(b);
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
     if (!session) {
@@ -1410,7 +1438,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const c = nonEmptyString(req.session_id) ? captures.get(req.session_id) : undefined;
     if (!c) return errFields('TARGET_NOT_FOUND', `no capture with session ${String(req.session_id)}`);
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    await c.binding?.publishing;
     const b = c.binding;
     if (!b) {
       // An unlink still being saved is not yet acknowledged to anyone.
@@ -1420,6 +1447,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const refused = intentRefusal();
     if (refused) return refused;
     c.binding = undefined;
+    cancelRearm(b);
     revokeBinding(intent, c.id);
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const persisted = persistIntent();

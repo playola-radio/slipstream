@@ -33,6 +33,7 @@ describe('reading Conductor scripts', () => {
     ['an escaped script key', '[scripts]\n"s\\u0065tup" = "npm ci"\n'],
     ['a multi-line string elsewhere in the file', '[notes]\ntext = \'\'\'\n[scripts]\nsetup = "x"\n\'\'\'\n'],
     ['a multi-line basic string elsewhere in the file', '[notes]\ntext = \"\"\"\nsetup = "x"\n\"\"\"\n[ui]\nx = 1\n'],
+    ['a multi-line string inside an array', '[notes]\nitems = [\"\"\"\n[scripts]\nsetup = "x"\n[other]\n\"\"\"]\n'],
   ] as const) {
     it(`refuses ${name} rather than guess`, () => {
       assert.throws(() => readTomlScripts(text, P), (err: Error) => err instanceof SettingsError && err.message.startsWith(`${P}:`));
