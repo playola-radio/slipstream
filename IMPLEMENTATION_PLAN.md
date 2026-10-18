@@ -172,8 +172,13 @@ checks, root-missing and watcher-failed stops, the LaunchAgent, `slipstream
 conductor install|setup|archive|enroll`) merged (#72). P4 (delete an inactive
 session while other captures record; gc stops every capture for maintenance,
 sweeps, and resumes each under its own id with linked chats back to setup
-pending; standalone `watch`/`serve` hold the store lock) is in review on
-`briankeane/autocapture-p4-maintenance`. P6 Not Started.
+pending; standalone `watch`/`serve` hold the store lock) merged (#75). P4b (gc
+waits for captures still closing) is separate and not merged. P6 In Progress: P6b
+(daemon release acceptance: `docs/autocapture/acceptance.md` maps every
+acceptance requirement to tests, the observed Conductor launch order is in the
+README, and `docs/autocapture/real-use-check.md` is the real-use runbook) is in
+review on `briankeane/autocapture-p6b-acceptance`. P6a (native app) is separate.
+The real-use day (the D8 verdict) has not been run; the feature is not complete.
 
 Known later work: after P5b an idle cycle still walks the Codex sessions tree once and
 stats each transcript, but reopens none whose header it already has; whether

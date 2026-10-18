@@ -4,11 +4,12 @@
  * Install chains `slipstream conductor setup` / `archive` into the personal
  * Conductor scripts (`~/.conductor/settings.toml`) and, for a repo that defines
  * its own scripts and so overrides the personal ones, into that repo's
- * `.conductor/settings.local.toml`, ahead of the repo's own command. Conductor's
- * documentation says setup runs after it creates a workspace and archive runs
- * before it archives one; it does not say whether the agent may start before
- * setup finishes, so capture can begin after an agent's first edits. The first
- * baseline is then the first state observed, never a claim of the original one.
+ * `.conductor/settings.local.toml`, ahead of the repo's own command. Conductor
+ * runs setup after it creates a workspace and archive before it archives one,
+ * but it was observed (README, "Capture every Conductor workspace") starting the
+ * agent without waiting for setup to finish, so capture can begin after an
+ * agent's first edits. The first baseline is then the first state observed,
+ * never a claim of the original one.
  */
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -199,9 +200,9 @@ async function install(deps: InstallDeps): Promise<number> {
   deps.out(`Personal Conductor scripts: ${personalPath}`);
   for (const path of chained) deps.out(`Repo override: ${path}`);
   for (const note of notes) deps.out(note);
-  deps.out('Conductor runs setup after it creates a workspace. Its documentation does not say whether the agent can '
-    + 'start before setup finishes, so a capture may begin after the agent\'s first edits; Slipstream then records '
-    + 'the first state it sees as the baseline.');
+  deps.out('Conductor runs setup after it creates a workspace but does not wait for it to finish before starting '
+    + 'the agent, so a capture may begin after the agent\'s first edits; Slipstream then records the first state it '
+    + 'sees as the baseline.');
   deps.out('Run `slipstream conductor enroll` to capture workspaces that already exist. '
     + 'Run this install again after upgrading Node or Slipstream.');
   return 0;

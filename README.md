@@ -189,9 +189,21 @@ when all 16 capture slots are in use). In that case Slipstream prints the reason
 and the setup script still fails, so the workspace shows that it isn't recording.
 Archiving a workspace stops its capture first and keeps the history; the repo's
 own archive script runs even if that stop fails.
-Conductor's documentation doesn't say whether the agent can start before setup
-finishes, so a capture may begin after the agent's first edits. In that case the
-first recorded state is whatever was there when recording started.
+Conductor does not wait for setup to finish before starting the agent. On this
+machine (October 2026), the agent's first tool call came about 10–15 seconds
+after the workspace was created, whatever the setup was doing. In a repo whose
+setup builds container images, setup ran for about 100 seconds and the agent
+made 14 tool calls before it ended. Slipstream runs first in setup, but whether
+recording is ready before the agent's first edit was not measured. If the agent
+edits first, the first recorded state is whatever was there when recording
+started, and those earlier edits are not shown as changes.
+
+Conductor removes an archived workspace's folder. Archive scripts were seen to
+run while the folder was still there (they could still use files in it), but
+whether Conductor waits for an archive script to finish before removing the
+folder was not observed. [real-use-check.md](docs/autocapture/real-use-check.md)
+has a direct check: an archived workspace's capture should end `stopped
+(archived)`, not `root-missing`.
 
 `enroll` reads Conductor's own list of workspaces that aren't archived, including
 sleeping ones. It captures them most recently active first. Past 16, the rest
