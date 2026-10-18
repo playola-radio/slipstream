@@ -165,9 +165,9 @@ blobs on start, P2 counting tests) is in review on
 `briankeane/autocapture-p2-multicapture`; its capture and binding intent is
 in memory only until P3. P3–P6 Not Started.
 
-Known later work: durable intent and restart recovery (P3); GC while captures run
-(P4; today `gc` still requires every capture detached, while deleting a stopped
-session no longer does); share transcript discovery across captures instead of
+Known later work: durable intent and restart recovery (P3); GC and session
+deletion while captures run (P4; today both still require every capture
+detached); share transcript discovery across captures instead of
 one `~/.codex/sessions` scan per capture (P5).
 
 Auto-connect findings (2026-09-27 research, not decisions): split "capture the
