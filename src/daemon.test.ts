@@ -8,6 +8,7 @@ import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts
 import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
+import { StorageError } from './storage.ts';
 import { createCas } from './cas.ts';
 import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
@@ -1847,16 +1848,31 @@ function createRootsPlatform() {
   };
 }
 
+/** A log whose store can be made to refuse every append and reopen with ENOSPC. */
+function fillableStore(): { full: boolean; createLog: typeof createLog } {
+  const enospc = () => new StorageError('append', Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }));
+  const store: { full: boolean; createLog: typeof createLog } = {
+    full: false,
+    createLog: (async (o) => {
+      if (store.full) throw enospc();
+      const log = await createLog(o);
+      return { ...log, append: (input) => store.full ? Promise.reject(enospc()) : log.append(input) };
+    }) as typeof createLog,
+  };
+  return store;
+}
+
 /** A daemon plus a supply of sibling workspace roots under one temp dir. */
 async function withCaptures(
   fn: (ctx: { store: string; call: Call; daemon: Daemon; roots: (n: number) => Promise<string[]>;
     fake: ReturnType<typeof createRootsPlatform> }) => Promise<void>,
+  deps: Parameters<typeof startDaemon>[0]['captureDependencies'] = {},
 ): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-daemon-table-'));
   const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-table-roots-')));
   const fake = createRootsPlatform();
   const daemon = await startDaemon({ storeDir: store, captureDependencies: {
-    platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
+    platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', ...deps,
   } });
   let made = 0;
   const roots = async (n: number): Promise<string[]> => {
@@ -1940,6 +1956,35 @@ describe('daemon capture table', () => {
       assert.deepEqual([rec(again).session_id, rec(again).state, String(rec(again).created)], [rec(x!).session_id, 'recording', 'false']);
       assert.equal((await readdir(join(store, 'sessions'))).length, 1);
     });
+  });
+
+  it('keeps refusing a workspace inside one whose capture is still stopping', async () => {
+    let release!: () => void;
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    const holdStops: typeof createLog = async (o) => {
+      const log = await createLog(o);
+      return { ...log, append: async (input) => {
+        if (input.type === 'slipstream.capture.stopped.v1') { held(); await gate; }
+        return log.append(input);
+      } };
+    };
+    await withCaptures(async ({ call, roots }) => {
+      const [a] = await roots(1);
+      await mkdir(join(a!, 'sub'));
+      await attachWatchOnly(call, a!);
+      const detaching = call({ verb: 'detach', target: a! });
+      try {
+        await isHeld;
+        const inside = await call({ verb: 'attach', mode: 'watch-only', worktree: join(a!, 'sub') });
+        assert.equal(inside.ok === false && inside.code, 'ROOT_OVERLAP');
+      } finally {
+        release();
+      }
+      assert.equal(rec(await detaching).state, 'stopped');
+      await attachWatchOnly(call, join(a!, 'sub'));
+    }, { createLog: holdStops });
   });
 
   it('refuses a workspace that contains or sits inside a recorded one, and allows siblings', async () => {
@@ -2116,6 +2161,38 @@ describe('daemon capture table', () => {
     });
   });
 
+  it('does not acknowledge a task to a chat unlinked while it was being recorded', async () => {
+    let release!: () => void;
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => { held = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    const holdTasks: typeof createLog = async (o) => {
+      const log = await createLog(o);
+      return { ...log, append: async (input) => {
+        if (input.type === 'slipstream.task.started.v1') { held(); await gate; }
+        return log.append(input);
+      } };
+    };
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      await linkChat(call, store, a!, 'c1');
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const task = call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!) });
+      let unlinking: Promise<ResponseEnvelope>;
+      try {
+        await isHeld;
+        unlinking = call({ verb: 'unlink', session_id: id });
+        await waitForRow(call, id, (r) => (r.binding as { state?: string } | null)?.state === 'unlinked', 'the unlink');
+      } finally {
+        release();
+      }
+      const res = await task;
+      assert.equal(res.ok === false && res.code, 'STALE_BINDING');
+      assert.equal((await unlinking).ok, true);
+    }, { createLog: holdTasks });
+  });
+
   it('routes tasks, questions and answers by chat identity across captures', async () => {
     await withCaptures(async ({ store, call, roots }) => {
       const [a, b] = await roots(2);
@@ -2144,6 +2221,42 @@ describe('daemon capture table', () => {
     });
   });
 
+  it('reports a capture whose store stops accepting events as not recording', async () => {
+    const disk = fillableStore();
+    await withCaptures(async ({ call, roots, fake }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      await writeFile(join(a!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(a!, 'x.ts');
+      const row = await waitForRow(call, idA, (r) => r.state !== 'recording', 'the full store to be reported');
+      assert.deepEqual([row.state, row.reason], ['not_recording', 'storage-unavailable']);
+      disk.full = false;
+      await waitForRow(call, idA, (r) => r.state === 'recording', 'recovery');
+      assert.equal((await captureRow(call, idB)).state, 'recording');
+    }, { createLog: disk.createLog });
+  });
+
+  it('never reports a detach as stopped when the stop could not be recorded', async () => {
+    const disk = fillableStore();
+    await withCaptures(async ({ store, call, roots, fake }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      await writeFile(join(a!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(a!, 'x.ts');
+      await waitForRow(call, id, (r) => r.reason === 'storage-unavailable', 'the full store to be reported');
+      const res = await call({ verb: 'detach', target: id });
+      assert.equal(res.ok, false);
+      assert.equal(res.ok === false ? res.code : '', 'STORAGE_UNAVAILABLE');
+      const row = await captureRow(call, id);
+      assert.deepEqual([row.state, row.reason], ['not_recording', 'stop-unconfirmed']);
+      assert.ok(!(await readLog(store, id)).some((e) => e.type === 'slipstream.capture.stopped.v1'));
+      disk.full = false;
+    }, { createLog: disk.createLog });
+  });
+
   it('lets independent readers follow each capture and lists every capture', async () => {
     await withCaptures(async ({ store, daemon, call, roots, fake }) => {
       const [a, b] = await roots(2);
@@ -2155,7 +2268,13 @@ describe('daemon capture table', () => {
       const auth = { headers: { authorization: `Bearer ${daemon.readerToken}` } };
       const events = async (id: string) => (await (await fetch(`${daemon.readerUrl}/v1/sessions/${id}/events?after=0`, auth)).text())
         .split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogRecord);
-      assert.ok((await events(idA)).some((e) => e.data.path === 'only-a.ts'));
+      // The reader publishes up to the durable boundary, which can trail the file.
+      let seen = false;
+      for (let i = 0; i < 100 && !seen; i++) {
+        seen = (await events(idA)).some((e) => e.data.path === 'only-a.ts');
+        if (!seen) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(seen, 'the reader serves capture A\'s change');
       assert.equal((await events(idB)).some((e) => e.data.path === 'only-a.ts'), false);
       const listed = await (await fetch(`${daemon.readerUrl}/v1/captures`, auth)).json() as { captures: Array<{ session_id: string; state: string }> };
       assert.deepEqual(listed.captures.map((r) => [r.session_id, r.state]).sort(), [[idA, 'recording'], [idB, 'recording']].sort());

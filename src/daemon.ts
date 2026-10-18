@@ -9,7 +9,7 @@ import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
-import { acquireSessionLock, SessionOwnedError, type SessionLock } from './lock.ts';
+import { acquireSessionLock, SessionOwnedError, STALE_MS, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
 import { isValidSessionId, listSessions, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { CorruptLogError } from './recovery.ts';
@@ -439,6 +439,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     if (entry.intent === 'waiting') return { state: 'not_recording', reason: 'capture-limit-reached', message: CAPTURE_LIMIT_MESSAGE };
     if (entry.last_failure) return { state: 'not_recording', reason: entry.last_failure.reason, message: entry.last_failure.message };
+    const health = c.session?.health.snapshot().state;
+    if (health === 'failing' || health === 'recovering') {
+      return { state: 'not_recording', reason: 'storage-unavailable', message: `the store cannot accept events (${health}); capture resumes when it recovers` };
+    }
     if (c.lifecycle === 'recording' || c.lifecycle === 'baselining') return { state: c.lifecycle, reason: null };
     return { state: 'queued', reason: null };
   }
@@ -478,9 +482,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function capturesProjection(): Promise<Record<string, unknown>> {
     const asOf = Date.now();
     const rows = await Promise.all([...captures.values()].map(async (c) => {
-      const { state, reason } = publicState(c);
+      let { state, reason } = publicState(c);
       let heartbeat: number | null = null;
       try { heartbeat = Math.trunc((await stat(join(storeDir, 'sessions', c.id, 'owner.lock'))).mtimeMs); } catch { /* no owner */ }
+      // A live owner is the public liveness rule (contracts.md §7): an owned state
+      // without a fresh heartbeat is not confirmed live.
+      if ((state === 'recording' || state === 'baselining') && (heartbeat === null || asOf - heartbeat > STALE_MS)) {
+        state = 'not_recording';
+        reason = 'daemon-unavailable';
+      }
       return { session_id: c.id, root: c.root, state, reason, retry: null, capture_mode: 'watch-only', heartbeat_ms: heartbeat,
         binding: bindingRow(c) };
     }));
@@ -548,8 +558,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const joined = await pending;
       return isErrorFields(joined) ? joined : { capture: joined.capture, created: false };
     }
-    const other = [...[...captures.values()].filter(isLive).map((c) => c.root), ...admitting.keys()]
-      .find((r) => overlaps(r, root));
+    // A withdrawn capture still watches its root until its stop completes.
+    const watching = [...captures.values()].filter((c) => isLive(c) || c.lifecycle === 'stopping');
+    const other = [...watching.map((c) => c.root), ...admitting.keys()].find((r) => overlaps(r, root));
     if (other) {
       return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
     }
@@ -1001,7 +1012,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return undefined;
   }
 
-  async function track<T>(c: Capture, promise: Promise<T>, ok: (v: T) => Record<string, unknown>): Promise<Record<string, unknown> | ErrorFields> {
+  async function track<T>(c: Capture, promise: Promise<T>, ok: (v: T) => Record<string, unknown> | ErrorFields): Promise<Record<string, unknown> | ErrorFields> {
     c.inflight.add(promise);
     try {
       return ok(await promise);
@@ -1043,9 +1054,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const stale = staleBinding(req, c, b);
     if (stale) return stale;
     if (b.check.state !== 'connected') return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
-    return track(c, c.session!.beginTask({ title: req.title, requestId: req.request_id }), (r) => ({
-      session_id: r.session_id, task_id: r.task_id, event_id: r.event_id, seq: r.seq,
-    }));
+    return track(c, c.session!.beginTask({ title: req.title, requestId: req.request_id }), (r) => c.binding !== b
+      ? errFields('STALE_BINDING', `task ${r.task_id} was recorded, but this chat was unlinked before it could be acknowledged`)
+      : { session_id: r.session_id, task_id: r.task_id, event_id: r.event_id, seq: r.seq });
   }
 
   /** Queue a question on the capture the app names. `askQuestion` installs its own
@@ -1156,15 +1167,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   // ---- maintenance --------------------------------------------------------
 
-  /** Admit and run a maintenance op while none of `affected` (by default every
-   * capture) is live, starting or stopping. The slot is claimed synchronously
-   * through `maintenanceInFlight`, so it cannot interleave with an admission. */
+  /** Admit and run a maintenance op while no capture is live, starting or
+   * stopping. The slot is claimed synchronously through `maintenanceInFlight`,
+   * so it cannot interleave with an admission. */
   async function runMaintenance(
     op: () => Promise<Record<string, unknown> | ErrorFields>,
-    affected: (c: Capture) => boolean = () => true,
   ): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    const busy = [...captures.values()].find((c) => affected(c) && (isLive(c) || c.session || c.lifecycle === 'stopping'));
+    const busy = [...captures.values()].find((c) => isLive(c) || c.session || c.lifecycle === 'stopping');
     if (busy) {
       return errFields('SESSION_ACTIVE', `the capture of ${busy.root} (session ${busy.id}) is ${publicState(busy).state}; `
         + 'detach it first');
@@ -1225,7 +1235,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
       }
       return { session_id: id };
-    }, (c) => c.id === id);
+    });
   }
 
   async function gc(): Promise<Record<string, unknown> | ErrorFields> {
