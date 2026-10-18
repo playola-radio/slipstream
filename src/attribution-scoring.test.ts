@@ -60,64 +60,72 @@ describe('attribution scoring', () => {
       assert.deepEqual(r.evidenceSeqs, [4n, 6n]);
     });
 
-    it('the same tool call in a forked conversation counts once -> heuristic', () => {
-      const original = inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] });
-      const copy = inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] });
-      const r = evaluateChange({
-        path: 'src/a.ts',
-        interval,
-        policy: POLICY,
-        invocations: [original, copy],
-      });
+    const copyA = () => inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] });
+    const copyB = () => inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] });
+    const run = (invocations: Invocation[]) =>
+      evaluateChange({ path: 'src/a.ts', interval, policy: POLICY, invocations });
+
+    it('identical copies of a tool call in a forked conversation count once and cite every copy', () => {
+      const r = run([copyA(), copyB()]);
       assert.equal(r.status, 'heuristic');
       assert.equal(r.reason, 'single-candidate');
-      assert.deepEqual(r.evidenceSeqs, [12n, 13n]);
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 17n, 19n]);
     });
 
-    it('the same forked tool call gives the same result regardless of listing order', () => {
-      const original = inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] });
-      const copy = inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] });
-      const r = evaluateChange({
-        path: 'src/a.ts',
-        interval,
-        policy: POLICY,
-        invocations: [copy, original],
-      });
+    it('identical copies give the same result regardless of listing order', () => {
+      const r = run([copyB(), copyA()]);
       assert.equal(r.status, 'heuristic');
       assert.equal(r.reason, 'single-candidate');
-      assert.deepEqual(r.evidenceSeqs, [12n, 13n]);
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 17n, 19n]);
     });
 
     it('a copied call plus a different call stays ambiguous', () => {
-      const r = evaluateChange({
-        path: 'src/a.ts',
-        interval,
-        policy: POLICY,
-        invocations: [
-          inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] }),
-          inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] }),
-          inv({ keyStr: 'a2', key: key('toolu_2', 'A'), evidenceSeqs: [21n] }),
-        ],
-      });
+      const r = run([
+        copyA(),
+        copyB(),
+        inv({ keyStr: 'a2', key: key('toolu_2', 'A'), evidenceSeqs: [21n] }),
+      ]);
       assert.equal(r.status, 'ambiguous');
       assert.equal(r.reason, 'multiple-candidates');
-      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 21n]);
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 17n, 19n, 21n]);
     });
 
     it('the same record id under different harnesses is two candidates', () => {
-      const r = evaluateChange({
-        path: 'src/a.ts',
-        interval,
-        policy: POLICY,
-        invocations: [
-          inv({ keyStr: 'cc', key: key('toolu_1', 'A'), evidenceSeqs: [12n] }),
-          inv({
-            keyStr: 'cx',
-            key: { harness: 'codex', harness_session_id: 'A', record_id: 'toolu_1' },
-            evidenceSeqs: [14n],
-          }),
-        ],
-      });
+      const r = run([
+        inv({ keyStr: 'cc', key: key('toolu_1', 'A'), evidenceSeqs: [12n] }),
+        inv({
+          keyStr: 'cx',
+          key: { harness: 'codex', harness_session_id: 'A', record_id: 'toolu_1' },
+          evidenceSeqs: [14n],
+        }),
+      ]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+    });
+
+    it('copies with different timestamps are not collapsed', () => {
+      const r = run([copyA(), { ...copyB(), minAtMs: 1500, maxAtMs: 1500 }]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+    });
+
+    it('a conflicted member stops the group collapsing and is disclosed', () => {
+      const r = run([
+        { ...copyA(), conflicted: true },
+        copyB(),
+        inv({ keyStr: 'c1', key: key('toolu_1', 'C'), evidenceSeqs: [23n, 24n] }),
+      ]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+      assert.deepEqual(r.evidenceSeqs, [17n, 19n, 23n, 24n]);
+      assert.deepEqual(
+        r.excludedConflicts.map((k) => k.harness_session_id),
+        ['A'],
+      );
+    });
+
+    it('copies with different known paths are not collapsed', () => {
+      const r = run([copyA(), { ...copyB(), knownPaths: ['src/a.ts', 'src/b.ts'] }]);
       assert.equal(r.status, 'ambiguous');
       assert.equal(r.reason, 'multiple-candidates');
     });
