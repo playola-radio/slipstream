@@ -15,7 +15,7 @@ import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import {
-  captureRow, chatOf, claimOf, controlCall, createRootsPlatform, linkChat, readLog, rec, waitForLog, waitForRow,
+  captureRow, chatOf, claimOf, controlCall, createRootsPlatform, fillableStore, linkChat, readLog, rec, waitForLog, waitForRow,
   type Call, type CallRequest, type LogRecord,
 } from './test/daemon-harness.ts';
 import type { PublicEventInput } from './public-events.ts';
@@ -1136,14 +1136,6 @@ describe('daemon maintenance verbs', () => {
       assert.equal(await exists(blobPath(store, HEX_DEAD)), false);
     });
   });
-
-  it('refuses to gc while any capture is recording', async () => {
-    await withDaemon(async ({ worktree, call }) => {
-      await attachWatchOnly(call, worktree);
-      const res = await call({ verb: 'gc' });
-      assert.equal(res.ok === false && res.code, 'SESSION_ACTIVE');
-    });
-  });
 });
 
 describe('daemon singleton', () => {
@@ -1730,17 +1722,17 @@ describe('daemon workspace resume concurrency', () => {
     return { workspaceLookup, release, entering };
   }
 
-  it('refuses delete_session and gc while an attach is still looking up the workspace', { timeout: 30_000 }, async () => {
+  it('lets delete_session run beside an attach still looking up its workspace, and gc wait for it', { timeout: 30_000 }, async () => {
     const held = heldLookup();
     await withResumeDaemon(async ({ worktree, call }) => {
       const attachP = call({ verb: 'attach', mode: 'watch-only', worktree });
       await held.entering;
       const del = await call({ verb: 'delete_session', session_id: ABSENT_ID });
-      assert.equal(del.ok === false && del.code, 'SESSION_ACTIVE');
-      const gc = await call({ verb: 'gc' });
-      assert.equal(gc.ok === false && gc.code, 'SESSION_ACTIVE');
+      assert.equal(del.ok === false && del.code, 'SESSION_NOT_FOUND');
+      const gcP = call({ verb: 'gc' });
       held.release();
       assert.equal((await attachP).ok, true);
+      assert.equal((await gcP).ok, true);
     }, { workspaceLookup: held.workspaceLookup });
   });
 
@@ -1784,20 +1776,6 @@ describe('daemon workspace resume concurrency', () => {
 
 /** A platform holding one fake subscription per watched root, so a test can
  * drive or break one capture's watcher while the others keep running. */
-
-/** A log whose store can be made to refuse every append and reopen with ENOSPC. */
-function fillableStore(): { full: boolean; createLog: typeof createLog } {
-  const enospc = () => new StorageError('append', Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }));
-  const store: { full: boolean; createLog: typeof createLog } = {
-    full: false,
-    createLog: (async (o) => {
-      if (store.full) throw enospc();
-      const log = await createLog(o);
-      return { ...log, append: (input) => store.full ? Promise.reject(enospc()) : log.append(input) };
-    }) as typeof createLog,
-  };
-  return store;
-}
 
 /** A daemon plus a supply of sibling workspace roots under one temp dir. */
 async function withCaptures(

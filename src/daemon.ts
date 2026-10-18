@@ -50,7 +50,8 @@ import {
  * verb WRITES public events, maintains the store, or reports state; none reads or
  * serves the feed — readers get the feed through the public HTTP view like any
  * other client. There is no privileged back channel for reading. delete_session
- * and gc run only while no capture intent exists and no capture is stopping.
+ * removes an inactive session while other captures keep recording; gc stops every
+ * capture for maintenance, sweeps, and resumes each one (D9).
  *
  * Captures are isolated from each other: one capture's failed baseline, lost
  * session lock or watcher error marks only that capture not recording.
@@ -265,12 +266,13 @@ interface Activation {
 }
 
 /** Why an activation ended on its own, with its capture intent still running. */
-type EndReason = 'root-missing' | 'watcher-failed';
+type EndReason = 'root-missing' | 'watcher-failed' | 'maintenance';
 type RootIdentity = { dev: string; ino: string };
 
 const END_MESSAGES: Record<EndReason, string> = {
   'root-missing': 'the workspace root was deleted or replaced; a directory recreated at that path is a new capture',
   'watcher-failed': 'the watcher stopped delivering changes for this workspace',
+  'maintenance': 'stopped while gc reclaims storage; it resumes on its own afterwards',
 };
 
 /** A capture's runtime. Its intent (running / waiting / withdrawn, last failure)
@@ -373,11 +375,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
    * Recreated after maintenance, which may delete blobs it trusts. */
   let cas: Cas | undefined;
   const connections = new Set<Socket>();
-  // At most one maintenance op (delete_session / gc) runs at a time, and only
-  // while the captures it affects are not live. The slot is claimed synchronously in
-  // runMaintenance before its first await, and admission refuses while it is
-  // held — so a single-threaded turn makes them mutually exclusive without a lock.
+  // At most one maintenance op (delete_session / gc) runs at a time. The slot is
+  // claimed synchronously in runMaintenance before its first await.
   let maintenanceInFlight: Promise<unknown> | undefined;
+  /** A gc is stopping, sweeping or resuming: no capture is admitted or started
+   * and no chat is linked or unlinked until it is done. */
+  let quiescing = false;
+  /** The session a delete_session is removing, for the whole operation, and every
+   * session deleted in this run: neither is ever resumed by an attach whose lookup
+   * found it first. */
+  let deleting: string | undefined;
+  const deleted = new Set<string>();
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
@@ -750,7 +758,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       else registry.reserve(id);
       if (entry.intent !== 'running') continue;
       const stoppedFor = last?.type === 'slipstream.capture.stopped.v1' ? (last.data as { reason?: unknown } | null)?.reason : undefined;
-      if (stoppedFor === 'root-missing' || stoppedFor === 'watcher-failed') c.ended = stoppedFor;
+      if (stoppedFor === 'root-missing' || stoppedFor === 'watcher-failed' || stoppedFor === 'maintenance') c.ended = stoppedFor;
       // Connection state is not persisted: a linked chat comes back pending and is
       // revalidated when its capture activates (contracts.md §8).
       const linked = intent.bindings.find((b) => b.session_id === id && b.intent === 'linked');
@@ -814,6 +822,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const refused = intentRefusal();
     if (refused) return refused;
     const identity = await rootIdentityOf(root);
+    if (quiescing) return errFields('CAPTURE_NOT_READY', 'gc is reclaiming storage; retry shortly');
     const live = liveCaptureAt(root, identity);
     if (live) return retryIfFailed(live);
     const pending = admitting.get(root);
@@ -828,9 +837,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (other) {
       return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
     }
-    // Admission and maintenance exclude each other: both claim their slot in the
-    // same synchronous turn as this check.
-    if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'a maintenance operation is running; retry shortly');
     const p = admitNew(root, identity);
     admitting.set(root, p);
     try {
@@ -869,6 +875,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: the daemon is shutting down or lost its store lock. ${RETRY_REMEDY}`);
       }
       return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    }
+    // Checked in the same turn as the intent entry below, which a delete checks.
+    if (match && (deleting === id || deleted.has(id))) {
+      return errFields('CAPTURE_NOT_READY', `session ${id} was deleted while this attach looked it up; retry attach`);
     }
     if (match) {
       // Pin the boundary at the durable high-water BEFORE the log can grow, and
@@ -1014,7 +1024,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           console.error(`slipstream daemon: revalidating the chat linked to ${c.id} failed:`, err);
           failed = controlFailure(err);
         }
-        if (!failed) return;
+        if (!failed || quiescing) return;
         const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
         b.revalidations = (b.revalidations ?? 0) + 1;
         if (!await waitForRearmDelay(b, delay)) return;
@@ -1070,7 +1080,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       b.revalidations = (b.revalidations ?? 0) + 1;
       const timer = setTimeout(() => {
         if (b.rearmTimer === timer) b.rearmTimer = undefined;
-        if (c.binding === b && b.unavailable && c.session === session && c.lifecycle === 'recording' && !torn && !compromised) {
+        if (c.binding === b && b.unavailable && c.session === session && c.lifecycle === 'recording' && !quiescing && !torn && !compromised) {
           startRearm(c, b, session);
         }
       }, delay);
@@ -1255,7 +1265,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   ): Promise<Record<string, unknown> | ErrorFields> {
     // Finish an admitted unlink before publishing a replacement binding.
     if (!c.binding) await Promise.allSettled([...c.inflight]);
-    if (torn || compromised || c.lifecycle !== 'recording' || !isRunning(c)) {
+    if (torn || compromised || quiescing || c.lifecycle !== 'recording' || !isRunning(c)) {
       return errFields('CAPTURE_NOT_READY', 'the capture is no longer recording');
     }
     const mine = c.binding;
@@ -1463,6 +1473,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const c = nonEmptyString(req.session_id) ? captures.get(req.session_id) : undefined;
     if (!c) return errFields('TARGET_NOT_FOUND', `no capture with session ${String(req.session_id)}`);
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    if (quiescing) return errFields('CAPTURE_NOT_READY', 'gc is reclaiming storage; retry shortly');
     const b = c.binding;
     if (!b) {
       // An unlink still being saved is not yet acknowledged to anyone.
@@ -1698,19 +1709,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   // ---- maintenance --------------------------------------------------------
 
-  /** Admit and run a maintenance op while no capture is live, starting or
-   * stopping. The slot is claimed synchronously through `maintenanceInFlight`,
-   * so it cannot interleave with an admission. */
+  /** Run one maintenance op at a time. The slot is claimed synchronously through
+   * `maintenanceInFlight`, and `op` runs up to its first await in the same turn. */
   async function runMaintenance(
     op: () => Promise<Record<string, unknown> | ErrorFields>,
   ): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    const busy = [...captures.values()].find((c) => isLive(c) || c.session || c.lifecycle === 'stopping');
-    if (busy) {
-      return errFields('SESSION_ACTIVE', `the capture of ${busy.root} (session ${busy.id}) is ${publicState(busy).state}; `
-        + 'detach it first');
-    }
-    if (admitting.size > 0) return errFields('SESSION_ACTIVE', 'a capture is being admitted; retry once it settles');
     if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'another maintenance operation is running; retry shortly');
     let release!: () => void;
     const slot = new Promise<void>((resolve) => { release = resolve; });
@@ -1731,80 +1735,208 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     const id = req.session_id;
     return runMaintenance(async () => {
-      let present: boolean;
-      try {
-        present = await sessionExists(storeDir, id);
-      } catch (err) {
-        return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+      // Checked in the same turn `deleting` is set, which admission checks in the
+      // same turn as its intent entry: neither can slip past the other.
+      const target = captures.get(id);
+      const entry = findCapture(intent, id);
+      if ((entry && entry.intent !== 'withdrawn') || target?.session || (target && !['stopped', 'failed'].includes(target.lifecycle))) {
+        const state = target ? publicState(target).state : entry!.intent;
+        return errFields('SESSION_ACTIVE', `session ${id} is ${state}; detach it and let it stop first`);
       }
-      if (!present) return errFields('SESSION_NOT_FOUND', `no session ${id} to delete`);
-      // Durable-tombstone-first: publish the marker (fsynced) BEFORE removing any
-      // history, so a crash in between leaves a session the reader already serves as
-      // gone and a later gc finishes the cleanup. Nothing is committed yet, so a
-      // failure here is a plain STORAGE_UNAVAILABLE — no rollback needed.
+      deleting = id;
       try {
-        await publishTombstone(storeDir, id);
-      } catch (err) {
-        return errFields('STORAGE_UNAVAILABLE', `could not durably record deletion of ${id}: ${(err as Error).message}`);
+        return await deleteInactive(id);
+      } finally {
+        deleting = undefined;
       }
-      // Now that the tombstone is durable, abort any in-flight follower of this
-      // session so it re-resolves, re-reads the tombstone, and gets 410 rather than
-      // streaming a log we are about to delete. The reader's installIfAbsent gives a
-      // followed retained session a registry entry this freeze can reach.
-      registry.freeze(id, 0n);
-      // Deletion removes the session's capture and binding entries (§8).
-      forgetSession(intent, id);
-      captures.delete(id);
-      try {
-        await persistIntent();
-      } catch (err) {
-        return errFields('STORAGE_UNAVAILABLE', `session ${id} is logically removed (tombstone durable), but ${(err as Error).message}`);
-      }
-      // The tombstone is durable → the session is logically removed and the marker is
-      // never rolled back. If we have since lost the store lock, or history cleanup
-      // fails, report that removal committed and cleanup is retryable via gc.
-      const committed = `session ${id} is logically removed (tombstone durable); history cleanup is retryable via gc`;
-      if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', committed);
-      try {
-        await removeSessionHistory(storeDir, id);
-      } catch (err) {
-        return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
-      }
-      return { session_id: id };
     });
   }
 
+  async function deleteInactive(id: string): Promise<Record<string, unknown> | ErrorFields> {
+    let present: boolean;
+    try {
+      present = await sessionExists(storeDir, id);
+    } catch (err) {
+      return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+    }
+    if (!present) return errFields('SESSION_NOT_FOUND', `no session ${id} to delete`);
+    // Durable-tombstone-first: publish the marker (fsynced) BEFORE removing any
+    // history, so a crash in between leaves a session the reader already serves as
+    // gone and a later gc finishes the cleanup. Nothing is committed yet, so a
+    // failure here is a plain STORAGE_UNAVAILABLE — no rollback needed.
+    try {
+      await publishTombstone(storeDir, id);
+    } catch (err) {
+      return errFields('STORAGE_UNAVAILABLE', `could not durably record deletion of ${id}: ${(err as Error).message}`);
+    }
+    deleted.add(id);
+    // Now that the tombstone is durable, abort any in-flight follower of this
+    // session so it re-resolves, re-reads the tombstone, and gets 410 rather than
+    // streaming a log we are about to delete. The reader's installIfAbsent gives a
+    // followed retained session a registry entry this freeze can reach.
+    registry.freeze(id, 0n);
+    // Deletion removes the session's capture and binding entries (§8).
+    forgetSession(intent, id);
+    captures.delete(id);
+    try {
+      await persistIntent();
+    } catch (err) {
+      return errFields('STORAGE_UNAVAILABLE', `session ${id} is logically removed (tombstone durable), but ${(err as Error).message}`);
+    }
+    // The tombstone is durable → the session is logically removed and the marker is
+    // never rolled back. If we have since lost the store lock, or history cleanup
+    // fails, report that removal committed and cleanup is retryable via gc.
+    const committed = `session ${id} is logically removed (tombstone durable); history cleanup is retryable via gc`;
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', committed);
+    try {
+      await removeSessionHistory(storeDir, id);
+    } catch (err) {
+      return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
+    }
+    return { session_id: id };
+  }
+
+  /** gc as one maintenance transaction (D9): close admission, stop every capture
+   * with `capture.stopped{maintenance}`, sweep, then resume each one stopped here.
+   * Intent is untouched throughout, so waiting captures keep their places. */
   async function gc(): Promise<Record<string, unknown> | ErrorFields> {
     return runMaintenance(async () => {
+      quiescing = true;
       try {
-        // Finish any interrupted deletion first: a session tombstoned by a
-        // delete_session that crashed before cleanup still carries residual history.
-        // Re-establish the tombstone's durability, invalidate any follower a partial
-        // delete left pinned, then complete the removal — the same publish -> freeze
-        // -> remove sequence delete_session runs. Stop before any mutation if we lose
-        // the store lock: a successor now owns this store's files.
-        for (const s of await listSessions(storeDir)) {
-          if (!s.removed) continue;
-          if (compromised || torn) {
-            throw new StorageError('gc-aborted', new Error('store ownership lost mid-cleanup'));
-          }
-          await publishTombstone(storeDir, s.id);
-          registry.freeze(s.id, 0n);
-          await removeSessionHistory(storeDir, s.id);
-        }
-        // Abort mid-sweep if we lose the store lock: a successor may then own the
-        // shared blobs, and deleting one it still references would be data loss.
-        // The shared blob store trusts blobs it published, some of which this
-        // sweep may delete: the next capture starts with a fresh instance.
-        cas = undefined;
-        const removed = await reclaimUnreferencedBlobs(storeDir, () => torn || compromised);
-        return { removed };
-      } catch (err) {
-        // A corrupt/missing retained log or an aborted sweep deletes nothing; report
-        // the store as unavailable rather than a partial success.
-        return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+        await Promise.allSettled([...admitting.values()]);
+        // Starts already queued run first; none begins until this pass ends.
+        const pass = baselines.then(maintenancePass);
+        baselines = pass.then(() => {}, () => {});
+        return await pass;
+      } finally {
+        quiescing = false;
       }
     });
+  }
+
+  async function maintenancePass(): Promise<Record<string, unknown> | ErrorFields> {
+    const stopped = new Set<Capture>();
+    const unproven: string[] = [];
+    try {
+      for (const c of captures.values()) {
+        if (c.session && c.lifecycle === 'recording') stopForMaintenance(c, stopped, unproven);
+      }
+      // A detach, a halt or an ended activation may own a stop too; every one of
+      // them must finish before any blob is swept. A session no stop is pending
+      // for (a withdrawal that could not be saved) is a writer still running.
+      for (;;) {
+        const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
+        if (busy.length === 0) break;
+        const closings = busy.map((c) => c.closing);
+        await Promise.allSettled(closings);
+        const stuck = busy.filter((c, i) => c.closing === closings[i] && (c.session || c.lifecycle === 'stopping'));
+        if (stuck.length === busy.length) {
+          for (const c of stuck) unproven.push(`capture ${c.id} has not stopped`);
+          break;
+        }
+      }
+      if (torn || compromised) throw new StorageError('gc-aborted', new Error('the daemon is shutting down or lost its store lock'));
+      if (unproven.length > 0) return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: ${unproven.join('; ')}`);
+      const foreign = await freshSessionLock();
+      if (foreign) {
+        return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: session ${foreign} is still being written by another process`);
+      }
+      return await sweep();
+    } catch (err) {
+      // A corrupt/missing retained log or an aborted sweep deletes nothing; report
+      // the store as unavailable rather than a partial success.
+      return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+    } finally {
+      // Resume even after a failed sweep: storage that refused a sweep may still
+      // record, and a capture that cannot fails visibly on its own.
+      quiescing = false;
+      if (!torn && !compromised) {
+        for (const entry of intent.captures) {
+          const c = captures.get(entry.session_id);
+          if (!c || !stopped.has(c) || entry.intent !== 'running' || c.lifecycle !== 'stopped') continue;
+          c.lifecycle = 'queued';
+          c.resume = true;
+          enqueueStart(c);
+        }
+      }
+    }
+  }
+
+  /** Stop one recording capture for maintenance, keeping its capture and binding
+   * intent. Admitted binding publication and chat work finish first, so a link in
+   * flight is kept rather than revoked; a check issued before the stop never
+   * connects afterwards. */
+  function stopForMaintenance(c: Capture, stopped: Set<Capture>, unproven: string[]): void {
+    const prior = c.closing;
+    c.closing = (async () => {
+      await prior;
+      while (c.binding?.publishing || c.inflight.size) {
+        if (c.binding) cancelRearm(c.binding);
+        await Promise.allSettled([c.binding?.publishing, ...c.inflight]);
+      }
+      const session = c.session;
+      // A detach or an ended activation took it over meanwhile, and owns its stop.
+      if (!session || c.lifecycle !== 'recording' || !isRunning(c) || torn || compromised) {
+        if (session && (torn || compromised)) unproven.push(`capture ${c.id} was not stopped`);
+        return;
+      }
+      c.lifecycle = 'stopping';
+      if (c.binding) c.binding.check = { state: 'setup_pending', checkId: randomUUID() };
+      registry.setAgentConnection(c.id, 'none');
+      while (c.inflight.size) await Promise.allSettled([...c.inflight]);
+      c.session = undefined;
+      const freeze = () => registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+      try {
+        await session.stop({ reason: 'maintenance', assertOwnership: () => {
+          if (torn || compromised) throw new Error('the daemon is shutting down or lost its store lock');
+        } });
+      } catch (err) {
+        freeze();
+        const message = (err as Error).message;
+        unproven.push(`capture ${c.id} could not record its maintenance stop: ${message}`);
+        fail(c, 'storage-unavailable', `gc could not record this capture's maintenance stop: ${message}`, { retry: true });
+        return;
+      }
+      freeze();
+      c.ended = 'maintenance';
+      c.lifecycle = 'stopped';
+      stopped.add(c);
+    })();
+  }
+
+  /** A session ownership lock some other writer refreshed recently: the daemon's
+   * own captures are all stopped by now, and released theirs. */
+  async function freshSessionLock(): Promise<string | undefined> {
+    for (const s of await listSessions(storeDir)) {
+      let mtimeMs: number;
+      try { mtimeMs = (await stat(join(storeDir, 'sessions', s.id, 'owner.lock'))).mtimeMs; } catch { continue; }
+      if (Date.now() - mtimeMs <= STALE_MS) return s.id;
+    }
+    return undefined;
+  }
+
+  /** Finish interrupted deletions, then reclaim unreferenced blobs. */
+  async function sweep(): Promise<Record<string, unknown>> {
+    // A session tombstoned by a delete_session that crashed before cleanup still
+    // carries residual history: re-establish the tombstone's durability, invalidate
+    // any follower a partial delete left pinned, then complete the removal. Stop
+    // before any mutation if we lose the store lock: a successor now owns this
+    // store's files.
+    for (const s of await listSessions(storeDir)) {
+      if (!s.removed) continue;
+      if (compromised || torn) {
+        throw new StorageError('gc-aborted', new Error('store ownership lost mid-cleanup'));
+      }
+      await publishTombstone(storeDir, s.id);
+      registry.freeze(s.id, 0n);
+      await removeSessionHistory(storeDir, s.id);
+    }
+    // The shared blob store trusts blobs it published, some of which this sweep
+    // may delete: every resumed capture starts with a fresh instance. The sweep
+    // aborts if we lose the store lock, since a successor may own the blobs.
+    cas = undefined;
+    const removed = await reclaimUnreferencedBlobs(storeDir, () => torn || compromised);
+    return { removed };
   }
 
   async function attach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
