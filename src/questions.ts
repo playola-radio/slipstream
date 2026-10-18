@@ -238,15 +238,6 @@ export function sameSourceContext(parent: QuestionContext | undefined, c: Questi
     && parent.line_start === c.line_start && parent.line_end === c.line_end;
 }
 
-/** Rebuild the request an exchange event was recorded from, so recovery reproduces its idempotency fingerprint. */
-export function exchangeRequestOf(event: QuestionExchangeRecordedEvent): QuestionExchangeRequest {
-  const d = event.data;
-  const { selected_text: _selected, ...context } = d.context;
-  const { reported_by: _reportedBy, ...conversation } = d.conversation;
-  return { session_id: d.session_id, request_id: d.request_id, text: d.text, context, answer_text: d.answer_text, conversation,
-    ...(d.reply_to_question_id !== undefined ? { reply_to_question_id: d.reply_to_question_id } : {}) };
-}
-
 export interface AnswerAccepted {
   session_id: string;
   question_id: string;

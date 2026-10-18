@@ -8,7 +8,7 @@ import { createFakePlatform } from './test/fake-platform.ts';
 import { withTempDir, waitForRecords, readRecords } from './test/helpers.ts';
 import { createLog } from './log.ts';
 import { StorageError } from './storage.ts';
-import type { QuestionRequest } from './questions.ts';
+import { readQuestionContext, type QuestionRequest } from './questions.ts';
 
 type Session = Awaited<ReturnType<typeof startCapture>>;
 type ExchangeInput = QuestionRequest & { answer_text: string; conversation: { harness: 'claude-code'; parent_session_id: string; fork_session_id: string } };
@@ -234,4 +234,48 @@ it('rejects after stop with CAPTURE_NOT_READY', async () => {
     await s.stop();
     await assert.rejects(s.recordQuestionExchange(input), { code: 'CAPTURE_NOT_READY' });
   });
+});
+
+function gatedReader() {
+  let release!: () => void; let entered!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const gate = new Promise<void>(r => { release = r; });
+  return { started, release: () => release(),
+    readQuestionContext: async (input: Parameters<typeof readQuestionContext>[0]) => { entered(); await gate; return readQuestionContext(input); } };
+}
+
+it('a conflicting retry sent while the first call is in flight is REQUEST_CONFLICT and one event is recorded', async () => {
+  const gated = gatedReader();
+  await fixture(async (s, input) => {
+    const first = s.recordQuestionExchange(input);
+    await gated.started;
+    await assert.rejects(s.recordQuestionExchange({ ...input, answer_text: 'a different answer' }), { code: 'REQUEST_CONFLICT' });
+    gated.release();
+    assert.equal((await first).duplicate, false);
+    assert.equal((await exchangeEvents(s)).length, 1);
+  }, { readQuestionContext: gated.readQuestionContext });
+});
+
+it('a matching hash with a different path is INVALID_CONTEXT and appends nothing', async () => {
+  await fixture(async (s, input) => {
+    const before = (await readRecords(s.logPath)).length;
+    await assert.rejects(s.recordQuestionExchange({ ...input, context: { ...input.context, path: 'other.ts' } }), { code: 'INVALID_CONTEXT' });
+    assert.equal((await readRecords(s.logPath)).length, before);
+  });
+});
+
+it('stop() while an exchange is in flight fails it with CAPTURE_NOT_READY and no exchange lands after the stop record', async () => {
+  const gated = gatedReader();
+  await fixture(async (s, input) => {
+    const pending = s.recordQuestionExchange(input);
+    const outcome = pending.then(() => 'recorded', (err: { code?: string }) => err.code);
+    await gated.started;
+    const stopping = s.stop({ reason: 'detached' });
+    gated.release();
+    await stopping;
+    assert.equal(await outcome, 'CAPTURE_NOT_READY');
+    const records = await readRecords(s.logPath);
+    assert.equal(records.filter(e => e.type === 'slipstream.question.exchange_recorded.v1').length, 0);
+    assert.equal(records.at(-1)!.type, 'slipstream.capture.stopped.v1');
+  }, { readQuestionContext: gated.readQuestionContext });
 });

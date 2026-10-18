@@ -21,8 +21,8 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import { EVENT_TYPES, type AnyEvent, type EnrichmentPolicy, type EventInput, type HarnessName } from './event.ts';
-import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent, QuestionExchangeRecordedInput, QuestionExchangeRecordedEvent, QuestionExchangeRecordedData } from './public-events.ts';
-import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted, normalizeExchange, exchangeBody, exchangeResult, exchangeRequestOf, sameSourceContext, type QuestionExchangeAccepted } from './questions.ts';
+import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent, QuestionExchangeRecordedInput, QuestionExchangeRecordedEvent } from './public-events.ts';
+import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted, normalizeExchange, exchangeBody, exchangeResult, sameSourceContext, type QuestionExchangeAccepted, type QuestionContext } from './questions.ts';
 import type { TranscriptScheduler } from './transcript/scheduler.ts';
 
 export interface CaptureOptions {
@@ -279,7 +279,7 @@ export async function startCapture(
   // QUESTION_LIMIT, or appear in the ask follow-up lookup.
   const committedExchanges = new Map<string, { body: string; result: QuestionExchangeAccepted }>();
   const inflightExchanges = new Map<string, { body: string; promise: Promise<QuestionExchangeAccepted> }>();
-  const exchangesById = new Map<string, QuestionExchangeRecordedData>();
+  const exchangesById = new Map<string, QuestionContext>();
   // Questions not yet attempted. Removed once dispatch is attempted (durably
   // consumed either way) so eligibility counting and claim lookup scan only
   // outstanding questions, not every question ever queued by a long-lived capture.
@@ -314,8 +314,8 @@ export async function startCapture(
     for (const event of rec.questionAnswers) committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
     committedExchanges.clear(); exchangesById.clear();
     for (const event of rec.questionExchanges) {
-      committedExchanges.set(event.data.request_id, { body: exchangeBody(exchangeRequestOf(event)), result: exchangeResult(event) });
-      exchangesById.set(event.data.question_id, event.data);
+      committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
+      exchangesById.set(event.data.question_id, event.data.context);
     }
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
@@ -363,7 +363,7 @@ export async function startCapture(
       if (event.type === 'slipstream.question.answered.v1') {
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
-      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, event.data);
+      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, event.data.context);
       if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
   };
@@ -1153,7 +1153,7 @@ export async function startCapture(
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
     if (req.reply_to_question_id !== undefined
-      && !sameSourceContext(exchangesById.get(req.reply_to_question_id)?.context, req.context)) {
+      && !sameSourceContext(exchangesById.get(req.reply_to_question_id), req.context)) {
       throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to an exchange in this capture about the same source');
     }
     // Defer starting I/O until the in-flight reservation is installed synchronously.
