@@ -34,11 +34,11 @@ export function blobPath(storeDir: string, hex: string): string {
   return join(storeDir, 'blobs', 'sha256', hex.slice(0, 2), hex);
 }
 
-interface FinalRecord { seq: bigint; time: unknown }
+export interface FinalRecord { seq: bigint; time: unknown; type: unknown }
 
-/** The last complete record's seq and time; undefined for a missing log or one
- * with no complete line. Torn trailing bytes are ignored. */
-async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
+/** The last complete record's seq, time and type; undefined for a missing log or
+ * one with no complete line. Torn trailing bytes are ignored. */
+export async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
   let handle;
   try { handle = await open(logPath, 'r'); }
   catch (err) {
@@ -72,8 +72,8 @@ async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
     lastLine = Buffer.concat(pieces.reverse()).toString('utf8');
   } finally { await handle.close(); }
   if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
-  let parsed: { seq?: unknown; time?: unknown } | null;
-  try { parsed = JSON.parse(lastLine) as { seq?: unknown; time?: unknown } | null; }
+  let parsed: { seq?: unknown; time?: unknown; type?: unknown } | null;
+  try { parsed = JSON.parse(lastLine) as typeof parsed; }
   catch { throw new LogCorruptError('high-water: invalid JSON in final record'); }
   if (typeof parsed !== 'object' || parsed === null) {
     throw new LogCorruptError('high-water: final record is not an object');
@@ -81,7 +81,7 @@ async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
   if (typeof parsed.seq !== 'string' || !SEQ_RE.test(parsed.seq)) {
     throw new LogCorruptError('high-water: final record has no valid decimal-string seq');
   }
-  return { seq: BigInt(parsed.seq), time: parsed.time };
+  return { seq: BigInt(parsed.seq), time: parsed.time, type: parsed.type };
 }
 
 export async function onDiskHighWater(logPath: string): Promise<bigint> {

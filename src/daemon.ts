@@ -11,7 +11,9 @@ import type { HarnessName } from './event.ts';
 import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, STALE_MS, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
-import { isValidSessionId, listSessions, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
+import {
+  isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, WorkspaceLookupError,
+} from './store-reader.ts';
 import { CorruptLogError } from './recovery.ts';
 import { LogCorruptError } from './log-reader.ts';
 import {
@@ -26,7 +28,7 @@ import {
   MAX_BINDINGS, MAX_CAPTURES, admitCapture, emptyIntent, findCapture, findLinked, forgetSession, linkBinding, linkedCount,
   revokeBinding, withdrawCapture, type NotRecordingReason,
 } from './capture-intent.ts';
-import { saveIntent } from './intent-store.ts';
+import { loadIntent, saveIntent } from './intent-store.ts';
 import { liveBoundary } from './reader-runtime.ts';
 import {
   createLineDecoder,
@@ -73,12 +75,33 @@ export interface DaemonOptions {
   /** The resolved enrichment + transcript config (Fork 4). Absent means built-in
    * defaults: no harness is `configured`, so no transcript is read. */
   config?: ResolvedConfig;
+  /** Delay before re-trying a capture whose start failed transiently: doubles per
+   * consecutive failure from `baseMs`, capped at `maxMs`. */
+  retryBackoff?: { baseMs: number; maxMs: number };
+  /** How long a delivered setup check waits before it is offered again. */
+  setupReofferMs?: number;
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
 const STORE_LOCK_WAIT_MS = 2_000;
 const STORE_LOCK_POLL_MS = 50;
-class RootIdentityError extends Error {}
+const RETRY_BACKOFF = { baseMs: 2_000, maxMs: 5 * 60_000 };
+const SETUP_REOFFER_MS = 30_000;
+
+type UnavailableReason = 'transcript-missing' | 'transcript-unreadable' | 'identity-changed' | 'runtime-unsupported';
+
+const UNAVAILABLE_BY_CLAUDE_REASON = {
+  'unavailable': 'transcript-unreadable', 'not-yet': 'transcript-unreadable', 'gap': 'transcript-unreadable',
+  'mismatch': 'identity-changed', 'unsupported-version': 'runtime-unsupported',
+} as const satisfies Record<string, UnavailableReason>;
+
+class RootIdentityError extends Error {
+  readonly reason: UnavailableReason;
+  constructor(reason: UnavailableReason, message: string) {
+    super(message);
+    this.reason = reason;
+  }
+}
 
 /** The intent record could not be written. Every later lifecycle change is
  * refused: acknowledging one the record does not hold would be a lie after a
@@ -197,8 +220,10 @@ async function bindControl(server: Server, socketPath: string): Promise<void> {
 interface AgentCheck {
   state: 'setup_pending' | 'connected';
   checkId: string;
-  /** Delivered once per arm; a repeated attach re-arms a pending check. */
-  delivered: boolean;
+  /** When the check was last handed to the chat's hook. It is offered again
+   * after `setupReofferMs` until it is answered, so a lost callback cannot strand
+   * the link; a repeated attach offers it again at once. */
+  offeredAtMs?: number;
   ack?: Record<string, unknown>;
   confirming?: Promise<Record<string, unknown> | ErrorFields>;
 }
@@ -212,6 +237,9 @@ interface Binding {
   /** Set until `agent.binding` and `setup_pending` are durable; hooks and
    * forwarders do not see the binding before then. */
   publishing?: Promise<ErrorFields | undefined>;
+  /** Its transcript failed revalidation on resume; the intent keeps the link and
+   * its slot, and records why (contracts.md §4). */
+  unavailable?: boolean;
 }
 
 /** One start of a capture. A lock-loss callback acts only on the activation that
@@ -237,6 +265,9 @@ interface Capture {
   closeError?: unknown;
   binding?: Binding;
   inflight: Set<Promise<unknown>>;
+  /** Consecutive transient start failures; reset by a successful activation. */
+  attempts: number;
+  retryTimer?: NodeJS.Timeout;
 }
 
 const CAPTURE_LIMIT_MESSAGE = `${MAX_CAPTURES}/${MAX_CAPTURES} capture slots in use. This workspace is NOT recording. `
@@ -287,7 +318,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // an onCompromised callback that fires mid-startup never hits a temporal dead
   // zone (it may run with `reader` still undefined — teardown null-checks it).
   const registry = createBoundaryRegistry();
-  const intent = emptyIntent();
+  const backoff = opts.retryBackoff ?? RETRY_BACKOFF;
+  const reofferMs = opts.setupReofferMs ?? SETUP_REOFFER_MS;
+  let intent = emptyIntent();
   /** The next intent write not yet started; joining it covers every mutation made
    * before it begins. Writes run one at a time. */
   let intentFlush: Promise<void> | undefined;
@@ -344,6 +377,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function doTeardown(): Promise<void> {
     torn = true;
+    for (const c of captures.values()) clearTimeout(c.retryTimer);
     // Drop live control connections so server.close() cannot block on an idle or
     // half-sent request.
     for (const sock of connections) sock.destroy();
@@ -413,6 +447,18 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  // Recovery reads intent only while holding the store lock, so a withdrawal a
+  // CLI recorded while no daemon ran is always seen, and pins every session it
+  // will resume before the reader can serve one.
+  let restored: Capture[];
+  try {
+    intent = await loadIntent(storeDir);
+    restored = await restoreCaptures();
+  } catch (err) {
+    await lock.release();
+    throw err;
+  }
+
   // Bring the reader up before accepting control traffic, so a verb can never be
   // dispatched against a reader that is not yet serving the public view.
   try {
@@ -478,6 +524,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return { state: 'queued', reason: null };
   }
 
+  /** When recovery will next try a failed capture, while one is scheduled. */
+  function retryOf(c: Capture): { next_attempt_at_ms: number } | null {
+    const entry = findCapture(intent, c.id);
+    const at = entry?.intent === 'running' ? entry.last_failure?.next_attempt_at_ms : null;
+    return typeof at === 'number' ? { next_attempt_at_ms: at } : null;
+  }
+
   function isRunning(c: Capture): boolean {
     return findCapture(intent, c.id)?.intent === 'running';
   }
@@ -492,15 +545,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const entry = intent.bindings.findLast((b) => b.session_id === c.id);
     if (!entry) return null;
     const live = entry.intent === 'linked' ? c.binding : undefined;
-    return {
-      harness: entry.harness, harness_session_id: entry.harness_session_id, binding_generation: entry.binding_generation,
-      state: entry.intent === 'revoked' ? 'unlinked' : live?.check.state ?? 'setup_pending', reason: null,
-    };
+    const row = { harness: entry.harness, harness_session_id: entry.harness_session_id, binding_generation: entry.binding_generation };
+    if (entry.intent === 'revoked') return { ...row, state: 'unlinked', reason: null };
+    if (entry.unavailable) return { ...row, state: 'unavailable', reason: entry.unavailable.reason, message: entry.unavailable.message };
+    return { ...row, state: live?.check.state ?? 'setup_pending', reason: null };
   }
 
   function statusRow(c: Capture): Record<string, unknown> {
     const { state, reason, message } = publicState(c);
-    const row: Record<string, unknown> = { session_id: c.id, root: c.root, state, reason, capture_mode: 'watch-only' };
+    const row: Record<string, unknown> = { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only' };
     if (message) row.message = message;
     if (c.session) row.durable_seq = c.session.health.snapshot().durable_seq;
     row.binding = bindingRow(c);
@@ -522,7 +575,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         state = 'not_recording';
         reason = 'daemon-unavailable';
       }
-      return { session_id: c.id, root: c.root, state, reason, retry: null, capture_mode: 'watch-only', heartbeat_ms: heartbeat,
+      return { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only', heartbeat_ms: heartbeat,
         binding: bindingRow(c) };
     }));
     return { as_of_ms: asOf, binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS }, captures: rows };
@@ -568,12 +621,83 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return entry ? captures.get(entry.session_id) : undefined;
   }
 
-  function fail(c: Capture, reason: NotRecordingReason, message: string): void {
+  /** Record a capture as not recording. A transient failure is retried with
+   * backoff, as a new activation. */
+  function fail(c: Capture, reason: NotRecordingReason, message: string, opts: { retry: boolean }): void {
     c.lifecycle = 'failed';
     const entry = findCapture(intent, c.id);
-    if (entry) entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: null };
-    console.error(`slipstream daemon: capture ${c.id} of ${c.root} is not recording: ${message}`);
+    const next = opts.retry && entry?.intent === 'running' && !torn && !compromised ? scheduleRetry(c) : null;
+    if (entry) entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: next };
+    console.error(`slipstream daemon: capture ${c.id} of ${c.root} is not recording: ${message}`
+      + (next === null ? '' : ` (retrying at ${new Date(next).toISOString()})`));
     persistQuietly();
+  }
+
+  function scheduleRetry(c: Capture): number {
+    clearTimeout(c.retryTimer);
+    c.attempts++;
+    const delay = Math.min(backoff.baseMs * 2 ** (c.attempts - 1), backoff.maxMs);
+    c.retryTimer = setTimeout(() => {
+      c.retryTimer = undefined;
+      void retryScheduled(c);
+    }, delay);
+    return Date.now() + delay;
+  }
+
+  async function retryScheduled(c: Capture): Promise<void> {
+    await c.closing;
+    const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
+    const entry = findCapture(intent, c.id);
+    if (torn || compromised || c.lifecycle !== 'failed' || entry?.intent !== 'running' || !entry.last_failure) return;
+    entry.last_failure.next_attempt_at_ms = null;
+    persistQuietly();
+    c.lifecycle = 'queued';
+    c.resume = resume;
+    enqueueStart(c);
+  }
+
+  /** Rebuild the capture table from the intent record after a restart. Every
+   * session recovery will resume is pinned at its durable high-water, and every
+   * fresh one reserved, before the reader is exposed or anything is written.
+   * Returns the running captures, in admission order, to start once ready. */
+  async function restoreCaptures(): Promise<Capture[]> {
+    const toStart: Capture[] = [];
+    let forgot = false;
+    for (const entry of [...intent.captures]) {
+      const id = entry.session_id;
+      // A delete that crashed after its durable tombstone: finish forgetting it.
+      if (await readTombstone(storeDir, id) !== null) {
+        forgetSession(intent, id);
+        forgot = true;
+        continue;
+      }
+      let last: Awaited<ReturnType<typeof finalRecord>>;
+      let unreadable = false;
+      try { last = await finalRecord(sessionLogPath(storeDir, id)); } catch { unreadable = true; }
+      const c: Capture = { id, root: entry.root, lifecycle: 'queued', resume: last !== undefined || unreadable,
+        inflight: new Set(), attempts: 0 };
+      captures.set(id, c);
+      if (entry.intent === 'withdrawn') {
+        // `stopped` only when the last activation's stop is durable (§6).
+        c.lifecycle = c.resume && last?.type !== 'slipstream.capture.stopped.v1' ? 'failed' : 'stopped';
+        continue;
+      }
+      // An unreadable log is pinned at 0; its resume fails visibly below.
+      if (c.resume) registry.freeze(id, last?.seq ?? 0n);
+      else registry.reserve(id);
+      if (entry.intent !== 'running') continue;
+      // Connection state is not persisted: a linked chat comes back pending and is
+      // revalidated when its capture activates (contracts.md §8).
+      const linked = intent.bindings.find((b) => b.session_id === id && b.intent === 'linked');
+      if (linked) {
+        c.binding = { harness: linked.harness, harnessSessionId: linked.harness_session_id,
+          transcript: linked.verified_transcript_path, generation: linked.binding_generation,
+          check: { state: 'setup_pending', checkId: randomUUID() } };
+      }
+      toStart.push(c);
+    }
+    if (forgot) await persistIntent();
+    return toStart;
   }
 
   /** Make the in-memory intent durable (contracts.md §8). Mutations are synchronous,
@@ -686,7 +810,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       intent.captures = intent.captures.filter((e) => e !== entry);
       return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
     }
-    const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set() };
+    const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set(), attempts: 0 };
     Object.assign(c, { root, lifecycle: 'queued', resume: lookup.match !== undefined, closeError: undefined });
     captures.set(id, c);
     if (entry.intent === 'running') enqueueStart(c);
@@ -700,6 +824,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
     const entry = findCapture(intent, c.id);
     if (c.lifecycle !== 'failed' || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
+    clearTimeout(c.retryTimer);
+    c.retryTimer = undefined;
     entry.last_failure = null;
     persistQuietly();
     c.lifecycle = 'queued';
@@ -745,10 +871,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (!c.resume) registry.freeze(c.id, 0n);
       if (activation.lost || c.lifecycle !== 'baselining') return;
       if (c.resume) {
-        const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError ? corruptRemedy(c.id) : RETRY_REMEDY;
-        fail(c, 'resume-failed', `could not resume session ${c.id}: ${(err as Error).message}. ${remedy}`);
+        const corrupt = err instanceof CorruptLogError || err instanceof LogCorruptError;
+        fail(c, 'resume-failed', `could not resume session ${c.id}: ${(err as Error).message}. `
+          + (corrupt ? corruptRemedy(c.id) : RETRY_REMEDY), { retry: !corrupt });
       } else {
-        fail(c, err instanceof StorageError ? 'storage-unavailable' : 'baseline-failed', (err as Error).message);
+        fail(c, err instanceof StorageError ? 'storage-unavailable' : 'baseline-failed', (err as Error).message, { retry: true });
       }
       return;
     }
@@ -763,24 +890,59 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // session now.
     if (torn || compromised || c.lifecycle !== 'baselining') return;
     c.lifecycle = 'recording';
+    c.attempts = 0;
+    const entry = findCapture(intent, c.id);
+    if (entry?.last_failure) {
+      entry.last_failure = null;
+      persistQuietly();
+    }
     registry.activate(c.id, liveBoundary(session.health));
     registry.setAgentConnection(c.id, 'none');
     // A chat stays linked across a restart of its capture, but `connected` is
     // re-earned only by a fresh round trip in the new activation.
     if (c.binding) {
       const b = c.binding;
-      b.check = { state: 'setup_pending', checkId: randomUUID(), delivered: false };
-      const rearm = publishBinding(c, b, false);
+      b.check = { state: 'setup_pending', checkId: randomUUID() };
+      const rearm = rearmBinding(c, b, session);
+      b.publishing = rearm;
       c.inflight.add(rearm);
-      void rearm.finally(() => c.inflight.delete(rearm));
+      void rearm.finally(() => {
+        c.inflight.delete(rearm);
+        if (b.publishing === rearm) b.publishing = undefined;
+      });
     }
+  }
+
+  /** Revalidate a linked chat's transcript in a new activation, then publish it
+   * pending. A link whose `agent.binding` never became durable (a crash after its
+   * intent) is recorded now, at its stored generation (contracts.md §6). */
+  async function rearmBinding(c: Capture, b: Binding, session: CaptureSession): Promise<ErrorFields | undefined> {
+    const entry = findLinked(intent, b.harness, b.harnessSessionId);
+    try {
+      b.transcript = await verifyRootTranscript(b.harness, b.harnessSessionId, c.root, b.transcript);
+    } catch (err) {
+      if (!(err instanceof RootIdentityError)) throw err;
+      b.unavailable = true;
+      if (entry) {
+        entry.unavailable = { reason: err.reason, message: err.message };
+        persistQuietly();
+      }
+      console.error(`slipstream daemon: the chat linked to ${c.id} is unavailable: ${err.message}`);
+      return undefined;
+    }
+    b.unavailable = false;
+    if (entry?.unavailable) {
+      entry.unavailable = null;
+      persistQuietly();
+    }
+    return publishBinding(c, b, { record: !session.bindingRecorded(b.generation), revokeOnFailure: false });
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
     console.error(`slipstream daemon: session ${c.id} lost its lock: ${reason}`);
     if (c.activation !== activation || activation.lost) return;
     activation.lost = true;
-    fail(c, 'storage-unavailable', `capture lost its session lock: ${reason}`);
+    fail(c, 'storage-unavailable', `capture lost its session lock: ${reason}`, { retry: true });
     if (activation.session) halt(c, activation.session);
   }
 
@@ -821,19 +983,19 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function verifyRootTranscript(harness: HarnessName, harnessSessionId: string, root: string, path: string): Promise<string> {
     let resolved: string;
     try { resolved = await realpath(path); } catch {
-      throw new RootIdentityError(harness === 'claude-code'
+      throw new RootIdentityError('transcript-missing', harness === 'claude-code'
         ? 'root Claude transcript is unavailable; check its path or retry attach after the first root tool call'
         : 'root Codex transcript cannot be resolved');
     }
     if (harness === 'codex') {
       if (!await verifyCodexRootTranscript(resolved, harnessSessionId, root)) {
-        throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime');
+        throw new RootIdentityError('identity-changed', 'root Codex transcript is missing, mismatched, or from an unsupported runtime');
       }
       return resolved;
     }
     const verified = await verifyClaudeRootTranscript(resolved, harnessSessionId, root);
     if (!verified.ok) {
-      throw new RootIdentityError(verified.reason === 'not-yet'
+      throw new RootIdentityError(UNAVAILABLE_BY_CLAUDE_REASON[verified.reason], verified.reason === 'not-yet'
         ? 'root Claude transcript head is not complete yet; retry attach after the first root tool call'
         : verified.reason === 'gap'
           ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
@@ -902,7 +1064,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const failed = await mine.publishing;
       if (failed) return failed;
       if (c.binding !== mine) return errFields('CAPTURE_NOT_READY', 'the chat was unlinked while it was being linked; retry attach');
-      if (mine.check.state === 'setup_pending') mine.check.delivered = false;
+      if (mine.unavailable) return relink(c, mine, chat.transcript);
+      if (mine.check.state === 'setup_pending') mine.check.offeredAtMs = undefined;
       return bindReply(c, mine, { already_active: true, created: false });
     }
     if (mine) return bindingExists(mine.harness, mine.harnessSessionId, c);
@@ -916,10 +1079,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       canonical_worktree: c.root, verified_transcript_path: chat.transcript,
     });
     const b: Binding = { ...chat, generation: entry.binding_generation,
-      check: { state: 'setup_pending', checkId: randomUUID(), delivered: false } };
+      check: { state: 'setup_pending', checkId: randomUUID() } };
     c.binding = b;
     // The binding is durable before any event names it.
-    const publishing = persistIntent().then(() => publishBinding(c, b, true), (err: Error) => {
+    const publishing = persistIntent().then(() => publishBinding(c, b, { record: true, revokeOnFailure: true }), (err: Error) => {
       if (c.binding === b) c.binding = undefined;
       revokeBinding(intent, c.id);
       return errFields('STORAGE_UNAVAILABLE', err.message);
@@ -936,9 +1099,36 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return failed ?? bindReply(c, b, { created });
   }
 
+  /** The same chat attaching again to its unavailable link, with a transcript that
+   * verifies now: the link keeps its generation and is published pending again. */
+  async function relink(c: Capture, b: Binding, transcript: string): Promise<Record<string, unknown> | ErrorFields> {
+    const refused = intentRefusal();
+    if (refused) return refused;
+    const entry = findLinked(intent, b.harness, b.harnessSessionId);
+    if (!entry || entry.session_id !== c.id) return errFields('CAPTURE_NOT_READY', 'the chat was unlinked while it was being linked; retry attach');
+    entry.unavailable = null;
+    entry.verified_transcript_path = transcript;
+    b.transcript = transcript;
+    b.unavailable = false;
+    b.check = { state: 'setup_pending', checkId: randomUUID() };
+    const publishing = persistIntent().then(
+      () => publishBinding(c, b, { record: !c.session!.bindingRecorded(b.generation), revokeOnFailure: false }),
+      (err: Error) => errFields('STORAGE_UNAVAILABLE', err.message));
+    b.publishing = publishing;
+    c.inflight.add(publishing);
+    let failed: ErrorFields | undefined;
+    try {
+      failed = await publishing;
+    } finally {
+      c.inflight.delete(publishing);
+      if (b.publishing === publishing) b.publishing = undefined;
+    }
+    return failed ?? bindReply(c, b, { created: false });
+  }
+
   /** Append a binding's events in contract order, then publish it to hooks and
-   * forwarders. A first link that cannot be recorded is revoked again. */
-  async function publishBinding(c: Capture, b: Binding, first: boolean): Promise<ErrorFields | undefined> {
+   * forwarders. A new link that cannot be recorded is revoked again. */
+  async function publishBinding(c: Capture, b: Binding, how: { record: boolean; revokeOnFailure: boolean }): Promise<ErrorFields | undefined> {
     const session = c.session!;
     const target = { harness: b.harness, harness_session_id: b.harnessSessionId };
     const own = (): void => {
@@ -948,7 +1138,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     };
     let recorded = false;
     try {
-      if (first) {
+      if (how.record) {
         await session.recordAgent({ type: 'slipstream.agent.binding.v1', occurred_at_ms: Date.now(), data: {
           binding_generation: b.generation, target: { ...target, worktree: c.root }, verified_transcript_path: b.transcript } }, own);
         recorded = true;
@@ -956,7 +1146,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       await session.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: {
         state: 'setup_pending', binding_generation: b.generation, target } }, own);
     } catch (err) {
-      if (first && c.binding === b) {
+      if (how.revokeOnFailure && c.binding === b) {
         c.binding = undefined;
         revokeBinding(intent, c.id);
         persistQuietly();
@@ -975,6 +1165,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   async function detach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (req.reason !== undefined && req.reason !== 'archived') return errFields('PROTOCOL', `unknown detach reason: ${String(req.reason)}`);
+    const why = req.reason === 'archived' ? 'archived' : 'detached';
     const c = await resolveTarget(req.target);
     if (isErrorFields(c)) return c;
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
@@ -982,7 +1174,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (entry && entry.intent !== 'withdrawn') {
       const refused = intentRefusal();
       if (refused) return refused;
-      const promoted = withdrawCapture(intent, c.id, 'detached');
+      const promoted = withdrawCapture(intent, c.id, why);
       revokeBinding(intent, c.id);
       const prior = c.closing;
       // Set in this turn, so a concurrent detach waits for the same stop. A
@@ -990,7 +1182,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       c.closing = persistIntent().then(() => {
         const next = promoted && captures.get(promoted.session_id);
         if (next) enqueueStart(next);
-        return closeCapture(c, prior);
+        return closeCapture(c, prior, why);
       }, () => {});
     }
     const already = entry?.intent === 'withdrawn' && c.lifecycle === 'stopped';
@@ -1004,11 +1196,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   /** Stop a withdrawn capture: unlink its chat, then record the stop. */
-  async function closeCapture(c: Capture, prior: Promise<void> | undefined): Promise<void> {
+  async function closeCapture(c: Capture, prior: Promise<void> | undefined, why: 'detached' | 'archived'): Promise<void> {
+    clearTimeout(c.retryTimer);
     const from = c.lifecycle;
     if (from === 'queued') {
-      // Never activated: the start job sees the withdrawal and starts nothing.
-      c.lifecycle = 'stopped';
+      // Not activated: the start job sees the withdrawal and starts nothing. It is
+      // `stopped` only if its last activation, if any, ended in a durable stop (§6).
+      const last = c.resume ? await finalRecord(sessionLogPath(storeDir, c.id)).catch(() => undefined) : undefined;
+      c.lifecycle = !c.resume || last?.type === 'slipstream.capture.stopped.v1' ? 'stopped' : 'failed';
       return;
     }
     c.lifecycle = 'stopping';
@@ -1028,7 +1223,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     c.session = undefined;
     try {
-      await session.stop(b ? { reason: 'detached', unlinkGeneration: b.generation } : { reason: 'detached' });
+      // A link the log never named (a crash before its `agent.binding`) has no
+      // unlink to record.
+      const named = b && session.bindingRecorded(b.generation);
+      await session.stop(named ? { reason: why, unlinkGeneration: b.generation } : { reason: why });
       c.lifecycle = 'stopped';
     } catch (err) {
       c.closeError = err;
@@ -1064,6 +1262,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // promise before closing the log.
       await persisted;
       await Promise.allSettled(admitted);
+      if (!session.bindingRecorded(b.generation)) return;
       await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
         data: { binding_generation: b.generation, reason: 'unlinked' } });
     })();
@@ -1095,7 +1294,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** The chat's published binding and its capture, if it may act now. */
   function chatTarget(c: Capture | undefined): { c: Capture; b: Binding } | undefined {
     const b = c?.binding;
-    return c && b && !b.publishing && c.lifecycle === 'recording' ? { c, b } : undefined;
+    return c && b && !b.publishing && !b.unavailable && c.lifecycle === 'recording' ? { c, b } : undefined;
   }
 
   /** The chat's binding when a request arrives. A request that awaits before it
@@ -1208,8 +1407,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const stale = staleBinding(req, c, b);
     if (stale) return stale;
     if (b.check.state === 'setup_pending') {
-      if (b.check.delivered) return { question: null };
-      b.check.delivered = true;
+      const now = Date.now();
+      if (b.check.offeredAtMs !== undefined && now - b.check.offeredAtMs < reofferMs) return { question: null };
+      b.check.offeredAtMs = now;
       return { question: null, setup_check: { check_id: b.check.checkId } };
     }
     return track(c, c.session!.claimQuestion({ harness: b.harness, harness_session_id: b.harnessSessionId, worktree: c.root },
@@ -1471,6 +1671,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // Startup is fully ready: reader running, lock held, not torn, readerRef bound.
   // Only now let the connection handler dispatch verbs (see the `ready` gate).
   ready = true;
+  for (const c of restored) enqueueStart(c);
 
   return {
     socketPath,

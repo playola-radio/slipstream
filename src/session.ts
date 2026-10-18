@@ -144,6 +144,8 @@ export interface CaptureSession {
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
   recordAgent<I extends AgentInput>(input: I, assertOwnership?: () => void): Promise<AgentEventFor<I>>;
+  /** Whether this session's log holds an `agent.binding` at `generation`. */
+  bindingRecorded(generation: string): boolean;
   /** Start reading transcripts for this worktree if it is not already; a no-op
    * once stopped, or when no harness is configured. */
   startTranscripts(runtime: TranscriptRuntime): void;
@@ -1154,10 +1156,12 @@ export async function startCapture(
     assertOwnership();
     questionReady();
     const event = await appendEvent(input);
+    if (input.type === 'slipstream.agent.binding.v1') recordedBindings.add(input.data.binding_generation);
     if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
     assertOwnership();
     return event;
   };
+  const recordedBindings = new Set(recovered?.bindingGenerations);
 
   const doStop = async (opts?: StopOptions): Promise<void> => {
     stopped = true;
@@ -1222,6 +1226,7 @@ export async function startCapture(
     claimQuestion,
     answerQuestion,
     recordAgent,
+    bindingRecorded: (generation) => recordedBindings.has(generation),
     startTranscripts,
     ingestEvidence,
     stop: (opts) => (stopPromise ??= doStop(opts)),

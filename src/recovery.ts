@@ -53,6 +53,9 @@ export interface RecoveredSession {
   questions: QuestionQueuedEvent[];
   questionAttempts: QuestionDispatchAttemptedEvent[];
   questionAnswers: QuestionAnsweredEvent[];
+  /** Generations with a durable `agent.binding` record, so a resume can append
+   * one a crash interrupted (contracts.md §6). */
+  bindingGenerations: Set<string>;
 }
 
 /** The envelope constraints every record must satisfy, regardless of type — so an
@@ -139,6 +142,7 @@ export async function recoverSession(
   let baselineCompleted = false;
   let currentTaskId: string | undefined;
   let taskResetSeq = 0n;
+  const bindingGenerations = new Set<string>();
   let seq = 0n;
 
   const verifyBlob = async (snap: Snapshot, where: string): Promise<void> => {
@@ -314,6 +318,9 @@ export async function recoverSession(
         });
         break;
       }
+      case 'slipstream.agent.binding.v1':
+        bindingGenerations.add(event.data.binding_generation);
+        break;
       case 'slipstream.session.resumed.v1':
       case 'slipstream.agent.unlinked.v1':
         currentTaskId = undefined;
@@ -363,5 +370,6 @@ export async function recoverSession(
     questions,
     questionAttempts,
     questionAnswers,
+    bindingGenerations,
   };
 }
