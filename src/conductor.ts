@@ -28,14 +28,18 @@ export function slipstreamCommand(kind: ScriptKind, p: ScriptPaths): string {
   return [p.node, p.cli, 'conductor', kind, '--store', p.store].map(shellWord).join(' ');
 }
 
-/** Slipstream first; the existing command runs only once capture is ready (setup)
- * or withdrawn (archive). Braces keep a multi-command script grouped. */
+/** Slipstream first, then the repo's own command whatever Slipstream returned, so
+ * Slipstream never stops a workspace being set up or archived. The script fails
+ * with the repo's code if its command fails, otherwise with Slipstream's. The
+ * subshell keeps an `exit` in the repo's command from skipping that. */
 export function chainScript(ours: string, own: string | null): string {
-  return own === null || own.trim() === '' ? ours : `${ours} && {\n${own}\n}`;
+  if (own === null || own.trim() === '') return ours;
+  return `slipstream_status=0\n${ours} || slipstream_status=$?\n(\n${own}\n) || exit $?\nexit $slipstream_status`;
 }
 
 const WORD = String.raw`(?:[\w@%+=:,./-]+|'[^']*'(?:\\''[^']*')*)`;
-const CHAINED = new RegExp(String.raw`^${WORD} ${WORD} conductor (?:setup|archive) --store ${WORD}(?: && \{\n([\s\S]*)\n\})?$`);
+const OURS = String.raw`${WORD} ${WORD} conductor (?:setup|archive) --store ${WORD}`;
+const CHAINED = new RegExp(String.raw`^(?:${OURS}|slipstream_status=0\n${OURS} \|\| slipstream_status=\$\?\n\(\n([\s\S]*)\n\) \|\| exit \$\?\nexit \$slipstream_status)$`);
 
 /** The command a Slipstream chain runs after its own, or undefined when `value`
  * is not a Slipstream chain. */

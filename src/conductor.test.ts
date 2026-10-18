@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -71,10 +72,49 @@ describe('the Slipstream chain in a Conductor script', () => {
     assert.equal(slipstreamCommand('setup', P), `'/opt/node 24/bin/node' '/opt/it'\\''s/dist/cli.js' conductor setup --store /Users/x/.slipstream`);
   });
 
-  it('runs the repo\'s own command only after Slipstream, grouped', () => {
+  it('is only Slipstream\'s command when the repo has no script of its own', () => {
     const ours = slipstreamCommand('archive', P);
-    assert.equal(chainScript(ours, 'a; b # c'), `${ours} && {\na; b # c\n}`);
     assert.equal(chainScript(ours, null), ours);
+    assert.equal(chainScript(ours, '  '), ours);
+  });
+
+  /** Run a chain under sh, with `ours` run in a subshell standing in for the
+   * `slipstream conductor …` process. */
+  async function runChain(ours: string, own: string | null): Promise<{ code: number | null; ran: string }> {
+    let result!: { code: number | null; ran: string };
+    await withTemp(async (dir) => {
+      const log = join(dir, 'ran');
+      await writeFile(log, '');
+      const child = spawn('/bin/sh', ['-c', chainScript(`(${ours})`, own)], { cwd: dir, env: { ...process.env, LOG: log }, stdio: 'ignore' });
+      const code = await new Promise<number | null>((done) => child.once('exit', done));
+      result = { code, ran: await read(log) };
+    });
+    return result;
+  }
+
+  it('runs the repo\'s setup and still exits non-zero when capture is limit-reached', async () => {
+    const r = await runChain('echo slipstream >> "$LOG"; exit 1', 'echo own >> "$LOG"');
+    assert.equal(r.ran, 'slipstream\nown\n');
+    assert.equal(r.code, 1);
+  });
+
+  it('exits with the repo\'s own failure code over Slipstream\'s', async () => {
+    assert.equal((await runChain('exit 1', 'exit 7')).code, 7);
+    assert.equal((await runChain('exit 0', 'false')).code, 1);
+  });
+
+  it('exits with Slipstream\'s code when the repo\'s own script succeeds, even one that exits itself', async () => {
+    assert.equal((await runChain('exit 3', 'true')).code, 3);
+    assert.equal((await runChain('exit 3', 'exit 0')).code, 3);
+    assert.equal((await runChain('exit 0', 'a=1\necho "$a" >> "$LOG"')).code, 0);
+  });
+
+  it('runs Slipstream before the repo\'s archive, whatever Slipstream returned', async () => {
+    for (const code of [0, 1]) {
+      const r = await runChain(`echo withdraw >> "$LOG"; exit ${code}`, 'echo own-archive >> "$LOG"');
+      assert.equal(r.ran, 'withdraw\nown-archive\n');
+      assert.equal(r.code, code);
+    }
   });
 
   it('recognizes its own chain and what it wraps, and nothing else', () => {

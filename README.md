@@ -184,8 +184,11 @@ would commit it. If the repo's script changes later, `conductor setup` warns
 until you run `install` again.
 
 From then on, a new workspace starts recording before the repo's own setup runs.
-If recording can't start, setup fails with the reason, and the repo's own setup
-does not run. Archiving a workspace stops its capture first and keeps the history.
+The repo's own setup always runs, even when recording can't start (for example,
+when all 16 capture slots are in use). In that case Slipstream prints the reason
+and the setup script still fails, so the workspace shows that it isn't recording.
+Archiving a workspace stops its capture first and keeps the history; the repo's
+own archive script runs even if that stop fails.
 Conductor's documentation doesn't say whether the agent can start before setup
 finishes, so a capture may begin after the agent's first edits. In that case the
 first recorded state is whatever was there when recording started.
