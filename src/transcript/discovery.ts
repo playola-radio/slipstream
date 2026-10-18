@@ -119,9 +119,15 @@ function segmentsOf(path: string): string[] {
   return path.split('/').filter((s) => s !== '' && s !== '.');
 }
 
+/** Where an unresolvable cwd sits once every living component is canonicalized,
+ * or `undecidable` when it cannot be placed cheaply. Root-independent, so one walk
+ * serves every capture root in a discovery cycle. */
+type UnresolvedPlacement = { kind: 'placed'; path: string } | { kind: 'undecidable' };
+
 /**
- * True when an UNRESOLVABLE cwd could still sit inside the capture root, so it is
- * an in-root candidate we failed to read rather than a genuine non-candidate.
+ * Place an UNRESOLVABLE cwd so each capture root can tell whether it could still
+ * sit inside it: an in-root candidate we failed to read rather than a genuine
+ * non-candidate.
  *
  * A textual check is unreliable both ways: the raw string may be in the root's
  * alias namespace (cwd `/tmp/proj/gone` for canonical root `/private/tmp/proj`)
@@ -145,11 +151,7 @@ function segmentsOf(path: string): string[] {
  * Undecidable cases (an uninspectable component, a symlink cycle past the hop
  * cap) fail toward disclosure: never claim non-membership we did not establish.
  */
-async function unresolvedCwdMayBeInRoot(
-  io: DiscoveryIO,
-  root: string,
-  cwd: string,
-): Promise<boolean> {
+async function placeUnresolvedCwd(io: DiscoveryIO, cwd: string): Promise<UnresolvedPlacement> {
   const queue = segmentsOf(cwd);
   let cursor = 0;
   let base = '/';
@@ -184,14 +186,43 @@ async function unresolvedCwdMayBeInRoot(
       // deleted space). Follow its literal target so a `..` after it is evaluated
       // against the target and the target's living parts get canonicalized above.
       symlinkHops += 1;
-      if (symlinkHops > MAX_UNRESOLVED_HOPS) return true; // cycle: disclose
+      if (symlinkHops > MAX_UNRESOLVED_HOPS) return { kind: 'undecidable' }; // cycle: disclose
       if (isAbsolute(probe.target)) base = '/';
       queue.splice(cursor, 0, ...segmentsOf(probe.target));
       continue;
     }
-    return true; // uninspectable (e.g. permissions): cannot rule out membership
+    return { kind: 'undecidable' }; // uninspectable (e.g. permissions): cannot rule out membership
   }
-  return isWithinRoot(root, base);
+  return { kind: 'placed', path: base };
+}
+
+/** Path resolution memoized for one discovery cycle, so a cwd shared by many
+ * transcripts, or checked against many capture roots, is resolved once. It holds
+ * filesystem facts only; each root still classifies against them itself. */
+interface CwdResolver {
+  realpath(path: string): Promise<string | undefined>;
+  placeUnresolved(cwd: string): Promise<UnresolvedPlacement>;
+}
+
+function createCwdResolver(io: DiscoveryIO): CwdResolver {
+  const real = new Map<string, Promise<string | undefined>>();
+  const placed = new Map<string, Promise<UnresolvedPlacement>>();
+  const memoIO: DiscoveryIO = {
+    ...io,
+    realpath: (path) => {
+      let p = real.get(path);
+      if (!p) real.set(path, (p = io.realpath(path)));
+      return p;
+    },
+  };
+  return {
+    realpath: memoIO.realpath,
+    placeUnresolved: (cwd) => {
+      let p = placed.get(cwd);
+      if (!p) placed.set(cwd, (p = placeUnresolvedCwd(memoIO, cwd)));
+      return p;
+    },
+  };
 }
 
 /** How a transcript's recorded cwd relates to the capture root. */
@@ -207,10 +238,11 @@ type CwdClassification =
  * (Claude) or a shared global sessions dir (Codex) cannot bind another worktree's
  * session to this root.
  */
-async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<CwdClassification> {
-  const canonicalCwd = await io.realpath(cwd);
+async function classifyCwd(resolver: CwdResolver, root: string, cwd: string): Promise<CwdClassification> {
+  const canonicalCwd = await resolver.realpath(cwd);
   if (canonicalCwd === undefined) {
-    return (await unresolvedCwdMayBeInRoot(io, root, cwd))
+    const placed = await resolver.placeUnresolved(cwd);
+    return placed.kind === 'undecidable' || isWithinRoot(root, placed.path)
       ? { kind: 'unresolved-in-root' }
       : { kind: 'out-of-root' };
   }
@@ -223,7 +255,7 @@ async function classifyCwd(io: DiscoveryIO, root: string, cwd: string): Promise<
   let rootAliases: string[] | undefined;
   if (cwd !== canonicalCwd) {
     const aliasRoot = resolve(cwd, relative(canonicalCwd, root));
-    if ((await io.realpath(aliasRoot)) === root) rootAliases = [aliasRoot];
+    if ((await resolver.realpath(aliasRoot)) === root) rootAliases = [aliasRoot];
   }
   return { kind: 'in-root', cwd: canonicalCwd, ...(rootAliases !== undefined ? { rootAliases } : {}) };
 }
@@ -311,70 +343,99 @@ async function resolveClaudeCwd(
   return { kind: 'none' };
 }
 
-export async function discoverClaude(
+/** One result per distinct root, each with its own arrays. */
+function emptyResults(roots: readonly string[]): Map<string, DiscoveryResult> {
+  return new Map([...new Set(roots)].map((root) => [root, { bindings: [], issues: [] }]));
+}
+
+/** Disclose one issue to every root it concerns, each getting its own copy. */
+function discloseTo(results: Map<string, DiscoveryResult>, roots: Iterable<string>, issue: CoverageIssue): void {
+  for (const root of roots) results.get(root)!.issues.push({ ...issue });
+}
+
+/**
+ * Claude discovery for several capture roots in one pass. Each Claude project
+ * directory is listed once and each transcript head read once, however many roots
+ * slug onto it; the recorded cwd then decides, per root, whether it is a member.
+ */
+export async function discoverClaudeRoots(
   io: DiscoveryIO,
   home: string,
-  root: string,
-): Promise<DiscoveryResult> {
-  const dir = `${home}/projects/${claudeSlug(root)}`;
-  const listed = await io.listDir(dir);
-  if (!listed.ok) {
-    return { bindings: [], issues: [{ kind: listed.reason, detail: `claude project dir ${dir}` }] };
+  roots: readonly string[],
+): Promise<Map<string, DiscoveryResult>> {
+  const results = emptyResults(roots);
+  const resolver = createCwdResolver(io);
+  const byDir = new Map<string, string[]>();
+  for (const root of results.keys()) {
+    const dir = `${home}/projects/${claudeSlug(root)}`;
+    byDir.set(dir, [...(byDir.get(dir) ?? []), root]);
   }
-  const bindings: TranscriptBinding[] = [];
-  const issues: CoverageIssue[] = [];
-  for (const path of listed.paths) {
-    const sessionId = baseName(path).slice(0, -'.jsonl'.length);
-    // The slug directory alone cannot establish membership: two distinct roots can
-    // collide onto one slug (e.g. /work/a-b and /work/a/b). So a transcript is bound
-    // ONLY once its recorded cwd has been read and confirmed in-root — it is never
-    // slug-trusted. Until confirmation:
-    //   - an empty or still-preamble transcript is withheld with no issue (pending
-    //     coverage); it is re-checked next tick once more is written, and no record
-    //     is ingested under an unconfirmed binding (so a colliding sibling's records
-    //     landing before confirmation can never be credited to this root);
-    //   - a transcript whose membership cannot be confirmed (unreadable/oversized or
-    //     truncated head, or an in-root cwd that will not resolve) is disclosed.
-    const head = await io.readFirstLine(path);
-    if (!head.ok) {
-      if (head.reason === 'empty') continue; // not yet written: withhold, stays pending
-      // A first line that exists but could not be read (malformed, e.g. invalid
-      // UTF-8 or an unbounded line; or inaccessible): disclose the gap.
-      issues.push({ kind: head.reason, detail: `claude transcript ${path}` });
+  for (const [dir, group] of byDir) {
+    const listed = await io.listDir(dir);
+    if (!listed.ok) {
+      discloseTo(results, group, { kind: listed.reason, detail: `claude project dir ${dir}` });
       continue;
     }
-    const resolution = await resolveClaudeCwd(io, path, head.line, head.id);
-    if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
-    if (resolution.kind === 'unconfirmed') {
-      issues.push({
-        kind: resolution.reason,
-        detail: `claude transcript ${path} membership unconfirmed: ${resolution.detail}`,
-      });
-      continue;
+    for (const path of listed.paths) {
+      const sessionId = baseName(path).slice(0, -'.jsonl'.length);
+      // The slug directory alone cannot establish membership: two distinct roots can
+      // collide onto one slug (e.g. /work/a-b and /work/a/b). So a transcript is bound
+      // ONLY once its recorded cwd has been read and confirmed in-root — it is never
+      // slug-trusted. Until confirmation:
+      //   - an empty or still-preamble transcript is withheld with no issue (pending
+      //     coverage); it is re-checked next tick once more is written, and no record
+      //     is ingested under an unconfirmed binding (so a colliding sibling's records
+      //     landing before confirmation can never be credited to this root);
+      //   - a transcript whose membership cannot be confirmed (unreadable/oversized or
+      //     truncated head, or an in-root cwd that will not resolve) is disclosed.
+      const head = await io.readFirstLine(path);
+      if (!head.ok) {
+        if (head.reason === 'empty') continue; // not yet written: withhold, stays pending
+        // A first line that exists but could not be read (malformed, e.g. invalid
+        // UTF-8 or an unbounded line; or inaccessible): disclose the gap.
+        discloseTo(results, group, { kind: head.reason, detail: `claude transcript ${path}` });
+        continue;
+      }
+      const resolution = await resolveClaudeCwd(io, path, head.line, head.id);
+      if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
+      if (resolution.kind === 'unconfirmed') {
+        discloseTo(results, group, {
+          kind: resolution.reason,
+          detail: `claude transcript ${path} membership unconfirmed: ${resolution.detail}`,
+        });
+        continue;
+      }
+      for (const root of group) {
+        const result = results.get(root)!;
+        const cls = await classifyCwd(resolver, root, resolution.cwd);
+        if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
+        if (cls.kind === 'unresolved-in-root') {
+          result.issues.push({
+            kind: 'inaccessible',
+            detail: `claude transcript ${path} cwd ${resolution.cwd} could not be resolved`,
+          });
+          continue;
+        }
+        result.bindings.push({
+          path,
+          ctx: {
+            harness: 'claude-code',
+            harnessSessionId: sessionId,
+            root,
+            cwd: cls.cwd,
+            adapterVersion: CLAUDE_ADAPTER_VERSION,
+            ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
+          },
+          generation: resolution.id,
+        });
+      }
     }
-    const cls = await classifyCwd(io, root, resolution.cwd);
-    if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
-    if (cls.kind === 'unresolved-in-root') {
-      issues.push({
-        kind: 'inaccessible',
-        detail: `claude transcript ${path} cwd ${resolution.cwd} could not be resolved`,
-      });
-      continue;
-    }
-    bindings.push({
-      path,
-      ctx: {
-        harness: 'claude-code',
-        harnessSessionId: sessionId,
-        root,
-        cwd: cls.cwd,
-        adapterVersion: CLAUDE_ADAPTER_VERSION,
-        ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
-      },
-      generation: resolution.id,
-    });
   }
-  return { bindings, issues };
+  return results;
+}
+
+export async function discoverClaude(io: DiscoveryIO, home: string, root: string): Promise<DiscoveryResult> {
+  return (await discoverClaudeRoots(io, home, [root])).get(root)!;
 }
 
 function parseSessionMeta(line: string): { id: string; cwd: string } | undefined {
@@ -395,43 +456,53 @@ function parseSessionMeta(line: string): { id: string; cwd: string } | undefined
   }
 }
 
-export async function discoverCodex(
+
+/**
+ * Codex discovery for several capture roots in one pass. The global sessions tree
+ * is enumerated once and each rollout's `session_meta` read once; its cwd then
+ * decides, per root, whether it is a member. A scan-wide gap (the file cap, an
+ * unreadable subdirectory, a rollout we cannot read) could hide any root's
+ * session, so it is disclosed to every root, exactly as a lone scan would.
+ */
+export async function discoverCodexRoots(
   io: DiscoveryIO,
   home: string,
-  root: string,
+  roots: readonly string[],
   limit: number,
-): Promise<DiscoveryResult> {
+): Promise<Map<string, DiscoveryResult>> {
+  const results = emptyResults(roots);
+  const all = [...results.keys()];
   const dir = `${home}/sessions`;
   const listed = await io.listTreeJsonl(dir, limit);
   if ('ok' in listed && listed.ok === false) {
-    return { bindings: [], issues: [{ kind: listed.reason, detail: `codex sessions dir ${dir}` }] };
+    discloseTo(results, all, { kind: listed.reason, detail: `codex sessions dir ${dir}` });
+    return results;
   }
   const { paths, truncated, incomplete } = listed as {
     paths: string[];
     truncated: boolean;
     incomplete: boolean;
   };
-  const issues: CoverageIssue[] = [];
   if (truncated) {
-    issues.push({
+    discloseTo(results, all, {
       kind: 'discovery-limited',
       detail: `codex session scan hit the ${limit}-file cap; some transcripts may be unread`,
     });
   }
   if (incomplete) {
-    issues.push({
+    discloseTo(results, all, {
       kind: 'inaccessible',
       detail: `some codex session subdirectories under ${dir} were unreadable`,
     });
   }
-  const bindings: TranscriptBinding[] = [];
+  const resolver = createCwdResolver(io);
   for (const path of paths) {
     // A file we cannot read or parse is a candidate we cannot rule out, so it is
     // disclosed as an issue — never silently skipped (which would let a readable
     // sibling conceal it and report coverage as clean).
     const head = await io.readFirstLine(path);
     if (!head.ok) {
-      issues.push({
+      discloseTo(results, all, {
         kind: head.reason === 'inaccessible' ? 'inaccessible' : 'malformed',
         detail: `codex rollout ${path}`,
       });
@@ -439,34 +510,60 @@ export async function discoverCodex(
     }
     const meta = parseSessionMeta(head.line);
     if (!meta) {
-      issues.push({ kind: 'malformed', detail: `codex rollout ${path} has no session_meta` });
+      discloseTo(results, all, { kind: 'malformed', detail: `codex rollout ${path} has no session_meta` });
       continue;
     }
-    const cls = await classifyCwd(io, root, meta.cwd);
-    if (cls.kind === 'out-of-root') continue;
-    if (cls.kind === 'unresolved-in-root') {
-      // An in-root candidate we failed to read: disclose the gap rather than let a
-      // readable sibling report clean coverage. A cwd whose nearest living ancestor
-      // is outside the root is a different worktree's session, skipped silently.
-      issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
-      continue;
+    for (const root of all) {
+      const result = results.get(root)!;
+      const cls = await classifyCwd(resolver, root, meta.cwd);
+      if (cls.kind === 'out-of-root') continue;
+      if (cls.kind === 'unresolved-in-root') {
+        // An in-root candidate we failed to read: disclose the gap rather than let a
+        // readable sibling report clean coverage. A cwd whose nearest living ancestor
+        // is outside the root is a different worktree's session, skipped silently.
+        result.issues.push({ kind: 'inaccessible', detail: `codex rollout ${path} cwd ${meta.cwd} could not be resolved` });
+        continue;
+      }
+      result.bindings.push({
+        path,
+        ctx: {
+          harness: 'codex',
+          harnessSessionId: meta.id,
+          root,
+          cwd: cls.cwd,
+          adapterVersion: CODEX_ADAPTER_VERSION,
+          ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
+        },
+        // The Codex ctx derives entirely from line 1 (session_meta), so the generation
+        // is the first-line read that produced it.
+        generation: head.id,
+      });
     }
-    bindings.push({
-      path,
-      ctx: {
-        harness: 'codex',
-        harnessSessionId: meta.id,
-        root,
-        cwd: cls.cwd,
-        adapterVersion: CODEX_ADAPTER_VERSION,
-        ...(cls.rootAliases !== undefined ? { rootAliases: cls.rootAliases } : {}),
-      },
-      // The Codex ctx derives entirely from line 1 (session_meta), so the generation
-      // is the first-line read that produced it.
-      generation: head.id,
-    });
   }
-  return { bindings, issues };
+  return results;
+}
+
+export async function discoverCodex(
+  io: DiscoveryIO,
+  home: string,
+  root: string,
+  limit: number,
+): Promise<DiscoveryResult> {
+  return (await discoverCodexRoots(io, home, [root], limit)).get(root)!;
+}
+
+/** One harness's discovery for every given capture root, sharing enumeration and
+ * header reads across them. */
+export async function discoverRoots(
+  harness: HarnessName,
+  io: DiscoveryIO,
+  home: string,
+  roots: readonly string[],
+  codexScanLimit: number,
+): Promise<Map<string, DiscoveryResult>> {
+  return harness === 'claude-code'
+    ? discoverClaudeRoots(io, home, roots)
+    : discoverCodexRoots(io, home, roots, codexScanLimit);
 }
 
 export async function discover(
@@ -476,7 +573,5 @@ export async function discover(
   root: string,
   codexScanLimit: number,
 ): Promise<DiscoveryResult> {
-  return harness === 'claude-code'
-    ? discoverClaude(io, home, root)
-    : discoverCodex(io, home, root, codexScanLimit);
+  return (await discoverRoots(harness, io, home, [root], codexScanLimit)).get(root)!;
 }

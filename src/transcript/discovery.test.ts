@@ -4,6 +4,7 @@ import {
   claudeSlug,
   discoverClaude,
   discoverCodex,
+  discoverRoots,
   isWithinRoot,
   type DiscoveryIO,
   type ListResult,
@@ -766,5 +767,111 @@ describe('transcript discovery', () => {
     );
     assert.equal(result.bindings.length, 0);
     assert.equal(result.issues.length, 0);
+  });
+});
+
+describe('shared discovery across several roots', () => {
+  const GEN = { dev: 1n, ino: 1n };
+  const meta = (id: string, cwd: string) => JSON.stringify({ type: 'session_meta', payload: { id, cwd } });
+  const record = (cwd: string) => JSON.stringify({ type: 'user', cwd, message: { content: 'hi' } });
+  const bump = (m: Map<string, number>, k: string): void => { m.set(k, (m.get(k) ?? 0) + 1); };
+  const ids = (r: { bindings: Array<{ ctx: { harnessSessionId: string } }> } | undefined) =>
+    r!.bindings.map((b) => b.ctx.harnessSessionId).sort();
+
+  it('lists a slug-colliding Claude dir once and binds each transcript only to the root its cwd is in', async () => {
+    const dir = `/home/projects/${claudeSlug('/work/a-b')}`;
+    assert.equal(claudeSlug('/work/a/b'), claudeSlug('/work/a-b'));
+    const heads = new Map([
+      [`${dir}/x.jsonl`, record('/work/a-b')],
+      [`${dir}/y.jsonl`, record('/work/a/b/pkg')],
+      [`${dir}/z.jsonl`, record('/work/other')],
+    ]);
+    const lists = new Map<string, number>();
+    const reads = new Map<string, number>();
+    const found = await discoverRoots('claude-code', io({
+      listDir: async (d) => { bump(lists, d); return { ok: true, paths: [...heads.keys()] }; },
+      readFirstLine: async (p) => { bump(reads, p); return { ok: true as const, line: heads.get(p)!, id: GEN }; },
+    }), '/home', ['/work/a-b', '/work/a/b'], 10);
+    assert.deepEqual([...lists], [[dir, 1]]);
+    assert.deepEqual([...reads.values()], [1, 1, 1]);
+    assert.deepEqual(ids(found.get('/work/a-b')), ['x']);
+    assert.deepEqual(ids(found.get('/work/a/b')), ['y']);
+    assert.equal(found.get('/work/a-b')!.issues.length + found.get('/work/a/b')!.issues.length, 0);
+  });
+
+  it('discloses a malformed Claude head to every root sharing its dir, and to no other root', async () => {
+    const shared = `/home/projects/${claudeSlug('/work/a-b')}`;
+    const found = await discoverRoots('claude-code', io({
+      listDir: async (d) => (d === shared ? { ok: true, paths: [`${shared}/bad.jsonl`] } : { ok: true, paths: [] }),
+      readFirstLine: async () => ({ ok: false as const, reason: 'malformed' as const }),
+    }), '/home', ['/work/a-b', '/work/a/b', '/work/c'], 10);
+    for (const root of ['/work/a-b', '/work/a/b']) {
+      assert.deepEqual(found.get(root)!.issues.map((i) => i.kind), ['malformed'], root);
+    }
+    assert.deepEqual(found.get('/work/c')!.issues, []);
+    assert.notEqual(found.get('/work/a-b')!.issues[0], found.get('/work/a/b')!.issues[0], 'each root owns its issue');
+  });
+
+  it('scans Codex once for nested roots, resolving each cwd once and deriving aliases per root', async () => {
+    const heads = new Map([
+      ['/c/outer.jsonl', meta('outer', '/work/proj')],
+      ['/c/inner.jsonl', meta('inner', '/alias/pkg')],
+    ]);
+    let scans = 0;
+    const reads = new Map<string, number>();
+    const resolves = new Map<string, number>();
+    const found = await discoverRoots('codex', io({
+      listTreeJsonl: async () => { scans += 1; return { paths: [...heads.keys()], truncated: false, incomplete: false }; },
+      readFirstLine: async (p) => { bump(reads, p); return { ok: true as const, line: heads.get(p)!, id: GEN }; },
+      realpath: async (p) => { bump(resolves, p); return p === '/alias/pkg' ? '/work/proj/pkg' : p; },
+    }), '/home', ['/work/proj', '/work/proj/pkg'], 10);
+    assert.equal(scans, 1);
+    assert.deepEqual([...reads.values()], [1, 1]);
+    assert.ok([...resolves.values()].every((n) => n === 1), JSON.stringify([...resolves]));
+    assert.deepEqual(ids(found.get('/work/proj')), ['inner', 'outer']);
+    assert.deepEqual(ids(found.get('/work/proj/pkg')), ['inner']);
+    const inner = found.get('/work/proj/pkg')!.bindings[0]!;
+    assert.deepEqual([inner.ctx.cwd, inner.ctx.rootAliases], ['/work/proj/pkg', ['/alias/pkg']]);
+    const single = await discoverCodex(io({
+      listTreeJsonl: async () => ({ paths: ['/c/inner.jsonl'], truncated: false, incomplete: false }),
+      readFirstLine: async (p) => ({ ok: true as const, line: heads.get(p)!, id: GEN }),
+      realpath: async (p) => (p === '/alias/pkg' ? '/work/proj/pkg' : p),
+    }), '/home', '/work/proj', 10);
+    assert.deepEqual(found.get('/work/proj')!.bindings.find((b) => b.ctx.harnessSessionId === 'inner')!.ctx.rootAliases,
+      single.bindings[0]!.ctx.rootAliases, 'the outer root derives the alias a lone scan would');
+  });
+
+  it('discloses an unresolvable cwd only to the root it may lie in', async () => {
+    const found = await discoverRoots('codex', io({
+      listTreeJsonl: async () => ({ paths: ['/c/v.jsonl'], truncated: false, incomplete: false }),
+      readFirstLine: async () => ({ ok: true as const, line: meta('vanished', '/work/proj/gone'), id: GEN }),
+      realpath: async (p) => (['/', '/work', '/work/proj', '/work/other'].includes(p) ? p : undefined),
+    }), '/home', ['/work/proj', '/work/other'], 10);
+    assert.ok(found.get('/work/proj')!.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/work/proj/gone')));
+    assert.deepEqual(found.get('/work/other')!.issues, []);
+  });
+
+  it('discloses an uninspectable cwd to every root, since membership cannot be ruled out for any', async () => {
+    const found = await discoverRoots('codex', io({
+      listTreeJsonl: async () => ({ paths: ['/c/ea.jsonl'], truncated: false, incomplete: false }),
+      readFirstLine: async () => ({ ok: true as const, line: meta('walled', '/links/alias'), id: GEN }),
+      realpath: async (p) => (p === '/links' ? '/links' : undefined),
+      probe: async (p) => (p === '/links/alias' ? { kind: 'error' } : { kind: 'absent' }),
+    }), '/home', ['/work/proj', '/work/other'], 10);
+    for (const root of ['/work/proj', '/work/other']) {
+      assert.ok(found.get(root)!.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/links/alias')), root);
+    }
+  });
+
+  it('discloses a truncated scan and a malformed rollout to every root, each with its own issue list', async () => {
+    const found = await discoverRoots('codex', io({
+      listTreeJsonl: async () => ({ paths: ['/c/bad.jsonl'], truncated: true, incomplete: false }),
+      readFirstLine: async () => ({ ok: true as const, line: 'not json', id: GEN }),
+    }), '/home', ['/work/a', '/work/b'], 1);
+    const a = found.get('/work/a')!.issues;
+    const b = found.get('/work/b')!.issues;
+    assert.deepEqual(a.map((i) => i.kind).sort(), ['discovery-limited', 'malformed']);
+    assert.deepEqual(b, a);
+    assert.notEqual(a, b);
   });
 });
