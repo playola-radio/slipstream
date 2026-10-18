@@ -42,6 +42,7 @@ import { QUESTION_TTL_MS } from './questions.ts';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
+import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -516,6 +517,20 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
   }
 }
 
+/** Detach, unlink or archive: through the daemon, or recorded offline without one. */
+async function runWithdrawal(store: string, run: (deps: WithdrawDeps) => Promise<number>, verb: string): Promise<void> {
+  const socketPath = controlSocketPath(store);
+  try {
+    process.exitCode = await run({ store, out: (line) => console.log(line), err: (line) => console.error(line),
+      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }) });
+  } catch (err) {
+    if (!(err instanceof OutcomeUnknownError)) throw err;
+    console.error(`slipstream: outcome unknown — ${err.message}`);
+    console.error(`slipstream: ${retryGuidance(verb)}`);
+    process.exitCode = 3;
+  }
+}
+
 type CaptureRow = Record<string, unknown> & { binding?: Record<string, unknown> | null };
 
 /** Human-readable `status`: the daemon, then one block per capture. */
@@ -664,12 +679,12 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'detach') {
-    await runControl(args.store, { verb: 'detach', target: args.target });
+    await runWithdrawal(args.store, (deps) => runWithdraw({ target: args.target, reason: 'detached' }, deps), 'detach');
     return;
   }
 
   if (args.command === 'unlink') {
-    await runControl(args.store, { verb: 'unlink', session_id: args.sessionId });
+    await runWithdrawal(args.store, (deps) => runUnlink({ sessionId: args.sessionId }, deps), 'unlink');
     return;
   }
 

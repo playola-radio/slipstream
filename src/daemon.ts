@@ -26,6 +26,7 @@ import {
   MAX_BINDINGS, MAX_CAPTURES, admitCapture, emptyIntent, findCapture, findLinked, forgetSession, linkBinding, linkedCount,
   revokeBinding, withdrawCapture, type NotRecordingReason,
 } from './capture-intent.ts';
+import { saveIntent } from './intent-store.ts';
 import { liveBoundary } from './reader-runtime.ts';
 import {
   createLineDecoder,
@@ -75,7 +76,20 @@ export interface DaemonOptions {
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
+const STORE_LOCK_WAIT_MS = 2_000;
+const STORE_LOCK_POLL_MS = 50;
 class RootIdentityError extends Error {}
+
+/** The intent record could not be written. Every later lifecycle change is
+ * refused: acknowledging one the record does not hold would be a lie after a
+ * restart. */
+class IntentWriteError extends Error {
+  constructor(cause: unknown) {
+    super(`the capture intent record could not be written (${(cause as Error).message}); `
+      + 'this daemon refuses attach, detach and unlink until it is restarted', { cause });
+    this.name = 'IntentWriteError';
+  }
+}
 
 /** Build the per-session transcript runtime from resolved config: only harnesses
  * the operator declared `configured` are read. */
@@ -274,6 +288,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // zone (it may run with `reader` still undefined — teardown null-checks it).
   const registry = createBoundaryRegistry();
   const intent = emptyIntent();
+  /** The next intent write not yet started; joining it covers every mutation made
+   * before it begins. Writes run one at a time. */
+  let intentFlush: Promise<void> | undefined;
+  let intentTail: Promise<void> = Promise.resolve();
+  let intentBroken: IntentWriteError | undefined;
   /** Every capture this daemon has admitted, by session id; withdrawn ones stay
    * for history until their session is deleted. */
   const captures = new Map<string, Capture>();
@@ -363,24 +382,35 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // isSocket() check proves type, not ownership, so deleting it could remove the
     // successor's socket. Leave it for the new owner instead.
     if (!compromised) await unlinkOwnSocket();
+    await intentTail;
     await lock.release();
     if (stopErr) throw stopErr;
   }
 
   let lock: SessionLock;
-  try {
-    lock = await acquireSessionLock(storeDir, {
-      onCompromised: (reason) => {
-        compromised = true;
-        console.error(`slipstream daemon: store lock lost: ${reason}`);
-        void teardown().catch((teardownErr) => {
-          console.error('slipstream daemon: teardown after store-lock loss failed:', teardownErr);
-        });
-      },
-    });
-  } catch (err) {
-    if (err instanceof SessionOwnedError) throw new DaemonAlreadyRunningError(socketPath);
-    throw err;
+  // A CLI recording a withdrawal while no daemon ran holds the store lock for
+  // milliseconds; wait it out. A lock still held after that, or a socket that
+  // starts answering, is another daemon.
+  const lockDeadline = Date.now() + STORE_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      lock = await acquireSessionLock(storeDir, {
+        onCompromised: (reason) => {
+          compromised = true;
+          console.error(`slipstream daemon: store lock lost: ${reason}`);
+          void teardown().catch((teardownErr) => {
+            console.error('slipstream daemon: teardown after store-lock loss failed:', teardownErr);
+          });
+        },
+      });
+      break;
+    } catch (err) {
+      if (!(err instanceof SessionOwnedError)) throw err;
+      if (Date.now() >= lockDeadline || await probeSocket(socketPath, PROBE_TIMEOUT_MS) !== 'stale') {
+        throw new DaemonAlreadyRunningError(socketPath);
+      }
+      await new Promise((resolve) => setTimeout(resolve, STORE_LOCK_POLL_MS));
+    }
   }
 
   // Bring the reader up before accepting control traffic, so a verb can never be
@@ -543,6 +573,37 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const entry = findCapture(intent, c.id);
     if (entry) entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: null };
     console.error(`slipstream daemon: capture ${c.id} of ${c.root} is not recording: ${message}`);
+    persistQuietly();
+  }
+
+  /** Make the in-memory intent durable (contracts.md §8). Mutations are synchronous,
+   * so slot counts and the write they back cannot interleave; a lifecycle verb
+   * awaits this before it acts or replies. */
+  function persistIntent(): Promise<void> {
+    if (intentBroken) return Promise.reject(intentBroken);
+    intentFlush ??= intentTail.then(async () => {
+      intentFlush = undefined;
+      if (intentBroken) throw intentBroken;
+      try {
+        await saveIntent(storeDir, intent);
+      } catch (err) {
+        intentBroken ??= new IntentWriteError(err);
+        console.error(`slipstream daemon: ${intentBroken.message}`);
+        throw intentBroken;
+      }
+    });
+    const flush = intentFlush;
+    intentTail = flush.catch(() => {});
+    return flush;
+  }
+
+  /** Persist a change no acknowledgement depends on (a recorded failure). */
+  function persistQuietly(): void {
+    persistIntent().catch(() => {});
+  }
+
+  function intentRefusal(): ErrorFields | undefined {
+    return intentBroken ? errFields('STORAGE_UNAVAILABLE', intentBroken.message) : undefined;
   }
 
   // ---- admission ----------------------------------------------------------
@@ -552,6 +613,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** Find or admit the capture of a canonical root. */
   async function admit(root: string): Promise<Admitted | ErrorFields> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const refused = intentRefusal();
+    if (refused) return refused;
     const live = liveCaptureAt(root);
     if (live) return retryIfFailed(live);
     const pending = admitting.get(root);
@@ -617,6 +680,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       registry.reserve(id);
     }
     const entry = admitCapture(intent, { session_id: id, root, root_identity: rootIdentity });
+    try {
+      await persistIntent();
+    } catch (err) {
+      intent.captures = intent.captures.filter((e) => e !== entry);
+      return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
+    }
     const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set() };
     Object.assign(c, { root, lifecycle: 'queued', resume: lookup.match !== undefined, closeError: undefined });
     captures.set(id, c);
@@ -632,6 +701,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const entry = findCapture(intent, c.id);
     if (c.lifecycle !== 'failed' || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
     entry.last_failure = null;
+    persistQuietly();
     c.lifecycle = 'queued';
     c.resume = resume;
     enqueueStart(c);
@@ -838,6 +908,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (mine) return bindingExists(mine.harness, mine.harnessSessionId, c);
     const elsewhere = captureForChat(chat.harness, chat.harnessSessionId);
     if (elsewhere) return bindingExists(chat.harness, chat.harnessSessionId, elsewhere);
+    const refused = intentRefusal();
+    if (refused) return refused;
     if (linkedCount(intent) >= MAX_BINDINGS) return errFields('BINDING_LIMIT_REACHED', BINDING_LIMIT_MESSAGE);
     const entry = linkBinding(intent, {
       session_id: c.id, harness: chat.harness, harness_session_id: chat.harnessSessionId,
@@ -846,7 +918,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const b: Binding = { ...chat, generation: entry.binding_generation,
       check: { state: 'setup_pending', checkId: randomUUID(), delivered: false } };
     c.binding = b;
-    const publishing = publishBinding(c, b, true);
+    // The binding is durable before any event names it.
+    const publishing = persistIntent().then(() => publishBinding(c, b, true), (err: Error) => {
+      if (c.binding === b) c.binding = undefined;
+      revokeBinding(intent, c.id);
+      return errFields('STORAGE_UNAVAILABLE', err.message);
+    });
     b.publishing = publishing;
     c.inflight.add(publishing);
     let failed: ErrorFields | undefined;
@@ -882,6 +959,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (first && c.binding === b) {
         c.binding = undefined;
         revokeBinding(intent, c.id);
+        persistQuietly();
         // The log already says this chat is linked; say it no longer is.
         if (recorded) {
           await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
@@ -902,16 +980,22 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     const entry = findCapture(intent, c.id);
     if (entry && entry.intent !== 'withdrawn') {
+      const refused = intentRefusal();
+      if (refused) return refused;
       const promoted = withdrawCapture(intent, c.id, 'detached');
-      if (promoted) {
-        const next = captures.get(promoted.session_id);
-        if (next) enqueueStart(next);
-      }
+      revokeBinding(intent, c.id);
       const prior = c.closing;
-      c.closing = closeCapture(c, prior);
+      // Set in this turn, so a concurrent detach waits for the same stop. A
+      // withdrawal that is not durable stops nothing.
+      c.closing = persistIntent().then(() => {
+        const next = promoted && captures.get(promoted.session_id);
+        if (next) enqueueStart(next);
+        return closeCapture(c, prior);
+      }, () => {});
     }
     const already = entry?.intent === 'withdrawn' && c.lifecycle === 'stopped';
     await c.closing;
+    if (intentBroken && !['stopped', 'failed'].includes(c.lifecycle)) return intentRefusal()!;
     if (c.closeError) {
       return errFields('STORAGE_UNAVAILABLE', `detach did not stop cleanly: ${(c.closeError as Error).message}`);
     }
@@ -932,11 +1016,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     await prior;
     // An unlink can join while an earlier admitted task is draining.
     while (c.inflight.size) await Promise.allSettled([...c.inflight]);
+    // Detach already revoked the binding's intent with the withdrawal.
     const b = c.binding;
-    if (b) {
-      c.binding = undefined;
-      revokeBinding(intent, c.id);
-    }
+    c.binding = undefined;
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
     if (!session) {
@@ -964,17 +1046,23 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     await c.binding?.publishing;
     const b = c.binding;
     if (!b) return { session_id: c.id, already_unlinked: true };
+    const refused = intentRefusal();
+    if (refused) return refused;
     c.binding = undefined;
     revokeBinding(intent, c.id);
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
+    const persisted = persistIntent();
     const session = c.session;
     if (!session || !['recording', 'stopping'].includes(c.lifecycle)) {
+      await persisted.catch(() => {});
       return errFields('STORAGE_UNAVAILABLE', 'the chat was unlinked, but its capture cannot record the unlink');
     }
     const admitted = [...c.inflight];
     const append = (async () => {
       // Revoke immediately, but end task selection only after old admitted tasks
-      // have committed. Detach also drains this promise before closing the log.
+      // have committed and the revocation is durable. Detach also drains this
+      // promise before closing the log.
+      await persisted;
       await Promise.allSettled(admitted);
       await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
         data: { binding_generation: b.generation, reason: 'unlinked' } });
@@ -1239,6 +1327,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // Deletion removes the session's capture and binding entries (§8).
       forgetSession(intent, id);
       captures.delete(id);
+      try {
+        await persistIntent();
+      } catch (err) {
+        return errFields('STORAGE_UNAVAILABLE', `session ${id} is logically removed (tombstone durable), but ${(err as Error).message}`);
+      }
       // The tombstone is durable → the session is logically removed and the marker is
       // never rolled back. If we have since lost the store lock, or history cleanup
       // fails, report that removal committed and cleanup is retryable via gc.
