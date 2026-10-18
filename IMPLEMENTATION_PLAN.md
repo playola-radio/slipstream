@@ -1234,4 +1234,4 @@ heuristic / single-candidate after the fork.
 
 ### Stage C1.3: `record_question_exchange` verb and event
 **Success Criteria**: per `docs/chat-console/DESIGN.md` Change 2, with its tests.
-**Status**: Not Started
+**Status**: Complete — d08b6fd..b1b80e9 (typecheck, npm test 1679/1679, test:tools 598/598, qa:check --all passed; conversation ids appear only in questions.ts validation and tests)
