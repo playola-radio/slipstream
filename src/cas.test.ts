@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { fstatSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createCas, StorageError } from './cas.ts';
@@ -57,6 +59,36 @@ describe('cas', () => {
         const again = await createCas(dir);
         await again.put(Buffer.from('kept'));
         assert.equal((await stat(again.pathFor(ref.sha256))).ino, before);
+      });
+    });
+
+    it('fsyncs the shard again when a publish into an already-synced shard failed', async (t) => {
+      await withTempDir(async (dir) => {
+        const shardOf = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 2);
+        const sameShard: string[] = [];
+        for (let n = 0; sameShard.length < 3; n++) if (shardOf(`${n}`) === shardOf('0')) sameShard.push(`${n}`);
+        const [a, b, c] = sameShard as [string, string, string];
+        await (await createCas(dir)).put(Buffer.from(a));
+        const cas = await createCas(dir);
+        await cas.put(Buffer.from(c)); // publishes into the shard
+        await cas.put(Buffer.from(a)); // reuse: syncs the shard once and remembers it
+        const probe = await open(dir, 'r');
+        const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+        await probe.close();
+        const realSync = proto.sync;
+        let failDirs = true;
+        let dirSyncs = 0;
+        t.mock.method(proto, 'sync', function (this: { fd: number }) {
+          if (fstatSync(this.fd).isDirectory()) {
+            if (failDirs) return Promise.reject(Object.assign(new Error('injected dir fsync failure'), { code: 'EIO' }));
+            dirSyncs++;
+          }
+          return realSync.call(this);
+        });
+        await assert.rejects(cas.put(Buffer.from(b)), StorageError);
+        failDirs = false;
+        await cas.put(Buffer.from(b));
+        assert.ok(dirSyncs > 0, 'the retried blob is not durable until its shard directory is synced');
       });
     });
 

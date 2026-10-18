@@ -127,6 +127,10 @@ export async function createCas(rootDir: string): Promise<Cas> {
         throw new StorageError('rename-blob', err);
       }
       await fsyncDir(shard); // persist the rename into the shard directory
+    } catch (err) {
+      // An earlier sync of this shard no longer covers the entry that may have landed.
+      syncedShards.delete(shard);
+      throw err;
     } finally {
       await unlink(tmp).catch(() => {});
     }
