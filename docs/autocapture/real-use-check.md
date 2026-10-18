@@ -59,11 +59,17 @@ grep -E "is not recording|stopped:|watcher" ~/Library/Logs/slipstream/daemon.log
 slipstream status
 ```
 
+Pass `--summary` the same `--store` you sampled with. If it can't read the
+store's sessions folder or a session log, it fails rather than reporting zero
+gaps.
+
 The summary prints:
 
 | Field | Meaning |
 |---|---|
 | `hours` | Time from the first sample to the last. |
+| `samples` | How many samples were taken. |
+| `max_gap_s` | The longest time between two samples, in seconds. Much more than the interval means the sampler missed part of the day (a sleeping Mac, a failed sample); the averages say nothing about that stretch. |
 | `cpu_pct_idle` | Average CPU, as a percentage of one core, over the intervals in which no session log grew. This is the idle CPU in the bar. |
 | `cpu_pct_all` | Average CPU over the whole day, idle or not. For context only. |
 | `idle_intervals` | How many intervals `cpu_pct_idle` averages. |
@@ -80,7 +86,7 @@ Each part of the bar, and the numbers that answer it:
 | Part of the bar | Read | Pass when |
 |---|---|---|
 | Sixteen workspaces recording, with linked chats | `slipstream status` at the start and the end of the day | 16 rows `state: recording`, with the chats you linked `connected` |
-| A working day of normal use | `hours`; your own account of the day | You judge it a normal working day |
+| A working day of normal use | `hours`, `max_gap_s`; your own account of the day | You judge it a normal working day, and `max_gap_s` shows no long unsampled stretch |
 | Idle CPU at or under 1% of one core on average | `cpu_pct_idle` | ≤ 1 |
 | Memory at or under 512 MiB | `rss_max_mib` | ≤ 512 |
 | No sustained growth | `rss_first_quarter_mib` against `rss_last_quarter_mib`, and the `rss_kib` column in the samples | Memory levels off rather than climbing through the day |
@@ -105,7 +111,11 @@ frees the slot the new workspace needs):
   with `state: stopped (archived)` in `slipstream status <session_id>`, not
   `root-missing`. `root-missing` means Conductor removed the folder before
   Slipstream's archive step stopped the capture.
-- **First edit.** Create one new workspace and have its agent edit a file right
-  away. If that file's first event in the session is `file.baselined` rather
-  than `file.changed`, recording started after the edit, and the edit was
-  recorded only as the starting state. That is honest but worth knowing.
+- **First edit.** Create one new workspace and have its agent's first action be
+  creating a new file that isn't in the repo. A file that existed before
+  recording began appears as `file.baselined`; one created after appears as
+  `file.changed` with no earlier content. So if the new file's first event is
+  `file.baselined`, recording started after the agent created it, and its
+  creation was recorded only as the starting state. That is honest but worth
+  knowing. (Editing an existing file can't answer this: it is baselined either
+  way.)

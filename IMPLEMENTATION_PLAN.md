@@ -177,7 +177,10 @@ waits for captures still closing) is separate and not merged. P6 In Progress: P6
 (daemon release acceptance: `docs/autocapture/acceptance.md` maps every
 acceptance requirement to tests, the observed Conductor launch order is in the
 README, and `docs/autocapture/real-use-check.md` is the real-use runbook) is in
-review on `briankeane/autocapture-p6b-acceptance`. P6a (native app) is separate.
+review on `briankeane/autocapture-p6b-acceptance`. It found that a `queued`
+capture reads as `daemon-unavailable` to an offline reader (no heartbeat yet),
+so public-reader parity is not met for `queued`; that is an open contract
+decision. P6a (native app) is separate.
 The real-use day (the D8 verdict) has not been run; the feature is not complete.
 
 Known later work: after P5b an idle cycle still walks the Codex sessions tree once and
