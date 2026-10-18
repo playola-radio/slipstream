@@ -65,6 +65,17 @@ describe('the LaunchAgent', () => {
     });
   });
 
+  it('restarts an unchanged LaunchAgent when asked, so new code at the same paths runs', async () => {
+    await withHome(async (home) => {
+      const l = fakeLaunchctl();
+      const o = { ...paths, home, store: join(home, '.slipstream'), uid: 501 };
+      await installLaunchAgent(o, l.run);
+      const res = await installLaunchAgent({ ...o, restart: true }, l.run);
+      assert.equal(res.reloaded, true);
+      assert.deepEqual(l.calls.at(-1), ['launchctl', 'kickstart', '-k', 'gui/501/radio.playola.slipstream']);
+    });
+  });
+
   it('rewrites and reloads the LaunchAgent after an upgrade moves Node', async () => {
     await withHome(async (home) => {
       const l = fakeLaunchctl();

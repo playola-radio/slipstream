@@ -68,6 +68,18 @@ describe('withdrawing a capture', () => {
     assert.match(d.warned.join('\n'), /no capture is recorded for \/nowhere/);
   });
 
+  it('counts a target with no capture as done when asked to, with or without a daemon', async () => {
+    const { store } = await seeded();
+    const offline = deps(store, async () => DOWN);
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, offline), 0);
+    assert.deepEqual(offline.printed, ['slipstream: no capture is recorded for /nowhere; nothing to withdraw.']);
+    const live = deps(store, async () => ({ v: 1, ok: false, code: 'TARGET_NOT_FOUND', message: 'no capture of /nowhere' }));
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, live), 0);
+    assert.deepEqual(live.printed, ['slipstream: no capture of /nowhere; nothing to withdraw.']);
+    const other = deps(store, async () => ({ v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'disk' }));
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, other), 1);
+  });
+
   it('retries over the socket when a daemon holds the store lock while it starts', async () => {
     const { store } = await seeded();
     const lock = await acquireSessionLock(store);

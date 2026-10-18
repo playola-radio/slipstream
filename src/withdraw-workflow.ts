@@ -7,7 +7,7 @@
  */
 import { realpath } from 'node:fs/promises';
 import type { ResponseEnvelope } from './control-protocol.ts';
-import { unlinkOffline, withdrawOffline } from './intent-store.ts';
+import { NoCaptureError, unlinkOffline, withdrawOffline } from './intent-store.ts';
 import { SessionOwnedError } from './lock.ts';
 import { isValidSessionId } from './store-reader.ts';
 
@@ -24,10 +24,20 @@ export interface WithdrawDeps {
 const LOCKED_RETRY_MS = 10_000;
 const LOCKED_POLL_MS = 250;
 
-export async function runWithdraw(opts: { target: string; reason: 'detached' | 'archived' }, deps: WithdrawDeps): Promise<number> {
+/** `missingOk` makes a target with no capture a success: an archive script must
+ * not fail for a workspace Slipstream never captured. */
+export async function runWithdraw(opts: { target: string; reason: 'detached' | 'archived'; missingOk?: boolean },
+  deps: WithdrawDeps): Promise<number> {
   const request = { verb: 'detach', target: opts.target, ...(opts.reason === 'archived' ? { reason: 'archived' } : {}) };
+  const nothing = (message: string) => deps.out(`slipstream: ${message}; nothing to withdraw.`);
+  const missing = opts.missingOk ? (res: ResponseEnvelope) => !res.ok && res.code === 'TARGET_NOT_FOUND' : () => false;
   return untilUnlocked(deps, request, async () => {
-    const result = await withdrawOffline(deps.store, await offlineTarget(opts.target), opts.reason);
+    let result;
+    try { result = await withdrawOffline(deps.store, await offlineTarget(opts.target), opts.reason); } catch (err) {
+      if (!opts.missingOk || !(err instanceof NoCaptureError)) throw err;
+      nothing(err.message);
+      return;
+    }
     if (result.withdrawn.length === 0) deps.out('already_withdrawn: true');
     for (const id of result.withdrawn) {
       deps.out(`session_id: ${id}`);
@@ -36,7 +46,7 @@ export async function runWithdraw(opts: { target: string; reason: 'detached' | '
     }
     deps.out('slipstream: no daemon is running; the withdrawal is recorded and will not be resumed. '
       + 'No stop was written to the session, because none was observed.');
-  });
+  }, missing, nothing);
 }
 
 export async function runUnlink(opts: { sessionId: string }, deps: WithdrawDeps): Promise<number> {
@@ -54,12 +64,17 @@ export async function runUnlink(opts: { sessionId: string }, deps: WithdrawDeps)
 /** Ask the daemon; with none answering, act offline. A store lock held while no
  * daemon answers is a daemon starting (or another CLI writing): ask again. */
 async function untilUnlocked(deps: WithdrawDeps, request: Record<string, unknown> & { verb: string },
-  offline: () => Promise<void>): Promise<number> {
+  offline: () => Promise<void>, missing: (res: ResponseEnvelope) => boolean = () => false,
+  nothing: (message: string) => void = () => {}): Promise<number> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + LOCKED_RETRY_MS;
   for (;;) {
     const res = await deps.control(request);
+    if (!res.ok && missing(res)) {
+      nothing(res.message);
+      return 0;
+    }
     if (res.ok || res.code !== 'DAEMON_UNAVAILABLE') return report(res, deps);
     try {
       await offline();

@@ -320,7 +320,7 @@ async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {
   }
 }
 
-function shellWord(value: string): string {
+export function shellWord(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 

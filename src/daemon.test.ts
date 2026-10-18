@@ -2038,6 +2038,20 @@ describe('daemon capture table', () => {
     });
   });
 
+  it('keeps a waiting workspace\'s place in line when it is attached again', async () => {
+    await withCaptures(async ({ call, roots }) => {
+      const ws = await roots(18);
+      const ids: string[] = [];
+      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
+      for (const root of [ws[16]!, ws[17]!, ws[16]!]) {
+        assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: root })), CAPTURE_LIMIT_TEXT);
+      }
+      await call({ verb: 'detach', target: ids[0]! });
+      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
+      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
+    });
+  });
+
   it('gives the sixteenth capture slot to exactly one of two racing workspaces', async () => {
     await withCaptures(async ({ call, roots }) => {
       const ws = await roots(17);

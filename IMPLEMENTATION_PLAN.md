@@ -161,11 +161,13 @@ Rules that keep the expansion additive:
 (capture table: one capture per workspace up to 16 with visible waiting, in-place
 chat linking up to 10, unlink and generation fencing, targeted `status` and
 `detach`, `attach --watch-only [--wait]`, `GET /v1/captures`, no re-save of stored
-blobs on start, P2 counting tests) is in review on
-`briankeane/autocapture-p2-multicapture`; its capture and binding intent is
-in memory only until P3. P3–P6 Not Started.
+blobs on start, P2 counting tests) merged (#70). P3 (durable capture and
+binding intent, restart recovery with fresh chat setup checks, root-missing and
+watcher-failed stops, the LaunchAgent, `slipstream conductor
+install|setup|archive|enroll`) is implemented on `briankeane/autocapture-p3-recovery`;
+PR to `develop` pending. P4–P6 Not Started.
 
-Known later work: durable intent and restart recovery (P3); GC and session
+Known later work: GC and session
 deletion while captures run (P4; today both still require every capture
 detached); share transcript discovery across captures instead of
 one `~/.codex/sessions` scan per capture (P5).

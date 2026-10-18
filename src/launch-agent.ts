@@ -18,13 +18,16 @@ export type Run = (command: string, args: string[]) => Promise<{ code: number | 
 /** A repo whose Conductor scripts the install chains Slipstream into. */
 export interface ManagedRepo {
   root: string;
-  /** The repo's own commands as they were when the install last chained them. */
+  /** The repo's shared (`settings.toml` or `conductor.json`) commands as they
+   * were when the install last chained them; a later change is drift. */
   setup: string | null;
   archive: string | null;
 }
 
 export interface ManagedInstall {
   version: 1;
+  /** The `@playola-radio/slipstream` version the paths were recorded from. */
+  package_version: string;
   node: string;
   cli: string;
   store: string;
@@ -130,8 +133,10 @@ export interface LaunchAgentResult { plist: string; log: string; reloaded: boole
 
 /** Write the LaunchAgent for these paths and make sure launchd runs it. A plist
  * whose paths changed is reloaded, which restarts the daemon on the new ones;
- * an unchanged, loaded one is left alone. */
-export async function installLaunchAgent(o: EntryPaths & { home: string; store: string; uid: number }, run: Run): Promise<LaunchAgentResult> {
+ * an unchanged, loaded one is left alone unless `restart` asks for the daemon to
+ * be restarted on new code at the same paths. */
+export async function installLaunchAgent(o: EntryPaths & { home: string; store: string; uid: number; restart?: boolean },
+  run: Run): Promise<LaunchAgentResult> {
   const plist = plistPath(o.home);
   const log = daemonLogPath(o.home);
   const text = renderPlist({ ...o, log });
@@ -139,7 +144,12 @@ export async function installLaunchAgent(o: EntryPaths & { home: string; store: 
   const domain = `gui/${o.uid}`;
   await mkdir(dirname(log), { recursive: true });
   if (current === text && (await run('launchctl', ['print', `${domain}/${LAUNCH_AGENT_LABEL}`])).code === 0) {
-    return { plist, log, reloaded: false };
+    if (!o.restart) return { plist, log, reloaded: false };
+    const restarted = await run('launchctl', ['kickstart', '-k', `${domain}/${LAUNCH_AGENT_LABEL}`]);
+    if (restarted.code !== 0) {
+      throw new InstallError(`launchctl could not restart the daemon (exit ${restarted.code}): ${restarted.output.trim()}`);
+    }
+    return { plist, log, reloaded: true };
   }
   if (current !== text) await writeAtomic(plist, text, 0o644);
   await run('launchctl', ['bootout', `${domain}/${LAUNCH_AGENT_LABEL}`]);

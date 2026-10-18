@@ -21,6 +21,9 @@ export function intentPath(storeDir: string): string {
 
 /** The record exists but is not a version-1 intent record. The daemon refuses to
  * start rather than reset it: a reset would silently forget withdrawals. */
+/** Nothing is recorded for a withdrawal's target. */
+export class NoCaptureError extends Error {}
+
 export class IntentCorruptError extends Error {
   constructor(path: string, detail: string) {
     super(`the capture intent record ${path} is unreadable (${detail}). Slipstream will not guess what to resume; `
@@ -106,7 +109,7 @@ export async function withdrawOffline(
       if (promoted) result.promoted.push(promoted.session_id);
     }
     if (entries.length === 0) {
-      throw new Error(`no capture is recorded for ${'sessionId' in target ? target.sessionId : target.root}`);
+      throw new NoCaptureError(`no capture is recorded for ${'sessionId' in target ? target.sessionId : target.root}`);
     }
     if (result.withdrawn.length > 0) await saveIntent(storeDir, record);
     return result;
