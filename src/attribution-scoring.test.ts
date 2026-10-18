@@ -124,6 +124,26 @@ describe('attribution scoring', () => {
       );
     });
 
+    it('an irrelevant differing copy still stops identical copies collapsing', () => {
+      const r = run([copyA(), copyB(), { ...copyB(), key: key('toolu_1', 'C'), keyStr: 'c1', knownPaths: ['b.ts'], evidenceSeqs: [30n, 31n] }]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 17n, 19n]);
+      assert.deepEqual(r.excludedConflicts, []);
+    });
+
+    it('an irrelevant conflicted copy stops collapsing but is not disclosed', () => {
+      const r = run([
+        copyA(),
+        copyB(),
+        { ...copyB(), key: key('toolu_1', 'C'), keyStr: 'c1', knownPaths: ['b.ts'], conflicted: true, evidenceSeqs: [30n, 31n] },
+      ]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 17n, 19n]);
+      assert.deepEqual(r.excludedConflicts, []);
+    });
+
     it('copies with different known paths are not collapsed', () => {
       const r = run([copyA(), { ...copyB(), knownPaths: ['src/a.ts', 'src/b.ts'] }]);
       assert.equal(r.status, 'ambiguous');

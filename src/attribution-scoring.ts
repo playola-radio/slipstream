@@ -55,17 +55,19 @@ function isExactCopy(a: Invocation, b: Invocation): boolean {
 }
 
 /**
- * Split relevant invocations into eligible candidates and conflicts. A group
- * sharing `(harness, record_id)` becomes one candidate citing every copy's
- * evidence only if it has 2+ members, none conflicted, all exact copies; any
- * other group is handled member by member.
+ * Split invocations into eligible candidates and conflicts. Groups are formed
+ * over ALL invocations sharing `(harness, record_id)` before relevance, so a
+ * differing or conflicted copy that is irrelevant to this change still stops
+ * the rest collapsing. A group of 2+ non-conflicted exact copies becomes one
+ * candidate citing every copy's evidence (if relevant); any other group is
+ * handled member by member, relevant members only.
  */
-function partitionRelevant(relevant: readonly Invocation[]): {
-  eligible: Invocation[];
-  conflicts: Invocation[];
-} {
+function partitionInvocations(
+  invocations: Iterable<Invocation>,
+  isRelevant: (inv: Invocation) => boolean,
+): { eligible: Invocation[]; conflicts: Invocation[] } {
   const groups = new Map<string, Invocation[]>();
-  for (const inv of relevant) {
+  for (const inv of invocations) {
     const id = `${inv.key.harness}\u0000${inv.key.record_id}`;
     const group = groups.get(id);
     if (group === undefined) groups.set(id, [inv]);
@@ -76,13 +78,17 @@ function partitionRelevant(relevant: readonly Invocation[]): {
   for (const group of groups.values()) {
     const [first] = group as [Invocation, ...Invocation[]];
     const collapsible =
-      group.length >= 2 &&
-      group.every((inv) => !inv.conflicted && isExactCopy(first, inv));
+      group.length >= 2 && group.every((inv) => !inv.conflicted && isExactCopy(first, inv));
     if (collapsible) {
-      eligible.push({ ...first, evidenceSeqs: group.flatMap((inv) => inv.evidenceSeqs) });
+      if (isRelevant(first)) {
+        eligible.push({ ...first, evidenceSeqs: group.flatMap((inv) => inv.evidenceSeqs) });
+      }
       continue;
     }
-    for (const inv of group) (inv.conflicted ? conflicts : eligible).push(inv);
+    for (const inv of group) {
+      if (!isRelevant(inv)) continue;
+      (inv.conflicted ? conflicts : eligible).push(inv);
+    }
   }
   return { eligible, conflicts };
 }
@@ -111,12 +117,12 @@ export function evaluateChange(input: EvaluationInput): EvaluationResult {
     };
   }
 
-  const relevant = [...input.invocations].filter(
+  const { eligible, conflicts } = partitionInvocations(
+    input.invocations,
     (inv) =>
       touchesPath(inv, input.path) &&
       windowOverlaps(inv, interval.start_ms, interval.end_ms, input.policy.window_ms),
   );
-  const { eligible, conflicts } = partitionRelevant(relevant);
 
   const evidenceSeqs = eligible
     .flatMap((inv) => inv.evidenceSeqs)
