@@ -12,7 +12,10 @@
  * previous one finishes.
  *
  * A failure in one harness's discovery or one capture's read is routed to
- * `onError` and never stops the others: enrichment degrades, never wedges.
+ * `onError` and never stops the others: enrichment degrades, never wedges. A
+ * shared scan that throws is retried one capture at a time, so a failure only one
+ * root hits costs that capture alone. Captures do share latency: a slow read
+ * delays the next cycle for all of them.
  */
 import type { HarnessName } from '../event.ts';
 import { discoverRoots, type DiscoveryIO, type DiscoveryResult } from './discovery.ts';
@@ -97,20 +100,27 @@ export function createTranscriptScheduler(opts: TranscriptSchedulerOptions): Tra
     for (const harness of opts.harnesses) {
       const due = [...entries];
       if (due.length === 0) return;
+      const discover = (roots: string[]): Promise<Map<string, DiscoveryResult>> =>
+        discoverRoots(harness, discoveryIO, opts.homes[harness], roots, opts.codexScanLimit);
       let found: Map<string, DiscoveryResult>;
       try {
-        found = await discoverRoots(
-          harness,
-          discoveryIO,
-          opts.homes[harness],
-          due.map((e) => e.root),
-          opts.codexScanLimit,
-        );
+        found = await discover(due.map((e) => e.root));
       } catch (err) {
         report(err);
-        continue;
+        // Retry one capture at a time, so a failure only one root's scan hits
+        // costs that capture alone, as it did when each capture scanned for itself.
+        found = new Map();
+        if (due.length > 1) {
+          for (const e of due) {
+            try {
+              found.set(e.root, (await discover([e.root])).get(e.root)!);
+            } catch (rootErr) {
+              report(rootErr);
+            }
+          }
+        }
       }
-      await Promise.all(due.map((e) => dispatch(e, harness, found.get(e.root)!)));
+      await Promise.all(due.filter((e) => found.has(e.root)).map((e) => dispatch(e, harness, found.get(e.root)!)));
     }
   };
 

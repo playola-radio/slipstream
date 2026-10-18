@@ -874,4 +874,17 @@ describe('shared discovery across several roots', () => {
     assert.deepEqual(b, a);
     assert.notEqual(a, b);
   });
+
+  it('works with a class-based discovery IO whose methods live on its prototype', async () => {
+    class ClassIO implements DiscoveryIO {
+      async listDir(): Promise<ListResult> { return { ok: true, paths: [] }; }
+      async listTreeJsonl() { return { paths: ['/c/v.jsonl'], truncated: false, incomplete: false }; }
+      async readFirstLine() { return { ok: true as const, line: meta('vanished', '/work/proj/gone'), id: GEN }; }
+      async readHeadLines() { return { ok: false as const, reason: 'inaccessible' as const }; }
+      async realpath(p: string) { return ['/', '/work', '/work/proj'].includes(p) ? p : undefined; }
+      async probe() { return { kind: 'absent' as const }; }
+    }
+    const found = await discoverRoots('codex', new ClassIO(), '/home', ['/work/proj'], 10);
+    assert.ok(found.get('/work/proj')!.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/work/proj/gone')));
+  });
 });

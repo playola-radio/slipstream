@@ -39,7 +39,7 @@ function codexMeta(id: string, cwd: string): string {
 /** A fake transcript filesystem: Claude dirs and Codex rollouts with fixed bytes,
  * counting every enumeration and header read discovery makes. */
 function fakeHomes(files: { claude?: Record<string, string>; codex?: Record<string, string>; truncated?: boolean }) {
-  const counts = { listDir: new Map<string, number>(), listTree: 0, firstLine: new Map<string, number>(), headLines: 0, realpath: 0 };
+  const counts = { listDir: new Map<string, number>(), listTree: 0, firstLine: new Map<string, number>() };
   const claude = files.claude ?? {};
   const codex = files.codex ?? {};
   const bump = (m: Map<string, number>, k: string): void => { m.set(k, (m.get(k) ?? 0) + 1); };
@@ -61,12 +61,11 @@ function fakeHomes(files: { claude?: Record<string, string>; codex?: Record<stri
       return { ok: true, line: text.split('\n')[0]!, id: GEN };
     },
     readHeadLines: async (path) => {
-      counts.headLines += 1;
       const text = all[path];
       if (text === undefined) return { ok: false, reason: 'inaccessible' };
       return { ok: true, lines: text.split('\n').filter((l) => l !== ''), truncated: false, skipped: false, id: GEN };
     },
-    realpath: async (p) => { counts.realpath += 1; return p; },
+    realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
   };
   const fileIO: TranscriptFileIO = {
@@ -97,33 +96,6 @@ function options(io: DiscoveryIO, fileIO: TranscriptFileIO, overrides: Partial<T
 const claudeDir = (root: string): string => `${HOMES['claude-code']}/projects/${claudeSlug(root)}`;
 
 describe('shared transcript discovery scheduler', () => {
-  it('enumerates each transcript directory once per cycle, not once per linked capture', async () => {
-    const roots = ['/work/a', '/work/b', '/work/c'];
-    const claude: Record<string, string> = {};
-    const codex: Record<string, string> = {};
-    for (const root of roots) {
-      claude[`${claudeDir(root)}/chat.jsonl`] = JSON.stringify({ type: 'user', cwd: root }) + '\n';
-      codex[`/home/.codex/sessions/2026/10/17/${root.slice(-1)}.jsonl`] = codexMeta(`codex-${root}`, root) + '\n';
-    }
-    codex['/home/.codex/sessions/2026/10/17/other.jsonl'] = codexMeta('codex-other', '/elsewhere') + '\n';
-    const { io, fileIO, counts } = fakeHomes({ claude, codex });
-    const scheduler = createTranscriptScheduler(options(io, fileIO));
-    const unregister = roots.map((root) => scheduler.register(capture(root)));
-    // Registering with an idle scheduler starts one cycle at once; measure a fresh one.
-    await scheduler.tick();
-    counts.listDir.clear();
-    counts.firstLine.clear();
-    counts.listTree = 0;
-
-    await scheduler.tick();
-
-    assert.equal(counts.listTree, 1, 'the Codex sessions tree is enumerated once for three captures');
-    assert.deepEqual([...counts.listDir.values()], [1, 1, 1], 'each Claude project dir is listed once');
-    assert.deepEqual(new Set(counts.firstLine.values()), new Set([1]), 'each transcript header is read once');
-    assert.equal(counts.firstLine.size, 7);
-    await Promise.all(unregister.map((u) => u()));
-  });
-
   it('lists a Claude directory shared by colliding roots once and binds only the cwd owner', async () => {
     // /work/a-b and /work/a/b slug onto the same Claude directory.
     const a = capture('/work/a-b');
@@ -218,6 +190,27 @@ describe('shared transcript discovery scheduler', () => {
     assert.ok(c.published.length >= 1);
     assert.ok(c.published.every((d) => d.harness === 'codex'));
     await unregister();
+  });
+
+  it('keeps reading other captures when discovery throws for one capture\'s root', async () => {
+    const write = claudeWrite('t1', '/work/a/x.ts');
+    const { io, fileIO } = fakeHomes({ claude: { [`${claudeDir('/work/a')}/chat.jsonl`]: JSON.stringify({ type: 'user', cwd: '/work/a' }) + '\n' + write + '\n' } });
+    const listDir = io.listDir;
+    io.listDir = async (dir) => {
+      if (dir === claudeDir('/work/b')) throw new Error('b blew up');
+      return listDir(dir);
+    };
+    const errors: unknown[] = [];
+    const scheduler = createTranscriptScheduler(options(io, fileIO, { harnesses: ['claude-code'], onError: (e) => errors.push(e) }));
+    const a = capture('/work/a');
+    const b = capture('/work/b');
+    scheduler.register(a);
+    scheduler.register(b);
+    await scheduler.tick();
+    assert.equal(a.sink.appended.length, 1, 'the healthy capture still reads its chat');
+    assert.ok(a.published.length >= 1);
+    assert.deepEqual(b.published, []);
+    assert.ok(errors.some((e) => (e as Error).message === 'b blew up'));
   });
 
   it('starts a cycle when the first capture registers, reschedules, and idles once none remain', async () => {

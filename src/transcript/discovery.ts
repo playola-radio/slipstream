@@ -151,7 +151,7 @@ type UnresolvedPlacement = { kind: 'placed'; path: string } | { kind: 'undecidab
  * Undecidable cases (an uninspectable component, a symlink cycle past the hop
  * cap) fail toward disclosure: never claim non-membership we did not establish.
  */
-async function placeUnresolvedCwd(io: DiscoveryIO, cwd: string): Promise<UnresolvedPlacement> {
+async function placeUnresolvedCwd(io: Pick<DiscoveryIO, 'realpath' | 'probe'>, cwd: string): Promise<UnresolvedPlacement> {
   const queue = segmentsOf(cwd);
   let cursor = 0;
   let base = '/';
@@ -207,8 +207,8 @@ interface CwdResolver {
 function createCwdResolver(io: DiscoveryIO): CwdResolver {
   const real = new Map<string, Promise<string | undefined>>();
   const placed = new Map<string, Promise<UnresolvedPlacement>>();
-  const memoIO: DiscoveryIO = {
-    ...io,
+  const memoIO: Pick<DiscoveryIO, 'realpath' | 'probe'> = {
+    probe: (path) => io.probe(path),
     realpath: (path) => {
       let p = real.get(path);
       if (!p) real.set(path, (p = io.realpath(path)));
