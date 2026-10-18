@@ -408,8 +408,9 @@ describe('gc as a maintenance transaction', () => {
       else error(...args);
     });
     await withStore(async ({ store, call, roots, fake, holdClose }) => {
-      const [a] = await roots(1);
+      const [a, b] = await roots(2);
       const id = await attachRecording(call, a!);
+      await attachRecording(call, b!);
       await writeFile(join(a!, 'z.txt'), 'only the queued change names this');
       const sha = sha256('only the queued change names this');
       holdAppend = true;
@@ -422,8 +423,11 @@ describe('gc as a maintenance transaction', () => {
       hold.release();
       await stealSessionLock(store, id);
       await losing;
+      const holdB = holdClose(b!);
       const collecting = call({ verb: 'gc' });
-      await Promise.race([collecting, new Promise((r) => setTimeout(r, 300))]);
+      // gc is stopping B, so it has already found A's detach still draining.
+      await holdB.held;
+      holdB.release();
       release();
       await detaching;
       const res = await collecting;
