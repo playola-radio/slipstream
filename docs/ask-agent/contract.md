@@ -424,16 +424,26 @@ interface RecordQuestionExchangeRequest {
   `CAPTURE_NOT_READY`, `STORAGE_UNAVAILABLE`, the `ask` validation codes,
   `INVALID_ANSWER` and `REQUEST_CONFLICT`. A malformed `conversation` (missing,
   an unknown harness, a parent/fork id that is empty, over 256 characters or has control characters, or equal parent and fork ids) is
-  `PROTOCOL`.
-- The only size limit on `answer_text` is the control socket's 1 MiB line cap; a
-  larger request fails `PROTOCOL` and appends nothing.
+  `PROTOCOL`. The 256 limit counts UTF-16 code units, which equals characters for ASCII ids; real
+  harness session ids are ASCII UUIDs.
+- The only size limit on `answer_text` is the control socket's 1 MiB line cap. An
+  oversize request is refused and appends nothing: the reply is `PROTOCOL`, or the
+  daemon closes the connection while the client is still writing. Check the encoded
+  request size against the 1 MiB control-message cap before sending (as `src/cli.ts`
+  does for its own requests).
 - It appends exactly one `slipstream.question.exchange_recorded.v1` event (see
   `schemas/`) and replies after it is durable. It adds no dispatch, binding,
   connection, attribution, or file-change event, and does not count against the
   queue limit.
 - Retrying a `request_id` with the same body returns the original result with
   `duplicate: true`, including after a daemon restart; a different body is
-  `REQUEST_CONFLICT`.
+  `REQUEST_CONFLICT`. Request ids are scoped per verb: an exchange's `request_id` is
+  checked only against earlier exchanges in the capture, not against `ask` requests,
+  so use a fresh `request_id` for each exchange and never reuse an `ask` draft's id.
+- `STORAGE_UNAVAILABLE`, and any timeout, dropped connection or malformed reply after
+  the request was sent, mean the outcome is unknown: the event may already be durable.
+  Retry with the same `request_id` and the identical body, never a new id. A retry of
+  a recorded exchange returns `duplicate: true` with the original `question_id`.
 - `conversation.*_session_id` values are client-reported and unverified. The
   event records `reported_by: "client"`. They are never used for binding or
   attribution, and never mean authorship.

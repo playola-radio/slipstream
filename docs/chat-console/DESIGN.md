@@ -1,6 +1,6 @@
 # Chat console — daemon side
 
-Date: 2026-10-18 · Status: design, awaiting Brian's approval · Architecture
+Date: 2026-10-18 · Status: approved by Brian 2026-10-18; Change 2 (record_question_exchange) implemented · Architecture
 consulted with Codex (gpt-6-astra).
 
 ## Why

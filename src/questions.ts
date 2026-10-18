@@ -213,10 +213,15 @@ export function normalizeExchange(value: unknown): QuestionExchangeRequest {
   } };
 }
 
-/** Idempotency fingerprint: the ask body plus the answer and the reported conversation. */
+/**
+ * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer and the
+ * reported conversation. A digest, not the JSON itself, so the capture does not retain every answer
+ * (up to ~1 MiB each) for its lifetime.
+ */
 export function exchangeBody(req: QuestionExchangeRequest): string {
   const c = req.conversation;
-  return JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+  return createHash('sha256').update(json).digest('hex');
 }
 
 export interface QuestionExchangeAccepted {

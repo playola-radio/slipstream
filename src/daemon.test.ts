@@ -2454,8 +2454,11 @@ describe('daemon record_question_exchange', () => {
       const res = await call(exchange());
       assert.equal(res.ok, true, JSON.stringify(res));
       const after = await readLog(store, id);
-      const added = after.filter((e) => !before.includes(e.seq));
+      const added = after.filter((e) => !before.includes(e.seq) && e.type !== 'slipstream.change.attribution.v1');
       assert.deepEqual(added.map((e) => e.type), [EXCHANGE_TYPE]);
+      const forbidden = ['slipstream.question.dispatch_attempted.v1', 'slipstream.agent.binding.v1',
+        'slipstream.agent.connection.v1', 'slipstream.file.changed.v1'];
+      assert.deepEqual(after.filter((e) => !before.includes(e.seq) && forbidden.includes(e.type)), []);
       assert.deepEqual([rec(res).session_id, rec(res).request_id, rec(res).question_id, rec(res).seq, (res as unknown as { duplicate: boolean }).duplicate],
         [id, EXCHANGE_REQUEST, added[0]!.data.question_id, added[0]!.seq, false]);
       assert.equal((added[0]!.data.context as { selected_text: string }).selected_text, 'one');
