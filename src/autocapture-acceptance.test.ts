@@ -1,0 +1,443 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile, spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { probeSocket, startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
+import type { Platform } from './platform.ts';
+import { bothReaders, foldCaptures, comparable } from './test/captures-fold.ts';
+import {
+  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, linkChat, linkRecording, readLog, rec, waitForLog,
+  waitForRow, type Call,
+} from './test/daemon-harness.ts';
+
+/** Release acceptance for workspace auto-capture (docs/autocapture/acceptance.md). */
+
+async function withStore(fn: (ctx: {
+  store: string;
+  roots: (n: number) => Promise<string[]>;
+  start: (extra?: Partial<DaemonOptions>) => Promise<{ daemon: Daemon; call: Call }>;
+  stop: () => Promise<void>;
+}) => Promise<void>): Promise<void> {
+  const store = await mkdtemp(join(tmpdir(), 'slip-accept-'));
+  await chmod(store, 0o700);
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-accept-roots-')));
+  let daemon: Daemon | undefined;
+  let made = 0;
+  const roots = async (n: number) => {
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const root = join(base, `ws-${made++}`);
+      await mkdir(root);
+      out.push(root);
+    }
+    return out;
+  };
+  const start = async (extra: Partial<DaemonOptions> = {}) => {
+    daemon = await startDaemon({ storeDir: store, captureDependencies: {
+      platform: createRootsPlatform().platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
+    }, ...extra });
+    return { daemon, call: controlCall(daemon.socketPath, 30_000) };
+  };
+  const stop = async () => {
+    const d = daemon;
+    daemon = undefined;
+    await d?.stop();
+  };
+  try {
+    await fn({ store, roots, start, stop });
+  } finally {
+    await stop();
+    await rm(store, { recursive: true, force: true });
+    await rm(base, { recursive: true, force: true });
+  }
+}
+
+const recording = (row: Record<string, unknown>) => row.state === 'recording';
+
+async function attachRecording(call: Call, root: string): Promise<string> {
+  const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  await waitForRow(call, rec(res).session_id!, recording);
+  return rec(res).session_id!;
+}
+
+type Row = Record<string, unknown>;
+const rowOf = (table: Record<string, unknown>, id: string) =>
+  (table.captures as Row[]).find((r) => r.session_id === id)!;
+const stateOf = (row: Row) => [row.state, row.reason, (row.binding as Row | null)?.state ?? null];
+
+describe('auto-capture acceptance: two independent readers', () => {
+  it('agree on every capture and binding state as the table fills, a slot frees, and a heartbeat goes stale', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const { daemon, call } = await start();
+      const agree = async (what: string) => {
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection, what);
+        return projection;
+      };
+      const ws = await roots(18);
+      const ids: string[] = [];
+      for (const root of ws.slice(0, 16)) ids.push(await attachRecording(call, root));
+      const waiting = [ws[16]!, ws[17]!].map(async (root) => {
+        const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
+        assert.equal(res.ok === false && res.code, 'CAPTURE_LIMIT_REACHED');
+        return rec(await call({ verb: 'status', target: root })).capture as unknown as Row;
+      });
+      const [seventeenth, eighteenth] = (await Promise.all(waiting)).map((row) => row.session_id as string);
+      await linkRecording(call, store, ws[0]!, 'chat-pending');
+      await linkRecording(call, store, ws[1]!, 'chat-connected');
+      await connect(call, store, 'chat-connected', ws[1]!);
+      await linkRecording(call, store, ws[2]!, 'chat-unlinked');
+      assert.equal((await call({ verb: 'unlink', session_id: ids[2]! })).ok, true);
+
+      let table = await agree('a full table with linked, connected, and unlinked chats');
+      assert.deepEqual(stateOf(rowOf(table, seventeenth!)), ['not_recording', 'capture-limit-reached', null]);
+      assert.deepEqual(stateOf(rowOf(table, ids[0]!)), ['recording', null, 'setup_pending']);
+      assert.deepEqual(stateOf(rowOf(table, ids[1]!)), ['recording', null, 'connected']);
+      assert.deepEqual(stateOf(rowOf(table, ids[2]!)), ['recording', null, 'unlinked']);
+      assert.deepEqual(table.binding_slots, { used: 2, limit: 10 });
+
+      const status = rec(await call({ verb: 'status' })) as unknown as { captures: Row[] };
+      for (const row of status.captures) {
+        assert.deepEqual(stateOf(row), stateOf(rowOf(table, row.session_id as string)), 'status verb and reader agree');
+      }
+
+      assert.equal((await call({ verb: 'detach', target: ids[3]! })).ok, true);
+      await waitForRow(call, seventeenth!, recording, 'the seventeenth recording once a slot freed');
+      assert.equal((await call({ verb: 'detach', target: eighteenth! })).ok, true);
+      table = await agree('a freed slot, a promoted workspace, and a withdrawn waiting one');
+      assert.deepEqual(stateOf(rowOf(table, ids[3]!)), ['stopped', 'detached', null]);
+      assert.deepEqual(stateOf(rowOf(table, seventeenth!)), ['recording', null, null]);
+      assert.deepEqual(stateOf(rowOf(table, eighteenth!)), ['stopped', 'detached', null]);
+
+      // The owner refreshes its heartbeat every 2 s; push it 60 s back and read at
+      // once. A refresh landing in between makes both readers see it live, so try again.
+      const lock = join(store, 'sessions', ids[4]!, 'owner.lock');
+      let stale: Row | undefined;
+      for (let i = 0; i < 5 && !stale; i++) {
+        const old = (Date.now() - 60_000) / 1000;
+        await utimes(lock, old, old);
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        const row = rowOf(projection, ids[4]!);
+        if (row.state === 'recording') continue;
+        assert.deepEqual(fold, projection, 'a stale heartbeat');
+        stale = row;
+      }
+      assert.deepEqual(stateOf(stale!), ['not_recording', 'daemon-unavailable', null]);
+
+      await stop();
+      const offline = comparable(await foldCaptures(store, Date.now()));
+      assert.deepEqual(stateOf(rowOf(offline, ids[0]!)), ['not_recording', 'daemon-unavailable', 'setup_pending'],
+        'with no daemon, a running capture is not recording; its chat was never confirmed in a live activation');
+      assert.deepEqual(stateOf(rowOf(offline, ids[3]!)), ['stopped', 'detached', null]);
+    });
+  });
+});
+
+describe('auto-capture acceptance: failed setup', () => {
+  it('stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      await writeFile(join(a!, 'notes.txt'), 'before setup');
+      const fake = createRootsPlatform();
+      let failing = true;
+      const platform: Platform = {
+        watch: async (o) => {
+          if (failing) throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+          return fake.platform.watch(o);
+        },
+      };
+      const { daemon, call } = await start({
+        retryBackoff: { baseMs: 100, maxMs: 100 },
+        captureDependencies: { platform, readQuestionContext: async () => 'selected' },
+      });
+      const res = await call({ verb: 'attach', mode: 'watch-only', worktree: a! });
+      const id = rec(res).session_id!;
+      const failed = await waitForRow(call, id, (row) => row.state === 'not_recording', 'the failed baseline');
+      assert.equal(failed.reason, 'baseline-failed');
+      assert.match(String(failed.message), /too many open files/);
+      const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+      assert.deepEqual(fold, projection, 'a failed setup with no session log');
+      assert.deepEqual(stateOf(rowOf(projection, id)), ['not_recording', 'baseline-failed', null]);
+      assert.equal(typeof (rowOf(projection, id).retry as Row | null)?.next_attempt_at_ms, 'number');
+
+      await writeFile(join(a!, 'notes.txt'), 'edited while not recording');
+      await writeFile(join(a!, 'added.txt'), 'created while not recording');
+      failing = false;
+      await waitForRow(call, id, recording, 'recording after the retry');
+
+      const log = await readLog(store, id);
+      const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+      const baselined = Object.fromEntries(log.filter((r) => r.type === 'slipstream.file.baselined.v1')
+        .map((r) => [r.data.path, (r.data.snapshot as Row).sha256]));
+      assert.deepEqual(baselined, { 'notes.txt': sha('edited while not recording'), 'added.txt': sha('created while not recording') });
+      assert.deepEqual(log.filter((r) => r.type === 'slipstream.file.changed.v1'), [], 'no edit is presented as captured history');
+      assert.equal(log.filter((r) => r.type === 'slipstream.session.started.v1').length, 1);
+      assert.equal((await captureRow(call, id)).retry, null);
+    });
+  });
+});
+
+describe('auto-capture acceptance: gc and setup checks', () => {
+  it('lets no setup check issued before gc connect either chat after it; each connects only through a new check of its own', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { call } = await start();
+      const [a, b] = await roots(2);
+      const links = [await linkRecording(call, store, a!, 'chat-a'), await linkRecording(call, store, b!, 'chat-b')];
+      const before = [await claimCheck(call, store, 'chat-a', a!), await claimCheck(call, store, 'chat-b', b!)];
+      assert.equal((await call({ verb: 'gc' })).ok, true);
+      for (const { id } of links) {
+        await waitForRow(call, id, recording);
+        await waitForLog(store, id, (log) => log.slice(log.findLastIndex((r) => r.type === 'slipstream.session.resumed.v1'))
+          .some((r) => r.type === 'slipstream.agent.connection.v1' && r.data.state === 'setup_pending'));
+      }
+      const after = [await claimCheck(call, store, 'chat-a', a!), await claimCheck(call, store, 'chat-b', b!)];
+      assert.notEqual(after[0]!.check_id, before[0]!.check_id);
+      assert.notEqual(after[1]!.check_id, before[1]!.check_id);
+      for (const [chat, root, check] of [['chat-a', a!, before[0]!], ['chat-b', b!, before[1]!]] as const) {
+        const late = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: check.check_id, text: 'connected' });
+        assert.equal(late.ok === false && late.code, 'QUESTION_NOT_FOUND', `${chat}'s pre-gc check must not connect`);
+      }
+      const crossed = await call({ verb: 'answer_question', ...chatOf('chat-a', a!), question_id: after[1]!.check_id, text: 'connected' });
+      assert.equal(crossed.ok === false && crossed.code, 'QUESTION_NOT_FOUND', 'chat-a cannot answer chat-b\'s new check');
+      for (const { id } of links) assert.equal(((await captureRow(call, id)).binding as Row).state, 'setup_pending');
+      for (const [chat, root, check] of [['chat-a', a!, after[0]!], ['chat-b', b!, after[1]!]] as const) {
+        const ack = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: check.check_id, text: 'connected' });
+        assert.equal(ack.ok, true, JSON.stringify(ack));
+      }
+      for (const { id } of links) assert.equal(((await captureRow(call, id)).binding as Row).state, 'connected');
+    });
+  });
+
+  it('connects a chat exactly once when its setup-check answer is lost and it answers the re-offered check', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { call } = await start({ setupReofferMs: 50 });
+      const [a] = await roots(1);
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      const first = await claimCheck(call, store, 'chat-a', a!);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const offered = await claimCheck(call, store, 'chat-a', a!);
+      assert.equal(offered.check_id, first.check_id);
+      const answer = { verb: 'answer_question', ...chatOf('chat-a', a!), question_id: offered.check_id, text: 'connected' };
+      const [one, two] = await Promise.all([call(answer), call(answer)]);
+      assert.deepEqual([one.ok, two.ok], [true, true]);
+      assert.deepEqual([rec(one).duplicate, rec(two).duplicate].sort(), [false, true]);
+      const connections = (await readLog(store, id)).filter((r) => r.type === 'slipstream.agent.connection.v1');
+      assert.deepEqual(connections.map((r) => r.data.state), ['setup_pending', 'connected']);
+    });
+  });
+});
+
+describe('auto-capture acceptance: races and recovery', () => {
+  it('never offers a setup check to a subagent callback, and a refused one does not use up the root chat\'s offer', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { call } = await start({ setupReofferMs: 60_000 });
+      const [a] = await roots(1);
+      await linkRecording(call, store, a!, 'chat-a');
+      const subagent = await call({ ...claimOf(store, 'chat-a', a!), agent_id: 'child', agent_type: 'general-purpose' });
+      assert.equal(subagent.ok === false && subagent.code, 'IDENTITY_UNRESOLVED');
+      const root = await call(claimOf(store, 'chat-a', a!));
+      assert.equal(typeof (rec(root) as unknown as { setup_check?: { check_id: string } }).setup_check?.check_id, 'string');
+    });
+  });
+
+  it('settles a concurrent unlink and relink of one chat into a single consistent link', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { daemon, call } = await start();
+      const [a] = await roots(1);
+      const { id, generation } = await linkRecording(call, store, a!, 'chat-a');
+      const [unlinked, relinked] = await Promise.all([call({ verb: 'unlink', session_id: id }), linkChat(call, store, a!, 'chat-a')]);
+      assert.equal(unlinked.ok, true, JSON.stringify(unlinked));
+      const binding = (await captureRow(call, id)).binding as Row;
+      if (relinked.ok) {
+        assert.ok(BigInt(rec(relinked).binding_generation!) > BigInt(generation));
+        if (binding.state === 'unlinked') assert.equal(binding.binding_generation, rec(relinked).binding_generation);
+        else assert.deepEqual([binding.state, binding.binding_generation], ['setup_pending', rec(relinked).binding_generation]);
+      } else {
+        assert.equal(binding.state, 'unlinked');
+      }
+      const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+      assert.deepEqual(fold, projection);
+      assert.ok((projection.binding_slots as { used: number }).used <= 1);
+      const unlinks = (await readLog(store, id)).filter((r) => r.type === 'slipstream.agent.unlinked.v1');
+      assert.ok(unlinks.every((r) => BigInt(r.data.binding_generation as string) >= BigInt(generation)));
+      assert.equal(new Set(unlinks.map((r) => r.data.binding_generation)).size, unlinks.length, 'each link is unlinked at most once');
+    });
+  });
+
+  it('honors an archive that arrives while a restarted capture is still failing to resume', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const id = await attachRecording(call, a!);
+      await linkRecording(call, store, a!, 'chat-a');
+      await stop();
+      const fake = createRootsPlatform();
+      let failing = true;
+      let attempts = 0;
+      const platform: Platform = {
+        watch: async (o) => {
+          attempts++;
+          if (failing) throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+          return fake.platform.watch(o);
+        },
+      };
+      const restarted = await start({
+        retryBackoff: { baseMs: 50, maxMs: 50 },
+        captureDependencies: { platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' },
+      });
+      call = restarted.call;
+      await waitForRow(call, id, (row) => row.reason === 'resume-failed', 'a failing resume');
+      const before = await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8');
+      const archived = await call({ verb: 'detach', target: a!, reason: 'archived' });
+      assert.equal(archived.ok, true, JSON.stringify(archived));
+      failing = false;
+      const tries = attempts;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(attempts, tries, 'an archived capture is not retried');
+      const row = await captureRow(call, id);
+      assert.deepEqual(stateOf(row), ['not_recording', 'stop-unconfirmed', 'unlinked'],
+        'the stop was never recorded in the log, so it is not shown as cleanly stopped');
+      assert.equal(await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8'), before, 'nothing resumed after the archive');
+      const { projection, fold } = await bothReaders(store, restarted.daemon.readerUrl, restarted.daemon.readerToken);
+      assert.deepEqual(fold, projection);
+      assert.deepEqual(projection.binding_slots, { used: 0, limit: 10 });
+    });
+  });
+});
+
+describe('auto-capture acceptance: end to end through real processes', () => {
+  it('traces Conductor setup, the Codex refusal, a Claude attach, a setup check, and Ask Agent through to both readers', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-accept-e2e-')));
+    const store = join(dir, 'store'); const wsA = join(dir, 'ws-a'); const wsB = join(dir, 'ws-b');
+    const claudeChat = '11111111-2222-4333-8444-555555555555';
+    const codexChat = '019a0000-0000-7000-8000-000000000001';
+    await mkdir(wsA); await mkdir(wsB);
+    const base = { PATH: process.env.PATH!, HOME: dir };
+    const run = (args: string[], env: Record<string, string> = {}, input?: string) =>
+      new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+        const child = execFile(process.execPath, ['src/cli.ts', ...args], { env: { ...base, ...env }, timeout: 30_000 },
+          (error, stdout, stderr) => done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+        child.stdin?.end(input ?? '');
+      });
+    const daemon = spawn(process.execPath, ['src/cli.ts', 'start', '--store', store], { env: base, stdio: 'ignore' });
+    const forwarder = spawn(process.execPath, ['src/mcp-forwarder.ts', '--store', store], {
+      env: { ...base, CLAUDE_CODE_SESSION_ID: claudeChat, CLAUDE_PROJECT_DIR: wsA }, stdio: ['pipe', 'pipe', 'inherit'] });
+    const replies = createInterface({ input: forwarder.stdout });
+    const rpc = async (id: number, method: string, params: Record<string, unknown>) => {
+      const reply = new Promise<string>((resolve) => replies.once('line', resolve));
+      forwarder.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      return JSON.parse(await reply) as { result: { isError?: boolean; content?: { text: string }[] } };
+    };
+    const answer = async (id: number, question_id: string, text: string) =>
+      (await rpc(id, 'tools/call', { name: 'slipstream_answer_question', arguments: { question_id, text } })).result;
+    const hook = (chat: string, cwd: string) => run(['hook', 'claude-code', 'post-tool-use', '--store', store], {},
+      JSON.stringify({ hook_event_name: 'PostToolUse', session_id: chat, cwd,
+        transcript_path: join(dir, 'claude', 'projects', 'p', `${chat}.jsonl`) }));
+    try {
+      while (await probeSocket(join(store, 'control.sock'), 200) !== 'live') await new Promise((r) => setTimeout(r, 50));
+      const setup = async (ws: string) => {
+        const res = await run(['conductor', 'setup', '--store', store], { CONDUCTOR_WORKSPACE_PATH: ws });
+        assert.equal(res.code, 0, res.stderr);
+        assert.match(res.stdout, /state: recording/);
+        return /session_id: (\S+)/.exec(res.stdout)![1]!;
+      };
+      const idA = await setup(wsA);
+      const idB = await setup(wsB);
+      const descriptor = (await readdir(join(store, 'runtime'))).find((f) => f.endsWith('.json'))!;
+      const { url, token } = JSON.parse(await readFile(join(store, 'runtime', descriptor), 'utf8')) as { url: string; token: string };
+      const readers = async () => {
+        const both = await bothReaders(store, url, token);
+        assert.deepEqual(both.fold, both.projection);
+        return both.projection;
+      };
+      const events = async (id: string) => {
+        const res = await fetch(`${url}/v1/sessions/${id}/events`, { headers: { authorization: `Bearer ${token}` } });
+        assert.equal(res.status, 200);
+        return (await res.text()).split('\n').filter(Boolean).map((l) => JSON.parse(l) as Row);
+      };
+
+      // Conductor bundles Codex 0.156.1, which Slipstream has not verified: an explicit refusal, nothing changed.
+      const rollouts = join(dir, '.codex', 'sessions', '2026', '10', '18');
+      await mkdir(rollouts, { recursive: true });
+      await writeFile(join(rollouts, `rollout-2026-10-18T00-00-00-${codexChat}.jsonl`), JSON.stringify({ type: 'session_meta',
+        payload: { session_id: codexChat, cwd: wsA, originator: 'codex_sdk_ts', source: 'exec', cli_version: '0.156.1' } }) + '\n');
+      const codex = await run(['attach', wsA, '--store', store], { CODEX_THREAD_ID: codexChat, CONDUCTOR_SESSION_ID: 'c' });
+      assert.equal(codex.code, 1);
+      assert.match(codex.stderr, /not a runtime Slipstream has verified.*nothing was installed or recorded/s);
+      await assert.rejects(stat(join(wsA, '.codex')));
+      await assert.rejects(stat(join(dir, '.codex', 'config.toml')));
+      assert.equal(rowOf(await readers(), idA).binding, null);
+
+      // The existing Claude attach workflow, run from a Conductor chat, links to the same auto-capture.
+      const config = join(dir, 'claude');
+      await mkdir(join(config, 'projects', 'p'), { recursive: true });
+      await writeFile(join(config, 'projects', 'p', `${claudeChat}.jsonl`), JSON.stringify({ type: 'user', sessionId: claudeChat,
+        cwd: wsA, version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+      const fakeClaude = join(dir, 'claude-bin');
+      await writeFile(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\nconst args = process.argv.slice(2);\n`
+        + `const sep = args.indexOf('--'); fs.writeFileSync(${JSON.stringify(join(config, '.claude.json'))}, JSON.stringify({ projects: `
+        + `{ [process.cwd()]: { mcpServers: { slipstream: { type: 'stdio', command: args[sep + 1], args: args.slice(sep + 2) } } } } }));\n`);
+      await chmod(fakeClaude, 0o755);
+      const claude = await run(['attach', wsA, '--store', store], { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SESSION_ID: claudeChat,
+        CLAUDE_CODE_EXECPATH: fakeClaude, CONDUCTOR_SESSION_ID: 'c' });
+      assert.equal(claude.code, 0, claude.stderr);
+      assert.match(claude.stdout, /agent setup pending/);
+      assert.equal(/session_id: (\S+)/.exec(claude.stdout)?.[1], idA);
+      assert.equal((rowOf(await readers(), idA).binding as Row).state, 'setup_pending');
+
+      // The chat's next tool call delivers the setup check; its MCP tool answers it.
+      await rpc(1, 'initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'claude-code', version: '1' } });
+      const offered = await hook(claudeChat, wsA);
+      const check = /Slipstream setup check (\S+)\./.exec(offered.stdout)?.[1];
+      assert.ok(check, offered.stdout + offered.stderr);
+      const ack = await answer(2, check, 'connected');
+      assert.equal(ack.isError, false, ack.content?.[0]?.text);
+      let table = await readers();
+      assert.equal((rowOf(table, idA).binding as Row).state, 'connected');
+      assert.deepEqual(table.binding_slots, { used: 1, limit: 10 });
+
+      // A real edit reaches the log and the reader serves exactly the durable log.
+      await writeFile(join(wsA, 'a.ts'), 'one\ntwo\n');
+      let change: Row | undefined;
+      for (let i = 0; i < 200 && !change; i++) {
+        change = (await events(idA)).find((e) => e.type === 'slipstream.file.changed.v1' && (e.data as Row).path === 'a.ts');
+        if (!change) await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(change, 'the edit never reached the reader');
+      const served = await events(idA);
+      const disk = (await readFile(join(store, 'sessions', idA, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean)
+        .map((l) => JSON.parse(l) as Row);
+      assert.deepEqual(served, disk.slice(0, served.length));
+
+      // Ask Agent: only the linked chat, in its own workspace, receives and answers the question.
+      const input = join(dir, 'question.json');
+      await writeFile(input, JSON.stringify({ text: 'Why two lines?', context: { change_seq: change.seq, path: 'a.ts',
+        snapshot_sha256: ((change.data as Row).after as Row).sha256, line_start: 1, line_end: 2 } }));
+      const asked = await run(['ask', '--store', store, '--session', idA, '--request-id', randomUUID(), '--input', input]);
+      assert.equal(asked.code, 0, asked.stderr);
+      const question = (JSON.parse(asked.stdout) as { question_id: string }).question_id;
+      assert.deepEqual((await hook(claudeChat, wsB)).stdout, '', 'the chat called back from another workspace gets nothing');
+      assert.deepEqual((await hook('22222222-2222-4333-8444-555555555555', wsA)).stdout, '', 'another chat gets nothing');
+      const delivered = await hook(claudeChat, wsA);
+      assert.match(delivered.stdout, new RegExp(`Slipstream question ${question} about`));
+      const answered = await answer(3, question, 'Because the file has two lines.');
+      assert.equal(answered.isError, false, answered.content?.[0]?.text);
+      const onA = (await events(idA)).filter((e) => e.type === 'slipstream.question.answered.v1');
+      assert.deepEqual(onA.map((e) => (e.data as Row).question_id), [question]);
+      assert.equal((await events(idB)).some((e) => String(e.type).startsWith('slipstream.question.')), false);
+      table = await readers();
+      assert.deepEqual(stateOf(rowOf(table, idB)), ['recording', null, null]);
+    } finally {
+      replies.close();
+      forwarder.kill();
+      daemon.kill('SIGTERM');
+      while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
