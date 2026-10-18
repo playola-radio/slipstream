@@ -11,8 +11,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
+// --liftoff-only: each replaced worker otherwise starts a background optimizing
+// compile of the grammar WASM; 20 of those pile up and can stall a slow CI
+// runner past the timeout. Termination is what's under test, not optimized code.
 test('terminating and replacing active parser workers never aborts the host process', async () => {
-  await promisify(execFile)(process.execPath, [fileURLToPath(new URL('./test/clip-parser-cancellation.ts', import.meta.url))],
+  await promisify(execFile)(process.execPath,
+    ['--liftoff-only', fileURLToPath(new URL('./test/clip-parser-cancellation.ts', import.meta.url))],
     { timeout: 15_000 });
 });
 
