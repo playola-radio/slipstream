@@ -393,6 +393,46 @@ the line after the question text:
 
 > This follows up Slipstream question <reply_to_question_id> about the same source.
 
+## Client-recorded exchanges
+
+When the Slipstream client answers a question itself, in its own forked chat
+([chat console design](../chat-console/DESIGN.md)), it records the question and
+that answer in one step instead of queueing a question for a bound chat.
+
+```typescript
+interface RecordQuestionExchangeRequest {
+  v: 1;
+  verb: 'record_question_exchange';
+  session_id: string;   // capture session
+  request_id: string;   // caller-generated canonical lowercase UUID
+  text: string;
+  context: { change_seq: string; path: string; snapshot_sha256: string; line_start: number; line_end: number };
+  reply_to_question_id?: string;
+  answer_text: string;  // stored verbatim, never truncated
+  conversation: { harness: 'claude-code' | 'codex'; parent_session_id: string; fork_session_id: string };
+}
+// ok: { v: 1, ok: true, session_id, request_id, question_id, seq, duplicate }
+```
+
+- `question`, `context` and `reply_to_question_id` follow the `ask` rules.
+  The daemon reads `context.selected_text` itself and never accepts it from the client.
+- The capture only has to be recording. A watch-only capture works: no binding,
+  chat, or agent connection is involved. Errors are `SESSION_NOT_SELECTED`,
+  `CAPTURE_NOT_READY`, `STORAGE_UNAVAILABLE`, the `ask` validation codes,
+  `INVALID_ANSWER` and `REQUEST_CONFLICT`.
+- The only size limit on `answer_text` is the control socket's 1 MiB line cap; a
+  larger request fails `PROTOCOL` and appends nothing.
+- It appends exactly one `slipstream.question.exchange_recorded.v1` event (see
+  `schemas/`) and replies after it is durable. It adds no dispatch, binding,
+  connection, attribution, or file-change event, and does not count against the
+  queue limit.
+- Retrying a `request_id` with the same body returns the original result with
+  `duplicate: true`, including after a daemon restart; a different body is
+  `REQUEST_CONFLICT`.
+- `conversation.*_session_id` values are client-reported and unverified. The
+  event records `reported_by: "client"`. They are never used for binding or
+  attribution, and never mean authorship.
+
 ## Agent readiness
 
 A verified root binding is not proof that the chat can receive a question and

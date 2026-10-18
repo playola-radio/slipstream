@@ -259,7 +259,7 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
       let type: string;
       try { type = decodeURIComponent(schemaMatch[1]!); }
       catch { send(res, 400, 'invalid type'); return; }
-      if (!/^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/.test(type)) {
+      if (!/^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$/.test(type)) {
         send(res, 400, 'invalid type'); return;
       }
       const bytes = await schemaBytes(type);

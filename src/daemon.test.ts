@@ -8,6 +8,7 @@ import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts
 import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
+import { readQuestionContext } from './questions.ts';
 import { StorageError } from './storage.ts';
 import { createCas } from './cas.ts';
 import { claudePostToolUse } from './question-hook.ts';
@@ -2410,5 +2411,173 @@ describe('daemon transcript enrichment follows configuration, not chat linking',
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('daemon record_question_exchange', () => {
+  const EXCHANGE_REQUEST = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const CONVERSATION = { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1' };
+  const EXCHANGE_TYPE = 'slipstream.question.exchange_recorded.v1';
+
+  /** A watch-only daemon whose single capture holds one real observed change. */
+  async function withSeededCapture(
+    fn: (ctx: { daemon: Daemon; store: string; call: Call; id: string; exchange: (extra?: Record<string, unknown>) => CallRequest }) => Promise<void>,
+    deps: Parameters<typeof startDaemon>[0]['captureDependencies'] = {},
+  ): Promise<void> {
+    await withCaptures(async ({ store, call, daemon, roots, fake }) => {
+      const [root] = await roots(1);
+      const id = await attachWatchOnly(call, root!);
+      await writeFile(join(root!, 'a.ts'), 'one\ntwo\n');
+      fake.observe(root!, 'a.ts');
+      const changed = (await waitForLog(store, id, (log) => log.some((e) => e.type === 'slipstream.file.changed.v1')))
+        .find((e) => e.type === 'slipstream.file.changed.v1')!;
+      for (let i = 0; i < 300; i++) {
+        const row = (await sessionsJson(daemon)).find((s) => s.id === id);
+        if (row && BigInt(row.durable_seq) >= BigInt(changed.seq)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const context = { change_seq: changed.seq, path: 'a.ts',
+        snapshot_sha256: (changed.data.after as { sha256: string }).sha256, line_start: 1, line_end: 1 };
+      const exchange = (extra: Record<string, unknown> = {}): CallRequest => ({ verb: 'record_question_exchange',
+        session_id: id, request_id: EXCHANGE_REQUEST, text: 'Why?', context, answer_text: 'Because.',
+        conversation: CONVERSATION, ...extra });
+      await fn({ daemon, store, call, id, exchange });
+    }, { readQuestionContext, ...deps });
+  }
+
+  it('succeeds on a watch-only capture and appends exactly one event', async () => {
+    await withSeededCapture(async ({ store, call, id, exchange }) => {
+      const before = (await readLog(store, id)).map((e) => e.seq);
+      const res = await call(exchange());
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const after = await readLog(store, id);
+      const added = after.filter((e) => !before.includes(e.seq));
+      assert.deepEqual(added.map((e) => e.type), [EXCHANGE_TYPE]);
+      assert.deepEqual([rec(res).session_id, rec(res).request_id, rec(res).question_id, rec(res).seq, (res as unknown as { duplicate: boolean }).duplicate],
+        [id, EXCHANGE_REQUEST, added[0]!.data.question_id, added[0]!.seq, false]);
+      assert.equal((added[0]!.data.context as { selected_text: string }).selected_text, 'one');
+    });
+  });
+
+  it('is CAPTURE_NOT_READY before the capture records and SESSION_NOT_SELECTED for an unknown session', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await withCaptures(async ({ call, roots }) => {
+        const [root] = await roots(1);
+        const attached = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
+        assert.equal(attached.ok, true);
+        const id = rec(attached).session_id!;
+        assert.notEqual((await captureRow(call, id)).state, 'recording');
+        const req = { verb: 'record_question_exchange', request_id: EXCHANGE_REQUEST, text: 'Why?', context: ASK_CONTEXT,
+          answer_text: 'Because.', conversation: CONVERSATION };
+        const early = await call({ ...req, session_id: id });
+        assert.equal(early.ok === false && early.code, 'CAPTURE_NOT_READY');
+        const unknown = await call({ ...req, session_id: ASK_ID });
+        assert.equal(unknown.ok === false && unknown.code, 'SESSION_NOT_SELECTED');
+        release();
+      }, { enumerate: () => gate });
+    } finally { release(); }
+  });
+
+  it('round-trips a 200 KiB answer byte-identical through the log and HTTP replay', async () => {
+    await withSeededCapture(async ({ daemon, store, call, id, exchange }) => {
+      const answer = 'é\r\n\t"quoted" \\ line\n'.repeat(Math.ceil((200 * 1024) / 20)).slice(0, 200 * 1024);
+      assert.ok(Buffer.byteLength(answer) >= 200 * 1024);
+      const res = await call(exchange({ answer_text: answer }));
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const logged = (await readLog(store, id)).find((e) => e.type === EXCHANGE_TYPE)!;
+      assert.equal(logged.data.answer_text, answer);
+      let replayed: LogRecord | undefined;
+      for (let i = 0; i < 300 && !replayed; i++) {
+        const text = await (await fetch(`${daemon.readerUrl}/v1/sessions/${id}/events?after=0`,
+          { headers: { authorization: `Bearer ${daemon.readerToken}` } })).text();
+        replayed = text.split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogRecord).find((e) => e.type === EXCHANGE_TYPE);
+        if (!replayed) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(replayed?.data.answer_text, answer);
+    });
+  });
+
+  it('serves the exchange schema over HTTP', async () => {
+    await withCaptures(async ({ daemon }) => {
+      const res = await fetch(`${daemon.readerUrl}/v1/schemas/slipstream.question.exchange_recorded.v1`,
+        { headers: { authorization: `Bearer ${daemon.readerToken}` } });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { properties: { type: { const: string } } };
+      assert.equal(body.properties.type.const, EXCHANGE_TYPE);
+    });
+  });
+
+  it('refuses a request over the control message cap and appends nothing', async () => {
+    const { MAX_MESSAGE_BYTES } = await import('./control-protocol.ts');
+    await withSeededCapture(async ({ daemon, store, call, id, exchange }) => {
+      const before = (await readLog(store, id)).length;
+      const outcome = await sendControlRequest({ socketPath: daemon.socketPath, responseTimeoutMs: 5000,
+        request: { v: 1, ...exchange({ answer_text: 'x'.repeat(MAX_MESSAGE_BYTES + 1) }) } })
+        .then((res) => (res.ok ? 'accepted' : res.code), (err: Error) => err.constructor.name);
+      assert.match(outcome, /^(PROTOCOL|OutcomeUnknownError)$/, `observed ${outcome}`);
+      assert.equal((await readLog(store, id)).length, before, 'nothing is appended');
+      assert.equal((await call({ verb: 'status' })).ok, true, 'the daemon still answers a new connection');
+    });
+  });
+
+  it('answers a retry after a daemon restart with duplicate true and the original question_id', async () => {
+    const fake = createRootsPlatform();
+    await withResumeDaemon(async ({ store, worktree, call, restart }) => {
+      const root = await realpath(worktree);
+      const id = await attachWatchOnly(call, worktree);
+      await writeFile(join(root, 'a.ts'), 'one\ntwo\n');
+      fake.observe(root, 'a.ts');
+      const changed = (await waitForLog(store, id, (log) => log.some((e) => e.type === 'slipstream.file.changed.v1')))
+        .find((e) => e.type === 'slipstream.file.changed.v1')!;
+      const req: CallRequest = { verb: 'record_question_exchange', session_id: id, request_id: EXCHANGE_REQUEST, text: 'Why?',
+        context: { change_seq: changed.seq, path: 'a.ts', snapshot_sha256: (changed.data.after as { sha256: string }).sha256, line_start: 1, line_end: 1 },
+        answer_text: 'Because.', conversation: CONVERSATION };
+      const first = await call(req);
+      assert.equal(first.ok, true, JSON.stringify(first));
+      await restart();
+      assert.equal(await attachWatchOnly(call, worktree), id);
+      const retry = await call(req);
+      assert.equal(retry.ok, true, JSON.stringify(retry));
+      assert.equal((retry as unknown as { duplicate: boolean }).duplicate, true);
+      assert.equal(rec(retry).question_id, rec(first).question_id);
+      assert.equal((await readLog(store, id)).filter((e) => e.type === EXCHANGE_TYPE).length, 1);
+    }, { captureDependencies: { platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' } });
+  });
+
+  it('detach drains an exchange that is mid-append', async () => {
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reachedAppend = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      await withSeededCapture(async ({ daemon, store, call, id, exchange }) => {
+        const pending = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...exchange() } });
+        void pending.catch(() => {});
+        await reachedAppend;
+        let detached = false;
+        const detach = call({ verb: 'detach', target: id }).then((res) => { detached = true; return res; });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.equal(detached, false, 'detach waits for the in-flight exchange');
+        release();
+        const res = await pending;
+        const logged = (await readLog(store, id)).filter((e) => e.type === EXCHANGE_TYPE).length;
+        assert.equal(logged, res.ok ? 1 : 0, 'ok means the event is logged; an error means it is not');
+        assert.equal((await detach).ok, true);
+      }, { createLog: async (opts) => {
+        const log = await createLog(opts);
+        return { ...log, append: async (input) => {
+          if (input.type === EXCHANGE_TYPE) { entered(); await gate; }
+          return log.append(input);
+        } };
+      } });
+    } finally { release(); }
+  });
+
+  it('leaves ask on a watch-only capture as AGENT_NOT_CONNECTED', async () => {
+    await withSeededCapture(async ({ call, id }) => {
+      const res = await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(res.ok === false && res.code, 'AGENT_NOT_CONNECTED');
+    });
   });
 });
