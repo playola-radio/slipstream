@@ -30,9 +30,10 @@ const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
 /** Averages over consecutive samples of one daemon process. An interval is idle
  * when no session log grew during it. */
 export function summarize(samples: Sample[]) {
-  let wall = 0, cpu = 0, idleWall = 0, idleCpu = 0, idleIntervals = 0, restarts = 0;
+  let wall = 0, cpu = 0, idleWall = 0, idleCpu = 0, idleIntervals = 0, restarts = 0, maxGap = 0;
   for (let i = 1; i < samples.length; i++) {
     const a = samples[i - 1]!, b = samples[i]!;
+    maxGap = Math.max(maxGap, (b.at_ms - a.at_ms) / 1000);
     if (a.pid !== b.pid) { restarts++; continue; }
     const dWall = (b.at_ms - a.at_ms) / 1000, dCpu = b.cpu_s - a.cpu_s;
     wall += dWall; cpu += dCpu;
@@ -42,6 +43,8 @@ export function summarize(samples: Sample[]) {
   const rss = samples.map((s) => s.rss_kib);
   return {
     hours: round((samples.at(-1)!.at_ms - samples[0]!.at_ms) / 3_600_000),
+    samples: samples.length,
+    max_gap_s: round(maxGap),
     cpu_pct_all: wall ? round((cpu / wall) * 100) : null,
     cpu_pct_idle: idleWall ? round((idleCpu / idleWall) * 100) : null,
     idle_intervals: idleIntervals,
@@ -53,15 +56,23 @@ export function summarize(samples: Sample[]) {
 }
 
 async function sessionLogs(storeDir: string): Promise<string[]> {
-  const ids = await readdir(join(storeDir, 'sessions')).catch(() => []);
+  const ids = await readdir(join(storeDir, 'sessions'));
   return ids.map((id) => join(storeDir, 'sessions', id, 'events.jsonl'));
+}
+
+/** A session that has not written its log yet has none; any other read failure is an error, never zero. */
+async function unlessMissing<T>(read: Promise<T>, absent: T): Promise<T> {
+  try { return await read; } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return absent;
+    throw err;
+  }
 }
 
 /** `capture.gap` and `capture.stopped` events in [fromMs, toMs], by reason. */
 export async function countLifecycle(storeDir: string, fromMs: number, toMs: number) {
   const gaps: Record<string, number> = {}, stops: Record<string, number> = {};
   for (const log of await sessionLogs(storeDir)) {
-    const text = await readFile(log, 'utf8').catch(() => '');
+    const text = await unlessMissing(readFile(log, 'utf8'), '');
     for (const line of text.split('\n')) {
       if (!line.includes('"slipstream.capture.gap.v1"') && !line.includes('"slipstream.capture.stopped.v1"')) continue;
       const e = JSON.parse(line) as { type: string; time: string; data: { reason: string } };
@@ -79,7 +90,7 @@ async function sample(storeDir: string): Promise<Sample> {
   const { stdout } = await promisify(execFile)('ps', ['-o', 'cputime=,rss=', '-p', String(pid)]);
   const [cpu, rss] = stdout.trim().split(/\s+/);
   let logBytes = 0;
-  for (const log of await sessionLogs(storeDir)) logBytes += (await stat(log).catch(() => ({ size: 0 }))).size;
+  for (const log of await sessionLogs(storeDir)) logBytes += (await unlessMissing(stat(log).then((st) => st.size), 0));
   return { at_ms: Date.now(), pid, cpu_s: parseCpuTime(cpu!), rss_kib: Number(rss), log_bytes: logBytes };
 }
 

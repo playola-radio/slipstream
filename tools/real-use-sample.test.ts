@@ -27,6 +27,12 @@ describe('real-use sampler', () => {
     assert.equal(s.idle_intervals, 2);
     assert.equal(s.rss_max_mib, 120);
     assert.equal(s.daemon_restarts, 0);
+    assert.equal(s.samples, 4);
+  });
+
+  it('reports the longest stretch with no sample, so a sampling outage is visible', () => {
+    const s = summarize([0, 60, 3660, 3720].map((sec) => ({ at_ms: sec * 1000, pid: 1, cpu_s: 0, rss_kib: 1024, log_bytes: 0 })));
+    assert.equal(s.max_gap_s, 3600);
   });
 
   it('skips the interval across a daemon restart and counts the restart', () => {
@@ -66,5 +72,22 @@ describe('real-use sampler', () => {
       gaps: { restart: 1, 'watcher-error': 1 },
       stops: { maintenance: 1, 'watcher-failed': 1 },
     });
+  });
+
+  it('refuses to count a store with no sessions folder rather than reporting zero gaps', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
+    await assert.rejects(countLifecycle(store, 0, Date.now()), { code: 'ENOENT' });
+  });
+
+  it('refuses to count a session log it cannot read', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
+    await mkdir(join(store, 'sessions', 'a', 'events.jsonl'), { recursive: true });
+    await assert.rejects(countLifecycle(store, 0, Date.now()), { code: 'EISDIR' });
+  });
+
+  it('counts a session with no log yet as having no events', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
+    await mkdir(join(store, 'sessions', 'a'), { recursive: true });
+    assert.deepEqual(await countLifecycle(store, 0, Date.now()), { gaps: {}, stops: {} });
   });
 });
