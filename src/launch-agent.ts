@@ -9,6 +9,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promis
 import { dirname, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertOwnerOnly, mkdirpDurable } from './storage.ts';
+import { acquireSessionLock, SessionOwnedError } from './lock.ts';
 
 export const LAUNCH_AGENT_LABEL = 'radio.playola.slipstream';
 /** git is on it, for the daemon's ignore-rule checks. */
@@ -144,6 +145,12 @@ export async function installLaunchAgent(o: EntryPaths & { home: string; store: 
   const log = daemonLogPath(o.home);
   const text = renderPlist({ ...o, log });
   const current = await readFile(plist, 'utf8').catch(() => null);
+  if (current !== null && current !== text) {
+    const store = current.match(/<string>--store<\/string>\s*<string>([^<]+)<\/string>/)?.[1];
+    if (store !== undefined && store !== xml(o.store)) {
+      throw new InstallError('a managed Slipstream daemon already belongs to another store; stop and remove that install before choosing a different store');
+    }
+  }
   const domain = `gui/${o.uid}`;
   await mkdir(dirname(log), { recursive: true });
   if (current === text && (await run('launchctl', ['print', `${domain}/${LAUNCH_AGENT_LABEL}`])).code === 0) {
@@ -156,6 +163,18 @@ export async function installLaunchAgent(o: EntryPaths & { home: string; store: 
   }
   if (current !== text) await writeAtomic(plist, text, 0o644);
   await run('launchctl', ['bootout', `${domain}/${LAUNCH_AGENT_LABEL}`]);
+  // launchd can stop only the process it owns. Prove no manual or legacy daemon
+  // still owns this shared store before saying the managed one was installed.
+  await mkdirpDurable(o.store);
+  try {
+    const ownership = await acquireSessionLock(o.store);
+    await ownership.release();
+  } catch (err) {
+    if (err instanceof SessionOwnedError) {
+      throw new InstallError(`another daemon still owns ${o.store}; stop it before installing the managed daemon`);
+    }
+    throw err;
+  }
   // launchd finishes a bootout asynchronously; a bootstrap right behind it can
   // fail until the old instance is gone.
   let loaded = await run('launchctl', ['bootstrap', domain, plist]);

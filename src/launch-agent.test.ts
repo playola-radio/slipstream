@@ -91,6 +91,14 @@ describe('the LaunchAgent', () => {
     });
   });
 
+  it('refuses to replace a managed daemon for a different store', async () => {
+    await withHome(async (home) => {
+      const l = fakeLaunchctl();
+      await installLaunchAgent({ ...paths, home, store: join(home, 'a'), uid: 501 }, l.run);
+      await assert.rejects(installLaunchAgent({ ...paths, home, store: join(home, 'b'), uid: 501 }, l.run), InstallError);
+    });
+  });
+
   it('retries a bootstrap that races the previous instance unloading', async () => {
     await withHome(async (home) => {
       const l = fakeLaunchctl(false, 2);

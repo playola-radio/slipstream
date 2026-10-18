@@ -14,6 +14,11 @@ describe('reading Conductor scripts', () => {
     assert.deepEqual(readTomlScripts('# empty\n[ui]\ntheme = "dark"\n', P), {});
   });
 
+  it('accepts triple quotes in comments and ordinary one-line strings', () => {
+    const text = '# """ is only a comment\n[notes]\nexample = \'echo """\'\n[scripts]\nsetup = "npm ci"\n';
+    assert.deepEqual(readTomlScripts(text, P), { setup: 'npm ci' });
+  });
+
   for (const [name, text] of [
     ['a multi-line string', '[scripts]\nsetup = """\nnpm ci\n"""\n'],
     ['a dotted key at the top level', 'scripts.setup = "npm ci"\n'],

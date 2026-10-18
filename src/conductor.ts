@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { shellWord } from './attach-workflow.ts';
 import {
-  SCRIPT_KINDS, SettingsError, readLegacyScripts, readTomlScripts, writeTomlScripts, type ScriptKind, type Scripts,
+  SCRIPT_KINDS, SettingsError, readLegacyScripts, readTomlScripts, removeTomlScripts, writeTomlScripts, type ScriptKind, type Scripts,
 } from './conductor-settings.ts';
 import {
   InstallError, entryPaths, installLaunchAgent, readManagedInstall, writeManagedInstall, type ManagedRepo, type Run,
@@ -152,6 +152,7 @@ async function install(deps: InstallDeps): Promise<number> {
     const local = localText === null ? {} : readTomlScripts(localText, localPath);
     const before = prior?.repos.find((r) => r.root === root);
     const next: Scripts = {};
+    const remove: ScriptKind[] = [];
     for (const kind of SCRIPT_KINDS) {
       const value = local[kind];
       const ourChain = value === undefined ? undefined : chainedOwn(value);
@@ -159,14 +160,20 @@ async function install(deps: InstallDeps): Promise<number> {
       if (ourChain) {
         // Follow a shared script that changed since the last install, unless the
         // chained command was edited by hand.
+        if (before && ourChain.own === before[kind] && shared[kind] === undefined) {
+          remove.push(kind);
+          continue;
+        }
         own = before && ourChain.own === before[kind] ? shared[kind] ?? null : ourChain.own;
       } else if (value !== undefined) own = value;
       else if (shared[kind] !== undefined) own = shared[kind];
       else continue;
       next[kind] = chainScript(ours(kind), own);
     }
-    if (Object.keys(next).length === 0) continue;
-    const out = writeTomlScripts(localText ?? '', next, localPath);
+    if (Object.keys(next).length === 0 && remove.length === 0) continue;
+    let out = localText ?? '';
+    if (remove.length > 0) out = removeTomlScripts(out, remove, localPath);
+    if (Object.keys(next).length > 0) out = writeTomlScripts(out, next, localPath);
     if (out !== localText) writes.push({ path: localPath, text: out });
     repos.push({ root, setup: shared.setup ?? null, archive: shared.archive ?? null });
     chained.push(localPath);

@@ -755,9 +755,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
    * awaits this before it acts or replies. */
   function persistIntent(): Promise<void> {
     if (intentBroken) return Promise.reject(intentBroken);
+    if (compromised) return Promise.reject(new Error('the store lock was lost; the intent record belongs to another daemon'));
     intentFlush ??= intentTail.then(async () => {
       intentFlush = undefined;
       if (intentBroken) throw intentBroken;
+      if (compromised) throw new Error('the store lock was lost; the intent record belongs to another daemon');
       try {
         await saveIntent(storeDir, intent);
       } catch (err) {
@@ -987,7 +989,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   function startRearm(c: Capture, b: Binding, session: CaptureSession): void {
-    const rearm = rearmBinding(c, b, session);
+    const rearm: Promise<ErrorFields | undefined> = (async (): Promise<ErrorFields | undefined> => {
+      for (;;) {
+        const failed = await rearmBinding(c, b, session);
+        if (!failed) return;
+        const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
+        b.revalidations = (b.revalidations ?? 0) + 1;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (c.binding !== b || c.session !== session || c.lifecycle !== 'recording' || torn || compromised) return;
+      }
+    })();
     b.publishing = rearm;
     c.inflight.add(rearm);
     void rearm.finally(() => {
@@ -1035,7 +1046,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function rootProblem(c: Capture): Promise<string | undefined> {
     const known = findCapture(intent, c.id)?.root_identity;
     let st;
-    try { st = await stat(c.root, { bigint: true }); } catch {
+    try { st = await stat(c.root, { bigint: true }); } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
       return `the workspace root ${c.root} no longer exists`;
     }
     if (st.isDirectory() && (!known || (st.dev.toString() === known.dev && st.ino.toString() === known.ino))) return undefined;

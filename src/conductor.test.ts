@@ -150,6 +150,17 @@ describe('slipstream conductor install', () => {
     });
   });
 
+  it('removes a generated repo override when its shared script is removed', async () => {
+    await withMachine(async (m) => {
+      const a = m.repo('a');
+      await put(join(a, '.conductor', 'settings.toml'), '[scripts]\nsetup = "npm ci"\n');
+      await runConductorInstall(m.deps());
+      await put(join(a, '.conductor', 'settings.toml'), '[scripts]\n');
+      await runConductorInstall(m.deps());
+      assert.deepEqual(readTomlScripts(await read(localSettingsPath(a)), 'l'), {});
+    });
+  });
+
   it('rewrites every script and the LaunchAgent to the new absolute paths after an upgrade', async () => {
     await withMachine(async (m) => {
       const a = m.repo('a');

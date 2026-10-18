@@ -48,6 +48,10 @@ function parseValue(raw: string, path: string, line: number): string {
 
 interface Located { scripts: Scripts; lines: string[]; header?: number; at: Partial<Record<ScriptKind, number>> }
 
+function opensMultilineString(line: string): boolean {
+  return /^\s*[^#=]+\s*=\s*(?:"""|''')/.test(line);
+}
+
 function locate(text: string, path: string): Located {
   const lines = text.split('\n');
   const scripts: Scripts = {};
@@ -55,7 +59,7 @@ function locate(text: string, path: string): Located {
   let table: string | null = '';
   let found: number | undefined;
   for (const [i, line] of lines.entries()) {
-    if (line.includes('"""') || line.includes("'''")) throw unsupported(path, i + 1, 'uses a multi-line string');
+    if (opensMultilineString(line)) throw unsupported(path, i + 1, 'uses a multi-line string');
     if (ARRAY_HEADER.test(line)) { table = null; continue; }
     const header = HEADER.exec(line);
     if (header) {
@@ -101,6 +105,14 @@ export function writeTomlScripts(text: string, scripts: Scripts, path: string): 
   const body = lines.join('\n');
   const sep = body === '' ? '' : body.endsWith('\n\n') ? '' : body.endsWith('\n') ? '\n' : '\n\n';
   return `${body}${sep}[scripts]\n${missing.join('\n')}\n`;
+}
+
+/** `text` with generated script entries removed, retaining all other text. */
+export function removeTomlScripts(text: string, kinds: readonly ScriptKind[], path: string): string {
+  const { lines, at } = locate(text, path);
+  const remove = kinds.map((kind) => at[kind]).filter((line): line is number => line !== undefined).sort((a, b) => b - a);
+  for (const line of remove) lines.splice(line, 1);
+  return lines.join('\n');
 }
 
 /** The scripts of a legacy `conductor.json`. */

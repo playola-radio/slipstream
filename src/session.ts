@@ -706,7 +706,10 @@ export async function startCapture(
   };
   const checkRoot = async (): Promise<boolean> => {
     let now;
-    try { now = await stat(root, { bigint: true }); } catch { /* gone */ }
+    try { now = await stat(root, { bigint: true }); } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return false;
+    }
     if (now?.isDirectory() && now.dev === rootStat.dev && now.ino === rootStat.ino) return false;
     end('root-missing', now ? `the workspace root ${root} was replaced` : `the workspace root ${root} no longer exists`);
     return true;
