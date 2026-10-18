@@ -711,6 +711,21 @@ describe('session', () => {
       );
     });
 
+    it('an unlink ends the current task, live and after recovery', async () => {
+      await withTempPair(async (root, store) => {
+        const platform = createFakePlatform();
+        const s1 = await startCapture({ root, storeDir: store }, { platform });
+        await s1.beginTask({ title: 'Linked chat task', requestId: 'req-1' });
+        await s1.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+          data: { binding_generation: '1', reason: 'unlinked' } });
+        await writeFile(join(root, 'c.ts'), 'v1');
+        platform.observe('c.ts');
+        const recs = await waitForRecords(s1.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
+        assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, undefined);
+        await s1.stop();
+      });
+    });
+
     it('rebuilds the dedup index across a resume but starts with no current task', async () => {
       await withTempPair(async (root, store) => {
         const platform = createFakePlatform();

@@ -36,12 +36,12 @@ export interface RecoveredSession {
   /** Seq of the disclosing gap for each recovered storage outage episode, so a
    * retried recovery reuses the surviving gap instead of appending a duplicate. */
   storageGapSeqByEpisode: Map<string, string>;
-  /** The `task_id` of the last task declaration after the latest `session.resumed`;
-   * undefined if none. A resume starts with no current task. */
+  /** The `task_id` of the last task declaration after the latest `session.resumed`
+   * or `agent.unlinked`; undefined if none. A resume or unlink clears the task. */
   currentTaskId: string | undefined;
-  /** Seq of the latest `session.resumed` record; 0n if never resumed. Questions
-   * queued at or before it are history only and are never claimable again. */
-  latestResumedSeq: bigint;
+  /** Seq of the latest `session.resumed` or `agent.unlinked` record; 0n if none.
+   * Questions queued at or before it are history only and never claimable again. */
+  taskResetSeq: bigint;
   /** Committed task declarations keyed by their idempotency `request_id`, so the
    * session rebuilds its dedup index: a replayed duplicate must not re-append. A
    * torn trailing declaration is discarded with the tail, so it never appears. */
@@ -138,7 +138,7 @@ export async function recoverSession(
   let maxBytes: number | undefined;
   let baselineCompleted = false;
   let currentTaskId: string | undefined;
-  let latestResumedSeq = 0n;
+  let taskResetSeq = 0n;
   let seq = 0n;
 
   const verifyBlob = async (snap: Snapshot, where: string): Promise<void> => {
@@ -315,8 +315,9 @@ export async function recoverSession(
         break;
       }
       case 'slipstream.session.resumed.v1':
+      case 'slipstream.agent.unlinked.v1':
         currentTaskId = undefined;
-        latestResumedSeq = BigInt(event.seq);
+        taskResetSeq = BigInt(event.seq);
         break;
     }
   }
@@ -356,7 +357,7 @@ export async function recoverSession(
     baselineUnknownDirs,
     storageGapSeqByEpisode,
     currentTaskId,
-    latestResumedSeq,
+    taskResetSeq,
     taskDeclarations,
     attributionEvents,
     questions,

@@ -300,7 +300,7 @@ export async function startCapture(
     for (const event of rec.questions) {
       committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
       // Questions queued before the latest resume stay history only (D2).
-      if (BigInt(event.seq) > rec.latestResumedSeq) unattemptedQuestions.set(event.data.question_id, event);
+      if (BigInt(event.seq) > rec.taskResetSeq) unattemptedQuestions.set(event.data.question_id, event);
     }
     for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
     questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
@@ -335,8 +335,11 @@ export async function startCapture(
       };
     },
     onCommitted: (event) => {
-      // A resume starts without a current task or claimable questions (D1/D2).
-      if (event.type === 'slipstream.session.resumed.v1') { currentTaskId = undefined; unattemptedQuestions.clear(); }
+      // A resume or an unlinked chat leaves no current task or claimable questions (D1/D2).
+      if (event.type === 'slipstream.session.resumed.v1' || event.type === 'slipstream.agent.unlinked.v1') {
+        currentTaskId = undefined;
+        unattemptedQuestions.clear();
+      }
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') {
@@ -1185,8 +1188,10 @@ export async function startCapture(
     await producer?.stop().catch(record);
     await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
     // Never manufactured: after a lost lock or during a storage outage the stop
-    // stays unrecorded, and a reader sees no stop and no live heartbeat.
-    if (opts && firstError === undefined && !surrendered && health.snapshot().state === 'healthy') {
+    // stays unrecorded and stop() rejects, so no caller can report it stopped.
+    if (opts && firstError === undefined && (surrendered || health.snapshot().state !== 'healthy')) {
+      record(new Error(`the stop could not be recorded: capture storage is ${surrendered ? 'owned by another process' : health.snapshot().state}`));
+    } else if (opts && firstError === undefined) {
       try {
         if (opts.unlinkGeneration !== undefined) {
           await appendEvent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: now(),
