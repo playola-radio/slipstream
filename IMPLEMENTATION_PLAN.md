@@ -161,16 +161,19 @@ Rules that keep the expansion additive:
 (capture table: one capture per workspace up to 16 with visible waiting, in-place
 chat linking up to 10, unlink and generation fencing, targeted `status` and
 `detach`, `attach --watch-only [--wait]`, `GET /v1/captures`, no re-save of stored
-blobs on start, P2 counting tests) merged (#70). P3 (durable capture and
-binding intent, restart recovery with fresh chat setup checks, root-missing and
+blobs on start, P2 counting tests) merged (#70). P5 (one daemon-wide transcript
+scheduler: each cycle scans `~/.codex/sessions` once and each Claude project
+folder once for every capture; transcript reading follows configuration, not
+chat linking; P5 counting tests) merged (#71). P3 (durable capture and binding
+intent, restart recovery with fresh chat setup checks, root-missing and
 watcher-failed stops, the LaunchAgent, `slipstream conductor
-install|setup|archive|enroll`) is implemented on `briankeane/autocapture-p3-recovery`;
-PR to `develop` pending. P4–P6 Not Started.
+install|setup|archive|enroll`) is in review as #72 on
+`briankeane/autocapture-p3-recovery`. P4 and P6 Not Started.
 
 Known later work: GC and session
 deletion while captures run (P4; today both still require every capture
-detached); share transcript discovery across captures instead of
-one `~/.codex/sessions` scan per capture (P5).
+detached). After P5 one shared Codex scan per cycle remains; whether its idle
+cost is acceptable is P6's real-use check.
 
 Auto-connect findings (2026-09-27 research, not decisions): split "capture the
 worktree" (needs no harness identity; a workspace-folder watch can trigger it)

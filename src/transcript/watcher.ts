@@ -11,7 +11,7 @@
  * creates a `file.changed` — it only refines and discloses coverage.
  */
 import type { CoverageIssue, CoverageState, EnrichmentCoverageData, HarnessName } from '../event.ts';
-import type { DiscoveryIO, TranscriptBinding } from './discovery.ts';
+import type { DiscoveryIO, DiscoveryResult, TranscriptBinding } from './discovery.ts';
 import { discover } from './discovery.ts';
 import {
   createTranscriptFileReader,
@@ -40,6 +40,9 @@ export interface TranscriptWatcherOptions {
 export interface TranscriptWatcher {
   /** Run one discovery + read pass; ingest evidence and publish coverage on change. */
   tick(): Promise<void>;
+  /** Run one read pass over an already-discovered result for this root (a shared
+   * discovery cycle); ingest evidence and publish coverage on change. */
+  apply(discovery: DiscoveryResult): Promise<void>;
 }
 
 /**
@@ -131,14 +134,7 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
   >();
   let lastKey: string | undefined;
 
-  const tick = async (): Promise<void> => {
-    const { bindings, issues: discoveryIssues } = await discover(
-      harness,
-      discoveryIO,
-      home,
-      root,
-      codexScanLimit,
-    );
+  const apply = async ({ bindings, issues: discoveryIssues }: DiscoveryResult): Promise<void> => {
 
     const perFile: Array<{
       state: FileReadResult['state'];
@@ -195,5 +191,9 @@ export function createTranscriptWatcher(opts: TranscriptWatcherOptions): Transcr
     }
   };
 
-  return { tick };
+  const tick = async (): Promise<void> => {
+    await apply(await discover(harness, discoveryIO, home, root, codexScanLimit));
+  };
+
+  return { tick, apply };
 }
