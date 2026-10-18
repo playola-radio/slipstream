@@ -7,10 +7,12 @@
  *   node tools/real-use-sample.ts [--store ~/.slipstream] [--interval 60] --out day.ndjson
  *   node tools/real-use-sample.ts [--store ~/.slipstream] --summary day.ndjson
  */
+import { createReadStream } from 'node:fs';
 import { appendFile, readFile, readdir, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 import { parseArgs } from 'node:util';
 
@@ -68,12 +70,32 @@ async function unlessMissing<T>(read: Promise<T>, absent: T): Promise<T> {
   }
 }
 
+/** Streams only newline-terminated JSONL records, so a concurrent append cannot
+ * turn an incomplete final record into a malformed event. */
+async function* completeLines(log: string): AsyncGenerator<string> {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  try {
+    for await (const chunk of createReadStream(log)) {
+      pending += decoder.write(chunk);
+      let newline: number;
+      while ((newline = pending.indexOf('\n')) >= 0) {
+        yield pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+      }
+    }
+    pending += decoder.end();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+}
+
 /** `capture.gap` and `capture.stopped` events in [fromMs, toMs], by reason. */
 export async function countLifecycle(storeDir: string, fromMs: number, toMs: number) {
   const gaps: Record<string, number> = {}, stops: Record<string, number> = {};
   for (const log of await sessionLogs(storeDir)) {
-    const text = await unlessMissing(readFile(log, 'utf8'), '');
-    for (const line of text.split('\n')) {
+    for await (const line of completeLines(log)) {
       if (!line.includes('"slipstream.capture.gap.v1"') && !line.includes('"slipstream.capture.stopped.v1"')) continue;
       const e = JSON.parse(line) as { type: string; time: string; data: { reason: string } };
       const t = Date.parse(e.time);

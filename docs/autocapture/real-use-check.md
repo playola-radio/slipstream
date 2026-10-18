@@ -22,9 +22,9 @@ Quoted verbatim from the
    that build.
 2. Run `slipstream conductor install` (its `Slipstream:` line shows the version
    the daemon now runs), then `slipstream conductor enroll`.
-3. Make sure 16 Conductor workspaces exist and aren't archived. `slipstream
-   status` must show `captures: 16`, every one `state: recording`. Any
-   `not_recording` row has a reason on it; fix that before starting.
+3. Make sure 16 intended Conductor workspace rows are `state: recording` in
+   `slipstream status`; retained or archived capture history does not count.
+   Any intended `not_recording` row has a reason on it; fix that before starting.
 4. Link a chat in as many of them as you will use; at most 10 can be linked.
    In each chat, ask the agent to run `slipstream attach`, then send the chat
    one more message. `slipstream status` shows that workspace's chat as

@@ -74,6 +74,30 @@ describe('real-use sampler', () => {
     });
   });
 
+  it('ignores an incomplete trailing lifecycle record from a live log', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
+    const at = (iso: string, type: string, reason: string) =>
+      JSON.stringify({ type: `slipstream.${type}.v1`, time: iso, data: { reason } });
+    await mkdir(join(store, 'sessions', 'a'), { recursive: true });
+    await writeFile(join(store, 'sessions', 'a', 'events.jsonl'),
+      at('2026-10-18T10:00:00.000Z', 'capture.gap', 'restart') + '\n'
+      + at('2026-10-18T10:01:00.000Z', 'capture.stopped', 'maintenance').slice(0, -3));
+
+    assert.deepEqual(
+      await countLifecycle(store, Date.parse('2026-10-18T09:00:00Z'), Date.parse('2026-10-18T11:00:00Z')),
+      { gaps: { restart: 1 }, stops: {} },
+    );
+  });
+
+  it('rejects a malformed complete lifecycle record', async () => {
+    const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
+    await mkdir(join(store, 'sessions', 'a'), { recursive: true });
+    await writeFile(join(store, 'sessions', 'a', 'events.jsonl'),
+      '{"type":"slipstream.capture.gap.v1"\n');
+
+    await assert.rejects(countLifecycle(store, 0, Date.now()), SyntaxError);
+  });
+
   it('refuses to count a store with no sessions folder rather than reporting zero gaps', async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-real-use-'));
     await assert.rejects(countLifecycle(store, 0, Date.now()), { code: 'ENOENT' });
