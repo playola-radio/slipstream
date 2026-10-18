@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -59,6 +59,15 @@ async function withRestartableStore(fn: (ctx: {
     await rm(store, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
   }
+}
+
+/** Replace a directory with a new one at the same path. The new directory is
+ * made before the old one goes, so it cannot reuse the old inode (Linux reuses
+ * a freed inode number at once). */
+async function replaceRoot(root: string): Promise<void> {
+  await mkdir(`${root}.new`);
+  await rm(root, { recursive: true });
+  await rename(`${root}.new`, root);
 }
 
 const recording = (row: Record<string, unknown>) => row.state === 'recording';
@@ -534,8 +543,7 @@ describe('a capture whose root or watcher goes away', () => {
       const [a] = await roots(1);
       const { call, fake } = await start();
       const id = await attachRecording(call, a!);
-      await rm(a!, { recursive: true });
-      await mkdir(a!);
+      await replaceRoot(a!);
       fake.observe(a!, '');
       await waitForLog(store, id, (l) => stoppedFor(l) === 'root-missing');
       const again = await call({ verb: 'attach', mode: 'watch-only', worktree: a });
@@ -614,8 +622,7 @@ describe('a capture whose root or watcher goes away', () => {
       const id = await attachRecording(call, a!);
       await stop();
       const before = (await readLog(store, id)).length;
-      await rm(a!, { recursive: true });
-      await mkdir(a!);
+      await replaceRoot(a!);
       ({ call } = await start());
       const row = await waitForRow(call, id, (r) => r.state === 'not_recording');
       assert.equal(row.reason, 'root-missing');
@@ -634,8 +641,7 @@ describe('a capture whose root or watcher goes away', () => {
       const fake = createRootsPlatform();
       const platform: Platform = {
         watch: async (o) => {
-          await rm(a!, { recursive: true });
-          await mkdir(a!);
+          await replaceRoot(a!);
           return fake.platform.watch(o);
         },
       };
@@ -651,8 +657,7 @@ describe('a capture whose root or watcher goes away', () => {
       const [a] = await roots(1);
       const { call, fake } = await start();
       const old = await attachRecording(call, a!);
-      await rm(a!, { recursive: true });
-      await mkdir(a!);
+      await replaceRoot(a!);
       fake.observe(a!, '');
       await waitForLog(store, old, (l) => stoppedFor(l) === 'root-missing');
       const fresh = await attachRecording(call, a!);
