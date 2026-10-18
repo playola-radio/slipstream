@@ -9,16 +9,18 @@
  *   slipstream serve [dir] [--store <dir>]
  *   slipstream view  ...
  *
- * Shared daemon (Stage 3): one long-lived daemon owns the shared store, one
- * public reader, and at most one active capture; the other verbs are thin
- * control clients that talk to it over its private socket. `start` comes up
- * detached — attach a worktree to begin capture.
+ * Shared daemon: one long-lived daemon owns the shared store, one public
+ * reader, and one capture per workspace (up to the capture cap); the other verbs
+ * are thin control clients that talk to it over its private socket. `start` comes
+ * up with nothing recording — attach a worktree to begin capture.
  *
  *   slipstream start  [--store <dir>]
  *   slipstream attach [dir] [--store <dir>]   (from inside the agent chat to connect)
+ *   slipstream attach --watch-only [dir] [--wait] [--store <dir>]
  *   slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id>
- *   slipstream status [--store <dir>]
- *   slipstream detach [--store <dir>]
+ *   slipstream status [<target>] [--store <dir>]
+ *   slipstream detach [<target>] [--store <dir>]   (target: session id or workspace; default: this directory)
+ *   slipstream unlink --session <id> [--store <dir>]
  *
  * Maintenance of retained sessions (only while the daemon is detached):
  *
@@ -39,7 +41,7 @@ import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts'
 import { QUESTION_TTL_MS } from './questions.ts';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
-import { runAttachWorkflow } from './attach-workflow.ts';
+import { runAttachWorkflow, runWatchOnlyAttach } from './attach-workflow.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -56,9 +58,11 @@ type Args =
   | { command: 'serve'; dir: string; store: string }
   | { command: 'view' }
   | { command: 'start'; store: string; configPath?: string; overrides: ConfigOverrides }
-  | { command: 'status'; store: string }
-  | { command: 'detach'; store: string }
-  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string; rootTranscript?: string }
+  | { command: 'status'; store: string; target?: string }
+  | { command: 'detach'; store: string; target: string }
+  | { command: 'unlink'; store: string; sessionId: string }
+  | { command: 'attach'; dir: string; store: string; harness?: string; harnessSessionId?: string; rootTranscript?: string;
+    watchOnly?: boolean; wait?: boolean }
   | { command: 'codex-hook'; store: string }
   | { command: 'claude-hook'; store: string }
   | { command: 'ask'; store: string; sessionId: string; requestId: string; inputPath: string }
@@ -198,16 +202,53 @@ function parseAsk(rest: string[]): Omit<Extract<Args, { command: 'ask' }>, 'comm
   return { store, sessionId, requestId, inputPath };
 }
 
+/** `[<target>] [--store <dir>]` for `status` and `detach`. A session id is sent
+ * as is; anything else is a workspace path, made absolute here because the
+ * daemon runs in another directory. */
+function parseTargeted(rest: string[]): { store: string; target?: string } | null {
+  let store: string | undefined;
+  let target: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    if (arg === '--store') {
+      const value = rest[++i];
+      if (value === undefined || value.startsWith('--')) return null;
+      store = resolve(value);
+    } else if (arg.startsWith('--') || target !== undefined) return null;
+    else target = isValidSessionId(arg) ? arg : resolve(arg);
+  }
+  return { store: store ?? DEFAULT_DAEMON_STORE, ...(target !== undefined ? { target } : {}) };
+}
+
+function parseUnlink(rest: string[]): { store: string; sessionId: string } | null {
+  let store: string | undefined;
+  let sessionId: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    const value = rest[++i];
+    if (value === undefined || value.startsWith('--')) return null;
+    if (arg === '--store') store = resolve(value);
+    else if (arg === '--session' && sessionId === undefined) sessionId = value;
+    else return null;
+  }
+  if (sessionId === undefined) return null;
+  return { store: store ?? DEFAULT_DAEMON_STORE, sessionId };
+}
+
 function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>, 'command'> | null {
   let dir = process.cwd();
   let store: string | undefined;
   let harness: string | undefined;
   let harnessSessionId: string | undefined;
   let rootTranscript: string | undefined;
+  let watchOnly = false;
+  let wait = false;
   let sawDir = false;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
-    if (arg === '--store' || arg === '--harness' || arg === '--harness-session-id' || arg === '--root-transcript') {
+    if (arg === '--watch-only') watchOnly = true;
+    else if (arg === '--wait') wait = true;
+    else if (arg === '--store' || arg === '--harness' || arg === '--harness-session-id' || arg === '--root-transcript') {
       const value = rest[++i];
       if (value === undefined || value.startsWith('--')) return null;
       if (arg === '--store') store = resolve(value);
@@ -221,6 +262,11 @@ function parseAttach(rest: string[]): Omit<Extract<Args, { command: 'attach' }>,
       sawDir = true;
     }
     else return null; // unknown flag
+  }
+  if (wait && !watchOnly) return null;
+  if (watchOnly) {
+    if (harness !== undefined || harnessSessionId !== undefined || rootTranscript !== undefined) return null;
+    return { dir, store: store ?? DEFAULT_DAEMON_STORE, watchOnly, wait };
   }
   return { dir, store: store ?? DEFAULT_DAEMON_STORE, harness, harnessSessionId, ...(rootTranscript ? { rootTranscript } : {}) };
 }
@@ -237,10 +283,22 @@ export function parseArgs(argv: string[]): Args | null {
     if (parsed === null) return null;
     return { command, store: parsed.store, configPath: parsed.configPath, overrides: parsed.overrides };
   }
-  if (command === 'status' || command === 'detach' || command === 'gc') {
+  if (command === 'gc') {
     const store = parseStoreOnly(argv.slice(1));
     if (store === null) return null;
     return { command, store };
+  }
+  if (command === 'status') {
+    const parsed = parseTargeted(argv.slice(1));
+    return parsed && { command, ...parsed };
+  }
+  if (command === 'detach') {
+    const parsed = parseTargeted(argv.slice(1));
+    return parsed && { command, store: parsed.store, target: parsed.target ?? process.cwd() };
+  }
+  if (command === 'unlink') {
+    const parsed = parseUnlink(argv.slice(1));
+    return parsed && { command, ...parsed };
   }
   if (command === 'attach') {
     const parsed = parseAttach(argv.slice(1));
@@ -280,11 +338,13 @@ function usage(): void {
   console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
   console.error('       slipstream attach [dir] [--store <dir>]   (run inside the agent chat to connect)');
+  console.error('       slipstream attach --watch-only [dir] [--wait] [--store <dir>]');
   console.error('       slipstream attach [dir] [--store <dir>] --harness <name> --harness-session-id <id> [--root-transcript <path>]');
   console.error('       slipstream hook codex post-tool-use --store <dir>');
   console.error('       slipstream hook claude-code post-tool-use --store <dir>');
-  console.error('       slipstream status [--store <dir>]');
-  console.error('       slipstream detach [--store <dir>]');
+  console.error('       slipstream status [<session-id or dir>] [--store <dir>]');
+  console.error('       slipstream detach [<session-id or dir>] [--store <dir>]   (default: this directory)');
+  console.error('       slipstream unlink --session <session-id> [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
   console.error('       slipstream delete <session-id> [--store <dir>]');
   console.error('       slipstream gc     [--store <dir>]');
@@ -436,11 +496,13 @@ export function retryGuidance(verb: string): string {
   }
 }
 
-async function runControl(store: string, request: Record<string, unknown> & { verb: string }): Promise<void> {
+async function runControl(store: string, request: Record<string, unknown> & { verb: string },
+  printOk?: (res: Record<string, unknown>) => void): Promise<void> {
   const socketPath = controlSocketPath(store);
   try {
     const res = await sendControlRequest({ socketPath, request: { v: 1, ...request } });
-    reportControl(res);
+    if (res.ok && printOk) printOk(res);
+    else reportControl(res);
   } catch (err) {
     if (err instanceof OutcomeUnknownError) {
       // Honesty: the request reached the daemon but its outcome is unknowable —
@@ -451,6 +513,45 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
       return;
     }
     throw err;
+  }
+}
+
+type CaptureRow = Record<string, unknown> & { binding?: Record<string, unknown> | null };
+
+/** Human-readable `status`: the daemon, then one block per capture. */
+export function formatStatus(res: Record<string, unknown>): string[] {
+  const lines = [`reader_url: ${String(res.reader_url)}`];
+  const slots = res.binding_slots as { used: number; limit: number } | undefined;
+  if (slots) lines.push(`linked_chats: ${slots.used}/${slots.limit}`);
+  const rows = res.capture ? [res.capture as CaptureRow] : (res.captures ?? []) as CaptureRow[];
+  if (!res.capture) lines.push(`captures: ${rows.length}`);
+  for (const row of rows) {
+    lines.push('', `${String(row.root)}`);
+    lines.push(`  session_id: ${String(row.session_id)}`);
+    lines.push(`  state: ${String(row.state)}${row.reason ? ` (${String(row.reason)})` : ''}`);
+    if (row.message) lines.push(`  ${String(row.message)}`);
+    const b = row.binding;
+    lines.push(b
+      ? `  chat: ${String(b.harness)} ${String(b.harness_session_id)} ${String(b.state)} (generation ${String(b.binding_generation)})`
+      : '  chat: none');
+  }
+  return lines;
+}
+
+/** `slipstream attach --watch-only` records a workspace without linking a chat. */
+async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<void> {
+  const socketPath = controlSocketPath(store);
+  try {
+    process.exitCode = await runWatchOnlyAttach({ dir, wait }, {
+      out: (line) => console.log(line),
+      err: (line) => console.error(line),
+      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
+    });
+  } catch (err) {
+    if (!(err instanceof OutcomeUnknownError)) throw err;
+    console.error(`slipstream: outcome unknown — ${err.message}`);
+    console.error(`slipstream: ${retryGuidance('attach')}`);
+    process.exitCode = 3;
   }
 }
 
@@ -525,7 +626,7 @@ async function main(): Promise<void> {
     const daemon = await startDaemon({ storeDir: args.store, config });
     console.error(`slipstream: daemon control ${daemon.socketPath}`);
     console.error(`slipstream: reader ${daemon.readerUrl}`);
-    console.error('slipstream: detached; `slipstream attach <dir>` a worktree to begin capture');
+    console.error('slipstream: nothing is recording yet; `slipstream attach <dir>` a worktree to begin capture');
     console.error('slipstream: press Ctrl-C to stop');
     let stopping = false;
     const stop = async (): Promise<void> => {
@@ -540,12 +641,18 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'status') {
-    await runControl(args.store, { verb: 'status' });
+    await runControl(args.store, { verb: 'status', ...(args.target !== undefined ? { target: args.target } : {}) },
+      (res) => formatStatus(res).forEach((line) => console.log(line)));
     return;
   }
 
   if (args.command === 'detach') {
-    await runControl(args.store, { verb: 'detach' });
+    await runControl(args.store, { verb: 'detach', target: args.target });
+    return;
+  }
+
+  if (args.command === 'unlink') {
+    await runControl(args.store, { verb: 'unlink', session_id: args.sessionId });
     return;
   }
 
@@ -564,6 +671,11 @@ async function main(): Promise<void> {
     await runAskControl(args.store, {
       verb: 'ask', session_id: args.sessionId, request_id: args.requestId, ...input,
     });
+    return;
+  }
+
+  if (args.command === 'attach' && args.watchOnly) {
+    await runWatchOnly(args.dir, args.store, args.wait === true);
     return;
   }
 
