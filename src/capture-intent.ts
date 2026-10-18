@@ -69,19 +69,17 @@ export function findCapture(record: IntentRecord, sessionId: string): CaptureInt
   return record.captures.find((c) => c.session_id === sessionId);
 }
 
-/** Admit a capture: `running` while `reserved` in-flight admissions plus running
- * intents leave a slot, otherwise `waiting`. A prior entry for the same session
- * (a re-attach after detach) is replaced and moves to the end, which is admission
- * order for waiting entries. */
+/** Admit a capture: `running` while a slot is free, otherwise `waiting`. A prior
+ * entry for the same session (a re-attach after detach) is replaced and moves to
+ * the end, which is admission order for waiting entries. */
 export function admitCapture(
   record: IntentRecord,
   entry: Pick<CaptureIntent, 'session_id' | 'root' | 'root_identity'>,
-  reserved = 0,
 ): CaptureIntent {
   record.captures = record.captures.filter((c) => c.session_id !== entry.session_id);
   const admitted: CaptureIntent = {
     ...entry,
-    intent: runningCount(record) + reserved < MAX_CAPTURES ? 'running' : 'waiting',
+    intent: runningCount(record) < MAX_CAPTURES ? 'running' : 'waiting',
     withdrawn_reason: null,
     capture_mode: 'watch-only',
     last_failure: null,

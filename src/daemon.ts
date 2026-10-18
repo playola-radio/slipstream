@@ -1,7 +1,7 @@
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { chmod, lstat, unlink, realpath } from 'node:fs/promises';
+import { chmod, lstat, unlink, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
 import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
@@ -21,6 +21,11 @@ import {
   reclaimUnreferencedBlobs,
 } from './maintenance.ts';
 import { createBoundaryRegistry } from './boundary-registry.ts';
+import { createCas, type Cas } from './cas.ts';
+import {
+  MAX_BINDINGS, MAX_CAPTURES, admitCapture, emptyIntent, findCapture, findLinked, forgetSession, linkBinding, linkedCount,
+  revokeBinding, withdrawCapture, type NotRecordingReason,
+} from './capture-intent.ts';
 import { liveBoundary } from './reader-runtime.ts';
 import {
   createLineDecoder,
@@ -32,15 +37,19 @@ import {
 
 /**
  * The one shared daemon (D3). It owns the shared store, exactly ONE public reader,
- * at most ONE active capture session, and the boundary registry that keeps the two
- * honest as a session attaches and detaches beneath the long-lived reader.
+ * a table of up to MAX_CAPTURES concurrent captures (one per canonical root), the
+ * chats linked to them, and the boundary registry that keeps the reader honest as
+ * captures start and stop beneath it.
  *
- * It speaks the PRIVATE control protocol (attach / detach / status / begin_task /
- * delete_session / gc). Every verb WRITES public events, maintains the store, or
- * reports state; none reads or serves the feed — readers get the feed through the
- * public HTTP view like any other client. There is no privileged back channel for
- * reading. delete_session and gc are DETACHED-ONLY: they run only when no capture
- * is active and never while a session is attaching or detaching.
+ * It speaks the PRIVATE control protocol (attach / detach / unlink / status /
+ * begin_task / ask / claim_question / answer_question / delete_session / gc). Every
+ * verb WRITES public events, maintains the store, or reports state; none reads or
+ * serves the feed — readers get the feed through the public HTTP view like any
+ * other client. There is no privileged back channel for reading. delete_session
+ * and gc run only while no capture intent exists and no capture is stopping.
+ *
+ * Captures are isolated from each other: one capture's failed baseline, lost
+ * session lock or watcher error marks only that capture not recording.
  *
  * Singleton-ness rests on two independent guards: the store lock (a live owner
  * makes {@link acquireSessionLock} throw {@link SessionOwnedError}) and, because a
@@ -95,19 +104,6 @@ export class DaemonAlreadyRunningError extends Error {
   }
 }
 
-type DaemonState = 'detached' | 'attaching' | 'active' | 'detaching' | 'wedged';
-
-/** Readiness of the chat bound at attach. The check id is private: only the bound
- * root's tool-use callback receives it, so its return through the answer tool
- * proves both delivery and answer return. */
-interface AgentCheck {
-  state: 'setup_pending' | 'connected';
-  checkId: string;
-  /** Delivered once per arm; a repeated attach re-arms a pending check. */
-  delivered: boolean;
-  ack?: Record<string, unknown>;
-  confirming?: Promise<Record<string, unknown> | ErrorFields>;
-}
 
 export const PROBE_TIMEOUT_MS = 1000;
 /** A connection must deliver one complete control request within this window;
@@ -180,6 +176,74 @@ async function bindControl(server: Server, socketPath: string): Promise<void> {
   }
 }
 
+/** Readiness of a linked chat. The check id is private: only the linked root's
+ * tool-use callback receives it, so its return through the answer tool proves both
+ * delivery and answer return. A new id is armed per binding generation and per
+ * activation, so an old check can never confirm a newer link. */
+interface AgentCheck {
+  state: 'setup_pending' | 'connected';
+  checkId: string;
+  /** Delivered once per arm; a repeated attach re-arms a pending check. */
+  delivered: boolean;
+  ack?: Record<string, unknown>;
+  confirming?: Promise<Record<string, unknown> | ErrorFields>;
+}
+
+interface Binding {
+  harness: HarnessName;
+  harnessSessionId: string;
+  transcript: string;
+  generation: string;
+  check: AgentCheck;
+  /** Set until `agent.binding` and `setup_pending` are durable; hooks and
+   * forwarders do not see the binding before then. */
+  publishing?: Promise<ErrorFields | undefined>;
+}
+
+/** One start of a capture. A lock-loss callback acts only on the activation that
+ * registered it, never on a later one. */
+interface Activation { session?: CaptureSession; lost: boolean }
+
+/** A capture's runtime. Its intent (running / waiting / withdrawn, last failure)
+ * lives in the intent record; this holds what only the live daemon knows. */
+interface Capture {
+  id: string;
+  root: string;
+  /** `queued` covers both waiting for a slot and waiting for the baseline slot;
+   * the intent tells them apart. */
+  lifecycle: 'queued' | 'baselining' | 'recording' | 'failed' | 'stopping' | 'stopped';
+  /** The session has history on disk to resume. */
+  resume: boolean;
+  session?: CaptureSession;
+  activation?: Activation;
+  /** The pending start job while queued for or holding the baseline slot. */
+  starting?: Promise<void>;
+  /** A stop in flight (detach, or a halt after lock loss). */
+  closing?: Promise<void>;
+  closeError?: unknown;
+  binding?: Binding;
+  inflight: Set<Promise<unknown>>;
+}
+
+const CAPTURE_LIMIT_MESSAGE = `${MAX_CAPTURES}/${MAX_CAPTURES} capture slots in use. This workspace is NOT recording. `
+  + 'It starts automatically when another workspace is archived or detached.';
+const BINDING_LIMIT_MESSAGE = `${MAX_BINDINGS}/${MAX_BINDINGS} chats linked. This workspace is still recording without `
+  + 'a linked chat. Unlink another chat to connect this one.';
+const WATCH_ONLY_MESSAGE = 'this capture is watch-only: no agent chat is linked to it. Run `slipstream attach` from '
+  + 'the agent chat to link one';
+const SETUP_PENDING_MESSAGE = 'the agent chat for this capture has not completed setup; finish the steps slipstream '
+  + 'attach printed';
+
+function isHarness(v: unknown): v is HarnessName {
+  return (HARNESSES as readonly unknown[]).includes(v);
+}
+
+/** One root contains the other, by whole path components. */
+function overlaps(a: string, b: string): boolean {
+  const within = (child: string, parent: string) => child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+  return within(a, b) || within(b, a);
+}
+
 export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const storeDir = opts.storeDir;
   const identityRealpath = opts.identityRealpath ?? realpath;
@@ -209,27 +273,27 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // an onCompromised callback that fires mid-startup never hits a temporal dead
   // zone (it may run with `reader` still undefined — teardown null-checks it).
   const registry = createBoundaryRegistry();
-  let state: DaemonState = 'detached';
-  let current:
-    | { id: string; session: CaptureSession; worktree: string; harness: string; harnessSessionId: string; rootTranscript?: string;
-        agent?: AgentCheck }
-    | undefined;
-  /** One start of a capture. `phase` tells a lock-loss callback whether the attach
-   * that created it is still starting, is live, or is over. */
-  type Activation = { session?: CaptureSession; phase: 'starting' | 'active' | 'over' };
-  const inflightTasks = new Set<Promise<unknown>>();
+  const intent = emptyIntent();
+  /** Every capture this daemon has admitted, by session id; withdrawn ones stay
+   * for history until their session is deleted. */
+  const captures = new Map<string, Capture>();
+  /** Roots between their canonicalization and their intent write. A second attach
+   * of the same root joins the first instead of admitting a duplicate. */
+  const admitting = new Map<string, Promise<Admitted | ErrorFields>>();
+  /** Baselines run one at a time, in admission order. */
+  let baselines: Promise<void> = Promise.resolve();
+  /** The store's blob store, shared by every capture (see CaptureOptions.cas).
+   * Recreated after maintenance, which may delete blobs it trusts. */
+  let cas: Cas | undefined;
   const connections = new Set<Socket>();
-  let attachInFlight: Promise<unknown> | undefined;
-  // At most one detached-only maintenance op (delete_session / gc) runs at a time.
-  // The slot is claimed synchronously in runMaintenance before its first await, and
-  // attach refuses while it is held — so a single-threaded turn makes maintenance
-  // and attach mutually exclusive without a lock.
+  // At most one maintenance op (delete_session / gc) runs at a time, and only
+  // while the captures it affects are not live. The slot is claimed synchronously in
+  // runMaintenance before its first await, and admission refuses while it is
+  // held — so a single-threaded turn makes them mutually exclusive without a lock.
   let maintenanceInFlight: Promise<unknown> | undefined;
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
-  let sessionCompromised = false; // current session lock lost mid-attach
-  let abortStopError: unknown; // a failed stop of a session aborted mid-attach
   // Gates DISPATCH, not acceptance: connections are tracked and given a deadline
   // from the moment they arrive (so bind/chmod-window sockets can never orphan or
   // hang shutdown), but no verb runs until startup is fully ready — which is also
@@ -265,34 +329,32 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // half-sent request.
     for (const sock of connections) sock.destroy();
     await closeServer();
-    // An attach whose capture is still starting must not outlive shutdown: wait for
-    // it to settle (it self-stops once it observes `torn`), then stop whatever it or
-    // an active session left installed.
-    if (attachInFlight) await attachInFlight.catch(() => {});
+    // Admissions and baselines in flight observe `torn` and start nothing new; wait
+    // for them so every session they opened is in the table and stopped below.
+    await Promise.allSettled([...admitting.values()]);
+    await baselines;
     // A maintenance op in flight has already seen `torn` (gc aborts its sweep); wait
     // for it to settle so a durable tombstone or blob unlink is not racing shutdown.
     if (maintenanceInFlight) await maintenanceInFlight.catch(() => {});
-    // An attach aborted mid-startup may have failed to stop its half-built session
-    // (it runs in startAndActivate, which sets abortStopError). Surface that too so
-    // shutdown never reports success over a capture that could not be confirmed
-    // stopped.
-    let stopErr: unknown = abortStopError;
-    if (current) {
-      // Drain in-flight task declarations before stopping, exactly like detach:
-      // `torn` is already set, so beginTask admits no new work, and the append of
-      // any task that slipped in before shutdown must not race the session log
-      // closing under session.stop().
-      await Promise.allSettled([...inflightTasks]);
+    let stopErr: unknown;
+    for (const c of captures.values()) {
+      await c.closing;
+      const session = c.session;
+      if (!session) continue;
+      // Drain admitted appends before stopping: `torn` is already set, so no new
+      // work is admitted, and an append in flight must not race the log closing.
+      await Promise.allSettled([...c.inflight]);
       // Do NOT swallow a failed stop: if capture could not be confirmed stopped,
       // shutdown must not report success. session.stop() still releases the session
       // lock and halts the engine even when it rethrows, so releasing the store
-      // lock below is safe; we surface the failure once cleanup is complete.
+      // lock below is safe; we surface the failure once cleanup is complete. No
+      // stop reason: shutdown is not a withdrawal, so no capture.stopped is written.
       try {
-        await current.session.stop();
+        await session.stop();
       } catch (err) {
-        stopErr = err;
+        stopErr ??= err;
       }
-      current = undefined;
+      c.session = undefined;
     }
     await reader?.close().catch(() => {});
     // Unlink the socket only while we still hold the store lock. On the compromise
@@ -323,7 +385,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // Bring the reader up before accepting control traffic, so a verb can never be
   // dispatched against a reader that is not yet serving the public view.
   try {
-    reader = await startReaderServer({ storeDir, registry });
+    reader = await startReaderServer({ storeDir, registry, captures: capturesProjection });
   } catch (err) {
     await lock.release();
     throw err;
@@ -365,521 +427,749 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   const readerRef = reader;
 
+  // ---- capture state ------------------------------------------------------
+
+  /** The public state of a capture (contracts.md §6), folded from its intent and
+   * its runtime. A withdrawn capture is `stopped` only once its stop is durable. */
+  function publicState(c: Capture): { state: string; reason: string | null; message?: string } {
+    const entry = findCapture(intent, c.id);
+    if (!entry || entry.intent === 'withdrawn') {
+      return c.lifecycle === 'stopped' ? { state: 'stopped', reason: entry?.withdrawn_reason ?? 'detached' }
+        : { state: 'not_recording', reason: 'stop-unconfirmed', message: 'detach was requested, but the capture could not be confirmed stopped' };
+    }
+    if (entry.intent === 'waiting') return { state: 'not_recording', reason: 'capture-limit-reached', message: CAPTURE_LIMIT_MESSAGE };
+    if (entry.last_failure) return { state: 'not_recording', reason: entry.last_failure.reason, message: entry.last_failure.message };
+    if (c.lifecycle === 'recording' || c.lifecycle === 'baselining') return { state: c.lifecycle, reason: null };
+    return { state: 'queued', reason: null };
+  }
+
+  function isRunning(c: Capture): boolean {
+    return findCapture(intent, c.id)?.intent === 'running';
+  }
+
+  function isLive(c: Capture): boolean {
+    const entry = findCapture(intent, c.id);
+    return entry !== undefined && entry.intent !== 'withdrawn';
+  }
+
+  /** The latest binding intent for a capture, linked or revoked. */
+  function bindingRow(c: Capture): Record<string, unknown> | null {
+    const entry = intent.bindings.findLast((b) => b.session_id === c.id);
+    if (!entry) return null;
+    const live = entry.intent === 'linked' ? c.binding : undefined;
+    return {
+      harness: entry.harness, harness_session_id: entry.harness_session_id, binding_generation: entry.binding_generation,
+      state: entry.intent === 'revoked' ? 'unlinked' : live?.check.state ?? 'setup_pending', reason: null,
+    };
+  }
+
+  function statusRow(c: Capture): Record<string, unknown> {
+    const { state, reason, message } = publicState(c);
+    const row: Record<string, unknown> = { session_id: c.id, root: c.root, state, reason, capture_mode: 'watch-only' };
+    if (message) row.message = message;
+    if (c.session) row.durable_seq = c.session.health.snapshot().durable_seq;
+    row.binding = bindingRow(c);
+    if (c.binding) row.binding = { ...row.binding as object, root_transcript: c.binding.transcript };
+    return row;
+  }
+
+  /** `GET /v1/captures` (contracts.md §9). Heartbeats are read from the session
+   * ownership locks, exactly as an offline client would. */
+  async function capturesProjection(): Promise<Record<string, unknown>> {
+    const asOf = Date.now();
+    const rows = await Promise.all([...captures.values()].map(async (c) => {
+      const { state, reason } = publicState(c);
+      let heartbeat: number | null = null;
+      try { heartbeat = Math.trunc((await stat(join(storeDir, 'sessions', c.id, 'owner.lock'))).mtimeMs); } catch { /* no owner */ }
+      return { session_id: c.id, root: c.root, state, reason, retry: null, capture_mode: 'watch-only', heartbeat_ms: heartbeat,
+        binding: bindingRow(c) };
+    }));
+    return { as_of_ms: asOf, binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS }, captures: rows };
+  }
+
   function statusFields(): Record<string, unknown> {
-    const fields: Record<string, unknown> = { state, reader_url: readerRef.url,
-      attach_features: ['agent-connection-v1'] };
-    if (current) {
-      // session_id is capture SCOPE, never authorship. The declared identity is the
-      // exact context the caller bound; semantic verification is the P4 forwarder's.
-      fields.session_id = current.id;
-      fields.worktree = current.worktree;
-      fields.harness = current.harness;
-      fields.harness_session_id = current.harnessSessionId;
-      if (current.rootTranscript) fields.root_transcript = current.rootTranscript;
-      fields.durable_seq = current.session.health.snapshot().durable_seq;
-      fields.agent_connection = current.agent?.state ?? 'disconnected';
-    }
-    return fields;
+    return {
+      reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'],
+      binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS },
+      captures: [...captures.values()].map(statusRow),
+    };
   }
 
-  /** The active session lost its own lock. Stop presenting healthy, preserve the
-   * boundary at the last durable seq, and refuse further mutations (decision 9).
-   * `current` is retained so teardown can still stop the wedged session. */
-  function handleSessionCompromise(id: string, reason: string, activation: Activation): void {
-    console.error(`slipstream daemon: session ${id} lost its lock: ${reason}`);
-    // Ids are reused across activations, so the callback is matched to the capture
-    // that registered it, never to the id: a late callback from an earlier
-    // activation must not wedge or abort a later one.
-    if (activation.session && current?.session === activation.session && state === 'active') {
-      registry.freeze(id, BigInt(current.session.health.snapshot().durable_seq));
-      state = 'wedged';
-      return;
-    }
-    if (activation.phase === 'starting' && state === 'attaching') sessionCompromised = true; // startup aborts below
+  async function status(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (req.target === undefined) return statusFields();
+    const c = await resolveTarget(req.target);
+    if (isErrorFields(c)) return c;
+    return { reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], capture: statusRow(c) };
   }
 
-  /** Why an attach in flight can no longer complete, for a resume that must name it. */
-  function attachInterruptedCause(): string {
-    if (torn) return 'the daemon is shutting down';
-    if (compromised) return 'the daemon lost its store lock';
-    if (sessionCompromised) return 'the session lock was lost while it was starting';
-    return 'the daemon could not complete the attach';
+  /** A target is a session id or a root path. The id is authoritative; a path
+   * matches a stored canonical root by realpath equality, or literally when it can
+   * no longer be resolved, never by prefix. */
+  async function resolveTarget(target: unknown): Promise<Capture | ErrorFields> {
+    if (!nonEmptyString(target)) return errFields('TARGET_NOT_FOUND', 'a target session id or workspace path is required');
+    const byId = captures.get(target);
+    if (byId) return byId;
+    let root: string;
+    try { root = await realpath(target); } catch { root = target; }
+    const atRoot = [...captures.values()].filter((c) => c.root === root);
+    const found = atRoot.find(isLive) ?? atRoot.at(-1);
+    return found ?? errFields('TARGET_NOT_FOUND', `no capture of ${target}`);
   }
 
-  async function startAndActivate(
-    id: string,
-    resume: boolean,
-    resolvedWorktree: string,
-    harness: string,
-    harnessSessionId: string,
-    rootTranscript?: string,
-  ): Promise<Record<string, unknown> | ErrorFields> {
-    let session: CaptureSession;
-    let resolvedTranscript: string | undefined;
-    const activation: Activation = { phase: 'starting' };
-    try {
-      if (rootTranscript !== undefined) {
-        if (harness !== 'codex' && harness !== 'claude-code') {
-          throw new RootIdentityError('root_transcript requires a supported harness');
-        }
-        try { resolvedTranscript = await realpath(rootTranscript); }
-        catch {
-          throw new RootIdentityError(harness === 'claude-code'
-            ? 'root Claude transcript is unavailable; check its path or retry attach after the first root tool call'
-            : 'root Codex transcript cannot be resolved');
-        }
-        if (harness === 'codex') {
-          if (!await verifyCodexRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree)) {
-            throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime');
-          }
-        } else {
-          const verified = await verifyClaudeRootTranscript(resolvedTranscript, harnessSessionId, resolvedWorktree);
-          if (!verified.ok) {
-            throw new RootIdentityError(verified.reason === 'not-yet'
-              ? 'root Claude transcript head is not complete yet; retry attach after the first root tool call'
-              : verified.reason === 'gap'
-                ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
-                : `root Claude transcript identity is ${verified.reason}`);
-          }
-        }
-      }
-      const transcript = transcriptRuntimeFrom(opts.config);
-      session = await startCapture(
-        {
-          root: resolvedWorktree,
-          storeDir,
-          ...(resume ? { resumeSessionId: id } : { sessionId: id }),
-          onCompromised: (reason) => handleSessionCompromise(id, reason, activation),
-          ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
-          ...(transcript ? { transcript } : {}),
-        },
-        opts.captureDependencies,
-      );
-      activation.session = session;
-    } catch (err) {
-      activation.phase = 'over';
-      // A fresh session never activated: freeze at 0, never delete the entry, so
-      // the reader cannot fall back to disk for a half-written log. A resumed
-      // session keeps the boundary pinned at its pre-resume high-water.
-      if (!resume) registry.freeze(id, 0n);
-      if (state === 'attaching') state = 'detached';
-      if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
-      if (resume) {
-        const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError
-          ? corruptRemedy(id)
-          : RETRY_REMEDY;
-        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${(err as Error).message}. ${remedy}`);
-      }
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
-      return errFields('CAPTURE_NOT_READY', (err as Error).message);
-    }
-    // A verified root chat starts setup-pending; anything else has no agent to ask.
-    let agent: AgentCheck | undefined;
-    let pendingFailed = false;
-    if (resolvedTranscript !== undefined && !(torn || compromised || sessionCompromised || state !== 'attaching')) {
-      try {
-        await session.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: { state: 'setup_pending',
-          target: { harness: harness as HarnessName, harness_session_id: harnessSessionId } } });
-        agent = { state: 'setup_pending', checkId: randomUUID(), delivered: false };
-      } catch { pendingFailed = true; }
-    }
-    if (pendingFailed || torn || compromised || sessionCompromised || state !== 'attaching') {
-      // Shutdown, store-lock loss, or a session compromise arrived while capture was
-      // starting: do not publish this session. Stop it and hold the boundary. A
-      // failed stop here is recorded (not swallowed) so teardown can surface it.
-      try {
-        await session.stop();
-      } catch (err) {
-        abortStopError ??= err;
-      }
-      registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
-      activation.phase = 'over';
-      if (state === 'attaching') state = 'detached';
-      if (resume) {
-        const cause = pendingFailed ? 'could not record the agent connection' : attachInterruptedCause();
-        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${cause}. ${RETRY_REMEDY}`);
-      }
-      return errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach');
-    }
-    activation.phase = 'active';
-    registry.activate(id, liveBoundary(session.health));
-    registry.setAgentConnection(id, agent?.state ?? 'none');
-    current = { id, session, worktree: resolvedWorktree, harness, harnessSessionId, rootTranscript: resolvedTranscript, agent };
-    state = 'active';
-    return { session_id: id, agent_connection: agent?.state ?? 'disconnected' };
+  function liveCaptureAt(root: string): Capture | undefined {
+    return [...captures.values()].find((c) => c.root === root && isLive(c));
   }
 
-  /** Attach while a capture is active never starts or rebinds a capture: the same
-   * chat in the same workspace gets the existing one (re-arming a pending check),
-   * anything else is refused and the binding is kept. */
-  async function attachAgain(req: RequestEnvelope & { worktree: string }): Promise<Record<string, unknown> | ErrorFields> {
-    const binding = current!;
-    let worktree: string;
-    try { worktree = await realpath(req.worktree); } catch { worktree = req.worktree; }
-    if (state !== 'active' || current !== binding) return errFields('CAPTURE_NOT_READY', 'the active capture changed; retry attach');
-    if (worktree !== binding.worktree) {
-      return errFields('SESSION_ACTIVE', `another workspace is being recorded: ${binding.worktree}. Detach it there first; nothing was changed`);
-    }
-    if (req.harness !== binding.harness || req.harness_session_id !== binding.harnessSessionId) {
-      return errFields('SESSION_ACTIVE', `this workspace is already recorded with another agent chat (${binding.harness} ${binding.harnessSessionId}); `
-        + 'that binding was kept. Detach first to switch chats');
-    }
-    if (binding.agent?.state === 'setup_pending') binding.agent.delivered = false;
-    return { session_id: binding.id, already_active: true, agent_connection: binding.agent?.state ?? 'disconnected' };
+  /** The capture a chat identity is linked to, store-wide (at most one). */
+  function captureForChat(harness: unknown, harnessSessionId: unknown): Capture | undefined {
+    const entry = typeof harness === 'string' && typeof harnessSessionId === 'string'
+      ? findLinked(intent, harness, harnessSessionId) : undefined;
+    return entry ? captures.get(entry.session_id) : undefined;
   }
 
-  async function attach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
-    if (!nonEmptyString(req.worktree) || !nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id)) {
-      // Structural fail-closed identity gate (honesty): an ambiguous or partial
-      // identity refuses attachment rather than guessing. Semantic verification
-      // that the declared harness is a live real process is the P4 forwarder's job.
-      return errFields('IDENTITY_UNRESOLVED', 'attach requires non-empty worktree, harness, and harness_session_id');
+  function fail(c: Capture, reason: NotRecordingReason, message: string): void {
+    c.lifecycle = 'failed';
+    const entry = findCapture(intent, c.id);
+    if (entry) entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: null };
+    console.error(`slipstream daemon: capture ${c.id} of ${c.root} is not recording: ${message}`);
+  }
+
+  // ---- admission ----------------------------------------------------------
+
+  interface Admitted { capture: Capture; created: boolean }
+
+  /** Find or admit the capture of a canonical root. */
+  async function admit(root: string): Promise<Admitted | ErrorFields> {
+    if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const live = liveCaptureAt(root);
+    if (live) return retryIfFailed(live);
+    const pending = admitting.get(root);
+    if (pending) {
+      const joined = await pending;
+      return isErrorFields(joined) ? joined : { capture: joined.capture, created: false };
     }
-    if (req.root_transcript !== undefined && !nonEmptyString(req.root_transcript)) {
-      return errFields('IDENTITY_UNRESOLVED', 'root_transcript must be a non-empty existing path');
+    const other = [...[...captures.values()].filter(isLive).map((c) => c.root), ...admitting.keys()]
+      .find((r) => overlaps(r, root));
+    if (other) {
+      return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
     }
-    if (state !== 'detached') {
-      if (state === 'active' && current) return attachAgain({ ...req, worktree: req.worktree });
-      if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
-      return errFields('CAPTURE_NOT_READY', `cannot attach while ${state}`);
-    }
-    // Refuse to attach over an in-flight maintenance op. This check and the
-    // `state === 'detached'` guard in runMaintenance are the two halves of the same
-    // mutual exclusion: both are synchronous, so whichever claims its slot first in
-    // this turn locks the other out. (Kept before `state = 'attaching'` so a refused
-    // attach leaves the state machine untouched.)
+    // Admission and maintenance exclude each other: both claim their slot in the
+    // same synchronous turn as this check.
     if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'a maintenance operation is running; retry shortly');
-    // Set attaching BEFORE the first await so a concurrent attach is refused.
-    state = 'attaching';
-    sessionCompromised = false;
-    const p = resolveAndStart(req);
-    attachInFlight = p;
+    const p = admitNew(root);
+    admitting.set(root, p);
     try {
       return await p;
     } finally {
-      if (attachInFlight === p) attachInFlight = undefined;
+      admitting.delete(root);
     }
   }
 
-  /** Canonicalize the worktree, find its existing session, and start or resume
-   * capture. Runs entirely inside `attachInFlight`, so shutdown and maintenance
-   * wait for the lookup as well as the startup. */
-  async function resolveAndStart(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
-    const abandon = (fields: ErrorFields): ErrorFields => {
-      if (state === 'attaching') state = 'detached';
-      return fields;
-    };
-    let worktree: string;
-    try {
-      // Canonicalize before binding and before lookup: capture resolves the root
-      // with realpath, so a symlinked or relative path must name the same root.
-      worktree = await realpath(req.worktree as string);
-    } catch (err) {
-      return abandon(errFields('CAPTURE_NOT_READY', (err as Error).message));
-    }
+  async function admitNew(root: string): Promise<Admitted | ErrorFields> {
     let lookup;
     try {
-      lookup = await workspaceLookup(storeDir, worktree);
+      lookup = await workspaceLookup(storeDir, root);
     } catch (err) {
       if (err instanceof WorkspaceLookupError) {
         const remedy = err.corrupt ? corruptRemedy(err.sessionId) : RETRY_REMEDY;
-        return abandon(errFields('SESSION_RESUME_FAILED', `${err.message}. ${remedy}`));
+        return errFields('SESSION_RESUME_FAILED', `${err.message}. ${remedy}`);
       }
-      return abandon(errFields('STORAGE_UNAVAILABLE', `could not look up this workspace's session: ${(err as Error).message}`));
+      return errFields('STORAGE_UNAVAILABLE', `could not look up this workspace's session: ${(err as Error).message}`);
     }
     for (const s of lookup.skipped) {
-      console.error(`slipstream daemon: skipped session ${s.id} while looking for ${worktree}'s session: ${s.reason}`);
+      console.error(`slipstream daemon: skipped session ${s.id} while looking for ${root}'s session: ${s.reason}`);
     }
-    if (torn || compromised || sessionCompromised || state !== 'attaching') {
+    const id = lookup.match?.id ?? randomUUID();
+    // A detach of this same session may still be stopping it; its lock must be
+    // released before the session can start again.
+    const prior = captures.get(id);
+    await prior?.closing;
+    let rootIdentity: { dev: string; ino: string } | null = null;
+    try {
+      const st = await stat(root, { bigint: true });
+      rootIdentity = { dev: st.dev.toString(), ino: st.ino.toString() };
+    } catch { /* recorded as unknown */ }
+    if (torn || compromised) {
       if (lookup.match) {
-        const { id } = lookup.match;
-        return abandon(errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: ${attachInterruptedCause()}. ${RETRY_REMEDY}`));
+        return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: the daemon is shutting down or lost its store lock. ${RETRY_REMEDY}`);
       }
-      return abandon(errFields('STORAGE_UNAVAILABLE', 'daemon could not complete the attach'));
+      return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     }
-    const identity = [req.harness as string, req.harness_session_id as string, req.root_transcript as string | undefined] as const;
     if (lookup.match) {
-      const { id, durableSeq } = lookup.match;
       // Pin the boundary at the durable high-water BEFORE the log can grow, and
       // hold it until activation: readers never see past it mid-resume.
-      registry.freeze(id, registry.get(id)?.boundary.current() ?? durableSeq);
-      return startAndActivate(id, true, worktree, ...identity);
+      registry.freeze(id, registry.get(id)?.boundary.current() ?? lookup.match.durableSeq);
+    } else {
+      // Reserve the registry entry (boundary 0) before startCapture creates the log
+      // dir on disk, so the reader never over-publishes an uncommitted record.
+      registry.reserve(id);
     }
-    const id = randomUUID();
-    // Reserve the registry entry (boundary 0) before startCapture creates the log
-    // dir on disk, so the reader never over-publishes an uncommitted record from a
-    // session that momentarily appears on disk mid-startup.
-    registry.reserve(id);
-    return startAndActivate(id, false, worktree, ...identity);
+    const entry = admitCapture(intent, { session_id: id, root, root_identity: rootIdentity });
+    const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set() };
+    Object.assign(c, { root, lifecycle: 'queued', resume: lookup.match !== undefined, closeError: undefined });
+    captures.set(id, c);
+    if (entry.intent === 'running') enqueueStart(c);
+    return { capture: c, created: true };
   }
 
-  async function detach(): Promise<Record<string, unknown> | ErrorFields> {
-    if (state !== 'active' || !current) {
-      return errFields('SESSION_NOT_SELECTED', 'no active session to detach');
-    }
-    const { id, session } = current;
-    state = 'detaching'; // close admission synchronously; in-flight tasks still settle
-    await Promise.allSettled([...inflightTasks]);
-    let stopErr: unknown;
+  /** Re-attaching a capture whose start or storage failed tries it again. */
+  async function retryIfFailed(c: Capture): Promise<Admitted> {
+    if (c.lifecycle !== 'failed') return { capture: c, created: false };
+    await c.closing;
+    const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
+    const entry = findCapture(intent, c.id);
+    if (c.lifecycle !== 'failed' || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
+    entry.last_failure = null;
+    c.lifecycle = 'queued';
+    c.resume = resume;
+    enqueueStart(c);
+    return { capture: c, created: false };
+  }
+
+  function enqueueStart(c: Capture): void {
+    const job = baselines.then(() => startOne(c)).catch((err) => {
+      console.error(`slipstream daemon: capture ${c.id} start failed unexpectedly:`, err);
+    });
+    c.starting = job;
+    baselines = job;
+  }
+
+  /** Start (or resume) one capture. Never rejects: a failure is recorded on the
+   * capture, and the other captures are untouched. */
+  async function startOne(c: Capture): Promise<void> {
+    if (torn || compromised || c.lifecycle !== 'queued' || !isRunning(c)) return;
+    c.lifecycle = 'baselining';
+    const activation: Activation = { lost: false };
+    c.activation = activation;
+    let session: CaptureSession;
     try {
-      await session.stop();
+      cas ??= await createCas(join(storeDir, 'blobs'));
+      session = await startCapture(
+        {
+          root: c.root,
+          storeDir,
+          ...(c.resume ? { resumeSessionId: c.id } : { sessionId: c.id }),
+          captureMode: 'watch-only',
+          cas,
+          onCompromised: (reason) => onSessionLockLost(c, activation, reason),
+          ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
+        },
+        opts.captureDependencies,
+      );
     } catch (err) {
-      stopErr = err;
+      // A fresh session never activated: freeze at 0, never delete the entry, so
+      // the reader cannot fall back to disk for a half-written log. A resumed
+      // session keeps the boundary pinned at its pre-resume high-water.
+      if (!c.resume) registry.freeze(c.id, 0n);
+      if (activation.lost || c.lifecycle !== 'baselining') return;
+      if (c.resume) {
+        const remedy = err instanceof CorruptLogError || err instanceof LogCorruptError ? corruptRemedy(c.id) : RETRY_REMEDY;
+        fail(c, 'resume-failed', `could not resume session ${c.id}: ${(err as Error).message}. ${remedy}`);
+      } else {
+        fail(c, err instanceof StorageError ? 'storage-unavailable' : 'baseline-failed', (err as Error).message);
+      }
+      return;
     }
-    // Pin the reader at the final durable seq the session reached (honest even if
-    // stop() failed — health still holds the last durable value).
-    registry.freeze(id, BigInt(session.health.snapshot().durable_seq));
-    if (stopErr) {
-      // Fail closed: never claim a clean detach or admit new capture. Retain
-      // `current` so teardown can still attempt to release the session's resources.
-      state = 'wedged';
-      return errFields('STORAGE_UNAVAILABLE', `detach did not stop cleanly: ${(stopErr as Error).message}`);
+    activation.session = session;
+    c.session = session;
+    c.resume = true;
+    if (activation.lost) {
+      halt(c, session);
+      return;
     }
-    current = undefined;
-    state = 'detached';
-    return { session_id: id };
+    // Shutdown or a detach arrived while starting: whoever is stopping it owns the
+    // session now.
+    if (torn || compromised || c.lifecycle !== 'baselining') return;
+    c.lifecycle = 'recording';
+    registry.activate(c.id, liveBoundary(session.health));
+    registry.setAgentConnection(c.id, 'none');
+    // A chat stays linked across a restart of its capture, but `connected` is
+    // re-earned only by a fresh round trip in the new activation.
+    if (c.binding) {
+      const b = c.binding;
+      b.check = { state: 'setup_pending', checkId: randomUUID(), delivered: false };
+      const rearm = publishBinding(c, b, false);
+      c.inflight.add(rearm);
+      void rearm.finally(() => c.inflight.delete(rearm));
+    }
+  }
+
+  function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
+    console.error(`slipstream daemon: session ${c.id} lost its lock: ${reason}`);
+    if (c.activation !== activation || activation.lost) return;
+    activation.lost = true;
+    fail(c, 'storage-unavailable', `capture lost its session lock: ${reason}`);
+    if (activation.session) halt(c, activation.session);
+  }
+
+  /** Stop a capture whose storage can no longer be trusted, without recording a
+   * stop it cannot make durable. Its boundary stays at the last durable seq. */
+  function halt(c: Capture, session: CaptureSession): void {
+    registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+    const prior = c.closing;
+    c.closing = (async () => {
+      await prior;
+      await Promise.allSettled([...c.inflight]);
+      try {
+        await session.stop();
+      } catch (err) {
+        console.error(`slipstream daemon: session ${c.id} did not stop cleanly after losing its lock:`, err);
+      }
+      if (c.session === session) c.session = undefined;
+    })();
+  }
+
+  // ---- attach / detach / unlink -------------------------------------------
+
+  function admissionReply({ capture, created }: Admitted): Record<string, unknown> | ErrorFields {
+    if (findCapture(intent, capture.id)?.intent === 'waiting') return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);
+    const { state, reason, message } = publicState(capture);
+    return { session_id: capture.id, state, reason, ...(message ? { message } : {}), created };
+  }
+
+  async function attachWatchOnly(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.worktree)) return errFields('PROTOCOL', 'attach --watch-only requires a worktree');
+    let root: string;
+    try { root = await realpath(req.worktree); } catch (err) { return errFields('CAPTURE_NOT_READY', (err as Error).message); }
+    const admitted = await admit(root);
+    return isErrorFields(admitted) ? admitted : admissionReply(admitted);
+  }
+
+  /** Verify a root chat transcript names this chat in this worktree. */
+  async function verifyRootTranscript(harness: HarnessName, harnessSessionId: string, root: string, path: string): Promise<string> {
+    let resolved: string;
+    try { resolved = await realpath(path); } catch {
+      throw new RootIdentityError(harness === 'claude-code'
+        ? 'root Claude transcript is unavailable; check its path or retry attach after the first root tool call'
+        : 'root Codex transcript cannot be resolved');
+    }
+    if (harness === 'codex') {
+      if (!await verifyCodexRootTranscript(resolved, harnessSessionId, root)) {
+        throw new RootIdentityError('root Codex transcript is missing, mismatched, or from an unsupported runtime');
+      }
+      return resolved;
+    }
+    const verified = await verifyClaudeRootTranscript(resolved, harnessSessionId, root);
+    if (!verified.ok) {
+      throw new RootIdentityError(verified.reason === 'not-yet'
+        ? 'root Claude transcript head is not complete yet; retry attach after the first root tool call'
+        : verified.reason === 'gap'
+          ? 'root Claude transcript head exceeds the verification bounds; select a new root early in its session'
+          : `root Claude transcript identity is ${verified.reason}`);
+    }
+    return resolved;
+  }
+
+  /** Attach from a chat. The chat's transcript is verified first, so a chat that
+   * cannot be linked records nothing. The workspace's capture is found or
+   * admitted; once it is recording the chat is linked in place. */
+  async function attachChat(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.worktree) || !nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id)) {
+      // Structural fail-closed identity gate (honesty): an ambiguous or partial
+      // identity refuses attachment rather than guessing.
+      return errFields('IDENTITY_UNRESOLVED', 'attach requires non-empty worktree, harness, and harness_session_id');
+    }
+    if (!nonEmptyString(req.root_transcript)) {
+      return errFields('IDENTITY_UNRESOLVED', 'linking a chat requires its root transcript; to record this workspace '
+        + 'without a chat, run `slipstream attach --watch-only`');
+    }
+    if (!isHarness(req.harness)) return errFields('IDENTITY_UNRESOLVED', 'root_transcript requires a supported harness');
+    const harness = req.harness;
+    const harnessSessionId = req.harness_session_id;
+    let root: string;
+    try { root = await realpath(req.worktree); } catch (err) { return errFields('CAPTURE_NOT_READY', (err as Error).message); }
+    let transcript: string;
+    try {
+      transcript = await verifyRootTranscript(harness, harnessSessionId, root, req.root_transcript);
+    } catch (err) {
+      if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
+      throw err;
+    }
+    const admitted = await admit(root);
+    if (isErrorFields(admitted)) return admitted;
+    const c = admitted.capture;
+    if (c.lifecycle !== 'recording' || !isRunning(c)) return admissionReply(admitted);
+    return link(c, { harness, harnessSessionId, transcript }, admitted.created);
+  }
+
+  function bindingExists(harness: string, harnessSessionId: string, c: Capture): ErrorFields {
+    return errFields('BINDING_EXISTS', `${harness} chat ${harnessSessionId} is already linked to the capture of ${c.root} `
+      + `(session ${c.id}). That link was kept. To link this chat here instead, run: slipstream unlink --session ${c.id}, `
+      + 'then run slipstream attach again from this chat.');
+  }
+
+  function bindReply(c: Capture, b: Binding, extra: Record<string, unknown>): Record<string, unknown> {
+    return { session_id: c.id, state: 'recording', binding_generation: b.generation, agent_connection: b.check.state, ...extra };
+  }
+
+  /** Link a chat to a recording capture in place: same session, no baseline, no
+   * resume, no gap. The slot and identity are claimed synchronously, so the tenth
+   * slot and a chat racing itself onto two captures each resolve to one link. */
+  async function link(
+    c: Capture,
+    chat: { harness: HarnessName; harnessSessionId: string; transcript: string },
+    created: boolean,
+  ): Promise<Record<string, unknown> | ErrorFields> {
+    const mine = c.binding;
+    if (mine && mine.harness === chat.harness && mine.harnessSessionId === chat.harnessSessionId) {
+      const failed = await mine.publishing;
+      if (failed) return failed;
+      if (c.binding !== mine) return errFields('CAPTURE_NOT_READY', 'the chat was unlinked while it was being linked; retry attach');
+      if (mine.check.state === 'setup_pending') mine.check.delivered = false;
+      return bindReply(c, mine, { already_active: true, created: false });
+    }
+    if (mine) return bindingExists(mine.harness, mine.harnessSessionId, c);
+    const elsewhere = captureForChat(chat.harness, chat.harnessSessionId);
+    if (elsewhere) return bindingExists(chat.harness, chat.harnessSessionId, elsewhere);
+    if (linkedCount(intent) >= MAX_BINDINGS) return errFields('BINDING_LIMIT_REACHED', BINDING_LIMIT_MESSAGE);
+    const entry = linkBinding(intent, {
+      session_id: c.id, harness: chat.harness, harness_session_id: chat.harnessSessionId,
+      canonical_worktree: c.root, verified_transcript_path: chat.transcript,
+    });
+    const b: Binding = { ...chat, generation: entry.binding_generation,
+      check: { state: 'setup_pending', checkId: randomUUID(), delivered: false } };
+    c.binding = b;
+    const publishing = publishBinding(c, b, true);
+    b.publishing = publishing;
+    c.inflight.add(publishing);
+    let failed: ErrorFields | undefined;
+    try {
+      failed = await publishing;
+    } finally {
+      c.inflight.delete(publishing);
+      b.publishing = undefined;
+    }
+    return failed ?? bindReply(c, b, { created });
+  }
+
+  /** Append a binding's events in contract order, then publish it to hooks and
+   * forwarders. A first link that cannot be recorded is revoked again. */
+  async function publishBinding(c: Capture, b: Binding, first: boolean): Promise<ErrorFields | undefined> {
+    const session = c.session!;
+    const target = { harness: b.harness, harness_session_id: b.harnessSessionId };
+    const own = (): void => {
+      if (torn || compromised || c.binding !== b || c.lifecycle !== 'recording' || c.activation?.lost) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the capture stopped or the chat was unlinked while it was being linked');
+      }
+    };
+    let recorded = false;
+    try {
+      if (first) {
+        await session.recordAgent({ type: 'slipstream.agent.binding.v1', occurred_at_ms: Date.now(), data: {
+          binding_generation: b.generation, target: { ...target, worktree: c.root }, verified_transcript_path: b.transcript } }, own);
+        recorded = true;
+      }
+      await session.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: {
+        state: 'setup_pending', binding_generation: b.generation, target } }, own);
+    } catch (err) {
+      if (first && c.binding === b) {
+        c.binding = undefined;
+        revokeBinding(intent, c.id);
+        // The log already says this chat is linked; say it no longer is.
+        if (recorded) {
+          await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+            data: { binding_generation: b.generation, reason: 'unlinked' } }).catch(() => {});
+        }
+      }
+      return controlFailure(err);
+    }
+    registry.setAgentConnection(c.id, 'setup_pending');
+    const transcripts = transcriptRuntimeFrom(opts.config);
+    if (transcripts) session.startTranscripts(transcripts);
+    return undefined;
+  }
+
+  async function detach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    const c = await resolveTarget(req.target);
+    if (isErrorFields(c)) return c;
+    if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const entry = findCapture(intent, c.id);
+    if (entry && entry.intent !== 'withdrawn') {
+      const promoted = withdrawCapture(intent, c.id, 'detached');
+      if (promoted) {
+        const next = captures.get(promoted.session_id);
+        if (next) enqueueStart(next);
+      }
+      const prior = c.closing;
+      c.closing = closeCapture(c, prior);
+    }
+    const already = entry?.intent === 'withdrawn' && c.lifecycle === 'stopped';
+    await c.closing;
+    if (c.closeError) {
+      return errFields('STORAGE_UNAVAILABLE', `detach did not stop cleanly: ${(c.closeError as Error).message}`);
+    }
+    const { state, reason } = publicState(c);
+    return { session_id: c.id, state, reason, ...(already ? { already_stopped: true } : {}) };
+  }
+
+  /** Stop a withdrawn capture: unlink its chat, then record the stop. */
+  async function closeCapture(c: Capture, prior: Promise<void> | undefined): Promise<void> {
+    const from = c.lifecycle;
+    if (from === 'queued') {
+      // Never activated: the start job sees the withdrawal and starts nothing.
+      c.lifecycle = 'stopped';
+      return;
+    }
+    c.lifecycle = 'stopping';
+    if (from === 'baselining') await c.starting;
+    await prior;
+    await Promise.allSettled([...c.inflight]);
+    const b = c.binding;
+    if (b) {
+      c.binding = undefined;
+      revokeBinding(intent, c.id);
+    }
+    if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
+    const session = c.session;
+    if (!session) {
+      // Its storage failed earlier and it was halted without a durable stop.
+      c.lifecycle = c.activation?.lost ? 'failed' : 'stopped';
+      return;
+    }
+    c.session = undefined;
+    try {
+      await session.stop(b ? { reason: 'detached', unlinkGeneration: b.generation } : { reason: 'detached' });
+      c.lifecycle = 'stopped';
+    } catch (err) {
+      c.closeError = err;
+      c.lifecycle = 'failed';
+    }
+    // Pin the reader at the final durable seq (honest even if stop() failed).
+    registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+  }
+
+  /** Revoke a capture's chat link; the capture keeps recording. */
+  async function unlinkChat(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    const c = nonEmptyString(req.session_id) ? captures.get(req.session_id) : undefined;
+    if (!c) return errFields('TARGET_NOT_FOUND', `no capture with session ${String(req.session_id)}`);
+    if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    await c.binding?.publishing;
+    const b = c.binding;
+    if (!b) return { session_id: c.id, already_unlinked: true };
+    c.binding = undefined;
+    revokeBinding(intent, c.id);
+    if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
+    const session = c.session;
+    if (!session || c.lifecycle !== 'recording') return { session_id: c.id, binding_generation: b.generation };
+    const append = session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+      data: { binding_generation: b.generation, reason: 'unlinked' } });
+    c.inflight.add(append);
+    try {
+      await append;
+    } catch (err) {
+      return errFields('STORAGE_UNAVAILABLE', `the chat was unlinked, but the unlink could not be recorded: ${(err as Error).message}`);
+    } finally {
+      c.inflight.delete(append);
+    }
+    return { session_id: c.id, binding_generation: b.generation };
+  }
+
+  // ---- chat-facing verbs --------------------------------------------------
+
+  /** Ownership check run immediately before an append on a chat's behalf. A
+   * stopping capture still accepts work it admitted: the stop drains it before
+   * revoking the binding. */
+  function owns(c: Capture, b: Binding): () => void {
+    return () => {
+      const live = c.lifecycle === 'recording' || c.lifecycle === 'stopping';
+      if (compromised || torn || c.binding !== b || !live || c.activation?.lost) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+      }
+    };
+  }
+
+  /** The chat's published binding and its capture, if it may act now. */
+  function chatTarget(c: Capture | undefined): { c: Capture; b: Binding } | undefined {
+    const b = c?.binding;
+    return c && b && !b.publishing && c.lifecycle === 'recording' ? { c, b } : undefined;
+  }
+
+  /** The chat's binding when a request arrives. A request that awaits before it
+   * acts must still find this same binding afterwards: an unlink and relink in
+   * between is a different binding, even at the same capture. */
+  function bindingAtEntry(req: RequestEnvelope): Binding | undefined {
+    return captureForChat(req.harness, req.harness_session_id)?.binding;
+  }
+
+  function staleBinding(req: RequestEnvelope, c: Capture, b: Binding): ErrorFields | undefined {
+    if (req.session_id !== undefined && req.session_id !== c.id) {
+      return errFields('STALE_BINDING', `session_id ${String(req.session_id)} is not the capture this chat is linked to`);
+    }
+    if (req.binding_generation !== undefined && req.binding_generation !== b.generation) {
+      return errFields('STALE_BINDING', `binding_generation ${String(req.binding_generation)} is no longer current`);
+    }
+    return undefined;
+  }
+
+  async function track<T>(c: Capture, promise: Promise<T>, ok: (v: T) => Record<string, unknown>): Promise<Record<string, unknown> | ErrorFields> {
+    c.inflight.add(promise);
+    try {
+      return ok(await promise);
+    } catch (err) {
+      if (err instanceof InvalidTitleError) return errFields('INVALID_TITLE', err.message);
+      return controlFailure(err);
+    } finally {
+      c.inflight.delete(promise);
+    }
   }
 
   async function beginTask(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
-    if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture is wedged; its storage is no longer trustworthy');
-    if (state !== 'active' || !current) {
-      if (state === 'attaching') return errFields('CAPTURE_NOT_READY', 'capture is still starting');
-      if (state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is detaching');
-      return errFields('SESSION_NOT_SELECTED', 'no active session');
-    }
-    if (req.session_id !== undefined && req.session_id !== current.id) {
-      // The optional target guards a retry after detach+attach-B from misrouting to
-      // a different session than the caller declared.
-      return errFields('SESSION_NOT_SELECTED', `session_id ${String(req.session_id)} is not the selected session`);
-    }
-    // Selection guard (locked design, decision X): the caller ships its verified
-    // identity triple and only the selected session's exact triple may declare.
-    // The P4 forwarder always sends the triple; a missing one is a contract
+    // The caller ships its verified identity triple; a missing one is a contract
     // violation, so fail closed rather than declare into whatever is selected.
     if (!nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)) {
       return errFields('IDENTITY_UNRESOLVED', 'begin_task requires harness, harness_session_id, and worktree');
     }
     if (!nonEmptyString(req.title)) return errFields('INVALID_TITLE', 'begin_task requires a non-empty title');
     if (!nonEmptyString(req.request_id)) return errFields('CAPTURE_NOT_READY', 'begin_task requires a non-empty request_id');
-    // Canonicalize the declared worktree with identityRealpath, which defaults to
-    // the same realpath policy attach uses (resolveAndStart), so a symlinked or
-    // relative declared path matches the durable root capture actually watches.
-    // The binding is captured before the await and compared by reference after it:
-    // a session id can now come back to life (detach, then resume), so an id match
-    // does not prove this is still the binding the request was admitted against.
-    const binding = current;
-    let declaredWorktree: string;
-    try {
-      declaredWorktree = await identityRealpath(req.worktree);
-    } catch {
-      declaredWorktree = req.worktree; // an unresolvable path cannot match the canonical root
+    // Canonicalize the declared worktree with the same realpath policy attach
+    // uses, so a symlinked or relative declared path matches the capture's root.
+    const atEntry = bindingAtEntry(req);
+    let worktree: string;
+    try { worktree = await identityRealpath(req.worktree); } catch { worktree = req.worktree; }
+    // Everything below runs without an await until the append is admitted, so a
+    // concurrent unlink or detach either sees it in flight or is seen here.
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const linked = captureForChat(req.harness, req.harness_session_id);
+    if (!linked || linked.root !== worktree) {
+      const here = liveCaptureAt(worktree);
+      if (here && !here.binding) return errFields('AGENT_NOT_CONNECTED', WATCH_ONLY_MESSAGE);
+      return errFields('SESSION_NOT_SELECTED', `this chat is not linked to a capture of ${worktree}`);
     }
-    // Re-verify selection AFTER the realpath await: a concurrent detach, teardown,
-    // or store-lock loss may have changed state or swapped the session while we
-    // canonicalized. From here through inflightTasks.add there is no await, so
-    // neither a detach nor a teardown can slip between these checks and the append
-    // (they either observe the task in flight and drain it, or are observed here).
-    // Teardown fails closed without touching `state`, so check `torn`/`compromised`
-    // explicitly — otherwise a request could append after the daemon has already
-    // begun shutting down or lost its store lock.
-    if (compromised || torn) {
-      return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    }
-    if (state !== 'active' || !current || current !== binding) {
-      return errFields('SESSION_NOT_SELECTED', 'the selected session changed before the declaration committed');
-    }
-    // Re-apply the optional session_id target guard after the await, exactly like
-    // the pre-await check: a concurrent detach+attach may have swapped in a session
-    // sharing the triple, and a request explicitly addressed to the prior session
-    // must not commit into its replacement.
-    if (req.session_id !== undefined && req.session_id !== current.id) {
-      return errFields('SESSION_NOT_SELECTED', `session_id ${String(req.session_id)} is not the selected session`);
-    }
-    if (
-      req.harness !== current.harness ||
-      req.harness_session_id !== current.harnessSessionId ||
-      declaredWorktree !== current.worktree
-    ) {
-      return errFields('SESSION_NOT_SELECTED', 'the declared identity is not the selected session');
-    }
-    const { session } = current;
-    const promise = session.beginTask({ title: req.title, requestId: req.request_id });
-    inflightTasks.add(promise);
-    try {
-      const result = await promise;
-      return {
-        session_id: result.session_id,
-        task_id: result.task_id,
-        event_id: result.event_id,
-        seq: result.seq,
-      };
-    } catch (err) {
-      if (err instanceof InvalidTitleError) return errFields('INVALID_TITLE', err.message);
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
-      return errFields('CAPTURE_NOT_READY', (err as Error).message);
-    } finally {
-      inflightTasks.delete(promise);
-    }
+    if (linked.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    const target = chatTarget(linked);
+    if (!target) return errFields('CAPTURE_NOT_READY', 'the linked capture is not recording yet');
+    if (target.b !== atEntry) return errFields('SESSION_NOT_SELECTED', 'this chat was unlinked or relinked while the request was in flight');
+    const { c, b } = target;
+    const stale = staleBinding(req, c, b);
+    if (stale) return stale;
+    if (b.check.state !== 'connected') return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
+    return track(c, c.session!.beginTask({ title: req.title, requestId: req.request_id }), (r) => ({
+      session_id: r.session_id, task_id: r.task_id, event_id: r.event_id, seq: r.seq,
+    }));
   }
 
-  /** Queue a question on the selected capture. `askQuestion` installs its own
-   * request reservation synchronously; install the daemon-level lifetime promise
-   * in the same turn so detach and shutdown drain source reads and appends. */
+  /** Queue a question on the capture the app names. `askQuestion` installs its own
+   * request reservation synchronously; the daemon-level lifetime promise is
+   * installed in the same turn so detach and shutdown drain it. */
   async function ask(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'daemon storage ownership is unavailable');
-    if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture is wedged; its storage is no longer trustworthy');
-    if (state !== 'active' || !current) {
-      if (state === 'attaching' || state === 'detaching') return errFields('CAPTURE_NOT_READY', 'capture is not ready to accept questions');
-      return errFields('SESSION_NOT_SELECTED', 'no active session');
+    const c = nonEmptyString(req.session_id) ? captures.get(req.session_id) : undefined;
+    if (!c || !isLive(c)) return errFields('SESSION_NOT_SELECTED', 'no capture with that session id is running');
+    if (c.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    if (!c.binding) return errFields('AGENT_NOT_CONNECTED', WATCH_ONLY_MESSAGE);
+    if (req.binding_generation !== undefined && req.binding_generation !== c.binding.generation) {
+      return errFields('STALE_BINDING', `binding_generation ${String(req.binding_generation)} is no longer current`);
     }
-    if (req.session_id !== current.id) return errFields('SESSION_NOT_SELECTED', 'question addresses a different capture');
-    if (current.agent?.state !== 'connected') {
-      return errFields('AGENT_NOT_CONNECTED', current.agent
-        ? 'the agent chat for this capture has not completed setup; finish the steps slipstream attach printed'
-        : 'this capture has no agent chat to ask; run slipstream attach from the agent');
-    }
-    // No await may appear before this call and registration: detach/shutdown must
-    // see any source verification admitted before they change state.
-    const binding = current;
-    const { session, harness, harnessSessionId, worktree } = binding;
-    const promise = session.askQuestion(req, {
-      harness: harness as HarnessName,
-      harness_session_id: harnessSessionId,
-      worktree,
-    }, () => {
-      if (compromised || sessionCompromised || current !== binding) {
-        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
-      }
-    });
-    inflightTasks.add(promise);
-    try {
-      const result = await promise;
-      return { ...result };
-    } catch (err) {
-      if (err instanceof QuestionError) return errFields(err.code, err.message);
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
-      return errFields('CAPTURE_NOT_READY', (err as Error).message);
-    } finally {
-      inflightTasks.delete(promise);
-    }
+    if (c.lifecycle !== 'recording' || !isRunning(c)) return errFields('CAPTURE_NOT_READY', 'the capture is not recording yet');
+    const target = chatTarget(c);
+    if (!target) return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
+    const { b } = target;
+    if (b.check.state !== 'connected') return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
+    return track(c, c.session!.askQuestion(req, {
+      harness: b.harness, harness_session_id: b.harnessSessionId, worktree: c.root,
+    }, owns(c, b)), (r) => ({ ...r }));
   }
 
+  /** The question hook asks for this chat's next question (or its setup check).
+   * Only a linked root chat may claim: subagents and other chats are refused. */
   async function claimQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
-    if (compromised || torn || state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
-    if (state !== 'active' || !current) return errFields('SESSION_NOT_SELECTED', 'no active capture');
-    if ((current.harness !== 'codex' && current.harness !== 'claude-code')
-      || !current.rootTranscript || req.harness !== current.harness
-      || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    if (!isHarness(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)
       || !nonEmptyString(req.transcript_path)
       || Object.hasOwn(req, 'agent_id') || Object.hasOwn(req, 'agent_type')) {
       return errFields('IDENTITY_UNRESOLVED', 'unsupported or incomplete root identity');
     }
-    const binding = current;
+    const atEntry = bindingAtEntry(req);
     let worktree: string; let transcript: string;
     try { [worktree, transcript] = await Promise.all([identityRealpath(req.worktree), identityRealpath(req.transcript_path)]); }
     catch { return errFields('IDENTITY_UNRESOLVED', 'identity path cannot be resolved'); }
-    if (compromised || torn || sessionCompromised || state !== 'active' || current !== binding
-      || req.harness_session_id !== binding.harnessSessionId
-      || worktree !== binding.worktree || transcript !== binding.rootTranscript) {
-      return errFields('SESSION_NOT_SELECTED', 'the callback is not the selected root session');
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    const linked = captureForChat(req.harness, req.harness_session_id);
+    if (linked?.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    const target = chatTarget(linked);
+    if (!target || target.b !== atEntry || target.c.root !== worktree || target.b.transcript !== transcript) {
+      return errFields('SESSION_NOT_SELECTED', 'the callback is not a linked root chat');
     }
-    if (binding.agent?.state === 'setup_pending') {
-      if (binding.agent.delivered) return { question: null };
-      binding.agent.delivered = true;
-      return { question: null, setup_check: { check_id: binding.agent.checkId } };
+    const { c, b } = target;
+    const stale = staleBinding(req, c, b);
+    if (stale) return stale;
+    if (b.check.state === 'setup_pending') {
+      if (b.check.delivered) return { question: null };
+      b.check.delivered = true;
+      return { question: null, setup_check: { check_id: b.check.checkId } };
     }
-    const promise = binding.session.claimQuestion({ harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId,
-      worktree: binding.worktree }, () => {
-      if (compromised || sessionCompromised || current !== binding) {
-        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
-      }
-    });
-    inflightTasks.add(promise);
-    try {
-      const result = await promise;
-      return result === null ? { question: null } : { question: result };
-    } catch (err) {
-      if (err instanceof QuestionError) return errFields(err.code, err.message);
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
-      return errFields('CAPTURE_NOT_READY', (err as Error).message);
-    } finally { inflightTasks.delete(promise); }
+    return track(c, c.session!.claimQuestion({ harness: b.harness, harness_session_id: b.harnessSessionId, worktree: c.root },
+      owns(c, b)), (r) => (r === null ? { question: null } : { question: r }));
   }
 
-  /** Record an answer returned through the selected harness session's MCP tool.
-   * Like begin_task, the caller's triple must equal the binding after the realpath
-   * await; with no transcript or agent id this proves the call came through the
-   * selected harness session, not which agent in it wrote the answer. */
+  /** Record an answer returned through a linked chat's MCP tool. The caller's
+   * identity routes it to that chat's capture; with no transcript or agent id this
+   * proves the call came through the linked chat, not which agent in it wrote the
+   * answer. A question queued for another chat is not found here. */
   async function answerQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     if (!nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)) {
       return errFields('IDENTITY_UNRESOLVED', 'answer_question requires harness, harness_session_id, and worktree');
     }
-    if (compromised || torn || state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
-    if (state !== 'active' || !current) return errFields('SESSION_NOT_SELECTED', 'no active capture');
-    const binding = current;
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    const atEntry = bindingAtEntry(req);
     let worktree: string;
     try { worktree = await identityRealpath(req.worktree); } catch { worktree = req.worktree; }
-    if (compromised || torn || sessionCompromised || state !== 'active' || current !== binding
-      || req.harness !== binding.harness || req.harness_session_id !== binding.harnessSessionId || worktree !== binding.worktree) {
-      return errFields('SESSION_NOT_SELECTED', 'the caller is not the selected harness session');
-    }
-    if (binding.agent && req.question_id === binding.agent.checkId) return confirmAgent(binding, binding.agent, req.text);
-    const promise = binding.session.answerQuestion({ question_id: req.question_id, text: req.text },
-      { harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId, worktree: binding.worktree }, () => {
-        if (compromised || sessionCompromised || current !== binding) {
-          throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
-        }
-      });
-    inflightTasks.add(promise);
-    try {
-      return { ...await promise };
-    } catch (err) {
-      if (err instanceof QuestionError) return errFields(err.code, err.message);
-      if (err instanceof StorageError) return errFields('STORAGE_UNAVAILABLE', err.message);
-      return errFields('CAPTURE_NOT_READY', (err as Error).message);
-    } finally { inflightTasks.delete(promise); }
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'capture storage is unavailable');
+    const linked = captureForChat(req.harness, req.harness_session_id);
+    if (linked?.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    const target = chatTarget(linked);
+    if (!target || target.b !== atEntry || target.c.root !== worktree) return errFields('SESSION_NOT_SELECTED', 'the caller is not a linked chat');
+    const { c, b } = target;
+    const stale = staleBinding(req, c, b);
+    if (stale) return stale;
+    if (req.question_id === b.check.checkId) return confirmAgent(c, b, req.text);
+    return track(c, c.session!.answerQuestion({ question_id: req.question_id, text: req.text },
+      { harness: b.harness, harness_session_id: b.harnessSessionId, worktree: c.root }, owns(c, b)), (r) => ({ ...r }));
   }
 
-  /** The bound chat returned its setup check: record it connected, once. */
-  async function confirmAgent(binding: NonNullable<typeof current>, agent: AgentCheck, text: unknown): Promise<Record<string, unknown> | ErrorFields> {
+  /** The linked chat returned its setup check: record it connected, once. */
+  async function confirmAgent(c: Capture, b: Binding, text: unknown): Promise<Record<string, unknown> | ErrorFields> {
+    const check = b.check;
     try { assertAnswerText(text); } catch (err) { return errFields((err as QuestionError).code, (err as Error).message); }
-    if (agent.ack) return { ...agent.ack, duplicate: true };
-    if (agent.confirming) {
-      const settled = await agent.confirming;
+    if (check.ack) return { ...check.ack, duplicate: true };
+    if (check.confirming) {
+      const settled = await check.confirming;
       return isErrorFields(settled) ? settled : { ...settled, duplicate: true };
     }
-    const promise = binding.session.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: { state: 'connected',
-      target: { harness: binding.harness as HarnessName, harness_session_id: binding.harnessSessionId } } }, () => {
-      if (compromised || sessionCompromised || current !== binding) {
-        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
-      }
+    const promise = c.session!.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: {
+      state: 'connected', binding_generation: b.generation, target: { harness: b.harness, harness_session_id: b.harnessSessionId } } },
+    () => {
+      owns(c, b)();
+      if (b.check !== check) throw new QuestionError('STORAGE_UNAVAILABLE', 'the setup check was re-armed by a restart');
     }).then((event): Record<string, unknown> => {
-      agent.state = 'connected';
-      registry.setAgentConnection(binding.id, 'connected');
-      agent.ack = { session_id: event.data.session_id, question_id: agent.checkId, event_id: event.seq, seq: event.seq,
+      check.state = 'connected';
+      registry.setAgentConnection(c.id, 'connected');
+      check.ack = { session_id: event.data.session_id, question_id: check.checkId, event_id: event.seq, seq: event.seq,
         answered_at_ms: Date.parse(event.time), duplicate: false };
-      return agent.ack;
+      return check.ack;
     }, controlFailure);
-    agent.confirming = promise;
-    inflightTasks.add(promise);
+    check.confirming = promise;
+    c.inflight.add(promise);
     try { return await promise; }
-    finally { inflightTasks.delete(promise); agent.confirming = undefined; }
+    finally { c.inflight.delete(promise); check.confirming = undefined; }
   }
 
-  /** Admit and run a detached-only maintenance op. Admission is synchronous through
-   * claiming `maintenanceInFlight`, so it cannot interleave with attach (which sets
-   * `state` synchronously and refuses while the slot is held). The op runs only in
-   * `detached`; anything else — an active/attaching/detaching session, a wedged or
-   * compromised store, an op already running — is refused without touching disk. */
+  // ---- maintenance --------------------------------------------------------
+
+  /** Admit and run a maintenance op while none of `affected` (by default every
+   * capture) is live, starting or stopping. The slot is claimed synchronously
+   * through `maintenanceInFlight`, so it cannot interleave with an admission. */
   async function runMaintenance(
     op: () => Promise<Record<string, unknown> | ErrorFields>,
+    affected: (c: Capture) => boolean = () => true,
   ): Promise<Record<string, unknown> | ErrorFields> {
     if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    if (state !== 'detached') {
-      // A capture in any stage — attaching, active, or detaching — is SESSION_ACTIVE;
-      // CAPTURE_NOT_READY is reserved for the maintenance-slot contention below.
-      if (state === 'wedged') return errFields('STORAGE_UNAVAILABLE', 'daemon is wedged; restart it');
-      return errFields('SESSION_ACTIVE', `a capture session is ${state}; detach it before deleting or collecting`);
+    const busy = [...captures.values()].find((c) => affected(c) && (isLive(c) || c.session || c.lifecycle === 'stopping'));
+    if (busy) {
+      return errFields('SESSION_ACTIVE', `the capture of ${busy.root} (session ${busy.id}) is ${publicState(busy).state}; `
+        + 'detach it first');
     }
+    if (admitting.size > 0) return errFields('SESSION_ACTIVE', 'a capture is being admitted; retry once it settles');
     if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'another maintenance operation is running; retry shortly');
     let release!: () => void;
     const slot = new Promise<void>((resolve) => { release = resolve; });
@@ -921,6 +1211,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // streaming a log we are about to delete. The reader's installIfAbsent gives a
       // followed retained session a registry entry this freeze can reach.
       registry.freeze(id, 0n);
+      // Deletion removes the session's capture and binding entries (§8).
+      forgetSession(intent, id);
+      captures.delete(id);
       // The tombstone is durable → the session is logically removed and the marker is
       // never rolled back. If we have since lost the store lock, or history cleanup
       // fails, report that removal committed and cleanup is retryable via gc.
@@ -932,7 +1225,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
       }
       return { session_id: id };
-    });
+    }, (c) => c.id === id);
   }
 
   async function gc(): Promise<Record<string, unknown> | ErrorFields> {
@@ -955,6 +1248,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         }
         // Abort mid-sweep if we lose the store lock: a successor may then own the
         // shared blobs, and deleting one it still references would be data loss.
+        // The shared blob store trusts blobs it published, some of which this
+        // sweep may delete: the next capture starts with a fresh instance.
+        cas = undefined;
         const removed = await reclaimUnreferencedBlobs(storeDir, () => torn || compromised);
         return { removed };
       } catch (err) {
@@ -965,13 +1261,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     });
   }
 
+  async function attach(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (req.mode === 'watch-only') return attachWatchOnly(req);
+    if (req.mode !== undefined) return errFields('PROTOCOL', `unknown attach mode: ${String(req.mode)}`);
+    return attachChat(req);
+  }
+
   async function dispatch(req: RequestEnvelope): Promise<ResponseEnvelope> {
     if (compromised) return { v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'daemon lost its store lock' };
     let outcome: Record<string, unknown> | ErrorFields;
     switch (req.verb) {
-      case 'status': outcome = statusFields(); break;
+      case 'status': outcome = await status(req); break;
       case 'attach': outcome = await attach(req); break;
-      case 'detach': outcome = await detach(); break;
+      case 'detach': outcome = await detach(req); break;
+      case 'unlink': outcome = await unlinkChat(req); break;
       case 'begin_task': outcome = await beginTask(req); break;
       case 'ask': outcome = await ask(req); break;
       case 'claim_question': outcome = await claimQuestion(req); break;
@@ -1074,6 +1377,6 @@ function corruptRemedy(id: string): string {
 }
 /** A lock, storage or shutdown failure says nothing about the session's data. */
 const RETRY_REMEDY = 'Retry attach';
-function isErrorFields(v: Record<string, unknown> | ErrorFields): v is ErrorFields {
+function isErrorFields<T extends object>(v: T | ErrorFields): v is ErrorFields {
   return (v as ErrorFields).__error === true;
 }

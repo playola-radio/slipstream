@@ -43,6 +43,8 @@ export interface ReaderServerOptions {
    * boundaries plus the SSE-follower set aborted on a session transition. When
    * absent, boundaries come from `active` (if any) or from disk high-water. */
   registry?: BoundaryRegistry;
+  /** The daemon's capture table (`GET /v1/captures`); absent for `serve`. */
+  captures?: () => Promise<unknown>;
 }
 export interface ReaderServer {
   url: string; port: number; token: string; descriptorPath: string; close(): Promise<void>;
@@ -162,6 +164,12 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     if (!checkAuth(req.headers.authorization, token)) { send(res, 401, 'unauthorized'); return; }
 
     const { pathname, searchParams } = new URL(req.url ?? '/', url);
+
+    if (pathname === '/v1/captures') {
+      if (!opts.captures) { send(res, 404, 'not found'); return; }
+      sendJson(res, 200, await opts.captures());
+      return;
+    }
 
     if (pathname === '/v1/sessions') {
       const sessions = await listSessions(opts.storeDir);

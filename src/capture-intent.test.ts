@@ -19,12 +19,6 @@ describe('capture intent', () => {
     assert.equal(runningCount(record), 16);
   });
 
-  it('counts in-flight admissions against the cap', () => {
-    const record = emptyIntent();
-    for (let i = 0; i < 15; i++) admitCapture(record, capture(i));
-    assert.equal(admitCapture(record, capture(15), 1).intent, 'waiting');
-  });
-
   it('promotes the oldest waiting capture when a running one is withdrawn', () => {
     const record = emptyIntent();
     for (let i = 0; i < 18; i++) admitCapture(record, capture(i));
