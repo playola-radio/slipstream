@@ -101,6 +101,19 @@ describe('slipstream attach (one command)', () => {
     }
   });
 
+  it('installs chat setup when a predicted slot refusal becomes a successful link', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const d = deps(f, claudeEnv, { live: true, status: { binding_slots: { used: 10, limit: 10 } } });
+      assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, d), 0);
+      const settings = JSON.parse(await readFile(join(f.worktree, '.claude', 'settings.local.json'), 'utf8'));
+      assert.equal(settings.hooks.PostToolUse.length, 1);
+      assert.equal(f.commands.length, 1);
+      assert.match(f.out.join('\n'), /claude --resume/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
   it('starts the daemon, installs the Claude hook and tool, and reports setup pending with the exact step', async () => {
     const f = await fixture();
     try {

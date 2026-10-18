@@ -69,8 +69,9 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   if (!status.ok) throw new Refusal(`${status.code}: ${status.message}`);
   requireCaptureTable(status, opts.store);
 
-  // When the daemon is sure to refuse, its reply is the explanation; nothing is installed first.
-  const changed = refusalExpected(status, chat, worktree) ? false : await applyAgentConfig(plan, worktree, deps);
+  // A status snapshot can predict a refusal, but slots may free before attach.
+  const deferredConfig = refusalExpected(status, chat, worktree);
+  let changed = deferredConfig ? false : await applyAgentConfig(plan, worktree, deps);
 
   const linked = await linkWhenRecording({ verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
     root_transcript: transcript }, deps);
@@ -80,6 +81,7 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   if (connection !== 'connected' && connection !== 'setup_pending') {
     throw new Refusal(`the daemon reported this chat as ${connection}; it is not connected.`);
   }
+  if (deferredConfig) changed = await applyAgentConfig(plan, worktree, deps);
   const again = res.already_active === true;
   if (connection === 'connected') {
     deps.out(again
