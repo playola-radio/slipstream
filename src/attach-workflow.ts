@@ -13,10 +13,11 @@ import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
+import { DaemonUnavailableError, ensureDaemon as ensureStoreDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 
 type Harness = 'claude-code' | 'codex';
 
-export interface AttachDeps {
+export interface AttachDeps extends EnsureDaemonDeps {
   env: Record<string, string | undefined>;
   home: string;
   nodePath: string;
@@ -24,11 +25,8 @@ export interface AttachDeps {
   cliPath: string;
   out: (line: string) => void;
   err: (line: string) => void;
-  probe: () => Promise<'live' | 'stale' | 'ambiguous'>;
-  startDaemon: () => { exited: Promise<number | null> };
   control: (request: Record<string, unknown> & { verb: string }) => Promise<ResponseEnvelope>;
   run: (command: string, args: string[], cwd: string) => Promise<{ code: number | null; output: string }>;
-  pollIntervalMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -37,7 +35,6 @@ interface Chat { harness: Harness; id: string; conductor: boolean }
 
 class Refusal extends Error {}
 
-const DAEMON_START_MS = 10_000;
 const HOOK_TIMEOUT_S = 3;
 /** Stays under an agent's default two-minute command timeout. */
 const ATTACH_WAIT_MS = 90_000;
@@ -206,8 +203,10 @@ function stillPending(worktree: string, id: string, deps: WaitDeps): number {
 function requireCaptureTable(status: Record<string, unknown>, store: string): void {
   const features = status.attach_features;
   if (Array.isArray(features) && features.includes('agent-connection-v1') && features.includes('capture-table-v1')) return;
-  throw new Refusal('the running daemon does not support multi-workspace capture and chat setup checks. Run '
-    + `\`slipstream stop --store ${shellWord(store)}\`, then \`slipstream attach --store ${shellWord(store)}\` again. Nothing was installed or recorded.`);
+  throw new Refusal('the running daemon does not support multi-workspace capture and chat setup checks. Stop it '
+    + `(end the \`slipstream start --store ${shellWord(store)}\` process, or run \`slipstream conductor install\` to restart `
+    + `a managed daemon on this version), then run \`slipstream attach --store ${shellWord(store)}\` again. `
+    + 'Nothing was installed or recorded.');
 }
 
 interface StatusRow { root?: unknown; state?: unknown; reason?: unknown;
@@ -313,23 +312,12 @@ async function verifyTranscript(chat: Chat, transcript: string, worktree: string
 }
 
 async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {
-  const verdict = await deps.probe();
-  if (verdict === 'live') return;
-  if (verdict === 'ambiguous') {
-    throw new Refusal(`the daemon for ${store} is not answering; run \`slipstream status --store ${store}\`. `
-      + 'Nothing was recorded.');
+  try {
+    await ensureStoreDaemon(store, deps);
+  } catch (err) {
+    if (err instanceof DaemonUnavailableError) throw new Refusal(err.message);
+    throw err;
   }
-  const child = deps.startDaemon();
-  let exited: number | null | undefined;
-  void child.exited.then((code) => { exited = code; });
-  const deadline = Date.now() + DAEMON_START_MS;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, deps.pollIntervalMs ?? 100));
-    if (await deps.probe() === 'live') return;
-    if (exited !== undefined) break;
-  }
-  throw new Refusal(`the Slipstream daemon did not start. Run \`slipstream start --store ${store}\` in a terminal `
-    + 'to see why. Nothing was recorded.');
 }
 
 function shellWord(value: string): string {

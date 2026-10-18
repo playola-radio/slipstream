@@ -176,7 +176,7 @@ describe('slipstream attach (one command)', () => {
       }));
       assert.equal(code, 1);
       assert.match(f.err.join('\n'), /running daemon does not support multi-workspace capture and chat setup checks/);
-      assert.match(f.err.join('\n'), new RegExp(`slipstream stop --store ${f.store}`));
+      assert.match(f.err.join('\n'), new RegExp(`end the .slipstream start --store ${f.store}. process`));
       assert.equal(attachRequests(f).length, 0);
       await assert.rejects(stat(join(f.worktree, '.claude')));
       assert.deepEqual(f.commands, []);
@@ -205,7 +205,7 @@ describe('slipstream attach (one command)', () => {
         live: true, legacy: true, status: { state: 'detached' },
       }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /slipstream stop --store '.*store with spaces'/);
+      assert.match(f.err.join('\n'), /slipstream start --store '.*store with spaces'/);
       assert.match(f.err.join('\n'), /slipstream attach --store '.*store with spaces'/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
