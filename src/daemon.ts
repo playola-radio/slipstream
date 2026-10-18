@@ -1816,27 +1816,33 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function maintenancePass(): Promise<Record<string, unknown> | ErrorFields> {
     const stopped = new Set<Capture>();
-    const unproven: string[] = [];
+    const unproven = new Map<string, string>();
     try {
       for (const c of captures.values()) {
         if (c.session && c.lifecycle === 'recording') stopForMaintenance(c, stopped, unproven);
       }
       // A detach, a halt or an ended activation may own a stop too; every one of
-      // them must finish before any blob is swept. A session no stop is pending
-      // for (a withdrawal that could not be saved) is a writer still running.
+      // them must finish, and record its stop, before any blob is swept. A session
+      // no stop is pending for (a withdrawal that could not be saved) is a writer
+      // still running.
+      const waited = new Set<Capture>();
       for (;;) {
         const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
         if (busy.length === 0) break;
+        for (const c of busy) waited.add(c);
         const closings = busy.map((c) => c.closing);
         await Promise.allSettled(closings);
         const stuck = busy.filter((c, i) => c.closing === closings[i] && (c.session || c.lifecycle === 'stopping'));
         if (stuck.length === busy.length) {
-          for (const c of stuck) unproven.push(`capture ${c.id} has not stopped`);
+          for (const c of stuck) unproven.set(c.id, `capture ${c.id} has not stopped`);
           break;
         }
       }
+      for (const c of waited) {
+        if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
+      }
       if (torn || compromised) throw new StorageError('gc-aborted', new Error('the daemon is shutting down or lost its store lock'));
-      if (unproven.length > 0) return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: ${unproven.join('; ')}`);
+      if (unproven.size > 0) return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: ${[...unproven.values()].join('; ')}`);
       const foreign = await freshSessionLock();
       if (foreign) {
         return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: session ${foreign} is still being written by another process`);
@@ -1866,7 +1872,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
    * intent. Admitted binding publication and chat work finish first, so a link in
    * flight is kept rather than revoked; a check issued before the stop never
    * connects afterwards. */
-  function stopForMaintenance(c: Capture, stopped: Set<Capture>, unproven: string[]): void {
+  function stopForMaintenance(c: Capture, stopped: Set<Capture>, unproven: Map<string, string>): void {
     const prior = c.closing;
     c.closing = (async () => {
       await prior;
@@ -1877,7 +1883,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const session = c.session;
       // A detach or an ended activation took it over meanwhile, and owns its stop.
       if (!session || c.lifecycle !== 'recording' || !isRunning(c) || torn || compromised) {
-        if (session && (torn || compromised)) unproven.push(`capture ${c.id} was not stopped`);
+        if (session && (torn || compromised)) unproven.set(c.id, `capture ${c.id} was not stopped`);
         return;
       }
       c.lifecycle = 'stopping';
@@ -1887,13 +1893,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       c.session = undefined;
       const freeze = () => registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
       try {
+        // A shutdown keeps the store lock, so only its loss makes the stop unrecordable.
         await session.stop({ reason: 'maintenance', assertOwnership: () => {
-          if (torn || compromised) throw new Error('the daemon is shutting down or lost its store lock');
+          if (compromised) throw new Error('the daemon lost its store lock');
         } });
       } catch (err) {
         freeze();
         const message = (err as Error).message;
-        unproven.push(`capture ${c.id} could not record its maintenance stop: ${message}`);
+        unproven.set(c.id, `capture ${c.id} could not record its maintenance stop: ${message}`);
         fail(c, 'storage-unavailable', `gc could not record this capture's maintenance stop: ${message}`, { retry: true });
         return;
       }

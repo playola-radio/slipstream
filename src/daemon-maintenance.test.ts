@@ -395,6 +395,34 @@ describe('gc as a maintenance transaction', () => {
     }, { stopError: true });
   });
 
+  it('sweeps nothing when a detach gc waited on could not record its stop', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, call, roots, holdClose }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      const idB = await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      const holdA = holdClose(a!);
+      const detaching = call({ verb: 'detach', target: idA });
+      await holdA.held;
+      const holdB = holdClose(b!);
+      const collecting = call({ verb: 'gc' });
+      // gc is stopping B, so it is already waiting on A's detach.
+      await holdB.held;
+      disk.full = true;
+      holdA.release();
+      const detached = await detaching;
+      assert.equal(detached.ok === false && detached.code, 'STORAGE_UNAVAILABLE', JSON.stringify(detached));
+      disk.full = false;
+      holdB.release();
+      const res = await collecting;
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      await waitForRow(call, idB, recording);
+    }, { deps: { createLog: disk.createLog }, stopError: true });
+  });
+
   it('lets a detach during gc withdraw its capture, which then stays stopped', async () => {
     await withStore(async ({ store, call, roots, holdClose }) => {
       const [a, b] = await roots(2);
