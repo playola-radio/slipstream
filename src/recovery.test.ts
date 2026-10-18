@@ -379,7 +379,7 @@ describe('recovery across a resume', () => {
       const rec = await recoverSession(path, SESSION, cas);
       assert.equal(rec.currentTaskId, undefined);
       assert.deepEqual([...rec.taskDeclarations.keys()], ['r1']);
-      assert.equal(rec.latestResumedSeq, 3n);
+      assert.equal(rec.taskResetSeq, 3n);
     });
   });
 
@@ -392,11 +392,22 @@ describe('recovery across a resume', () => {
     });
   });
 
-  it('reports latestResumedSeq 0 for a log that was never resumed', async () => {
+  it('clears the current task at an unlink', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const unlinked = { type: 'slipstream.agent.unlinked.v1', occurred_at_ms: 7,
+        data: { binding_generation: '1', reason: 'unlinked' } } as unknown as EventInput;
+      const rec = await recoverSession(await seedLog(dir, [started, task('t1', 'r1'), unlinked]), SESSION, cas);
+      assert.equal(rec.currentTaskId, undefined);
+      assert.equal(rec.taskResetSeq, 3n);
+    });
+  });
+
+  it('reports taskResetSeq 0 for a log that was never resumed', async () => {
     await withTempDir(async (dir) => {
       const cas = await createCas(join(dir, 'blobs'));
       const rec = await recoverSession(await seedLog(dir, [started]), SESSION, cas);
-      assert.equal(rec.latestResumedSeq, 0n);
+      assert.equal(rec.taskResetSeq, 0n);
     });
   });
 });

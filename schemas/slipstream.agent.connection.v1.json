@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.agent.connection.v1.json",
   "title": "slipstream.agent.connection.v1",
-  "$comment": "Whether the agent chat bound to this capture can take questions. setup_pending: the chat was bound at attach but no setup check has completed. connected: the bound chat received a one-time setup check through its tool-use callback and returned it through its answer tool, proving delivery and answer return at this event's time. It does not prove the chat is still open later; a capture that is no longer live has no agent connection, which /v1/sessions reports. Self-contained; unknown fields permitted for forward compatibility.",
+  "$comment": "Whether the agent chat bound to this capture can take questions. setup_pending: the chat was bound at attach but no setup check has completed. connected: the bound chat received a one-time setup check through its tool-use callback and returned it through its answer tool, proving delivery and answer return at this event's time. It does not prove the chat is still open later; a capture that is no longer live has no agent connection, which /v1/sessions reports. binding_generation names the agent.binding this handshake belongs to; a connection whose generation is not the binding's current one is history only. It is absent only on records written before bindings had generations. Self-contained; unknown fields permitted for forward compatibility.",
   "type": "object",
   "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "data"],
   "properties": {
@@ -19,6 +19,7 @@
       "properties": {
         "session_id": { "type": "string" },
         "state": { "enum": ["setup_pending", "connected"] },
+        "binding_generation": { "type": "string", "pattern": "^[1-9][0-9]*$" },
         "target": {
           "type": "object",
           "required": ["harness", "harness_session_id"],

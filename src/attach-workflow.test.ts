@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat, chmod, symlink
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAttachWorkflow, type AttachDeps } from './attach-workflow.ts';
+import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach, type AttachDeps } from './attach-workflow.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
@@ -61,13 +61,23 @@ function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDe
     control: async (req) => {
       f.requests.push(req);
       const fields = req.verb === 'status'
-        ? { attach_features: daemon.legacy ? undefined : ['agent-connection-v1'], state: 'detached', ...daemon.status }
-        : daemon.attach ?? { session_id: 'cap-1', agent_connection: 'setup_pending' };
+        ? { attach_features: daemon.legacy ? undefined : FEATURES, captures: [], binding_slots: { used: 0, limit: 10 },
+          ...daemon.status }
+        : daemon.attach ?? LINKED;
       return { v: 1, ok: true, ...fields } as ResponseEnvelope;
     },
     run: async (command, args) => { f.commands.push([command, ...args]); return { code: 0, output: '' }; },
     pollIntervalMs: 1,
   };
+}
+
+const FEATURES = ['agent-connection-v1', 'capture-table-v1'];
+const LINKED = { session_id: 'cap-1', state: 'recording', binding_generation: '1', agent_connection: 'setup_pending',
+  created: true };
+
+function row(f: Fixture, fields: Record<string, unknown> = {}): Record<string, unknown> {
+  return { session_id: 'cap-1', root: f.worktree, state: 'recording', reason: null, capture_mode: 'watch-only',
+    binding: null, ...fields };
 }
 
 const claudeEnv = { CLAUDE_CODE_SESSION_ID: CLAUDE_ID, CLAUDE_CODE_EXECPATH: '/opt/claude' };
@@ -90,6 +100,45 @@ describe('slipstream attach (one command)', () => {
       } finally { await rm(f.root, { recursive: true, force: true }); }
     }
   });
+
+  it('installs chat setup when a predicted slot refusal becomes a successful link', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const d = deps(f, claudeEnv, { live: true, status: { binding_slots: { used: 10, limit: 10 } } });
+      assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, d), 0);
+      const settings = JSON.parse(await readFile(join(f.worktree, '.claude', 'settings.local.json'), 'utf8'));
+      assert.equal(settings.hooks.PostToolUse.length, 1);
+      assert.equal(f.commands.length, 1);
+      assert.match(f.out.join('\n'), /claude --resume/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  for (const failure of ['hook write', 'answer tool'] as const) {
+    it(`reports the saved session when deferred ${failure} setup fails`, async () => {
+      const f = await fixture();
+      try {
+        await claudeTranscript(f);
+        await mkdir(join(f.worktree, '.claude'));
+        const d = deps(f, claudeEnv, { live: true, status: { binding_slots: { used: 10, limit: 10 } } });
+        if (failure === 'hook write') await chmod(join(f.worktree, '.claude'), 0o500);
+        else d.run = async () => ({ code: 1, output: 'injected tool installation failure' });
+        assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, d), 1);
+        assert.equal(attachRequests(f).length, 1);
+        const output = [...f.out, ...f.err].join('\n');
+        assert.match(output, /session_id: cap-1/);
+        assert.match(output, /agent_connection: setup_pending/);
+        assert.match(output, /workspace is recording and this chat is linked/);
+        assert.match(output, /setup is incomplete/);
+        assert.match(output, failure === 'hook write' ? /could not write.*EACCES/ : /injected tool installation failure/);
+        assert.match(output, /run `slipstream attach.*again/);
+        assert.doesNotMatch(output, /Nothing was recorded|Attached successfully/);
+      } finally {
+        await chmod(join(f.worktree, '.claude'), 0o700);
+        await rm(f.root, { recursive: true, force: true });
+      }
+    });
+  }
 
   it('starts the daemon, installs the Claude hook and tool, and reports setup pending with the exact step', async () => {
     const f = await fixture();
@@ -126,11 +175,24 @@ describe('slipstream attach (one command)', () => {
         live: true, legacy: true, status: { state: 'detached' },
       }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /running daemon does not support chat setup checks/);
+      assert.match(f.err.join('\n'), /running daemon does not support multi-workspace capture and chat setup checks/);
       assert.match(f.err.join('\n'), new RegExp(`slipstream stop --store ${f.store}`));
       assert.equal(attachRequests(f).length, 0);
       await assert.rejects(stat(join(f.worktree, '.claude')));
       assert.deepEqual(f.commands, []);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a daemon that runs only one capture at a time before changing anything', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const d = deps(f, claudeEnv, { live: true, status: { attach_features: ['agent-connection-v1'] } });
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
+      assert.equal(code, 1);
+      assert.match(f.err.join('\n'), /running daemon does not support/);
+      assert.equal(attachRequests(f).length, 0);
+      await assert.rejects(stat(join(f.worktree, '.claude')));
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
@@ -162,8 +224,9 @@ describe('slipstream attach (one command)', () => {
       const excludeBefore = await readFile(join(f.worktree, '.git', 'info', 'exclude'), 'utf8');
       f.out.length = 0; f.commands.length = 0;
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
-        status: { state: 'active', worktree: f.worktree, harness: 'claude-code', harness_session_id: CLAUDE_ID },
-        attach: { session_id: 'cap-1', already_active: true, agent_connection: 'connected' } }));
+        status: { captures: [row(f, { binding: { harness: 'claude-code', harness_session_id: CLAUDE_ID,
+          binding_generation: '1', state: 'connected' } })] },
+        attach: { ...LINKED, already_active: true, agent_connection: 'connected' } }));
       assert.equal(code, 0);
       assert.equal((await stat(settingsPath)).mtimeMs, before.mtimeMs);
       assert.equal(await readFile(join(f.worktree, '.git', 'info', 'exclude'), 'utf8'), excludeBefore);
@@ -173,17 +236,108 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
-  it('refuses before any write when another workspace is being recorded', async () => {
+  it('links alongside the capture of another workspace', async () => {
     const f = await fixture();
     try {
       await claudeTranscript(f);
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
-        status: { state: 'active', worktree: '/elsewhere', harness: 'codex', harness_session_id: 'x' } }));
+        status: { captures: [row(f, { session_id: 'cap-0', root: '/elsewhere' })] } }));
+      assert.equal(code, 0, f.err.join('\n'));
+      assert.equal(attachRequests(f).length, 1);
+      assert.match(f.out.join('\n'), /session_id: cap-1/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  for (const [what, status, refusal] of [
+    ['this chat is linked to another workspace', (f: Fixture) => ({ captures: [row(f, { root: '/elsewhere',
+      binding: { harness: 'claude-code', harness_session_id: CLAUDE_ID, binding_generation: '1', state: 'connected' } })] }),
+    { code: 'BINDING_EXISTS', message: 'claude-code chat x is already linked to the capture of /elsewhere' }],
+    ['another chat is linked to this workspace', (f: Fixture) => ({ captures: [row(f, {
+      binding: { harness: 'codex', harness_session_id: 'other', binding_generation: '1', state: 'connected' } })] }),
+    { code: 'BINDING_EXISTS', message: 'codex chat other is already linked' }],
+    ['this workspace waits for a capture slot', (f: Fixture) => ({ captures: [row(f, { state: 'not_recording',
+      reason: 'capture-limit-reached' })] }),
+    { code: 'CAPTURE_LIMIT_REACHED', message: '16/16 capture slots in use.' }],
+    ['every chat slot is used', () => ({ binding_slots: { used: 10, limit: 10 } }),
+    { code: 'BINDING_LIMIT_REACHED', message: '10/10 chats linked.' }],
+  ] as const) {
+    it(`installs nothing and reports the daemon's refusal when ${what}`, async () => {
+      const f = await fixture();
+      try {
+        await claudeTranscript(f);
+        const d = deps(f, claudeEnv, { live: true, status: status(f) });
+        const control = d.control;
+        d.control = async (req) => req.verb === 'attach'
+          ? { v: 1, ok: false, ...refusal } as ResponseEnvelope : control(req);
+        const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
+        assert.equal(code, 1);
+        assert.match(f.err.join('\n'), new RegExp(`${refusal.code}: ${refusal.message.replaceAll('.', '\\.')}`));
+        await assert.rejects(stat(join(f.worktree, '.claude')));
+        assert.deepEqual(f.commands, []);
+      } finally { await rm(f.root, { recursive: true, force: true }); }
+    });
+  }
+
+  it('waits for a starting capture past the control timeout, then links the chat', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      let now = 0;
+      let polls = 0;
+      const d = deps(f, claudeEnv, { live: true });
+      d.now = () => now;
+      d.sleep = async (ms) => { now += ms; };
+      d.pollIntervalMs = 5_000;
+      d.control = async (req) => {
+        f.requests.push(req);
+        if (req.verb === 'status' && req.target === undefined) {
+          return { v: 1, ok: true, attach_features: FEATURES, captures: [], binding_slots: { used: 0, limit: 10 } };
+        }
+        if (req.verb === 'status') {
+          polls += 1;
+          return { v: 1, ok: true, capture: row(f, { state: polls < 5 ? 'baselining' : 'recording' }) };
+        }
+        return { v: 1, ok: true, ...(polls < 5 ? { session_id: 'cap-1', state: 'queued', reason: null, created: true }
+          : LINKED) } as ResponseEnvelope;
+      };
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
+      assert.equal(code, 0, f.err.join('\n'));
+      assert.ok(now > 15_000, 'outlived one control timeout');
+      assert.equal(polls, 5);
+      assert.equal(attachRequests(f).length, 2);
+      assert.match(f.out.join('\n'), /agent_connection: setup_pending$/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('says the outcome is unknown, with a distinct exit, when the capture is still starting at the deadline', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      let now = 0;
+      const d = deps(f, claudeEnv, { live: true });
+      d.now = () => now;
+      d.sleep = async (ms) => { now += ms; };
+      d.pollIntervalMs = 5_000;
+      const control = d.control;
+      d.control = async (req) => req.verb === 'status' && req.target !== undefined
+        ? { v: 1, ok: true, capture: row(f, { state: 'baselining' }) }
+        : req.verb === 'attach' ? { v: 1, ok: true, session_id: 'cap-1', state: 'baselining', reason: null, created: false }
+          : control(req);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
+      assert.equal(code, 3);
+      assert.match(f.err.join('\n'), /still pending, outcome unknown \(session cap-1\)/);
+      assert.doesNotMatch(f.out.join('\n'), /Recording|Attached/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses when the capture could not start', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
+        attach: { session_id: 'cap-1', state: 'not_recording', reason: 'resume-failed', message: 'log is corrupt' } }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /\/elsewhere is being recorded/);
-      assert.equal(attachRequests(f).length, 0);
-      await assert.rejects(stat(join(f.worktree, '.claude')));
-      assert.deepEqual(f.commands, []);
+      assert.match(f.err.join('\n'), /is not recording \(not_recording\): log is corrupt/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
@@ -344,7 +498,7 @@ describe('slipstream attach (one command)', () => {
       await claudeTranscript(f);
       const d = deps(f, claudeEnv, { live: true });
       d.control = async (req) => req.verb === 'status'
-        ? { v: 1, ok: true, state: 'detached', attach_features: ['agent-connection-v1'] } as ResponseEnvelope
+        ? { v: 1, ok: true, attach_features: FEATURES, captures: [] } as ResponseEnvelope
         : { v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'disk full' } as ResponseEnvelope;
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
       assert.equal(code, 1);
@@ -443,29 +597,15 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
-  it('refuses a same-chat capture that was attached without question delivery', async () => {
-    const f = await fixture();
-    try {
-      await claudeTranscript(f);
-      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
-        status: { state: 'active', worktree: f.worktree, harness: 'claude-code', harness_session_id: CLAUDE_ID,
-          agent_connection: 'disconnected' } }));
-      assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /without question delivery.*slipstream detach/s);
-      assert.equal(attachRequests(f).length, 0);
-      await assert.rejects(stat(join(f.worktree, '.claude')));
-    } finally { await rm(f.root, { recursive: true, force: true }); }
-  });
-
   it('does not report pending when the daemon says the chat is disconnected', async () => {
     const f = await fixture();
     try {
       await claudeTranscript(f);
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true,
-        attach: { session_id: 'cap-1', already_active: true, agent_connection: 'disconnected' } }));
+        attach: { ...LINKED, already_active: true, agent_connection: 'disconnected' } }));
       assert.equal(code, 1);
       assert.doesNotMatch(f.out.join('\n'), /setup pending|Attached successfully/);
-      assert.match(f.err.join('\n'), /without question delivery/);
+      assert.match(f.err.join('\n'), /reported this chat as disconnected; it is not connected/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
   it('keeps the permissions of a config file it edits', async () => {
@@ -532,5 +672,90 @@ describe('slipstream attach (one command)', () => {
       assert.match(f.err.join('\n'), /different `slipstream` MCP server/);
       assert.equal(attachRequests(f).length, 0);
     } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+});
+
+describe('slipstream attach --watch-only', () => {
+  const run = async (replies: Record<string, unknown>[], wait: boolean, clock?: { now: number }) => {
+    const out: string[] = []; const err: string[] = []; const requests: Record<string, unknown>[] = [];
+    const code = await runWatchOnlyAttach({ dir: '/w', wait }, {
+      out: (l) => out.push(l), err: (l) => err.push(l),
+      control: async (req) => { requests.push(req); return { v: 1, ...replies.shift()! } as ResponseEnvelope; },
+      ...(clock ? { now: () => clock.now, sleep: async (ms: number) => { clock.now += ms; } } : {}),
+      pollIntervalMs: 5_000,
+    });
+    return { code, out: out.join('\n'), err: err.join('\n'), requests };
+  };
+
+  it('records a workspace without a chat', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'recording', reason: null, created: true }], false);
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.requests, [{ verb: 'attach', mode: 'watch-only', worktree: '/w' }]);
+    assert.match(r.out, /Recording \/w; this command linked no chat\.\nsession_id: s1\nstate: recording/);
+  });
+
+  it('reports a starting capture honestly without --wait', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'baselining', reason: null, created: true }], false);
+    assert.equal(r.code, 0);
+    assert.match(r.out, /is starting \(baselining\); it is not recording yet/);
+    assert.equal(r.requests.length, 1);
+  });
+
+  it('with --wait, polls with short status requests past the control timeout until recording', async () => {
+    const clock = { now: 0 };
+    const starting = { ok: true, capture: { session_id: 's1', state: 'baselining' } };
+    const r = await run([{ ok: true, session_id: 's1', state: 'queued', reason: null, created: true },
+      starting, starting, starting, starting, { ok: true, capture: { session_id: 's1', state: 'recording' } }], true, clock);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(clock.now > 15_000);
+    assert.deepEqual(r.requests.slice(1).map((q) => q.target), ['s1', 's1', 's1', 's1', 's1']);
+    assert.match(r.out, /state: recording/);
+  });
+
+  it('with --wait, says the outcome is unknown at its own deadline', async () => {
+    const clock = { now: 0 };
+    const replies = [{ ok: true, session_id: 's1', state: 'baselining', reason: null, created: true },
+      ...Array.from({ length: 50 }, () => ({ ok: true, capture: { session_id: 's1', state: 'baselining' } }))];
+    const r = await run(replies, true, clock);
+    assert.equal(r.code, 3);
+    assert.match(r.err, /still pending, outcome unknown/);
+  });
+
+  it('exits non-zero with the exact capture-limit text when every slot is used', async () => {
+    const text = '16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another '
+      + 'workspace is archived or detached.';
+    const r = await run([{ ok: false, code: 'CAPTURE_LIMIT_REACHED', message: text }], true);
+    assert.equal(r.code, 1);
+    assert.equal(r.err, `slipstream: CAPTURE_LIMIT_REACHED: ${text}`);
+  });
+});
+
+describe('slipstream attach with identity flags', () => {
+  const request = { verb: 'attach' as const, worktree: '/w', harness: 'codex', harness_session_id: 'c1', root_transcript: '/t.jsonl' };
+  const run = async (replies: Record<string, unknown>[], clock = { now: 0 }) => {
+    const err: string[] = []; const reported: Record<string, unknown>[] = []; const requests: Record<string, unknown>[] = [];
+    const code = await runIdentityAttach(request, {
+      out: () => {}, err: (l) => err.push(l), report: (res) => reported.push(res),
+      control: async (req) => { requests.push(req); return { v: 1, ...replies.shift()! } as ResponseEnvelope; },
+      now: () => clock.now, sleep: async (ms: number) => { clock.now += ms; }, pollIntervalMs: 5_000,
+    });
+    return { code, err: err.join('\n'), reported, requests };
+  };
+
+  it('links the chat once a starting capture records', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'queued', reason: null, created: true },
+      { ok: true, capture: { session_id: 's1', state: 'recording' } },
+      { ok: true, session_id: 's1', state: 'recording', binding_generation: '1', agent_connection: 'setup_pending' }]);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(r.requests.map((q) => q.verb), ['attach', 'status', 'attach']);
+    assert.equal(r.reported[0]!.binding_generation, '1');
+  });
+
+  it('says the outcome is unknown when the capture is still starting at its deadline', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'baselining', reason: null, created: true },
+      ...Array.from({ length: 50 }, () => ({ ok: true, capture: { session_id: 's1', state: 'baselining' } }))]);
+    assert.equal(r.code, 3);
+    assert.match(r.err, /still pending, outcome unknown/);
+    assert.equal(r.reported.length, 0);
   });
 });

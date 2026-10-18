@@ -127,14 +127,22 @@ If the chat has to reload to pick those up, `attach` prints the exact command.
 Then:
 
 ```sh
-slipstream status    # what's being recorded, and the reader URL
+slipstream status                       # every capture, its state and linked chat, and the reader URL
+slipstream status <session-id or dir>   # one capture
 slipstream view --store ~/.slipstream --session <capture-session-id>
-slipstream detach    # stop recording; history is kept
+slipstream unlink --session <id>        # disconnect the chat; the workspace keeps recording
+slipstream detach [<session-id or dir>] # stop recording (default: this directory); history is kept
 ```
 
+Several workspaces can record at once, each with its own session ID. To record
+a workspace without connecting a chat, run `slipstream attach --watch-only [dir]`
+(add `--wait` to return only once it is recording). Running `attach` from a chat
+in a workspace that is already recording connects the chat to that same capture:
+no new baseline and no gap.
+
 After a detach, `attach` in the same workspace from any chat resumes the same
-session ID. While it is recording, another chat cannot attach, but can join the
-live stream through its normal agent connection.
+session ID. Each capture has at most one linked chat, and a chat is linked to at
+most one capture; attach explains and changes nothing otherwise.
 
 Current limits:
 
@@ -143,7 +151,13 @@ Current limits:
   0.154.0 and 0.155.1, launched through its SDK. Anything else is refused and
   nothing is recorded. The versions Conductor ships today aren't on the list
   yet, so Conductor chats are refused for now.
-- One workspace and one chat are recorded at a time.
+- At most 16 workspaces record at once. Past that, a workspace is shown as NOT
+  recording (`capture-limit-reached`) and starts on its own, oldest first, when
+  another is detached.
+- At most 10 chats are linked at once. Past that, the workspace keeps recording
+  without a chat (`BINDING_LIMIT_REACHED`); unlink another chat to connect it.
+- The list of captures lives in the daemon's memory: when the daemon stops,
+  captures do not restart by themselves yet. Run `attach` again.
 
 **Recording any chat, without Ask Agent.** If your agent version isn't
 verified, you can still record its workspace by naming the chat yourself:

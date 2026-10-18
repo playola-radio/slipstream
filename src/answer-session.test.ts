@@ -208,3 +208,12 @@ it('finishes an in-flight answer before stop closes the log', async () => {
     assert.equal((await answers(session)).length, 1);
   });
 });
+
+it('an unlink leaves no question claimable', async () => {
+  await fixture(async ({ session, target, ask }) => {
+    await ask();
+    await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: 1000,
+      data: { binding_generation: '1', reason: 'unlinked' } });
+    assert.equal(await session.claimQuestion(target), null);
+  });
+});

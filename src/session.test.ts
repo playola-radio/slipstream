@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { startCapture, InvalidTitleError } from './session.ts';
+import { startCapture, InvalidTitleError, type TranscriptRuntime } from './session.ts';
+import { createCas, type Cas } from './cas.ts';
 import { createLog, type Log } from './log.ts';
 import { StorageError } from './storage.ts';
 import { CorruptLogError } from './recovery.ts';
@@ -710,6 +711,31 @@ describe('session', () => {
       );
     });
 
+    it('an unlink ends the current task, live and after recovery', async () => {
+      await withTempPair(async (root, store) => {
+        const platform = createFakePlatform();
+        const s1 = await startCapture({ root, storeDir: store }, { platform });
+        await s1.beginTask({ title: 'Linked chat task', requestId: 'req-1' });
+        await s1.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+          data: { binding_generation: '1', reason: 'unlinked' } });
+        await writeFile(join(root, 'c.ts'), 'v1');
+        platform.observe('c.ts');
+        const recs = await waitForRecords(s1.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
+        assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, undefined);
+        await s1.stop();
+        const platform2 = createFakePlatform();
+        const s2 = await startCapture({ root, storeDir: store, resumeSessionId: s1.sessionId }, { platform: platform2 });
+        try {
+          await writeFile(join(root, 'd.ts'), 'v1');
+          platform2.observe('d.ts');
+          const after = await waitForRecords(s2.logPath, (r) => changesFor(r, 'd.ts').length >= 1);
+          assert.equal(changesFor(after, 'd.ts')[0]!.data.task_hint_id, undefined);
+        } finally {
+          await s2.stop();
+        }
+      });
+    });
+
     it('rebuilds the dedup index across a resume but starts with no current task', async () => {
       await withTempPair(async (root, store) => {
         const platform = createFakePlatform();
@@ -741,6 +767,157 @@ describe('session', () => {
         } finally {
           await s2.stop();
         }
+      });
+    });
+  });
+
+  describe('capture lifecycle events', () => {
+    const types = (recs: LoggedRecord[]): string[] => recs.map((r) => r.type);
+
+    it('appends capture.ready once, after the baseline and policy, on a new capture', async () => {
+      await withTempPair(async (root, store) => {
+        await writeFile(join(root, 'a.ts'), 'v1');
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        try {
+          const recs = await readRecords(s.logPath);
+          const t = types(recs);
+          assert.equal(t.filter((x) => x === 'slipstream.capture.ready.v1').length, 1);
+          assert.ok(t.indexOf('slipstream.capture.ready.v1') > t.indexOf('slipstream.capture.baseline.completed.v1'));
+          assert.ok(t.indexOf('slipstream.capture.ready.v1') > t.indexOf('slipstream.enrichment.configured.v1'));
+          const started = recs.find((r) => r.type === 'slipstream.session.started.v1')!;
+          assert.equal('capture_mode' in started.data, false, 'absent capture_mode means a chat-started activation');
+        } finally {
+          await s.stop();
+        }
+      });
+    });
+
+    it('appends capture.ready once, after reconciliation, on a resume', async () => {
+      await withTempPair(async (root, store) => {
+        await writeFile(join(root, 'a.ts'), 'v1');
+        const s1 = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        await s1.stop();
+        await writeFile(join(root, 'a.ts'), 'v2-offline');
+        const s2 = await startCapture({ root, storeDir: store, resumeSessionId: s1.sessionId }, { platform: createFakePlatform() });
+        try {
+          const t = types(await readRecords(s2.logPath));
+          const resumedAt = t.indexOf('slipstream.session.resumed.v1');
+          const after = t.slice(resumedAt);
+          assert.equal(after.filter((x) => x === 'slipstream.capture.ready.v1').length, 1);
+          assert.ok(after.indexOf('slipstream.capture.ready.v1') > after.lastIndexOf('slipstream.file.changed.v1'),
+            'ready follows the reconciled change');
+        } finally {
+          await s2.stop();
+        }
+      });
+    });
+
+    it('records watch-only on the start and on a watch-only resume', async () => {
+      await withTempPair(async (root, store) => {
+        const s1 = await startCapture({ root, storeDir: store, captureMode: 'watch-only' }, { platform: createFakePlatform() });
+        await s1.stop();
+        const s2 = await startCapture(
+          { root, storeDir: store, resumeSessionId: s1.sessionId, captureMode: 'watch-only' },
+          { platform: createFakePlatform() },
+        );
+        await s2.stop();
+        const recs = await readRecords(s2.logPath);
+        const started = recs.find((r) => r.type === 'slipstream.session.started.v1')!;
+        const resumed = recs.find((r) => r.type === 'slipstream.session.resumed.v1')!;
+        assert.equal((started.data as { capture_mode?: string }).capture_mode, 'watch-only');
+        assert.equal((resumed.data as { capture_mode?: string }).capture_mode, 'watch-only');
+      });
+    });
+
+    it('a stop with a reason appends capture.stopped as the final record', async () => {
+      await withTempPair(async (root, store) => {
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        await s.stop({ reason: 'detached' });
+        const recs = await readRecords(s.logPath);
+        const last = recs.at(-1)!;
+        assert.equal(last.type, 'slipstream.capture.stopped.v1');
+        assert.deepEqual(last.data, { session_id: s.sessionId, reason: 'detached' });
+      });
+    });
+
+    it('a stop without a reason manufactures no capture.stopped', async () => {
+      await withTempPair(async (root, store) => {
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        await s.stop();
+        assert.ok(!types(await readRecords(s.logPath)).includes('slipstream.capture.stopped.v1'));
+      });
+    });
+
+    it('a detach of a linked capture appends agent.unlinked immediately before capture.stopped', async () => {
+      await withTempPair(async (root, store) => {
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        await s.stop({ reason: 'detached', unlinkGeneration: '4' });
+        const recs = await readRecords(s.logPath);
+        assert.deepEqual(types(recs.slice(-2)), ['slipstream.agent.unlinked.v1', 'slipstream.capture.stopped.v1']);
+        assert.deepEqual(recs.at(-2)!.data, { session_id: s.sessionId, binding_generation: '4', reason: 'detached' });
+      });
+    });
+
+    it('records a binding and an unlink while capture keeps running', async () => {
+      await withTempPair(async (root, store) => {
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        try {
+          const target = { harness: 'codex' as const, harness_session_id: 'chat', worktree: await realpath(root) };
+          const binding = await s.recordAgent({ type: 'slipstream.agent.binding.v1', occurred_at_ms: Date.now(),
+            data: { binding_generation: '1', target, verified_transcript_path: '/t.jsonl' } });
+          assert.equal(binding.type, 'slipstream.agent.binding.v1');
+          const unlinked = await s.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+            data: { binding_generation: '1', reason: 'unlinked' } });
+          assert.deepEqual(unlinked.data, { session_id: s.sessionId, binding_generation: '1', reason: 'unlinked' });
+          assert.equal(s.health.snapshot().state, 'healthy');
+        } finally {
+          await s.stop();
+        }
+      });
+    });
+
+    it('reads no transcripts until startTranscripts, then reads them, and never after stop', async () => {
+      await withTempPair(async (root, store) => {
+        let listings = 0;
+        const runtime: TranscriptRuntime = {
+          harnesses: ['claude-code'], homes: { 'claude-code': '/fake/.claude', codex: '/fake/.codex' },
+          codexScanLimit: 10, pollIntervalMs: 10,
+          discoveryIO: {
+            listDir: async () => { listings += 1; return { ok: false, reason: 'missing' }; },
+            listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
+            readFirstLine: async () => ({ ok: false, reason: 'empty' }),
+            readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+            realpath: async (p) => p,
+            probe: async () => ({ kind: 'absent' }),
+          },
+        };
+        const s = await startCapture({ root, storeDir: store }, { platform: createFakePlatform() });
+        try {
+          await new Promise((r) => setTimeout(r, 50));
+          assert.equal(listings, 0);
+          s.startTranscripts(runtime);
+          s.startTranscripts(runtime);
+          await waitForRecords(s.logPath, (recs) => recs.some((r) => r.type === 'slipstream.enrichment.coverage.v1'));
+          assert.ok(listings > 0);
+        } finally {
+          await s.stop();
+        }
+        const after = listings;
+        s.startTranscripts(runtime);
+        await new Promise((r) => setTimeout(r, 50));
+        assert.equal(listings, after);
+      });
+    });
+
+    it('publishes blobs through a shared blob store when one is given', async () => {
+      await withTempPair(async (root, store) => {
+        await writeFile(join(root, 'a.ts'), 'shared');
+        const real = await createCas(join(store, 'blobs'));
+        let puts = 0;
+        const cas: Cas = { ...real, put: (bytes) => { puts += 1; return real.put(bytes); } };
+        const s = await startCapture({ root, storeDir: store, cas }, { platform: createFakePlatform() });
+        await s.stop();
+        assert.ok(puts > 0);
       });
     });
   });

@@ -157,10 +157,18 @@ Rules that keep the expansion additive:
 - One shared reader for the daemon, never one per capture.
 - Every event and question carries its `session_id`.
 
-Known later work: key the daemon's single slot by session; give `detach` and
-`status` a target and a list; make delete/GC safe while captures run (today they
-require full detachment); share transcript discovery across captures instead of
-one `~/.codex/sessions` scan per capture.
+**Status**: In Progress. P1 (measurements, D10 cap, contracts) merged (#69). P2
+(capture table: one capture per workspace up to 16 with visible waiting, in-place
+chat linking up to 10, unlink and generation fencing, targeted `status` and
+`detach`, `attach --watch-only [--wait]`, `GET /v1/captures`, no re-save of stored
+blobs on start, P2 counting tests) is in review on
+`briankeane/autocapture-p2-multicapture`; its capture and binding intent is
+in memory only until P3. P3–P6 Not Started.
+
+Known later work: durable intent and restart recovery (P3); GC and session
+deletion while captures run (P4; today both still require every capture
+detached); share transcript discovery across captures instead of
+one `~/.codex/sessions` scan per capture (P5).
 
 Auto-connect findings (2026-09-27 research, not decisions): split "capture the
 worktree" (needs no harness identity; a workspace-folder watch can trigger it)

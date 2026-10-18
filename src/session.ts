@@ -2,7 +2,7 @@ import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFil
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { createCas } from './cas.ts';
+import { createCas, type Cas } from './cas.ts';
 import { createReader, DEFAULT_MAX_BYTES, type Reader } from './reader.ts';
 import { createLog, type AppendSequencer, type Log } from './log.ts';
 import { addUnknownScope, createEngine, isUnderUnknownScope } from './engine.ts';
@@ -20,8 +20,8 @@ import {
   type AttributionProducer,
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
-import type { AnyEvent, EnrichmentPolicy, EventInput, HarnessName } from './event.ts';
-import type { AgentConnectionEvent, AgentConnectionInput, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
+import { EVENT_TYPES, type AnyEvent, type EnrichmentPolicy, type EventInput, type HarnessName } from './event.ts';
+import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
 import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
 import type { DiscoveryIO } from './transcript/discovery.ts';
@@ -56,6 +56,8 @@ export interface CaptureOptions {
    * disk (D3). Mutually exclusive with {@link resumeSessionId}. A fresh id whose
    * log already exists is rejected — appending fresh would corrupt its sequence. */
   sessionId?: string;
+  /** Recorded on this activation's `session.started`/`session.resumed`. */
+  captureMode?: CaptureMode;
   /** Notified once if this session loses its lock to another owner. Capture has
    * already stopped acknowledging by the time this fires; the daemon uses it to
    * wedge its state machine (decision 9). */
@@ -67,8 +69,13 @@ export interface CaptureOptions {
   enrichmentPolicy?: EnrichmentPolicy;
   /** Transcript-reading settings. When present with configured harnesses, the
    * session runs a coverage watcher that reads those harnesses' transcripts for
-   * this worktree, ingesting evidence and disclosing coverage. */
+   * this worktree, ingesting evidence and disclosing coverage. A capture started
+   * without it can begin reading later with {@link CaptureSession.startTranscripts}. */
   transcript?: TranscriptRuntime;
+  /** The store's blob store. A process running several captures over one store
+   * must share one instance: it is what makes a blob another capture is still
+   * publishing safe to trust. Absent means a private instance. */
+  cas?: Cas;
   /** Server clock for question TTL; no timers or expiry records. */
   now?: () => number;
 }
@@ -98,6 +105,21 @@ export class InvalidTitleError extends Error {
   }
 }
 
+/** Appends `capture.stopped{reason}` as the activation's final record; a stop
+ * without options records nothing (daemon shutdown leaves the hole to the
+ * heartbeat). `unlinkGeneration` names a binding withdrawn with the capture:
+ * `agent.unlinked{reason}` is appended immediately before the stop. */
+export type StopOptions =
+  | { reason: 'detached' | 'archived'; unlinkGeneration?: string }
+  | { reason: Exclude<CaptureStopReason, 'detached' | 'archived'>; unlinkGeneration?: undefined };
+
+type AgentInput = AgentConnectionInput | AgentBindingInput | AgentUnlinkedInput;
+type AgentEventFor<I extends AgentInput> = I extends AgentConnectionInput ? AgentConnectionEvent
+  : I extends AgentBindingInput ? AgentBindingEvent : AgentUnlinkedEvent;
+
+const CORE_EVENT_TYPES = new Set<string>(EVENT_TYPES);
+const isCoreEvent = (event: PublicEvent): event is AnyEvent => CORE_EVENT_TYPES.has(event.type);
+
 export interface CaptureSession {
   sessionId: string;
   logPath: string;
@@ -120,9 +142,12 @@ export interface CaptureSession {
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
-  /** Durably record the bound agent chat's connection state; never attribution. */
-  recordAgentConnection(data: AgentConnectionInput['data'], assertOwnership?: () => void): Promise<AgentConnectionEvent>;
-  stop(): Promise<void>;
+  /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
+  recordAgent<I extends AgentInput>(input: I, assertOwnership?: () => void): Promise<AgentEventFor<I>>;
+  /** Start reading transcripts for this worktree if it is not already; a no-op
+   * once stopped, or when no harness is configured. */
+  startTranscripts(runtime: TranscriptRuntime): void;
+  stop(opts?: StopOptions): Promise<void>;
 }
 
 interface CaptureDependencies {
@@ -230,6 +255,7 @@ export async function startCapture(
   const slipstreamApplied = frozenSlip !== undefined;
 
   const resuming = opts.resumeSessionId !== undefined;
+  const captureModeField = opts.captureMode ? { capture_mode: opts.captureMode } : {};
   const sessionId = opts.resumeSessionId ?? opts.sessionId ?? randomUUID();
   const blobsDir = join(storeDir, 'blobs');
   const sessionDir = join(storeDir, 'sessions', sessionId);
@@ -238,7 +264,7 @@ export async function startCapture(
   await assertOwnerOnly(sessionDir, 'dir'); // blobsDir perms are checked by createCas
   const logPath = join(sessionDir, 'events.jsonl');
 
-  const cas = await createCas(blobsDir);
+  const cas = opts.cas ?? await createCas(blobsDir);
 
   // Durable task boundaries (Stage 3). `currentTaskId` is the latest committed
   // declaration in shared append order — the grouping hint stamped onto changes.
@@ -274,7 +300,7 @@ export async function startCapture(
     for (const event of rec.questions) {
       committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
       // Questions queued before the latest resume stay history only (D2).
-      if (BigInt(event.seq) > rec.latestResumedSeq) unattemptedQuestions.set(event.data.question_id, event);
+      if (BigInt(event.seq) > rec.taskResetSeq) unattemptedQuestions.set(event.data.question_id, event);
     }
     for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
     questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
@@ -309,8 +335,11 @@ export async function startCapture(
       };
     },
     onCommitted: (event) => {
-      // A resume starts without a current task or claimable questions (D1/D2).
-      if (event.type === 'slipstream.session.resumed.v1') { currentTaskId = undefined; unattemptedQuestions.clear(); }
+      // A resume or an unlinked chat leaves no current task or claimable questions (D1/D2).
+      if (event.type === 'slipstream.session.resumed.v1' || event.type === 'slipstream.agent.unlinked.v1') {
+        currentTaskId = undefined;
+        unattemptedQuestions.clear();
+      }
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') {
@@ -324,9 +353,7 @@ export async function startCapture(
       if (event.type === 'slipstream.question.answered.v1') {
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
-      if (event.type !== 'slipstream.question.queued.v1' && event.type !== 'slipstream.question.dispatch_attempted.v1'
-        && event.type !== 'slipstream.question.answered.v1' && event.type !== 'slipstream.capture.scope.v1'
-        && event.type !== 'slipstream.agent.connection.v1') producer?.noteCommitted(event);
+      if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
   };
 
@@ -435,7 +462,7 @@ export async function startCapture(
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
-  function appendEvent(input: AgentConnectionInput): Promise<AgentConnectionEvent>;
+  function appendEvent<I extends AgentInput>(input: I): Promise<AgentEventFor<I>>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
     if (surrendered) {
@@ -831,6 +858,7 @@ export async function startCapture(
         data: {
           recovered_through_seq: recovered!.recoveredThroughSeq.toString(),
           discarded_tail_bytes: recovered!.discardedTailBytes,
+          ...captureModeField,
         },
       });
       const restartGap = await appendEvent({
@@ -852,7 +880,7 @@ export async function startCapture(
       await appendEvent({
         type: 'slipstream.session.started.v1',
         occurred_at_ms: Date.now(),
-        data: { root, max_bytes: maxBytes },
+        data: { root, max_bytes: maxBytes, ...captureModeField },
       });
       await appendEvent(scopeEvent());
 
@@ -887,6 +915,8 @@ export async function startCapture(
       producer.start([]);
       await producer.ensurePolicy(enrichmentPolicy);
     }
+    // Every append above resolved durable, so the barrier has passed.
+    await appendEvent({ type: 'slipstream.capture.ready.v1', occurred_at_ms: Date.now(), data: {} });
   } catch (err) {
     // A failed startup may already have kicked the recovery supervisor (an append
     // fault calls enterFailing). Stop it and await the in-flight attempt before
@@ -915,8 +945,8 @@ export async function startCapture(
   // re-read (including a late transcript after a restart) revises without
   // duplicating. Runs only when a harness is actually configured.
   let coverageRunner: CoverageRunner | undefined;
-  const tc = opts.transcript;
-  if (tc && tc.harnesses.length > 0) {
+  const startTranscripts = (tc: TranscriptRuntime): void => {
+    if (coverageRunner || stopped || tc.harnesses.length === 0) return;
     coverageRunner = createCoverageRunner({
       harnesses: tc.harnesses,
       homes: tc.homes,
@@ -932,7 +962,8 @@ export async function startCapture(
       onError: (err) => console.error(`slipstream: transcript watcher error: ${(err as Error).message}`),
     });
     coverageRunner.start();
-  }
+  };
+  if (opts.transcript) startTranscripts(opts.transcript);
 
   const beginTask = async ({ title, requestId }: BeginTaskInput): Promise<BeginTaskResult> => {
     // Readiness: only a live, healthy, still-owned session may declare a task.
@@ -1119,16 +1150,16 @@ export async function startCapture(
     finally { inflightAnswers.delete(id); }
   };
 
-  const recordAgentConnection = async (data: AgentConnectionInput['data'], assertOwnership: () => void = () => {}): Promise<AgentConnectionEvent> => {
+  const recordAgent = async <I extends AgentInput>(input: I, assertOwnership: () => void = () => {}): Promise<AgentEventFor<I>> => {
     assertOwnership();
     questionReady();
-    const event = await appendEvent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: now(), data });
+    const event = await appendEvent(input);
     if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
     assertOwnership();
     return event;
   };
 
-  const doStop = async (): Promise<void> => {
+  const doStop = async (opts?: StopOptions): Promise<void> => {
     stopped = true;
     // Stop feeding the engine immediately: if the watcher unsubscribe below
     // rejects, late observations buffer instead of appending after the lock is
@@ -1156,6 +1187,21 @@ export async function startCapture(
     // log closes: a stale evaluation must never append after the log is gone.
     await producer?.stop().catch(record);
     await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
+    // Never manufactured: after a lost lock or during a storage outage the stop
+    // stays unrecorded and stop() rejects, so no caller can report it stopped.
+    if (opts && firstError === undefined && (surrendered || health.snapshot().state !== 'healthy')) {
+      record(new Error(`the stop could not be recorded: capture storage is ${surrendered ? 'owned by another process' : health.snapshot().state}`));
+    } else if (opts && firstError === undefined) {
+      try {
+        if (opts.unlinkGeneration !== undefined) {
+          await appendEvent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: now(),
+            data: { binding_generation: opts.unlinkGeneration, reason: opts.reason } });
+        }
+        await appendEvent({ type: 'slipstream.capture.stopped.v1', occurred_at_ms: now(), data: { reason: opts.reason } });
+      } catch (err) {
+        record(err);
+      }
+    }
     await underlying.close().catch(record);
     await lock.release().catch(record);
     if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(record);
@@ -1175,9 +1221,10 @@ export async function startCapture(
     askQuestion,
     claimQuestion,
     answerQuestion,
-    recordAgentConnection,
+    recordAgent,
+    startTranscripts,
     ingestEvidence,
-    stop: () => (stopPromise ??= doStop()),
+    stop: (opts) => (stopPromise ??= doStop(opts)),
   };
 }
 

@@ -1,10 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { fstatSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createCas, StorageError } from './cas.ts';
-import { withCas } from './test/helpers.ts';
+import { createReader } from './reader.ts';
+import { withCas, withTempDir } from './test/helpers.ts';
 
 describe('cas', () => {
   describe('put', () => {
@@ -48,6 +51,91 @@ describe('cas', () => {
         const stored = await readFile(cas.pathFor(ref.sha256));
         assert.deepEqual(stored, Buffer.from('hello'));
         assert.ok(cas.pathFor(ref.sha256).includes(`/2c/${ref.sha256}`));
+      });
+    });
+    it('trusts a blob another instance already stored instead of rewriting it', async () => {
+      await withTempDir(async (dir) => {
+        const ref = await (await createCas(dir)).put(Buffer.from('kept'));
+        const before = (await stat((await createCas(dir)).pathFor(ref.sha256))).ino;
+        const again = await createCas(dir);
+        await again.put(Buffer.from('kept'));
+        assert.equal((await stat(again.pathFor(ref.sha256))).ino, before);
+      });
+    });
+
+    it('fsyncs the shard again when a publish into an already-synced shard failed', async (t) => {
+      await withTempDir(async (dir) => {
+        const shardOf = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 2);
+        const sameShard: string[] = [];
+        for (let n = 0; sameShard.length < 3; n++) if (shardOf(`${n}`) === shardOf('0')) sameShard.push(`${n}`);
+        const [a, b, c] = sameShard as [string, string, string];
+        await (await createCas(dir)).put(Buffer.from(a));
+        const cas = await createCas(dir);
+        await cas.put(Buffer.from(c)); // publishes into the shard
+        await cas.put(Buffer.from(a)); // reuse: syncs the shard once and remembers it
+        const probe = await open(dir, 'r');
+        const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+        await probe.close();
+        const realSync = proto.sync;
+        let failDirs = true;
+        let dirSyncs = 0;
+        t.mock.method(proto, 'sync', function (this: { fd: number }) {
+          if (fstatSync(this.fd).isDirectory()) {
+            if (failDirs) return Promise.reject(Object.assign(new Error('injected dir fsync failure'), { code: 'EIO' }));
+            dirSyncs++;
+          }
+          return realSync.call(this);
+        });
+        await assert.rejects(cas.put(Buffer.from(b)), StorageError);
+        failDirs = false;
+        await cas.put(Buffer.from(b));
+        assert.ok(dirSyncs > 0, 'the retried blob is not durable until its shard directory is synced');
+      });
+    });
+
+    it('surfaces stored-blob read failures instead of unavailable source snapshots', async () => {
+      await withTempDir(async (dir) => {
+        const store = join(dir, 'store');
+        const bytes = Buffer.from('readable source');
+        await writeFile(join(dir, 'source.txt'), bytes);
+        const ref = await (await createCas(store)).put(bytes);
+        const cas = await createCas(store);
+        const path = cas.pathFor(ref.sha256);
+        const reader = createReader({ root: dir, cas });
+        await chmod(path, 0o000);
+        try {
+          for (const read of [() => cas.put(bytes), () => reader.read('source.txt')]) {
+            await assert.rejects(read, (err: unknown) => {
+              assert.ok(err instanceof StorageError, `expected StorageError, got ${err}`);
+              assert.equal(err.code, 'EACCES');
+              assert.equal(err.operation, 'read-blob');
+              return true;
+            });
+          }
+        } finally { await chmod(path, 0o600); }
+        assert.deepEqual(await reader.read('source.txt'), { kind: 'content', ...ref });
+      });
+    });
+
+    it('repairs same-size damaged blobs before reusing their address', async () => {
+      await withTempDir(async (dir) => {
+        const first = await createCas(dir);
+        const ref = await first.put(Buffer.from('whole'));
+        await writeFile(first.pathFor(ref.sha256), 'WRONG');
+        const again = await createCas(dir);
+        await again.put(Buffer.from('whole'));
+        assert.deepEqual(await again.read(ref.sha256), Buffer.from('whole'));
+      });
+    });
+
+    it('rewrites a stored blob whose size does not match its content', async () => {
+      await withTempDir(async (dir) => {
+        const first = await createCas(dir);
+        const ref = await first.put(Buffer.from('whole'));
+        await writeFile(first.pathFor(ref.sha256), 'who');
+        const again = await createCas(dir);
+        await again.put(Buffer.from('whole'));
+        assert.deepEqual(await again.read(ref.sha256), Buffer.from('whole'));
       });
     });
   });

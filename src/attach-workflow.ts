@@ -29,6 +29,8 @@ export interface AttachDeps {
   control: (request: Record<string, unknown> & { verb: string }) => Promise<ResponseEnvelope>;
   run: (command: string, args: string[], cwd: string) => Promise<{ code: number | null; output: string }>;
   pollIntervalMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface Chat { harness: Harness; id: string; conductor: boolean }
@@ -37,6 +39,11 @@ class Refusal extends Error {}
 
 const DAEMON_START_MS = 10_000;
 const HOOK_TIMEOUT_S = 3;
+/** Stays under an agent's default two-minute command timeout. */
+const ATTACH_WAIT_MS = 90_000;
+const WAIT_POLL_MS = 250;
+/** Distinct from a refusal (1) and a usage error (2). */
+export const PENDING_EXIT = 3;
 
 export async function runAttachWorkflow(opts: { dir: string; store: string }, deps: AttachDeps): Promise<number> {
   try {
@@ -60,16 +67,32 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   await ensureDaemon(opts.store, deps);
   const status = await deps.control({ verb: 'status' });
   if (!status.ok) throw new Refusal(`${status.code}: ${status.message}`);
-  requireSetupCheck(status, opts.store);
-  refuseOtherBinding(status, chat, worktree);
+  requireCaptureTable(status, opts.store);
 
-  const changed = await applyAgentConfig(plan, worktree, deps);
+  // A status snapshot can predict a refusal, but slots may free before attach.
+  const deferredConfig = refusalExpected(status, chat, worktree);
+  let changed = deferredConfig ? false : await applyAgentConfig(plan, worktree, deps);
 
-  const res = await deps.control({ verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
-    root_transcript: transcript });
-  if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
+  const linked = await linkWhenRecording({ verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
+    root_transcript: transcript }, deps);
+  if (typeof linked === 'number') return linked;
+  const res = linked;
   const connection = String(res.agent_connection);
-  if (connection !== 'connected' && connection !== 'setup_pending') throw noDelivery();
+  if (connection !== 'connected' && connection !== 'setup_pending') {
+    throw new Refusal(`the daemon reported this chat as ${connection}; it is not connected.`);
+  }
+  if (deferredConfig) {
+    try {
+      changed = await applyAgentConfig(plan, worktree, deps);
+    } catch (err) {
+      deps.out(`session_id: ${String(res.session_id)}`);
+      deps.out(`agent_connection: ${connection}`);
+      // Setup's pre-attach refusals cannot describe a link already saved by the daemon.
+      const reason = (err instanceof Error ? err.message : String(err)).replace(/ Nothing was recorded\.$/, '');
+      throw new Refusal(`The workspace is recording and this chat is linked, but setup is incomplete. ${reason} `
+        + `Fix the setup error, then run \`slipstream attach${storeFlag(opts.store, deps.home)}\` again from this chat.`);
+    }
+  }
   const again = res.already_active === true;
   if (connection === 'connected') {
     deps.out(again
@@ -84,11 +107,124 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   return 0;
 }
 
-function requireSetupCheck(status: Record<string, unknown>, store: string): void {
+/** `slipstream attach` with explicit identity flags: link that chat, waiting out a
+ * starting capture exactly as the chat-detecting form does. */
+export async function runIdentityAttach(request: Record<string, unknown> & { verb: 'attach'; worktree: string },
+  deps: WaitDeps & { report: (res: Record<string, unknown>) => void }): Promise<number> {
+  try {
+    const res = await linkWhenRecording(request, deps);
+    if (typeof res === 'number') return res;
+    deps.report(res);
+    return 0;
+  } catch (err) {
+    if (!(err instanceof Refusal)) throw err;
+    deps.err(`slipstream: ${err.message}`);
+    return 1;
+  }
+}
+
+/** Attach a chat. A capture that is still starting is polled until it records,
+ * then the same attach is resubmitted (it is idempotent). Returns the link reply,
+ * or the exit code after reporting that the capture is still pending. */
+async function linkWhenRecording(request: Record<string, unknown> & { verb: string; worktree: string },
+  deps: WaitDeps): Promise<Record<string, unknown> | number> {
+  const deadline = clock(deps) + ATTACH_WAIT_MS;
+  for (;;) {
+    const res = await deps.control(request);
+    if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
+    if (res.binding_generation !== undefined) return res;
+    if (res.state === 'not_recording') throw notRecording(request.worktree, res);
+    const row = await waitForCapture(String(res.session_id), deadline, deps);
+    if (row === null) return stillPending(request.worktree, String(res.session_id), deps);
+    if (row.state !== 'recording') throw notRecording(request.worktree, row);
+  }
+}
+
+/** `slipstream attach --watch-only`: record a workspace with no chat linked. */
+export async function runWatchOnlyAttach(opts: { dir: string; wait: boolean }, deps: WaitDeps): Promise<number> {
+  try {
+    const res = await deps.control({ verb: 'attach', mode: 'watch-only', worktree: opts.dir });
+    if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
+    const id = String(res.session_id);
+    let state = String(res.state);
+    if (state === 'queued' || state === 'baselining') {
+      if (!opts.wait) {
+        deps.out(`Capture of ${opts.dir} is starting (${state}); it is not recording yet. `
+          + `Check with \`slipstream status ${id}\`.`);
+        deps.out(`session_id: ${id}`);
+        deps.out(`state: ${state}`);
+        return 0;
+      }
+      const row = await waitForCapture(id, clock(deps) + ATTACH_WAIT_MS, deps);
+      if (row === null) return stillPending(opts.dir, id, deps);
+      if (row.state !== 'recording') throw notRecording(opts.dir, row);
+      state = 'recording';
+    }
+    if (state !== 'recording') throw notRecording(opts.dir, res);
+    deps.out(`Recording ${opts.dir}; this command linked no chat.`);
+    deps.out(`session_id: ${id}`);
+    deps.out(`state: ${state}`);
+    return 0;
+  } catch (err) {
+    if (!(err instanceof Refusal)) throw err;
+    deps.err(`slipstream: ${err.message}`);
+    return 1;
+  }
+}
+
+type WaitDeps = Pick<AttachDeps, 'control' | 'out' | 'err' | 'pollIntervalMs' | 'now' | 'sleep'>;
+
+function clock(deps: WaitDeps): number {
+  return (deps.now ?? Date.now)();
+}
+
+/** Poll one capture with short status requests until it is no longer starting.
+ * Null means the deadline passed first. */
+async function waitForCapture(id: string, deadline: number, deps: WaitDeps): Promise<Record<string, unknown> | null> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  for (;;) {
+    const res = await deps.control({ verb: 'status', target: id });
+    if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
+    const row = res.capture as Record<string, unknown>;
+    if (row.state !== 'queued' && row.state !== 'baselining') return row;
+    if (clock(deps) >= deadline) return null;
+    await sleep(deps.pollIntervalMs ?? WAIT_POLL_MS);
+  }
+}
+
+function notRecording(worktree: string, row: Record<string, unknown>): Refusal {
+  const why = row.message ?? row.reason ?? row.state;
+  return new Refusal(`${worktree} is not recording (${String(row.state)}): ${String(why)}`);
+}
+
+function stillPending(worktree: string, id: string, deps: WaitDeps): number {
+  deps.err(`slipstream: the capture of ${worktree} is still pending, outcome unknown (session ${id}). `
+    + `Check with \`slipstream status ${id}\`; running this command again does not start a second capture.`);
+  return PENDING_EXIT;
+}
+
+function requireCaptureTable(status: Record<string, unknown>, store: string): void {
   const features = status.attach_features;
-  if (Array.isArray(features) && features.includes('agent-connection-v1')) return;
-  throw new Refusal('the running daemon does not support chat setup checks. Run '
+  if (Array.isArray(features) && features.includes('agent-connection-v1') && features.includes('capture-table-v1')) return;
+  throw new Refusal('the running daemon does not support multi-workspace capture and chat setup checks. Run '
     + `\`slipstream stop --store ${shellWord(store)}\`, then \`slipstream attach --store ${shellWord(store)}\` again. Nothing was installed or recorded.`);
+}
+
+interface StatusRow { root?: unknown; state?: unknown; reason?: unknown;
+  binding?: { harness?: unknown; harness_session_id?: unknown; state?: unknown } | null }
+
+/** Whether the daemon will refuse to link this chat: it is linked elsewhere, this
+ * workspace waits for a capture slot or has another chat, or every chat slot is used. */
+function refusalExpected(status: Record<string, unknown>, chat: Chat, worktree: string): boolean {
+  const rows = (Array.isArray(status.captures) ? status.captures : []) as StatusRow[];
+  const linked = (r: StatusRow) => r.binding != null && r.binding.state !== 'unlinked';
+  const mine = rows.find((r) => linked(r) && r.binding!.harness === chat.harness
+    && r.binding!.harness_session_id === chat.id);
+  if (mine) return mine.root !== worktree;
+  const here = rows.find((r) => r.root === worktree && r.state !== 'stopped');
+  if (here && (here.reason === 'capture-limit-reached' || linked(here))) return true;
+  const slots = status.binding_slots as { used?: unknown; limit?: unknown } | undefined;
+  return typeof slots?.used === 'number' && typeof slots.limit === 'number' && slots.used >= slots.limit;
 }
 
 function detectChat(env: Record<string, string | undefined>): Chat {
@@ -194,25 +330,6 @@ async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {
   }
   throw new Refusal(`the Slipstream daemon did not start. Run \`slipstream start --store ${store}\` in a terminal `
     + 'to see why. Nothing was recorded.');
-}
-
-function refuseOtherBinding(status: Record<string, unknown>, chat: Chat, worktree: string): void {
-  if (status.state !== 'active') return;
-  if (status.worktree !== worktree) {
-    throw new Refusal(`another workspace, ${String(status.worktree)} is being recorded. Detach it there first `
-      + '(`slipstream detach`); nothing was changed.');
-  }
-  if (status.harness !== chat.harness || status.harness_session_id !== chat.id) {
-    throw new Refusal(`this workspace is already recorded with another agent chat (${String(status.harness)} `
-      + `${String(status.harness_session_id)}); that binding was kept. Run \`slipstream detach\` first to switch chats.`);
-  }
-  if (status.agent_connection === 'disconnected') throw noDelivery();
-}
-
-function noDelivery(): Refusal {
-  return new Refusal('this workspace is already recorded with this chat, but without question delivery (it was '
-    + 'attached without its transcript). The recording was kept; run `slipstream detach`, then `slipstream attach` '
-    + 'again to connect the chat.');
 }
 
 function shellWord(value: string): string {

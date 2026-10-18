@@ -26,9 +26,16 @@ ID, transcript path, Node path, or checkout path.
   Codex's own hook review.
 - Running it again in the same chat reports the existing capture; it never starts
   a second recording or changes the binding.
-- One workspace is recorded at a time. If another workspace or another chat is
-  recorded, attach explains and changes nothing; run `slipstream detach` there
-  first.
+- Several workspaces can record at once, and attach in a workspace that is
+  already recording links the chat to that capture in place (same session ID, no
+  new baseline). A capture links one chat, and a chat links one capture: if this
+  chat is linked elsewhere, or another chat is linked here, attach installs and
+  changes nothing and prints the `slipstream unlink --session <id>` step. The
+  same holds when all 16 capture slots or all 10 chat slots are in use.
+- If the workspace's capture is still starting, attach waits for it with short
+  status checks and then links the chat. If it is still starting after 90
+  seconds, attach says the outcome is unknown and exits with code 3; running it
+  again never starts a second capture.
 - Attach refuses, recording nothing, when it cannot tell which chat it is in,
   when the chat's transcript cannot be found, or when the harness version is not
   one Slipstream has verified. It never falls back to recording without an agent.

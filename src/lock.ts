@@ -110,7 +110,7 @@ const HEARTBEAT_MS = 2_000;
  * live owner from being declared stale by a GC/scheduling pause, while still
  * reclaiming a hung owner promptly enough for a supervisor restart.
  */
-const STALE_MS = 12_000;
+export const STALE_MS = 12_000;
 const MAX_ACQUIRE_ATTEMPTS = 8;
 
 export async function acquireSessionLock(

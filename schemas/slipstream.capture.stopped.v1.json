@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.capture.stopped.v1.json",
+  "title": "slipstream.capture.stopped.v1",
+  "$comment": "The final record of an activation that stopped cleanly: observation stopped, accepted work drained, then this record was made durable before the log closed. It is never written after a lost lock or an unwritable store, so a missing stop together with no live owner heartbeat means not confirmed live, never still recording. detached: an explicit detach. archived: the workspace was archived. maintenance: stopped for garbage collection; capture resumes later on the same session. root-missing: the watched root was deleted or replaced. watcher-failed: the watcher subscription closed or could not be kept. The reason set is closed for v1. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.capture.stopped.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "reason"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "detached",
+            "archived",
+            "maintenance",
+            "root-missing",
+            "watcher-failed"
+          ]
+        }
+      }
+    }
+  }
+}

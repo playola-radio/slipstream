@@ -17,6 +17,7 @@ import { stat, rm, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from '../src/daemon.ts';
 import { sendControlRequest } from '../src/control-client.ts';
 import type { ResponseEnvelope } from '../src/control-protocol.ts';
@@ -70,11 +71,31 @@ export function attachedDurableSeq(status: ResponseEnvelope): bigint {
   if (!status.ok) {
     throw new Error(`qa-daemon: attached status failed (${status.code}): ${status.message}`);
   }
-  const value = (status as Record<string, unknown>).durable_seq;
+  const capture = (status as Record<string, unknown>).capture as Record<string, unknown> | undefined;
+  const value = capture?.durable_seq;
   if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
     throw new Error('qa-daemon: attached status has missing or invalid durable_seq');
   }
   return BigInt(value);
+}
+
+const RECORDING_DEADLINE_MS = 60_000;
+
+/** Poll a capture's targeted status until it is recording; any other settled
+ * state, or the deadline, is a startup failure. */
+async function waitUntilRecording(socketPath: string, sessionId: string, interrupted: () => boolean): Promise<ResponseEnvelope> {
+  const deadline = Date.now() + RECORDING_DEADLINE_MS;
+  for (;;) {
+    const status = await sendControlRequest({ socketPath, request: { v: 1, verb: 'status', target: sessionId } });
+    if (interrupted() || !status.ok) return status;
+    const state = ((status as Record<string, unknown>).capture as { state?: unknown } | undefined)?.state;
+    if (state === 'recording') return status;
+    if (state !== 'queued' && state !== 'baselining') {
+      throw new Error(`qa-daemon: capture ${sessionId} did not start recording (state ${String(state)})`);
+    }
+    if (Date.now() > deadline) throw new Error(`qa-daemon: capture ${sessionId} was still ${state} after ${RECORDING_DEADLINE_MS} ms`);
+    await sleep(50);
+  }
 }
 
 /** Parse qa-daemon flags. `--root` resolves relative to cwd; the rest are simple
@@ -310,11 +331,11 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
     // the SAME shutdown so the exit code reflects its actual teardown outcome.
     if (stopping) return await shutdownComplete!;
 
-    // Attach the sandbox worktree with an explicitly synthetic identity. `qa` is a
-    // capture SCOPE marker, never a claim of authorship.
+    // Record the sandbox worktree watch-only: no chat is linked, so nothing here
+    // claims authorship.
     const attach = await sendControlRequest({
       socketPath: daemon.socketPath,
-      request: { v: 1, verb: 'attach', worktree, harness: 'qa', harness_session_id: `qa:${runId}` },
+      request: { v: 1, verb: 'attach', mode: 'watch-only', worktree },
     });
     // A signal can land anywhere in this in-flight window, not only during
     // startDaemon (the check above). Once shutdown has begun it has already claimed
@@ -329,9 +350,11 @@ export async function runQaDaemon(io: RunIO): Promise<number> {
       return 1;
     }
     const sessionId = attach.session_id as string;
-    // Attach returns only after startup and reconciliation committed, so on a
-    // resumed session this is the position past the resume records.
-    const attachedStatus = await sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, verb: 'status' } });
+    // Admission returns before the capture starts. Once it is recording, startup
+    // and reconciliation have committed, so on a resumed session this is the
+    // position past the resume records.
+    const attachedStatus = await waitUntilRecording(daemon.socketPath, sessionId, () => stopping);
+    if (stopping) return await shutdownComplete!;
     const attachedThrough = attachedDurableSeq(attachedStatus);
 
     const descriptor = await bootstrapReader(store);

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArgs, retryGuidance } from './cli.ts';
+import { resolve } from 'node:path';
+import { parseArgs, retryGuidance, formatStatus } from './cli.ts';
 
 const ASK_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -382,6 +383,47 @@ describe('cli attach (one command)', () => {
   });
 });
 
+describe('cli capture table (real daemon)', () => {
+  it('records a workspace watch-only, lists and targets it, detaches it, and repeats safely', async () => {
+    const { mkdtemp, mkdir, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { spawn, execFile } = await import('node:child_process');
+    const { probeSocket } = await import('./daemon.ts');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-table-')));
+    const work = join(dir, 'work'); const store = join(dir, 'store');
+    await mkdir(work);
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: dir };
+    const daemon = spawn(process.execPath, ['src/cli.ts', 'start', '--store', store], { env, stdio: 'ignore' });
+    const run = (args: string[]) => new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+      execFile(process.execPath, ['src/cli.ts', ...args, '--store', store], { env, cwd: process.cwd(), timeout: 30_000 },
+        (error, stdout, stderr) => done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+    });
+    try {
+      while (await probeSocket(join(store, 'control.sock'), 200) !== 'live') await new Promise((r) => setTimeout(r, 50));
+      const attached = await run(['attach', '--watch-only', work, '--wait']);
+      assert.equal(attached.code, 0, attached.stderr);
+      assert.match(attached.stdout, /state: recording/);
+      const id = /session_id: (\S+)/.exec(attached.stdout)?.[1];
+      const listed = await run(['status']);
+      assert.match(listed.stdout, new RegExp(`captures: 1\n\n${work}\n  session_id: ${id}\n  state: recording\n  chat: none`));
+      assert.match((await run(['status', id!])).stdout, new RegExp(`${work}\n  session_id: ${id}`));
+      assert.match((await run(['unlink', '--session', id!])).stdout, /already_unlinked: true/);
+      const detached = await run(['detach', work]);
+      assert.equal(detached.code, 0, detached.stderr);
+      assert.match(detached.stdout, /state: stopped/);
+      assert.match((await run(['detach', id!])).stdout, /already_stopped: true/);
+      const missing = await run(['detach', join(dir, 'nowhere')]);
+      assert.equal(missing.code, 1);
+      assert.match(missing.stderr, /TARGET_NOT_FOUND/);
+    } finally {
+      daemon.kill('SIGTERM');
+      while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
     assert.deepEqual(parseArgs(['start', '--store', '/s']), {
@@ -408,9 +450,26 @@ describe('cli parseArgs (daemon commands)', () => {
   it('rejects start with a stray positional (start takes store options only)', () => {
     assert.equal(parseArgs(['start', '/some/dir']), null);
   });
-  it('parses status and detach as store-only commands', () => {
+  it('parses status with an optional target and detach with a target that defaults to this directory', () => {
+    const id = '11111111-2222-4333-8444-555555555555';
     assert.deepEqual(parseArgs(['status', '--store', '/s']), { command: 'status', store: '/s' });
-    assert.deepEqual(parseArgs(['detach', '--store', '/s']), { command: 'detach', store: '/s' });
+    assert.deepEqual(parseArgs(['status', id, '--store', '/s']), { command: 'status', store: '/s', target: id });
+    assert.deepEqual(parseArgs(['detach', 'rel/dir', '--store', '/s']),
+      { command: 'detach', store: '/s', target: resolve('rel/dir') });
+    assert.deepEqual(parseArgs(['detach', '--store', '/s']), { command: 'detach', store: '/s', target: process.cwd() });
+    assert.equal(parseArgs(['detach', 'a', 'b']), null);
+  });
+  it('parses unlink with a required session', () => {
+    assert.deepEqual(parseArgs(['unlink', '--session', 'abc', '--store', '/s']),
+      { command: 'unlink', store: '/s', sessionId: 'abc' });
+    assert.equal(parseArgs(['unlink']), null);
+    assert.equal(parseArgs(['unlink', 'abc']), null);
+  });
+  it('parses attach --watch-only with --wait, and refuses --wait or identity flags in the wrong mode', () => {
+    assert.deepEqual(parseArgs(['attach', '--watch-only', '/w', '--wait', '--store', '/s']),
+      { command: 'attach', dir: '/w', store: '/s', watchOnly: true, wait: true });
+    assert.equal(parseArgs(['attach', '/w', '--wait']), null);
+    assert.equal(parseArgs(['attach', '--watch-only', '/w', '--harness', 'codex']), null);
   });
   it('parses attach with worktree, store, and identity flags', () => {
     assert.deepEqual(
@@ -425,6 +484,20 @@ describe('cli parseArgs (daemon commands)', () => {
   });
   it('rejects --harness without a following value', () => {
     assert.equal(parseArgs(['attach', '/w', '--harness']), null);
+  });
+});
+
+describe('cli formatStatus', () => {
+  it('lists every capture with its state, any reason and message, and its chat', () => {
+    const lines = formatStatus({ reader_url: 'http://r', binding_slots: { used: 1, limit: 10 }, captures: [
+      { session_id: 's1', root: '/a', state: 'recording', reason: null,
+        binding: { harness: 'codex', harness_session_id: 'c1', binding_generation: '2', state: 'connected' } },
+      { session_id: 's2', root: '/b', state: 'not_recording', reason: 'capture-limit-reached', message: '16/16 ...',
+        binding: null },
+    ] });
+    assert.deepEqual(lines, ['reader_url: http://r', 'linked_chats: 1/10', 'captures: 2',
+      '', '/a', '  session_id: s1', '  state: recording', '  chat: codex c1 connected (generation 2)',
+      '', '/b', '  session_id: s2', '  state: not_recording (capture-limit-reached)', '  16/16 ...', '  chat: none']);
   });
 });
 

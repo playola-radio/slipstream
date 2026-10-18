@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.agent.unlinked.v1.json",
+  "title": "slipstream.agent.unlinked.v1",
+  "$comment": "Binding intent for this generation was revoked. unlinked: an explicit unlink; capture keeps running. detached and archived: capture intent was withdrawn too, and this record comes immediately before capture.stopped. Revoked intent wins over a missing record: a crash between the revoke and this append leaves no record, and the next activation's capture.gap restart discloses the hole. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "datacontenttype",
+    "seq",
+    "time",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^urn:slipstream:session:"
+    },
+    "type": {
+      "const": "slipstream.agent.unlinked.v1"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "binding_generation",
+        "reason"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "binding_generation": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "reason": {
+          "enum": [
+            "unlinked",
+            "detached",
+            "archived"
+          ]
+        }
+      }
+    }
+  }
+}

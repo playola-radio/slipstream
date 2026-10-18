@@ -69,7 +69,7 @@ export const f4Answer: AcceptanceModule = {
       handle = await startQaDaemon({ root, keep: true });
       const { store, worktree } = handle.env;
       let reader = createReaderClient(handle.env.url, handle.env.token);
-      await cli(['detach', '--store', store]);
+      await cli(['detach', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `claude-root-${randomUUID()}.jsonl`);
       await writeFile(transcript, JSON.stringify({ type: 'attachment', sessionId: harnessSessionId, cwd: worktree,
@@ -158,7 +158,7 @@ export const f4Answer: AcceptanceModule = {
           if (sse !== 2) throw new Error(`SSE replay carried ${sse} answers`);
           rows['sse-replay-has-answers'] = sse;
 
-          const detached = await cli(['detach', '--store', store]);
+          const detached = await cli(['detach', worktree, '--store', store]);
           if (detached.code !== 0) throw new Error('could not detach answer capture');
           expectCode('answer-after-detach', await answer(q1, text), 'SESSION_NOT_SELECTED');
 
