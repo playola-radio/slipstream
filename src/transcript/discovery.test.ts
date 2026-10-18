@@ -2,13 +2,16 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   claudeSlug,
+  createDiscoveryMemory,
   discoverClaude,
   discoverCodex,
   discoverRoots,
   isWithinRoot,
   type DiscoveryIO,
+  type DiscoveryMemory,
   type ListResult,
 } from './discovery.ts';
+import type { FileId } from './file-reader.ts';
 
 const ROOT = '/work/proj';
 
@@ -18,6 +21,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+    stat: async () => undefined,
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -881,10 +885,189 @@ describe('shared discovery across several roots', () => {
       async listTreeJsonl() { return { paths: ['/c/v.jsonl'], truncated: false, incomplete: false }; }
       async readFirstLine() { return { ok: true as const, line: meta('vanished', '/work/proj/gone'), id: GEN }; }
       async readHeadLines() { return { ok: false as const, reason: 'inaccessible' as const }; }
+      async stat() { return undefined; }
       async realpath(p: string) { return ['/', '/work', '/work/proj'].includes(p) ? p : undefined; }
       async probe() { return { kind: 'absent' as const }; }
     }
     const found = await discoverRoots('codex', new ClassIO(), '/home', ['/work/proj'], 10);
     assert.ok(found.get('/work/proj')!.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes('/work/proj/gone')));
+  });
+});
+
+/** A mutable fake transcript filesystem for discovery across cycles: each file has
+ * text and a generation, and every header open is counted. */
+function cyclingFs() {
+  const files = new Map<string, { text: string; id: FileId }>();
+  const resolvable = new Set<string>(['/', '/work', ROOT]);
+  const opens: string[] = [];
+  const readText = (path: string): { text: string; id: FileId } | undefined => {
+    opens.push(path);
+    return files.get(path);
+  };
+  const fsIO = io({
+    listTreeJsonl: async () => ({ paths: [...files.keys()].filter((p) => p.startsWith('/home/sessions/')), truncated: false, incomplete: false }),
+    listDir: async (dir): Promise<ListResult> => ({ ok: true, paths: [...files.keys()].filter((p) => p.startsWith(`${dir}/`)) }),
+    readFirstLine: async (path) => {
+      const f = readText(path);
+      if (f === undefined) return { ok: false, reason: 'inaccessible' };
+      if (f.text === '') return { ok: false, reason: 'empty' };
+      return { ok: true, line: f.text.split('\n')[0]!, id: f.id };
+    },
+    readHeadLines: async (path) => {
+      const f = readText(path);
+      if (f === undefined) return { ok: false, reason: 'inaccessible' };
+      return { ok: true, lines: f.text.split('\n').filter((l) => l !== ''), truncated: false, skipped: false, id: f.id };
+    },
+    stat: async (path) => {
+      const f = files.get(path);
+      return f === undefined ? undefined : { id: f.id, size: Buffer.byteLength(f.text) };
+    },
+    realpath: async (p) => (resolvable.has(p) ? p : undefined),
+  });
+  return { files, resolvable, opens, io: fsIO };
+}
+
+const rolloutMeta = (id: string, cwd: string): string => JSON.stringify({ type: 'session_meta', payload: { id, cwd } });
+
+describe('discovery memory across cycles', () => {
+  const R1 = '/home/sessions/2026/10/17/r1.jsonl';
+  const R2 = '/home/sessions/2026/10/17/r2.jsonl';
+  const codexCycle = async (fs: ReturnType<typeof cyclingFs>, memory: DiscoveryMemory, limit = 1000) =>
+    (await discoverRoots('codex', fs.io, '/home', [ROOT], limit, memory)).get(ROOT)!;
+
+  it('reads a rollout that appears after the first cycle, and only that one', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    fs.files.set(R1, { text: `${rolloutMeta('t1', ROOT)}\n`, id: { dev: 1n, ino: 1n } });
+    await codexCycle(fs, memory);
+    fs.opens.length = 0;
+    fs.files.set(R2, { text: `${rolloutMeta('t2', ROOT)}\n`, id: { dev: 1n, ino: 2n } });
+    const found = await codexCycle(fs, memory);
+    assert.deepEqual(fs.opens, [R2]);
+    assert.deepEqual(found.bindings.map((b) => b.ctx.harnessSessionId).sort(), ['t1', 't2']);
+  });
+
+  it('rereads a rollout replaced at the same path and binds the new generation', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    fs.files.set(R1, { text: `${rolloutMeta('old', ROOT)}\n`, id: { dev: 1n, ino: 1n } });
+    await codexCycle(fs, memory);
+    fs.opens.length = 0;
+    fs.files.set(R1, { text: `${rolloutMeta('new', ROOT)}\n{"more":1}\n`, id: { dev: 1n, ino: 9n } });
+    const found = await codexCycle(fs, memory);
+    assert.deepEqual(fs.opens, [R1]);
+    assert.deepEqual(found.bindings.map((b) => [b.ctx.harnessSessionId, b.generation.ino]), [['new', 9n]]);
+  });
+
+  it('rereads a rollout that shrank in place', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const id = { dev: 1n, ino: 1n };
+    fs.files.set(R1, { text: `${rolloutMeta('long-session-id', ROOT)}\n`, id });
+    await codexCycle(fs, memory);
+    fs.opens.length = 0;
+    fs.files.set(R1, { text: `${rolloutMeta('short', ROOT)}\n`, id });
+    const found = await codexCycle(fs, memory);
+    assert.deepEqual(fs.opens, [R1]);
+    assert.deepEqual(found.bindings.map((b) => b.ctx.harnessSessionId), ['short']);
+  });
+
+  it('forgets a header whose reread failed, so a later regrowth is read again', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const id = { dev: 1n, ino: 1n };
+    fs.files.set(R1, { text: `${rolloutMeta('first', ROOT)}\n`, id });
+    await codexCycle(fs, memory);
+    fs.files.set(R1, { text: '{"type":', id });
+    assert.ok((await codexCycle(fs, memory)).issues.some((i) => i.kind === 'malformed'));
+    fs.files.set(R1, { text: `${rolloutMeta('rewritten', ROOT)}\n{"more":1}\n`, id });
+    fs.opens.length = 0;
+    const found = await codexCycle(fs, memory);
+    assert.deepEqual([fs.opens, found.bindings.map((b) => b.ctx.harnessSessionId)], [[R1], ['rewritten']]);
+  });
+
+  it('forgets a deleted rollout, so one reappearing at its path is read again', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const file = { text: `${rolloutMeta('t1', ROOT)}\n`, id: { dev: 1n, ino: 1n } };
+    fs.files.set(R1, file);
+    await codexCycle(fs, memory);
+    fs.files.delete(R1);
+    await codexCycle(fs, memory);
+    assert.equal(memory.codex.size, 0);
+    fs.files.set(R1, file);
+    fs.opens.length = 0;
+    await codexCycle(fs, memory);
+    assert.deepEqual(fs.opens, [R1]);
+  });
+
+  it('rereads and discloses an unreadable or malformed rollout every cycle', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const R3 = '/home/sessions/2026/10/17/r3.jsonl';
+    fs.files.set(R1, { text: 'not json\n', id: { dev: 1n, ino: 1n } });
+    fs.files.set(R2, { text: `${rolloutMeta('t2', ROOT)}\n`, id: { dev: 1n, ino: 2n } });
+    fs.files.set(R3, { text: `${rolloutMeta('t3', ROOT)}\n`, id: { dev: 1n, ino: 3n } });
+    const read = fs.io.readFirstLine;
+    fs.io.readFirstLine = async (p) => (p === R3 ? (fs.opens.push(p), { ok: false, reason: 'inaccessible' }) : read(p));
+    await codexCycle(fs, memory);
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      fs.opens.length = 0;
+      const found = await codexCycle(fs, memory);
+      assert.deepEqual(fs.opens, [R1, R3], 'failed reads are retried; the good rollout is not reread');
+      assert.deepEqual(found.issues.map((i) => [i.kind, i.detail.includes(i.kind === 'malformed' ? R1 : R3)]),
+        [['malformed', true], ['inaccessible', true]]);
+    }
+  });
+
+  it('keeps disclosing a limited or incomplete scan on cycles that read nothing', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    fs.files.set(R1, { text: `${rolloutMeta('t1', ROOT)}\n`, id: { dev: 1n, ino: 1n } });
+    fs.io.listTreeJsonl = async () => ({ paths: [R1], truncated: true, incomplete: true });
+    await codexCycle(fs, memory, 1);
+    fs.opens.length = 0;
+    const found = await codexCycle(fs, memory, 1);
+    assert.deepEqual(fs.opens, []);
+    assert.deepEqual(found.issues.map((i) => i.kind).sort(), ['discovery-limited', 'inaccessible']);
+  });
+
+  it('reclassifies a remembered cwd that starts or stops resolving, without rereading', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const cwd = `${ROOT}/pkg`;
+    fs.files.set(R1, { text: `${rolloutMeta('t1', cwd)}\n`, id: { dev: 1n, ino: 1n } });
+    const unresolved = await codexCycle(fs, memory);
+    assert.equal(unresolved.bindings.length, 0);
+    assert.ok(unresolved.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes(cwd)));
+    fs.opens.length = 0;
+    fs.resolvable.add(cwd);
+    const resolved = await codexCycle(fs, memory);
+    assert.deepEqual([resolved.bindings.map((b) => b.ctx.cwd), resolved.issues], [[cwd], []]);
+    fs.resolvable.delete(cwd);
+    const gone = await codexCycle(fs, memory);
+    assert.equal(gone.bindings.length, 0);
+    assert.ok(gone.issues.some((i) => i.kind === 'inaccessible' && i.detail.includes(cwd)));
+    assert.deepEqual(fs.opens, []);
+  });
+
+  it('rereads a Claude transcript until its cwd appears, then stops', async () => {
+    const fs = cyclingFs();
+    const memory = createDiscoveryMemory();
+    const dir = `/home/projects/${claudeSlug(ROOT)}`;
+    const path = `${dir}/s.jsonl`;
+    const id = { dev: 1n, ino: 1n };
+    const preamble = JSON.stringify({ type: 'queue-operation' });
+    const claudeCycle = async () => (await discoverRoots('claude-code', fs.io, '/home', [ROOT], 1000, memory)).get(ROOT)!;
+    fs.files.set(path, { text: `${preamble}\n`, id });
+    assert.equal((await claudeCycle()).bindings.length, 0);
+    fs.opens.length = 0;
+    await claudeCycle();
+    assert.deepEqual(fs.opens, [path, path], 'a preamble is not remembered');
+    fs.files.set(path, { text: `${preamble}\n${JSON.stringify({ type: 'user', cwd: ROOT })}\n`, id });
+    assert.equal((await claudeCycle()).bindings.length, 1);
+    fs.opens.length = 0;
+    assert.deepEqual((await claudeCycle()).bindings.map((b) => b.ctx.cwd), [ROOT]);
+    assert.deepEqual(fs.opens, []);
   });
 });
