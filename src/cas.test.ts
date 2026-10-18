@@ -92,6 +92,17 @@ describe('cas', () => {
       });
     });
 
+    it('repairs same-size damaged blobs before reusing their address', async () => {
+      await withTempDir(async (dir) => {
+        const first = await createCas(dir);
+        const ref = await first.put(Buffer.from('whole'));
+        await writeFile(first.pathFor(ref.sha256), 'WRONG');
+        const again = await createCas(dir);
+        await again.put(Buffer.from('whole'));
+        assert.deepEqual(await again.read(ref.sha256), Buffer.from('whole'));
+      });
+    });
+
     it('rewrites a stored blob whose size does not match its content', async () => {
       await withTempDir(async (dir) => {
         const first = await createCas(dir);

@@ -32,7 +32,7 @@ export interface Cas {
 /**
  * When an on-disk blob can be trusted without rewriting it: the only way a file
  * reaches its content address is a fully written, fsynced temp file renamed into
- * place, so a regular file of the expected size there holds the right bytes. Only
+ * place. Existing bytes are hash-checked once before reuse to detect damage. Only
  * its directory entry might not be durable yet — so the shard (and base) are
  * fsynced once by this instance, after the blob was seen, before it is trusted.
  * That relies on one instance per store per process (the daemon shares one), and
@@ -147,7 +147,8 @@ export async function createCas(rootDir: string): Promise<Cas> {
     if (existing) return existing;
 
     const pending = (async () => {
-      if ((await storedSize(sha256)) === bytes.length) {
+      if ((await storedSize(sha256)) === bytes.length
+        && createHash('sha256').update(await readFile(pathFor(sha256))).digest('hex') === sha256) {
         await syncShardOnce(dirname(pathFor(sha256)));
         durable.add(sha256);
         return { sha256, size: bytes.length };
