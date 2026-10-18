@@ -390,7 +390,11 @@ function sameFile(a: FileId, b: FileId): boolean {
   return a.dev === b.dev && a.ino === b.ino;
 }
 
-/** `read`'s result for `path`, or the remembered header if the file is unchanged. */
+/**
+ * `read`'s result for `path`, or the remembered header if the file is unchanged.
+ * A permission change keeps the header: the bytes it came from are unchanged,
+ * and a bound transcript that turns unreadable is still disclosed by its reader.
+ */
 async function readRemembered<T, F>(
   io: DiscoveryIO,
   memory: Map<string, Remembered<T>> | undefined,
