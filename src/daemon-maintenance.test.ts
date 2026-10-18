@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { createLog } from './log.ts';
+import { STALE_MS } from './lock.ts';
 import { loadIntent } from './intent-store.ts';
 import { blobPath, findWorkspaceSession, sessionLogPath, tombstonePath } from './store-reader.ts';
 import type { Platform } from './platform.ts';
@@ -103,6 +104,17 @@ async function seedBlob(store: string, sha: string): Promise<void> {
 }
 
 const DEAD = 'd'.repeat(64);
+
+/** Take a session's ownership lock as a process that has since stopped refreshing
+ * it: its holder loses the lock, and gc finds no fresh writer there. */
+async function stealSessionLock(store: string, id: string): Promise<void> {
+  const lock = join(store, 'sessions', id, 'owner.lock');
+  const thief = `${lock}.thief`;
+  await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+  const old = (Date.now() - STALE_MS - 5_000) / 1000;
+  await utimes(thief, old, old);
+  await rename(thief, lock);
+}
 
 function changedTo(sha: string) {
   return (log: LogRecord[]) => log.some((r) => r.type === 'slipstream.file.changed.v1'
@@ -378,6 +390,64 @@ describe('gc as a maintenance transaction', () => {
     });
   });
 
+  it('waits for a detach still draining when its session lock is lost, so no later event names a swept blob', { timeout: 30_000 }, async (t) => {
+    let holdAppend = false;
+    let entered!: () => void; const entering = new Promise<void>((r) => { entered = r; });
+    let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
+    const heldLog: typeof createLog = async (o) => {
+      const log = await createLog(o);
+      return { ...log, append: async (input) => {
+        if (holdAppend && input.type === 'slipstream.file.changed.v1') { holdAppend = false; entered(); await gate; }
+        return log.append(input);
+      } };
+    };
+    let lost!: () => void; const losing = new Promise<void>((r) => { lost = r; });
+    const error = console.error;
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      if (/lost its lock/.test(String(args[0]))) lost();
+      else error(...args);
+    });
+    await withStore(async ({ store, call, roots, fake, holdClose }) => {
+      const [a, b] = await roots(2);
+      const id = await attachRecording(call, a!);
+      await attachRecording(call, b!);
+      await writeFile(join(a!, 'z.txt'), 'only the queued change names this');
+      const sha = sha256('only the queued change names this');
+      holdAppend = true;
+      fake.observe(a!, 'z.txt');
+      await entering;
+      // The detach's stop reaches the watcher, then drains the queued append.
+      const hold = holdClose(a!);
+      let releaseB: (() => void) | undefined;
+      try {
+        const detaching = call({ verb: 'detach', target: id });
+        await hold.held;
+        hold.release();
+        await stealSessionLock(store, id);
+        await losing;
+        const holdB = holdClose(b!);
+        releaseB = holdB.release;
+        const collecting = call({ verb: 'gc' });
+        // gc is stopping B, so it has already found A's detach still draining.
+        await holdB.held;
+        holdB.release();
+        release();
+        await detaching;
+        const res = await collecting;
+        for (const r of await readLog(store, id)) {
+          const after = (r.data.after as { sha256?: string } | undefined)?.sha256;
+          if (after) assert.equal(await exists(blobPath(store, after)), true, `seq ${r.seq} names blob ${after}, which must be on disk`);
+        }
+        assert.ok(changedTo(sha)(await readLog(store, id)), 'the queued change landed');
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      } finally {
+        hold.release();
+        releaseB?.();
+        release();
+      }
+    }, { deps: { createLog: heldLog }, stopError: true });
+  });
+
   it('resumes every capture under its own id when the sweep fails', async () => {
     await withStore(async ({ store, call, roots }) => {
       const [a] = await roots(1);
@@ -472,6 +542,78 @@ describe('gc as a maintenance transaction', () => {
       assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
       await waitForRow(call, idB, recording);
     }, { deps: { createLog: disk.createLog }, stopError: true });
+  });
+
+  it('sweeps nothing when a stop gc waited on failed and was requeued before gc finished waiting', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, call, roots, fake, holdClose }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      const idB = await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      const holdA = holdClose(a!);
+      fake.closeWith(a!, new Error('stream closed'));
+      await holdA.held;
+      const holdB = holdClose(b!);
+      const collecting = call({ verb: 'gc' });
+      // gc is stopping B, so it is already waiting on A's ended activation.
+      await holdB.held;
+      try {
+        disk.full = true;
+        holdA.release();
+        // A's stop went unrecorded, and its retry has requeued it behind gc.
+        await waitForRow(call, idA, (r) => r.reason === 'storage-unavailable' && r.retry === null, 'the requeued retry');
+        disk.full = false;
+        holdB.release();
+        const res = await collecting;
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+        assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+        assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+        await waitForRow(call, idB, recording);
+      } finally {
+        disk.full = false;
+        holdA.release();
+        holdB.release();
+      }
+    }, { deps: { createLog: disk.createLog }, daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
+  });
+
+  it('sweeps nothing when a halted stop went unrecorded and its retry was waiting on it before gc', { timeout: 30_000 }, async (t) => {
+    let lost!: () => void; const losing = new Promise<void>((r) => { lost = r; });
+    const error = console.error;
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      if (/lost its lock/.test(String(args[0]))) lost();
+      else if (!/is not recording/.test(String(args[0]))) error(...args);
+    });
+    await withStore(async ({ store, call, roots, holdClose }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      const holdA = holdClose(a!);
+      await stealSessionLock(store, idA);
+      await losing;
+      await holdA.held;
+      // A's retry falls due while its halt is still stopping, so it waits on that stop before gc does.
+      const row = await waitForRow(call, idA, (r) => r.retry !== null, 'a scheduled retry');
+      const due = (row.retry as { next_attempt_at_ms: number }).next_attempt_at_ms;
+      await new Promise((r) => setTimeout(r, Math.max(0, due - Date.now()) + 50));
+      const holdB = holdClose(b!);
+      const collecting = call({ verb: 'gc' });
+      // gc is stopping B, so it is already waiting on A's halt.
+      await holdB.held;
+      try {
+        holdA.release();
+        holdB.release();
+        const res = await collecting;
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+        assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+        assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      } finally {
+        holdA.release();
+        holdB.release();
+      }
+    }, { daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
   });
 
   it('still sweeps after an earlier detach failed to record its stop, without recording one for it', async () => {

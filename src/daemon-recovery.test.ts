@@ -2,12 +2,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { createLog } from './log.ts';
 import { admitCapture, emptyIntent } from './capture-intent.ts';
-import { loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
+import { intentPath, loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
 import { publishTombstone } from './maintenance.ts';
 import { sessionLogPath } from './store-reader.ts';
 import type { Platform } from './platform.ts';
@@ -546,6 +546,85 @@ describe('linked chats across a daemon restart', () => {
       assert.equal((await bindingState(call, id)).state, 'unlinked');
     });
   });
+
+  it('retries a recovered link whose first write failed, until the chat is pending again', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      await stop();
+      let failures = 1;
+      ({ call } = await start({
+        retryBackoff: { baseMs: 20, maxMs: 20 },
+        captureDependencies: {
+          platform: createRootsPlatform().platform,
+          enumerate: async () => {},
+          readQuestionContext: async () => 'selected',
+          createLog: async (options) => {
+            const log = await createLog(options);
+            return { ...log, append: async (input) => {
+              if (input.type === 'slipstream.agent.connection.v1' && failures > 0) {
+                failures--;
+                throw new Error('transient write failure');
+              }
+              return log.append(input);
+            } };
+          },
+        },
+      }));
+      await waitForLog(store, id, (l) => l.some((r) => r.type === 'slipstream.session.resumed.v1') && pendingAfterResume(l));
+      assert.equal(failures, 0, 'the first write failed');
+      await connect(call, store, 'chat-a', a!);
+      assert.equal((await bindingState(call, id)).state, 'connected');
+    });
+  });
+
+  it('never rewrites the intent record once another daemon has taken its store lock', { timeout: 30_000 }, async (t) => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      const fake = createRootsPlatform();
+      let holding = false;
+      let entered!: () => void; const held = new Promise<void>((r) => { entered = r; });
+      let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
+      const platform: Platform = {
+        watch: async (o) => {
+          const sub = await fake.platform.watch(o);
+          return { close: async () => {
+            if (holding) { holding = false; entered(); await gate; }
+            await sub.close();
+          } };
+        },
+      };
+      let lost!: () => void; const losing = new Promise<void>((r) => { lost = r; });
+      const error = console.error;
+      t.mock.method(console, 'error', (...args: unknown[]) => {
+        if (/^slipstream daemon: session .* lost its lock/.test(String(args[0]))) lost();
+        error(...args);
+      });
+      const { call } = await start({ captureDependencies: { platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' } });
+      const id = await attachRecording(call, a!);
+      holding = true;
+      let successor: string;
+      try {
+        const thief = join(store, 'thief');
+        await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+        await rename(thief, join(store, 'owner.lock'));
+        // The daemon shuts down, held while stopping the capture; the successor owns intent.
+        await held;
+        successor = await readFile(intentPath(store), 'utf8') + ' ';
+        await writeFile(intentPath(store), successor);
+        // A capture failure would record itself in intent, if intent were still ours.
+        const sessionThief = join(store, 'sessions', id, 'thief');
+        await writeFile(sessionThief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+        await rename(sessionThief, join(store, 'sessions', id, 'owner.lock'));
+        await losing;
+      } finally {
+        release();
+        await stop().catch(() => {});
+      }
+      assert.equal(await readFile(intentPath(store), 'utf8'), successor);
+    });
+  });
 });
 
 const lastType = (log: LogRecord[]) => log.at(-1)?.type;
@@ -713,6 +792,27 @@ describe('a capture whose root or watcher goes away', () => {
         await chmod(join(store, 'control'), 0o700);
       }
       assert.equal((await loadIntent(store)).captures[0]?.intent, 'running');
+    });
+  });
+
+  it('retries rather than abandons a capture whose root is momentarily unreadable', {
+    skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'permission bits do not restrict this user' : false,
+  }, async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start({ retryBackoff: { baseMs: 50, maxMs: 50 } });
+      const id = await attachRecording(call, a!);
+      await chmod(dirname(a!), 0o000);
+      try {
+        fake.closeWith(a!, new Error('stream closed'));
+        const log = await waitForLog(store, id, (l) => stoppedFor(l) !== undefined);
+        assert.equal(stoppedFor(log), 'watcher-failed');
+        // A retry gets past the root check and fails only at the unreadable root.
+        await waitForRow(call, id, (r) => r.reason === 'resume-failed', 'a retry past the root check');
+      } finally {
+        await chmod(dirname(a!), 0o700);
+      }
+      await waitForRow(call, id, recording);
     });
   });
 });
