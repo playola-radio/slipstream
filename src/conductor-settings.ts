@@ -60,16 +60,17 @@ function locate(text: string, path: string): Located {
     const header = HEADER.exec(line);
     if (header) {
       table = header[1]!;
-      if (/^(["'])scripts\1$/.test(table)) throw unsupported(path, i + 1, 'quotes the [scripts] table name');
+      if (/^["']/.test(table)) throw unsupported(path, i + 1, 'quotes a table name');
       if (table === 'scripts') {
         if (found !== undefined) throw unsupported(path, i + 1, 'repeats the [scripts] table');
         found = i;
       }
       continue;
     }
-    if (table === '' && /^\s*("?scripts"?\s*[.=])/.test(line)) throw unsupported(path, i + 1, 'sets scripts outside a [scripts] table');
+    if (table === '' && /^\s*["']/.test(line)) throw unsupported(path, i + 1, 'quotes a top-level key');
+    if (table === '' && /^\s*scripts\s*[.=]/.test(line)) throw unsupported(path, i + 1, 'sets scripts outside a [scripts] table');
     if (table !== 'scripts') continue;
-    if (/^\s*["'](setup|archive)["']\s*=/.test(line)) throw unsupported(path, i + 1, 'quotes a script key');
+    if (/^\s*["']/.test(line)) throw unsupported(path, i + 1, 'quotes a script key');
     const key = KEY.exec(line);
     if (!key) continue;
     const kind = key[1] as ScriptKind;

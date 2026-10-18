@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { startCapture, InvalidTitleError, RootChangedError, type TranscriptRuntime } from './session.ts';
@@ -150,6 +150,24 @@ describe('session', () => {
 
   describe('caller-supplied sessionId', () => {
     const PRE = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+
+    it('starts afresh over an empty log, and frees the session when it cannot', async () => {
+      await withTempPair(async (root, store) => {
+        const dir = join(store, 'sessions', PRE);
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        const log = join(dir, 'events.jsonl');
+        await writeFile(log, '', { mode: 0o400 });
+        await assert.rejects(startCapture({ root, storeDir: store, sessionId: PRE }));
+        await chmod(log, 0o600);
+        const session = await startCapture({ root, storeDir: store, sessionId: PRE });
+        try {
+          const recs = await waitForRecords(session.logPath, (r) => r.length > 0);
+          assert.equal(recs[0]?.type, 'slipstream.session.started.v1');
+        } finally {
+          await session.stop();
+        }
+      });
+    });
 
     it('starts a fresh session under the pre-generated id', async () => {
       await withTempPair(async (root, store) => {

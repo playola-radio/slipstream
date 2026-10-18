@@ -23,6 +23,9 @@ describe('reading Conductor scripts', () => {
     ['a non-string value', '[scripts]\nsetup = 3\n'],
     ['a double-quoted scripts header', '["scripts"]\nsetup = "npm ci"\n'],
     ['a single-quoted scripts header', "[ 'scripts' ]\narchive = 'rm -rf tmp'\n"],
+    ['an escaped scripts header', '["scr\\u0069pts"]\nsetup = "npm ci"\n'],
+    ['an escaped top-level scripts key', '"scr\\u0069pts".setup = "npm ci"\n'],
+    ['an escaped script key', '[scripts]\n"s\\u0065tup" = "npm ci"\n'],
     ['a multi-line string elsewhere in the file', '[notes]\ntext = \'\'\'\n[scripts]\nsetup = "x"\n\'\'\'\n'],
     ['a multi-line basic string elsewhere in the file', '[notes]\ntext = \"\"\"\nsetup = "x"\n\"\"\"\n[ui]\nx = 1\n'],
   ] as const) {

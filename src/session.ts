@@ -403,15 +403,19 @@ export async function startCapture(
     // create then release the same id between the check and log creation.
     // A log holding no complete record (a first start that failed before its
     // `session.started` became durable) recorded nothing, so it starts afresh.
-    const logExists = await access(logPath).then(() => true, () => false);
-    const unstarted = logExists && await finalRecord(logPath).then((r) => r === undefined, () => false);
-    if (unstarted) await truncate(logPath, 0);
-    if (logExists && !unstarted) {
+    try {
+      const logExists = await access(logPath).then(() => true, () => false);
+      const unstarted = logExists && await finalRecord(logPath).then((r) => r === undefined, () => false);
+      if (unstarted) await truncate(logPath, 0);
+      if (logExists && !unstarted) {
+        throw new Error(
+          `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
+        );
+      }
+    } catch (err) {
       await lock.release();
       if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
-      throw new Error(
-        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
-      );
+      throw err;
     }
   }
 
