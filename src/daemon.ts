@@ -367,6 +367,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** Every capture this daemon has admitted, by session id; withdrawn ones stay
    * for history until their session is deleted. */
   const captures = new Map<string, Capture>();
+  /** Stops that settled with their capture `failed`: they recorded no stop. Read
+   * by the stop, since a retry waiting on it may requeue the capture first. */
+  const unrecordedStops = new WeakSet<Promise<void>>();
   /** Roots between their canonicalization and their intent write. A second attach
    * of the same root joins the first instead of admitting a duplicate. */
   const admitting = new Map<string, Promise<Admitted | ErrorFields>>();
@@ -1182,10 +1185,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     })());
   }
 
-  /** Make `closing` the capture's stop in flight until it settles. */
+  /** Make `closing` the capture's stop in flight until it settles. Its outcome is
+   * read here, before any later waiter on it can run. */
   function setClosing(c: Capture, closing: Promise<void>): void {
     c.closing = closing;
-    const settle = () => { if (c.closing === closing) c.closing = undefined; };
+    const settle = () => {
+      if (c.lifecycle === 'failed') unrecordedStops.add(closing);
+      if (c.closing === closing) c.closing = undefined;
+    };
     closing.then(settle, settle);
   }
 
@@ -1842,8 +1849,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // A detach, a halt or an ended activation may own a stop too; every stop gc
       // waits for must finish and record its stop before any blob is swept.
       // Read as each stop settles: a retry may requeue a failed capture later.
-      const settled = (c: Capture) => {
-        if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
+      const settled = (c: Capture, closing: Promise<void> | undefined) => {
+        const failed = c.lifecycle === 'failed' || (closing !== undefined && unrecordedStops.has(closing));
+        if (failed && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
       };
       // A stop still settling counts whatever the lifecycle reads: a lock lost
       // mid-detach marks the capture `failed` while its log is still draining.
@@ -1852,7 +1860,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         const busy = [...captures.values()].filter(writing);
         if (busy.length === 0) break;
         const closings = busy.map((c) => c.closing);
-        await Promise.allSettled(busy.map((c, i) => Promise.resolve(closings[i]).then(() => settled(c), () => settled(c))));
+        await Promise.allSettled(busy.map((c, i) => Promise.resolve(closings[i]).then(() => settled(c, closings[i]), () => settled(c, closings[i]))));
         const stuck = busy.filter((c, i) => c.closing === closings[i] && writing(c));
         if (stuck.length === busy.length) {
           for (const c of stuck) unproven.set(c.id, `capture ${c.id} has not stopped`);

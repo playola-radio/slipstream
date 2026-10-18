@@ -560,6 +560,39 @@ describe('gc as a maintenance transaction', () => {
     }, { deps: { createLog: disk.createLog }, daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
   });
 
+  it('sweeps nothing when a halted stop went unrecorded and its retry was waiting on it before gc', { timeout: 30_000 }, async (t) => {
+    let lost!: () => void; const losing = new Promise<void>((r) => { lost = r; });
+    const error = console.error;
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      if (/lost its lock/.test(String(args[0]))) lost();
+      else if (!/is not recording/.test(String(args[0]))) error(...args);
+    });
+    await withStore(async ({ store, call, roots, holdClose }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      const holdA = holdClose(a!);
+      await stealSessionLock(store, idA);
+      await losing;
+      await holdA.held;
+      // A's retry falls due while its halt is still stopping, so it waits on that stop before gc does.
+      const row = await waitForRow(call, idA, (r) => r.retry !== null, 'a scheduled retry');
+      const due = (row.retry as { next_attempt_at_ms: number }).next_attempt_at_ms;
+      await new Promise((r) => setTimeout(r, Math.max(0, due - Date.now()) + 50));
+      const holdB = holdClose(b!);
+      const collecting = call({ verb: 'gc' });
+      // gc is stopping B, so it is already waiting on A's halt.
+      await holdB.held;
+      holdA.release();
+      holdB.release();
+      const res = await collecting;
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+    }, { daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
+  });
+
   it('still sweeps after an earlier detach failed to record its stop, without recording one for it', async () => {
     const disk = fillableStore();
     await withStore(async ({ store, call, roots }) => {
