@@ -42,11 +42,35 @@ function touchesPath(inv: Invocation, path: string): boolean {
   return inv.knownPaths.includes(path);
 }
 
+function firstSeq(inv: Invocation): bigint | undefined {
+  return inv.evidenceSeqs.reduce<bigint | undefined>((m, s) => (m === undefined || s < m ? s : m), undefined);
+}
+
+/** Whether `a` appeared earlier in the log than `b`; ties break by key string. */
+function appearedFirst(a: Invocation, b: Invocation): boolean {
+  const sa = firstSeq(a);
+  const sb = firstSeq(b);
+  if (sa !== sb) return sb === undefined || (sa !== undefined && sa < sb);
+  return a.keyStr < b.keyStr;
+}
+
+function collapseForkedCopies(invocations: readonly Invocation[]): Invocation[] {
+  const byToolCall = new Map<string, Invocation>();
+  for (const inv of invocations) {
+    const id = `${inv.key.harness}\u0000${inv.key.record_id}`;
+    const kept = byToolCall.get(id);
+    if (kept === undefined || appearedFirst(inv, kept)) byToolCall.set(id, inv);
+  }
+  return [...byToolCall.values()];
+}
+
 /**
  * Match one change against the known invocations under its bound policy. An
  * unavailable interval resolves to `unknown` with its own distinct reason — never
  * conflated with "we looked and found nothing". Each eligible invocation
  * contributes one candidate; conflicts are excluded and disclosed, never counted.
+ * Invocations sharing `(harness, record_id)` are one tool call repeated in a forked
+ * transcript, so they count once, credited to the copy with the lowest evidence seq.
  */
 export function evaluateChange(input: EvaluationInput): EvaluationResult {
   const { interval } = input;
@@ -63,7 +87,7 @@ export function evaluateChange(input: EvaluationInput): EvaluationResult {
     };
   }
 
-  const eligible: Invocation[] = [];
+  const eligibleAll: Invocation[] = [];
   const conflicts: Invocation[] = [];
   for (const inv of input.invocations) {
     const relevant =
@@ -71,8 +95,9 @@ export function evaluateChange(input: EvaluationInput): EvaluationResult {
       windowOverlaps(inv, interval.start_ms, interval.end_ms, input.policy.window_ms);
     if (!relevant) continue;
     if (inv.conflicted) conflicts.push(inv);
-    else eligible.push(inv);
+    else eligibleAll.push(inv);
   }
+  const eligible = collapseForkedCopies(eligibleAll);
 
   const evidenceSeqs = eligible
     .flatMap((inv) => inv.evidenceSeqs)

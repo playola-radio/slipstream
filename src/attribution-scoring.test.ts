@@ -60,6 +60,68 @@ describe('attribution scoring', () => {
       assert.deepEqual(r.evidenceSeqs, [4n, 6n]);
     });
 
+    it('the same tool call in a forked conversation counts once -> heuristic', () => {
+      const original = inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] });
+      const copy = inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] });
+      const r = evaluateChange({
+        path: 'src/a.ts',
+        interval,
+        policy: POLICY,
+        invocations: [original, copy],
+      });
+      assert.equal(r.status, 'heuristic');
+      assert.equal(r.reason, 'single-candidate');
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n]);
+    });
+
+    it('the same forked tool call gives the same result regardless of listing order', () => {
+      const original = inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] });
+      const copy = inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] });
+      const r = evaluateChange({
+        path: 'src/a.ts',
+        interval,
+        policy: POLICY,
+        invocations: [copy, original],
+      });
+      assert.equal(r.status, 'heuristic');
+      assert.equal(r.reason, 'single-candidate');
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n]);
+    });
+
+    it('a copied call plus a different call stays ambiguous', () => {
+      const r = evaluateChange({
+        path: 'src/a.ts',
+        interval,
+        policy: POLICY,
+        invocations: [
+          inv({ keyStr: 'a1', key: key('toolu_1', 'A'), evidenceSeqs: [12n, 13n] }),
+          inv({ keyStr: 'b1', key: key('toolu_1', 'B'), evidenceSeqs: [17n, 19n] }),
+          inv({ keyStr: 'a2', key: key('toolu_2', 'A'), evidenceSeqs: [21n] }),
+        ],
+      });
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+      assert.deepEqual(r.evidenceSeqs, [12n, 13n, 21n]);
+    });
+
+    it('the same record id under different harnesses is two candidates', () => {
+      const r = evaluateChange({
+        path: 'src/a.ts',
+        interval,
+        policy: POLICY,
+        invocations: [
+          inv({ keyStr: 'cc', key: key('toolu_1', 'A'), evidenceSeqs: [12n] }),
+          inv({
+            keyStr: 'cx',
+            key: { harness: 'codex', harness_session_id: 'A', record_id: 'toolu_1' },
+            evidenceSeqs: [14n],
+          }),
+        ],
+      });
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+    });
+
     it('no candidates under an available interval -> unknown / no-matching-evidence', () => {
       const r = evaluateChange({ path: 'src/a.ts', interval, policy: POLICY, invocations: [] });
       assert.equal(r.status, 'unknown');
