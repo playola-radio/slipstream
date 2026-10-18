@@ -414,12 +414,17 @@ interface RecordQuestionExchangeRequest {
 // ok: { v: 1, ok: true, session_id, request_id, question_id, seq, duplicate }
 ```
 
-- `question`, `context` and `reply_to_question_id` follow the `ask` rules.
-  The daemon reads `context.selected_text` itself and never accepts it from the client.
+- `text` and `context` follow the `ask` rules. The daemon reads
+  `context.selected_text` itself and never accepts it from the client.
+- `reply_to_question_id`, if present, must name an earlier recorded exchange in
+  this capture about the same source (same change seq, path, snapshot hash and
+  line range), else `INVALID_CONTEXT`. A question queued by `ask` does not count.
 - The capture only has to be recording. A watch-only capture works: no binding,
   chat, or agent connection is involved. Errors are `SESSION_NOT_SELECTED`,
   `CAPTURE_NOT_READY`, `STORAGE_UNAVAILABLE`, the `ask` validation codes,
-  `INVALID_ANSWER` and `REQUEST_CONFLICT`.
+  `INVALID_ANSWER` and `REQUEST_CONFLICT`. A malformed `conversation` (missing,
+  an unknown harness, a parent/fork id that is empty, over 256 characters or has control characters, or equal parent and fork ids) is
+  `PROTOCOL`.
 - The only size limit on `answer_text` is the control socket's 1 MiB line cap; a
   larger request fails `PROTOCOL` and appends nothing.
 - It appends exactly one `slipstream.question.exchange_recorded.v1` event (see

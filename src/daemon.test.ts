@@ -2436,6 +2436,9 @@ describe('daemon record_question_exchange', () => {
         if (row && BigInt(row.durable_seq) >= BigInt(changed.seq)) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
+      const reached = (await sessionsJson(daemon)).find((s) => s.id === id);
+      assert.ok(reached && BigInt(reached.durable_seq) >= BigInt(changed.seq),
+        `durable_seq never reached the change at ${changed.seq}: ${reached?.durable_seq}`);
       const context = { change_seq: changed.seq, path: 'a.ts',
         snapshot_sha256: (changed.data.after as { sha256: string }).sha256, line_start: 1, line_end: 1 };
       const exchange = (extra: Record<string, unknown> = {}): CallRequest => ({ verb: 'record_question_exchange',
@@ -2555,15 +2558,22 @@ describe('daemon record_question_exchange', () => {
         const pending = sendControlRequest({ socketPath: daemon.socketPath, request: { v: 1, ...exchange() } });
         void pending.catch(() => {});
         await reachedAppend;
-        let detached = false;
-        const detach = call({ verb: 'detach', target: id }).then((res) => { detached = true; return res; });
+        const order: string[] = [];
+        const settled = pending.then((res) => { order.push('exchange'); return res; });
+        const detach = call({ verb: 'detach', target: id }).then((res) => { order.push('detach'); return res; });
         await new Promise((resolve) => setTimeout(resolve, 50));
-        assert.equal(detached, false, 'detach waits for the in-flight exchange');
+        assert.deepEqual(order, [], 'neither has settled while the append is held');
         release();
-        const res = await pending;
-        const logged = (await readLog(store, id)).filter((e) => e.type === EXCHANGE_TYPE).length;
-        assert.equal(logged, res.ok ? 1 : 0, 'ok means the event is logged; an error means it is not');
+        const res = await settled;
         assert.equal((await detach).ok, true);
+        assert.deepEqual(order, ['exchange', 'detach'], 'detach resolved after the exchange settled');
+        const log = await readLog(store, id);
+        const exchanges = log.filter((e) => e.type === EXCHANGE_TYPE);
+        assert.equal(exchanges.length, res.ok ? 1 : 0, 'ok means the event is logged; an error means it is not');
+        if (res.ok) {
+          const stopped = log.find((e) => e.type === 'slipstream.capture.stopped.v1')!;
+          assert.ok(BigInt(exchanges[0]!.seq) < BigInt(stopped.seq), 'the exchange is logged before the capture stopped');
+        }
       }, { createLog: async (opts) => {
         const log = await createLog(opts);
         return { ...log, append: async (input) => {
