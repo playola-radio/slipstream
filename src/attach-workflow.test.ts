@@ -114,6 +114,32 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
+  for (const failure of ['hook write', 'answer tool'] as const) {
+    it(`reports the saved session when deferred ${failure} setup fails`, async () => {
+      const f = await fixture();
+      try {
+        await claudeTranscript(f);
+        await mkdir(join(f.worktree, '.claude'));
+        const d = deps(f, claudeEnv, { live: true, status: { binding_slots: { used: 10, limit: 10 } } });
+        if (failure === 'hook write') await chmod(join(f.worktree, '.claude'), 0o500);
+        else d.run = async () => ({ code: 1, output: 'injected tool installation failure' });
+        assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, d), 1);
+        assert.equal(attachRequests(f).length, 1);
+        const output = [...f.out, ...f.err].join('\n');
+        assert.match(output, /session_id: cap-1/);
+        assert.match(output, /agent_connection: setup_pending/);
+        assert.match(output, /workspace is recording and this chat is linked/);
+        assert.match(output, /setup is incomplete/);
+        assert.match(output, failure === 'hook write' ? /could not write.*EACCES/ : /injected tool installation failure/);
+        assert.match(output, /run `slipstream attach.*again/);
+        assert.doesNotMatch(output, /Nothing was recorded|Attached successfully/);
+      } finally {
+        await chmod(join(f.worktree, '.claude'), 0o700);
+        await rm(f.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   it('starts the daemon, installs the Claude hook and tool, and reports setup pending with the exact step', async () => {
     const f = await fixture();
     try {

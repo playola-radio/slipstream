@@ -81,7 +81,18 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   if (connection !== 'connected' && connection !== 'setup_pending') {
     throw new Refusal(`the daemon reported this chat as ${connection}; it is not connected.`);
   }
-  if (deferredConfig) changed = await applyAgentConfig(plan, worktree, deps);
+  if (deferredConfig) {
+    try {
+      changed = await applyAgentConfig(plan, worktree, deps);
+    } catch (err) {
+      deps.out(`session_id: ${String(res.session_id)}`);
+      deps.out(`agent_connection: ${connection}`);
+      // Setup's pre-attach refusals cannot describe a link already saved by the daemon.
+      const reason = (err instanceof Error ? err.message : String(err)).replace(/ Nothing was recorded\.$/, '');
+      throw new Refusal(`The workspace is recording and this chat is linked, but setup is incomplete. ${reason} `
+        + `Fix the setup error, then run \`slipstream attach${storeFlag(opts.store, deps.home)}\` again from this chat.`);
+    }
+  }
   const again = res.already_active === true;
   if (connection === 'connected') {
     deps.out(again
