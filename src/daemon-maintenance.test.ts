@@ -532,6 +532,34 @@ describe('gc as a maintenance transaction', () => {
     }, { deps: { createLog: disk.createLog }, stopError: true });
   });
 
+  it('sweeps nothing when a stop gc waited on failed and was requeued before gc finished waiting', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, call, roots, fake, holdClose }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      const idB = await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      const holdA = holdClose(a!);
+      fake.closeWith(a!, new Error('stream closed'));
+      await holdA.held;
+      const holdB = holdClose(b!);
+      const collecting = call({ verb: 'gc' });
+      // gc is stopping B, so it is already waiting on A's ended activation.
+      await holdB.held;
+      disk.full = true;
+      holdA.release();
+      // A's stop went unrecorded, and its retry has requeued it behind gc.
+      await waitForRow(call, idA, (r) => r.reason === 'storage-unavailable' && r.retry === null, 'the requeued retry');
+      disk.full = false;
+      holdB.release();
+      const res = await collecting;
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      await waitForRow(call, idB, recording);
+    }, { deps: { createLog: disk.createLog }, daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
+  });
+
   it('still sweeps after an earlier detach failed to record its stop, without recording one for it', async () => {
     const disk = fillableStore();
     await withStore(async ({ store, call, roots }) => {
