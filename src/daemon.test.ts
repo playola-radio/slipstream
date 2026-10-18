@@ -1867,6 +1867,7 @@ async function withCaptures(
   fn: (ctx: { store: string; call: Call; daemon: Daemon; roots: (n: number) => Promise<string[]>;
     fake: ReturnType<typeof createRootsPlatform> }) => Promise<void>,
   deps: Parameters<typeof startDaemon>[0]['captureDependencies'] = {},
+  expectedStopError?: RegExp,
 ): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-daemon-table-'));
   const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-table-roots-')));
@@ -1887,7 +1888,8 @@ async function withCaptures(
   try {
     await fn({ store, call: controlCall(daemon.socketPath), daemon, roots, fake });
   } finally {
-    await daemon.stop();
+    if (expectedStopError) await assert.rejects(daemon.stop(), expectedStopError);
+    else await daemon.stop();
     await rm(store, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
   }
@@ -2173,7 +2175,7 @@ describe('daemon capture table', () => {
         return log.append(input);
       } };
     };
-    await withCaptures(async ({ store, call, roots }) => {
+    await withCaptures(async ({ store, call, roots, fake }) => {
       const [a] = await roots(1);
       const id = await attachWatchOnly(call, a!);
       await linkChat(call, store, a!, 'c1');
@@ -2190,7 +2192,60 @@ describe('daemon capture table', () => {
       const res = await task;
       assert.equal(res.ok === false && res.code, 'STALE_BINDING');
       assert.equal((await unlinking).ok, true);
+      await writeFile(join(a!, 'after.ts'), 'after unlink');
+      fake.observe(a!, 'after.ts');
+      const log = await waitForLog(store, id, (events) => events.some(e => e.data.path === 'after.ts'));
+      assert.equal(log.find(e => e.data.path === 'after.ts')!.data.task_hint_id, undefined);
+      assert.ok(log.findIndex(e => e.type === 'slipstream.task.started.v1')
+        < log.findIndex(e => e.type === 'slipstream.agent.unlinked.v1'));
     }, { createLog: holdTasks });
+  });
+
+  it('records an unlink overlapping detach while an admitted task drains', async () => {
+    let release!: () => void;
+    let held!: () => void;
+    const isHeld = new Promise<void>(r => { held = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    const holdTasks: typeof createLog = async o => {
+      const log = await createLog(o);
+      return { ...log, append: async input => {
+        if (input.type === 'slipstream.task.started.v1') { held(); await gate; }
+        return log.append(input);
+      } };
+    };
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      await linkChat(call, store, a!, 'c1');
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const task = call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!) });
+      await isHeld;
+      const detaching = call({ verb: 'detach', target: id });
+      let unlinking!: Promise<ResponseEnvelope>;
+      try {
+        await waitForRow(call, id, r => r.reason === 'stop-unconfirmed');
+        unlinking = call({ verb: 'unlink', session_id: id });
+        await waitForRow(call, id, r => (r.binding as { state?: string })?.state === 'unlinked');
+      } finally { release(); }
+      await task;
+      assert.equal((await unlinking).ok, true);
+      assert.equal(rec(await detaching).state, 'stopped');
+      const log = await readLog(store, id);
+      assert.equal(log.filter(e => e.type === 'slipstream.agent.unlinked.v1').length, 1);
+      assert.equal(log.at(-1)!.type, 'slipstream.capture.stopped.v1');
+    }, { createLog: holdTasks });
+  });
+
+  it('does not report a failed baseline as cleanly stopped after detach', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const admitted = await call({ verb: 'attach', mode: 'watch-only', worktree: a! });
+      const id = rec(admitted).session_id!;
+      await waitForRow(call, id, r => r.reason === 'baseline-failed');
+      const detached = rec(await call({ verb: 'detach', target: id }));
+      assert.deepEqual([detached.state, detached.reason], ['not_recording', 'stop-unconfirmed']);
+      assert.equal((await readLog(store, id)).some(e => e.type === 'slipstream.capture.stopped.v1'), false);
+    }, { enumerate: async () => { throw new Error('baseline failed'); } });
   });
 
   it('routes tasks, questions and answers by chat identity across captures', async () => {
@@ -2254,7 +2309,7 @@ describe('daemon capture table', () => {
       assert.deepEqual([row.state, row.reason], ['not_recording', 'stop-unconfirmed']);
       assert.ok(!(await readLog(store, id)).some((e) => e.type === 'slipstream.capture.stopped.v1'));
       disk.full = false;
-    }, { createLog: disk.createLog });
+    }, { createLog: disk.createLog }, /stop could not be recorded/);
   });
 
   it('lets independent readers follow each capture and lists every capture', async () => {
@@ -2280,4 +2335,25 @@ describe('daemon capture table', () => {
       assert.deepEqual(listed.captures.map((r) => [r.session_id, r.state]).sort(), [[idA, 'recording'], [idB, 'recording']].sort());
     });
   });
+});
+
+it('shutdown reports a saved detach stop failure after releasing the store lock', async () => {
+  const store = await mkdtemp(join(tmpdir(), 'slip-stop-fail-'));
+  const worktree = await mkdtemp(join(tmpdir(), 'slip-stop-wt-'));
+  const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+    platform: { watch: async () => ({ close: async () => { throw new Error('watcher close failed'); } }) },
+    enumerate: async () => {},
+  } });
+  try {
+    const call = controlCall(daemon.socketPath);
+    const id = await attachWatchOnly(call, worktree);
+    const detached = await call({ verb: 'detach', target: id });
+    assert.equal(detached.ok, false);
+    await assert.rejects(daemon.stop(), /watcher close failed/);
+    await assert.rejects(stat(join(store, 'owner.lock')), { code: 'ENOENT' });
+  } finally {
+    await daemon.stop().catch(() => {});
+    await rm(store, { recursive: true, force: true });
+    await rm(worktree, { recursive: true, force: true });
+  }
 });

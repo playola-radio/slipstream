@@ -339,6 +339,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     let stopErr: unknown;
     for (const c of captures.values()) {
       await c.closing;
+      stopErr ??= c.closeError;
       const session = c.session;
       if (!session) continue;
       // Drain admitted appends before stopping: `torn` is already set, so no new
@@ -821,6 +822,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     chat: { harness: HarnessName; harnessSessionId: string; transcript: string },
     created: boolean,
   ): Promise<Record<string, unknown> | ErrorFields> {
+    // Finish an admitted unlink before publishing a replacement binding.
+    if (!c.binding) await Promise.allSettled([...c.inflight]);
+    if (torn || compromised || c.lifecycle !== 'recording' || !isRunning(c)) {
+      return errFields('CAPTURE_NOT_READY', 'the capture is no longer recording');
+    }
     const mine = c.binding;
     if (mine && mine.harness === chat.harness && mine.harnessSessionId === chat.harnessSessionId) {
       const failed = await mine.publishing;
@@ -924,7 +930,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     c.lifecycle = 'stopping';
     if (from === 'baselining') await c.starting;
     await prior;
-    await Promise.allSettled([...c.inflight]);
+    // An unlink can join while an earlier admitted task is draining.
+    while (c.inflight.size) await Promise.allSettled([...c.inflight]);
     const b = c.binding;
     if (b) {
       c.binding = undefined;
@@ -934,7 +941,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const session = c.session;
     if (!session) {
       // Its storage failed earlier and it was halted without a durable stop.
-      c.lifecycle = c.activation?.lost ? 'failed' : 'stopped';
+      c.lifecycle = c.activation ? 'failed' : 'stopped';
       return;
     }
     c.session = undefined;
@@ -961,9 +968,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     revokeBinding(intent, c.id);
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
-    if (!session || c.lifecycle !== 'recording') return { session_id: c.id, binding_generation: b.generation };
-    const append = session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
-      data: { binding_generation: b.generation, reason: 'unlinked' } });
+    if (!session || !['recording', 'stopping'].includes(c.lifecycle)) {
+      return errFields('STORAGE_UNAVAILABLE', 'the chat was unlinked, but its capture cannot record the unlink');
+    }
+    const admitted = [...c.inflight];
+    const append = (async () => {
+      // Revoke immediately, but end task selection only after old admitted tasks
+      // have committed. Detach also drains this promise before closing the log.
+      await Promise.allSettled(admitted);
+      await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
+        data: { binding_generation: b.generation, reason: 'unlinked' } });
+    })();
     c.inflight.add(append);
     try {
       await append;
