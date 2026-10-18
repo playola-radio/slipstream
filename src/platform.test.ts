@@ -17,6 +17,7 @@ const fakeHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
     ignore: ignore.map((d) => join(FAKE_ROOT, d)),
     onObservation: (abs) => observations.push(abs),
     onError: () => {},
+    onClosed: () => {},
   });
   return {
     root: FAKE_ROOT,
@@ -34,7 +35,7 @@ describe('FakePlatform', () => {
   it('delivers a relative observation as an absolute path under the watched root', async () => {
     const platform = createFakePlatform();
     const observations: Array<[string, number]> = [];
-    await platform.watch({ root: '/root', ignore: [], onObservation: (p, at) => observations.push([p, at]), onError: () => {} });
+    await platform.watch({ root: '/root', ignore: [], onObservation: (p, at) => observations.push([p, at]), onError: () => {}, onClosed: () => {} });
     platform.observe('src/a.ts', 123);
     assert.deepEqual(observations, [['/root/src/a.ts', 123]]);
   });
@@ -42,7 +43,7 @@ describe('FakePlatform', () => {
   it('routes failWith to onError as an honest coverage-gap signal', async () => {
     const platform = createFakePlatform();
     const errors: Error[] = [];
-    await platform.watch({ root: '/root', ignore: [], onObservation: () => {}, onError: (e) => errors.push(e) });
+    await platform.watch({ root: '/root', ignore: [], onObservation: () => {}, onError: (e) => errors.push(e), onClosed: () => {} });
     platform.failWith(new Error('watch lapsed'));
     assert.equal(errors.length, 1);
     assert.match(errors[0]!.message, /watch lapsed/);

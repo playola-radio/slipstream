@@ -321,18 +321,25 @@ Capture before user login is not promised.
   with LaunchAgent supervision for the managed install. Explicit daemon
   configuration is preserved. Fix the nonexistent `slipstream stop` advice.
 - **Setup script.** `slipstream conductor setup`: ensure the daemon, admit a
-  watch-only capture for `$CONDUCTOR_WORKSPACE_PATH`, wait for ready, then run the
-  repo's own setup. If capture cannot become ready: non-zero exit with a readable
-  reason, and the workspace shows NOT recording (D1 revised). Never a silent
-  half-capture.
-- **Archive script.** `slipstream conductor archive` durably withdraws running
-  intent and stops that target before any repo archive command can remove the
-  root. History is retained (D4).
+  watch-only capture for `$CONDUCTOR_WORKSPACE_PATH`, and wait for ready. Then the
+  repo's own setup runs whatever Slipstream returned: Slipstream never stops a
+  workspace from being set up, including one waiting for a capture slot (Brian,
+  2026-10-18). If capture cannot become ready, Slipstream prints a readable reason
+  and the workspace shows NOT recording (D1 revised); the script still exits
+  non-zero. Never a silent half-capture.
+- **Archive script.** `slipstream conductor archive` runs first, so it durably
+  withdraws running intent and stops that target before the repo's archive
+  command can remove the root. Its failure does not block the repo's archive.
+  History is retained (D4).
 - **Overrides.** The installer inspects effective configuration, including legacy
   `conductor.json`, and writes `<repo>/.conductor/settings.local.toml` chaining
-  `slipstream conductor setup && <repo's own setup>` (and the archive equivalent),
-  preserving unrelated settings, recording the chained command, and reporting
-  drift if the repo's script later changes.
+  `slipstream conductor setup` and then the repo's own setup (and the archive
+  equivalent). The repo's command runs whatever Slipstream returned, in a subshell
+  so its own `exit` cannot skip the status rule. The script exits with the repo's
+  code if the repo's command fails, otherwise with Slipstream's. This supersedes
+  the earlier `setup && <repo's own setup>` chain (Brian, 2026-10-18). The
+  installer preserves unrelated settings, records the chained command, and
+  reports drift if the repo's script later changes.
 - **Existing-workspace enrollment.** An idempotent command consumes Conductor's
   verified inventory of non-archived workspaces, including sleeping ones, and
   enrolls them through the same queue. It does not infer "open" from a directory
@@ -377,8 +384,8 @@ without measurements.
 ### Data flow
 
 Conductor creates a workspace -> setup script -> `slipstream conductor setup` ->
-daemon admits a watch-only capture (queued -> baselining -> ready) -> setup exits
-0, then the repo's own setup runs. If the agent edits before ready, those edits
+daemon admits a watch-only capture (queued -> baselining -> ready) -> Slipstream
+exits, then the repo's own setup runs whatever it returned. If the agent edits before ready, those edits
 are inside the first baseline, which says so by being the first observed state.
 Changes flow through the existing watcher -> engine -> log -> reader path, per
 capture.

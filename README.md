@@ -156,8 +156,47 @@ Current limits:
   another is detached.
 - At most 10 chats are linked at once. Past that, the workspace keeps recording
   without a chat (`BINDING_LIMIT_REACHED`); unlink another chat to connect it.
-- The list of captures lives in the daemon's memory: when the daemon stops,
-  captures do not restart by themselves yet. Run `attach` again.
+- Captures survive a daemon restart. Each one resumes under the same session
+  ID, with a `restart` gap covering the time nobody was watching. A linked chat
+  comes back as `setup_pending` and counts as connected again only after it
+  answers a fresh setup check. A workspace whose folder was deleted or replaced
+  in the meantime is not resumed; it shows as stopped (`root-missing`).
+
+### Capture every Conductor workspace
+
+```sh
+slipstream conductor install   # once, and again after upgrading Node or Slipstream
+slipstream conductor enroll    # capture the workspaces that already exist
+```
+
+`install` adds a LaunchAgent that keeps the daemon running and restarts it after
+a crash or a login (log: `~/Library/Logs/slipstream/daemon.log`). It also puts
+`slipstream conductor setup` and `slipstream conductor archive` in your personal
+Conductor scripts (`~/.conductor/settings.toml`), ahead of anything already
+there. Both the LaunchAgent and the scripts use the absolute paths of the Node and
+Slipstream that ran `install`; nothing depends on nvm or your shell profile.
+
+A repo with its own Conductor setup or archive script overrides your personal one.
+For each such repo, `install` writes `.conductor/settings.local.toml` in the repo's
+folder. That file runs Slipstream first and then the repo's own command, and keeps
+anything else in the file. It is for this machine only; `install` warns you if git
+would commit it. If the repo's script changes later, `conductor setup` warns
+until you run `install` again.
+
+From then on, a new workspace starts recording before the repo's own setup runs.
+The repo's own setup always runs, even when recording can't start (for example,
+when all 16 capture slots are in use). In that case Slipstream prints the reason
+and the setup script still fails, so the workspace shows that it isn't recording.
+Archiving a workspace stops its capture first and keeps the history; the repo's
+own archive script runs even if that stop fails.
+Conductor's documentation doesn't say whether the agent can start before setup
+finishes, so a capture may begin after the agent's first edits. In that case the
+first recorded state is whatever was there when recording started.
+
+`enroll` reads Conductor's own list of workspaces that aren't archived, including
+sleeping ones. It captures them most recently active first. Past 16, the rest
+wait and start by themselves, in that order, as slots free up. Archive the
+workspaces you no longer use to free slots. `enroll` is safe to run again.
 
 **Recording any chat, without Ask Agent.** If your agent version isn't
 verified, you can still record its workspace by naming the chat yourself:
@@ -311,6 +350,8 @@ The full decision record is in [NOTES-architecture.md](NOTES-architecture.md).
 | `attach [dir]` | Run inside an agent chat: connect it and start recording |
 | `attach [dir] --harness h --harness-session-id id` | Record a worktree for a chat you name yourself |
 | `status` / `detach` | Show or stop the active recording |
+| `conductor install` / `conductor enroll` | Keep the daemon running and capture every Conductor workspace |
+| `conductor setup` / `conductor archive` | Run by Conductor's setup and archive scripts |
 | `view --store dir [--session id] [--changes] [--context N] [--full] [--disk]` | List sessions, or follow one live in the terminal |
 | `ask --store dir --session id --request-id uuid --input file` | Queue a question for the agent (experimental) |
 | `hook <codex\|claude-code> post-tool-use` | The hook command agents run to receive questions |

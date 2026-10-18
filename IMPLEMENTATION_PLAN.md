@@ -161,16 +161,18 @@ Rules that keep the expansion additive:
 (capture table: one capture per workspace up to 16 with visible waiting, in-place
 chat linking up to 10, unlink and generation fencing, targeted `status` and
 `detach`, `attach --watch-only [--wait]`, `GET /v1/captures`, no re-save of stored
-blobs on start, P2 counting tests) merged (#70); its capture and binding intent is
-in memory only until P3. P5 (one daemon-wide transcript scheduler: each cycle
-scans `~/.codex/sessions` once and each Claude project folder once for every
-capture; transcript reading follows configuration, not chat linking; P5
-counting tests) merged (#71). P5b (discovery remembers each transcript's
-header by file identity and size, so an idle cycle stats transcripts instead of
-reopening them; P5b counting tests) is in review on
-`briankeane/autocapture-p5b-transcript-reuse`. P3, P4 and P6 Not Started.
+blobs on start, P2 counting tests) merged (#70). P5 (one daemon-wide transcript
+scheduler: each cycle scans `~/.codex/sessions` once and each Claude project
+folder once for every capture; transcript reading follows configuration, not
+chat linking; P5 counting tests) merged (#71). P5b (discovery remembers each
+transcript's header by file identity and size, so an idle cycle stats
+transcripts instead of reopening them; P5b counting tests) merged (#73). P3
+(durable capture and binding intent, restart recovery with fresh chat setup
+checks, root-missing and watcher-failed stops, the LaunchAgent, `slipstream
+conductor install|setup|archive|enroll`) is in review as #72 on
+`briankeane/autocapture-p3-recovery`. P4 and P6 Not Started.
 
-Known later work: durable intent and restart recovery (P3); GC and session
+Known later work: GC and session
 deletion while captures run (P4; today both still require every capture
 detached). After P5b an idle cycle still walks the Codex sessions tree once and
 stats each transcript, but reopens none whose header it already has; whether

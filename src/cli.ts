@@ -22,6 +22,12 @@
  *   slipstream detach [<target>] [--store <dir>]   (target: session id or workspace; default: this directory)
  *   slipstream unlink --session <id> [--store <dir>]
  *
+ * Conductor integration: install the LaunchAgent and chain setup/archive into
+ * Conductor's scripts, the scripts themselves, and enrollment of existing
+ * workspaces.
+ *
+ *   slipstream conductor install|setup|archive|enroll [--store <dir>]
+ *
  * Maintenance of retained sessions (only while the daemon is detached):
  *
  *   slipstream delete <session-id> [--store <dir>]
@@ -30,7 +36,7 @@
 import { readFile, open, lstat, realpath, constants } from 'node:fs/promises';
 import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
 import { startReaderServer } from './http-reader.ts';
@@ -42,6 +48,12 @@ import { QUESTION_TTL_MS } from './questions.ts';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
+import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
+import { ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
+import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
+import {
+  InventoryError, readConductorInventory, runConductorArchive, runConductorEnroll, runConductorInstall, runConductorSetup,
+} from './conductor.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -67,7 +79,12 @@ type Args =
   | { command: 'claude-hook'; store: string }
   | { command: 'ask'; store: string; sessionId: string; requestId: string; inputPath: string }
   | { command: 'delete'; store: string; sessionId: string }
-  | { command: 'gc'; store: string };
+  | { command: 'gc'; store: string }
+  | { command: 'conductor'; action: ConductorAction; store: string };
+
+const CONDUCTOR_ACTIONS = ['install', 'setup', 'archive', 'enroll'] as const;
+type ConductorAction = typeof CONDUCTOR_ACTIONS[number];
+const CONDUCTOR_DB = join(homedir(), 'Library', 'Application Support', 'com.conductor.app', 'conductor.db');
 
 /** The shared daemon's default store lives under the home dir, not the worktree:
  * one daemon serves every worktree from a single owner-only root. */
@@ -323,6 +340,10 @@ export function parseArgs(argv: string[]): Args | null {
     if (!parsed) return null;
     return { command: 'ask', ...parsed };
   }
+  if (command === 'conductor' && (CONDUCTOR_ACTIONS as readonly string[]).includes(argv[1] ?? '')) {
+    const store = parseStoreOnly(argv.slice(2));
+    return store === null ? null : { command, action: argv[1] as ConductorAction, store };
+  }
   if (command === 'view') return { command: 'view' };
   return null;
 }
@@ -345,6 +366,9 @@ function usage(): void {
   console.error('       slipstream status [<session-id or dir>] [--store <dir>]');
   console.error('       slipstream detach [<session-id or dir>] [--store <dir>]   (default: this directory)');
   console.error('       slipstream unlink --session <session-id> [--store <dir>]');
+  console.error('       slipstream conductor install [--store <dir>]   (LaunchAgent + Conductor setup/archive scripts)');
+  console.error('       slipstream conductor enroll  [--store <dir>]   (capture every existing Conductor workspace)');
+  console.error('       slipstream conductor setup|archive [--store <dir>]   (run by Conductor\'s scripts)');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
   console.error('       slipstream delete <session-id> [--store <dir>]');
   console.error('       slipstream gc     [--store <dir>]');
@@ -516,6 +540,20 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
   }
 }
 
+/** Detach, unlink or archive: through the daemon, or recorded offline without one. */
+async function runWithdrawal(store: string, run: (deps: WithdrawDeps) => Promise<number>, verb: string): Promise<void> {
+  const socketPath = controlSocketPath(store);
+  try {
+    process.exitCode = await run({ store, out: (line) => console.log(line), err: (line) => console.error(line),
+      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }) });
+  } catch (err) {
+    if (!(err instanceof OutcomeUnknownError)) throw err;
+    console.error(`slipstream: outcome unknown — ${err.message}`);
+    console.error(`slipstream: ${retryGuidance(verb)}`);
+    process.exitCode = 3;
+  }
+}
+
 type CaptureRow = Record<string, unknown> & { binding?: Record<string, unknown> | null };
 
 /** Human-readable `status`: the daemon, then one block per capture. */
@@ -539,10 +577,10 @@ export function formatStatus(res: Record<string, unknown>): string[] {
 }
 
 /** `slipstream attach --watch-only` records a workspace without linking a chat. */
-async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<void> {
+async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<number> {
   const socketPath = controlSocketPath(store);
   try {
-    process.exitCode = await runWatchOnlyAttach({ dir, wait }, {
+    return await runWatchOnlyAttach({ dir, wait }, {
       out: (line) => console.log(line),
       err: (line) => console.error(line),
       control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
@@ -551,7 +589,85 @@ async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<
     if (!(err instanceof OutcomeUnknownError)) throw err;
     console.error(`slipstream: outcome unknown — ${err.message}`);
     console.error(`slipstream: ${retryGuidance('attach')}`);
-    process.exitCode = 3;
+    return 3;
+  }
+}
+
+const runCommand: Run = (command, commandArgs) => new Promise((done) => {
+  execFile(command, commandArgs, { timeout: 30_000 }, (err, stdout, stderr) => {
+    const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
+    done({ code, output: `${stdout}${stderr}` });
+  });
+});
+
+/** How to start this store's daemon: through launchd when `conductor install`
+ * manages it, so there is only ever the supervised one; otherwise detached. */
+async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaemonDeps> {
+  const socketPath = controlSocketPath(store);
+  const probe = () => probeSocket(socketPath, PROBE_TIMEOUT_MS);
+  const managed = await readManagedInstall(store).catch(() => null);
+  if (managed && process.getuid) {
+    const uid = process.getuid();
+    return { probe, logPath: managed.log, startDaemon: () => kickstartLaunchAgent(uid, runCommand) };
+  }
+  return {
+    probe,
+    startDaemon: () => {
+      const child = spawn(process.execPath, [cliPath, 'start', '--store', store], { cwd: homedir(), detached: true, stdio: 'ignore' });
+      const exited = new Promise<number | null>((done) => {
+        child.once('exit', (code) => done(code));
+        child.once('error', () => done(null));
+      });
+      child.unref();
+      return { exited };
+    },
+  };
+}
+
+async function packageVersion(): Promise<string> {
+  return (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+}
+
+async function runConductor(action: ConductorAction, store: string): Promise<number> {
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  const socketPath = controlSocketPath(store);
+  const out = (line: string) => console.log(line);
+  const err = (line: string) => console.error(line);
+  const control = (request: Record<string, unknown> & { verb: string }) => sendControlRequest({ socketPath, request: { v: 1, ...request } });
+  const ensure = async () => ensureDaemon(store, await daemonStarter(store, cliPath));
+  if (action === 'install') {
+    if (!process.getuid) {
+      err('slipstream: `conductor install` needs macOS launchd.');
+      return 1;
+    }
+    return runConductorInstall({
+      home: homedir(), store, uid: process.getuid(), execPath: process.execPath, nodeVersion: process.versions.node,
+      cliPath, packageVersion: await packageVersion(), run: runCommand, out, err,
+      listRepos: async () => (await readConductorInventory(CONDUCTOR_DB)).repos,
+    });
+  }
+  if (action === 'setup') {
+    return runConductorSetup({ env: process.env, store, packageVersion: await packageVersion(), ensureDaemon: ensure, err,
+      attach: (dir) => runWatchOnly(dir, store, true) });
+  }
+  if (action === 'archive') {
+    await runWithdrawal(store, (deps) => runConductorArchive({ env: process.env, err,
+      withdraw: (target) => runWithdraw({ target, reason: 'archived', missingOk: true }, deps) }), 'detach');
+    return Number(process.exitCode ?? 0);
+  }
+  let inventory;
+  try { inventory = await readConductorInventory(CONDUCTOR_DB); } catch (e) {
+    if (!(e instanceof InventoryError)) throw e;
+    err(`slipstream: ${e.message}`);
+    return 1;
+  }
+  try {
+    return await runConductorEnroll(inventory, { ensureDaemon: ensure, control, out, err });
+  } catch (e) {
+    if (!(e instanceof OutcomeUnknownError)) throw e;
+    err(`slipstream: outcome unknown — ${e.message}`);
+    err(`slipstream: ${retryGuidance('attach')}`);
+    return 3;
   }
 }
 
@@ -581,17 +697,7 @@ async function runThisChatAttach(dir: string, store: string): Promise<void> {
       env: process.env, home: homedir(), nodePath: process.execPath, cliPath,
       out: (line) => console.log(line),
       err: (line) => console.error(line),
-      probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
-      startDaemon: () => {
-        const child = spawn(process.execPath, [cliPath, 'start', '--store', store],
-          { cwd: homedir(), detached: true, stdio: 'ignore' });
-        const exited = new Promise<number | null>((done) => {
-          child.once('exit', (code) => done(code));
-          child.once('error', () => done(null));
-        });
-        child.unref();
-        return { exited };
-      },
+      ...await daemonStarter(store, cliPath),
       control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
       run: (command, commandArgs, cwd) => new Promise((done) => {
         execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
@@ -664,12 +770,12 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'detach') {
-    await runControl(args.store, { verb: 'detach', target: args.target });
+    await runWithdrawal(args.store, (deps) => runWithdraw({ target: args.target, reason: 'detached' }, deps), 'detach');
     return;
   }
 
   if (args.command === 'unlink') {
-    await runControl(args.store, { verb: 'unlink', session_id: args.sessionId });
+    await runWithdrawal(args.store, (deps) => runUnlink({ sessionId: args.sessionId }, deps), 'unlink');
     return;
   }
 
@@ -692,7 +798,12 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'attach' && args.watchOnly) {
-    await runWatchOnly(args.dir, args.store, args.wait === true);
+    process.exitCode = await runWatchOnly(args.dir, args.store, args.wait === true);
+    return;
+  }
+
+  if (args.command === 'conductor') {
+    process.exitCode = await runConductor(args.action, args.store);
     return;
   }
 

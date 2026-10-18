@@ -1,4 +1,4 @@
-import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
@@ -12,7 +12,7 @@ import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
 import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
-import { isValidSessionId } from './store-reader.ts';
+import { finalRecord, isValidSessionId } from './store-reader.ts';
 import { createPlatform, type Platform, type Subscription } from './platform.ts';
 import {
   createAttributionProducer,
@@ -36,12 +36,22 @@ export interface CaptureOptions {
    * disk (D3). Mutually exclusive with {@link resumeSessionId}. A fresh id whose
    * log already exists is rejected — appending fresh would corrupt its sequence. */
   sessionId?: string;
+  /** The device and inode the root had when its capture was admitted. A root
+   * that no longer has them, before or after the watcher is installed, is a
+   * different directory: the start fails with {@link RootChangedError}. */
+  rootIdentity?: { dev: string; ino: string };
   /** Recorded on this activation's `session.started`/`session.resumed`. */
   captureMode?: CaptureMode;
   /** Notified once if this session loses its lock to another owner. Capture has
    * already stopped acknowledging by the time this fires; the daemon uses it to
    * wedge its state machine (decision 9). */
   onCompromised?: (reason: string) => void;
+  /** Notified once when this activation can no longer observe its root: the root
+   * was deleted or replaced (its device or inode changed), or the watcher
+   * subscription closed. A closed subscription has already disclosed its
+   * `capture.gap{watcher-error}`. The caller ends the activation with
+   * `stop({ reason })` (contracts.md §2). */
+  onTerminal?: (reason: 'root-missing' | 'watcher-failed', message: string) => void;
   /** The effective attribution policy for this session. Defaults to
    * {@link DEFAULT_ENRICHMENT_POLICY} (real sources `unconfigured`, since A1
    * wires no transcript adapters); the daemon drives coverage and timing as
@@ -77,6 +87,8 @@ export interface BeginTaskResult {
 
 /** A `request_id` was reused with a different title — a caller mistake, not a
  * retry, so it never commits a second declaration. */
+export class RootChangedError extends Error {}
+
 export class InvalidTitleError extends Error {
   readonly code = 'INVALID_TITLE';
   constructor(message: string) {
@@ -124,6 +136,8 @@ export interface CaptureSession {
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
   recordAgent<I extends AgentInput>(input: I, assertOwnership?: () => void): Promise<AgentEventFor<I>>;
+  /** Whether this session's log holds an `agent.binding` at `generation`. */
+  bindingRecorded(generation: string): boolean;
   stop(opts?: StopOptions): Promise<void>;
 }
 
@@ -203,6 +217,13 @@ export async function startCapture(
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
+  const rootStat = await stat(root, { bigint: true });
+  const expected = opts.rootIdentity;
+  const replaced = (st: { dev: bigint; ino: bigint } | undefined): boolean => expected !== undefined
+    && (st?.dev.toString() !== expected.dev || st.ino.toString() !== expected.ino);
+  if (replaced(rootStat)) {
+    throw new RootChangedError(`the workspace root ${root} was replaced; a directory recreated there is captured under a new session`);
+  }
   // Validate the store before freezing anything, so a bad store directory fails
   // without leaving a frozen copy of the ignore rules behind.
   await mkdirpDurable(opts.storeDir);
@@ -357,13 +378,21 @@ export async function startCapture(
     // duplicates seqs. Resuming existing history requires resumeSessionId. The
     // check runs while we hold the session lock so a concurrent caller cannot
     // create then release the same id between the check and log creation.
-    const logExists = await access(logPath).then(() => true, () => false);
-    if (logExists) {
+    // A log holding no complete record (a first start that failed before its
+    // `session.started` became durable) recorded nothing, so it starts afresh.
+    try {
+      const logExists = await access(logPath).then(() => true, () => false);
+      const unstarted = logExists && await finalRecord(logPath).then((r) => r === undefined, () => false);
+      if (unstarted) await truncate(logPath, 0);
+      if (logExists && !unstarted) {
+        throw new Error(
+          `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
+        );
+      }
+    } catch (err) {
       await lock.release();
       if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
-      throw new Error(
-        `cannot start a fresh session ${sessionId}: a log already exists at ${logPath}; use resumeSessionId to continue it`,
-      );
+      throw err;
     }
   }
 
@@ -506,7 +535,11 @@ export async function startCapture(
   const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
-    if (rel === '' || escapesBase(rel)) return;
+    if (rel === '') {
+      void checkRoot();
+      return;
+    }
+    if (escapesBase(rel)) return;
     if (live && scope.policy === 'filesystem') {
       engine.notify(rel, observedAtMs);
       return;
@@ -628,13 +661,41 @@ export async function startCapture(
 
   // A native-watcher error means delivery may have lapsed; disclose an honest
   // session-wide coverage gap instead of letting the miss vanish silently.
+  const watcherGap = (): Promise<unknown> => appendEvent({
+    type: 'slipstream.capture.gap.v1',
+    occurred_at_ms: Date.now(),
+    data: { scope: { kind: 'session' }, reason: 'watcher-error' },
+  }).catch(() => {});
   const onError = (err: Error): void => {
     console.error(`slipstream: watcher error: ${err.message}`);
-    void appendEvent({
-      type: 'slipstream.capture.gap.v1',
-      occurred_at_ms: Date.now(),
-      data: { scope: { kind: 'session' }, reason: 'watcher-error' },
-    }).catch(() => {});
+    if (terminal) return;
+    void watcherGap();
+    void checkRoot();
+  };
+
+  // The activation ends, once, when the root it watches is gone or the watcher
+  // can no longer deliver for it.
+  let terminal = false;
+  const end = (reason: 'root-missing' | 'watcher-failed', message: string): void => {
+    if (terminal || stopped) return;
+    terminal = true;
+    opts.onTerminal?.(reason, message);
+  };
+  const checkRoot = async (): Promise<boolean> => {
+    let now;
+    try { now = await stat(root, { bigint: true }); } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return false;
+    }
+    if (now?.isDirectory() && now.dev === rootStat.dev && now.ino === rootStat.ino) return false;
+    end('root-missing', now ? `the workspace root ${root} was replaced` : `the workspace root ${root} no longer exists`);
+    return true;
+  };
+  const onClosed = async (err: Error): Promise<void> => {
+    console.error(`slipstream: watcher subscription closed: ${err.message}`);
+    if (terminal || stopped || await checkRoot()) return;
+    await watcherGap();
+    end('watcher-failed', `the watcher stopped delivering changes for ${root}: ${err.message}`);
   };
 
   const priorFor = (path: string, unknownDirs: Set<string>): Snapshot =>
@@ -821,7 +882,14 @@ export async function startCapture(
   // scan is missed; buffered events reconcile against the baseline afterward.
   let subscription: Subscription | undefined;
   try {
-    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError });
+    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError,
+      onClosed: (err) => { void onClosed(err); } });
+    // The root may have been swapped between its first stat and the watcher's
+    // install; nothing is written for a directory this session never watched.
+    const watched = await stat(root, { bigint: true }).catch(() => undefined);
+    if (!watched || watched.dev !== rootStat.dev || watched.ino !== rootStat.ino) {
+      throw new RootChangedError(watched ? `the workspace root ${root} was replaced` : `the workspace root ${root} no longer exists`);
+    }
 
     if (resuming) {
       // Replay barrier: rebuild the producer's projections and reconstruct
@@ -1118,10 +1186,12 @@ export async function startCapture(
     assertOwnership();
     questionReady();
     const event = await appendEvent(input);
+    if (input.type === 'slipstream.agent.binding.v1') recordedBindings.add(input.data.binding_generation);
     if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
     assertOwnership();
     return event;
   };
+  const recordedBindings = new Set(recovered?.bindingGenerations);
 
   const doStop = async (opts?: StopOptions): Promise<void> => {
     stopped = true;
@@ -1186,6 +1256,7 @@ export async function startCapture(
     claimQuestion,
     answerQuestion,
     recordAgent,
+    bindingRecorded: (generation) => recordedBindings.has(generation),
     ingestEvidence,
     stop: (opts) => (stopPromise ??= doStop(opts)),
   };

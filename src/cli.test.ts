@@ -424,6 +424,46 @@ describe('cli capture table (real daemon)', () => {
   });
 });
 
+describe('cli conductor scripts against a running daemon', () => {
+  it('records the workspace on setup, stops it as archived on archive, and archives an unknown one quietly', async () => {
+    const { mkdtemp, mkdir, readFile, readdir, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { spawn, execFile } = await import('node:child_process');
+    const { probeSocket } = await import('./daemon.ts');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-conductor-')));
+    const work = join(dir, 'work'); const store = join(dir, 'store');
+    await mkdir(work);
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: dir };
+    const daemon = spawn(process.execPath, ['src/cli.ts', 'start', '--store', store], { env, stdio: 'ignore' });
+    const run = (action: string, workspace: string) => new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+      execFile(process.execPath, ['src/cli.ts', 'conductor', action, '--store', store],
+        { env: { ...env, CONDUCTOR_WORKSPACE_PATH: workspace }, cwd: process.cwd(), timeout: 30_000 },
+        (error, stdout, stderr) => done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+    });
+    try {
+      while (await probeSocket(join(store, 'control.sock'), 200) !== 'live') await new Promise((r) => setTimeout(r, 50));
+      const setup = await run('setup', work);
+      assert.equal(setup.code, 0, setup.stderr);
+      assert.match(setup.stdout, /state: recording/);
+      const id = /session_id: (\S+)/.exec(setup.stdout)![1]!;
+      const archived = await run('archive', work);
+      assert.equal(archived.code, 0, archived.stderr);
+      assert.match(archived.stdout, /state: stopped/);
+      const log = (await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+      assert.deepEqual([log.at(-1).type, log.at(-1).data.reason], ['slipstream.capture.stopped.v1', 'archived']);
+      const unknown = await run('archive', join(dir, 'never-captured'));
+      assert.equal(unknown.code, 0, unknown.stderr);
+      assert.match(unknown.stdout, /nothing to withdraw/);
+      assert.deepEqual(await readdir(join(store, 'sessions')), [id]);
+    } finally {
+      daemon.kill('SIGTERM');
+      while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
     assert.deepEqual(parseArgs(['start', '--store', '/s']), {
@@ -615,3 +655,27 @@ for (const kind of ['file', 'stale socket'] as const) {
     });
   }
 }
+
+describe('cli conductor', () => {
+  it('parses each conductor action with an optional store', () => {
+    for (const action of ['install', 'setup', 'archive', 'enroll']) {
+      assert.deepEqual(parseArgs(['conductor', action, '--store', '/s']), { command: 'conductor', action, store: '/s' });
+    }
+    assert.equal(parseArgs(['conductor', 'launch']), null);
+    assert.equal(parseArgs(['conductor', 'setup', '/extra']), null);
+  });
+
+  it('refuses setup and archive outside a Conductor script', async () => {
+    const { execFile } = await import('node:child_process');
+    for (const action of ['setup', 'archive']) {
+      const env = { ...process.env };
+      delete env.CONDUCTOR_WORKSPACE_PATH;
+      const result = await new Promise<{ code: number | null; stderr: string }>((done) => {
+        execFile(process.execPath, ['src/cli.ts', 'conductor', action, '--store', '/missing-store'], { env, timeout: 5000 },
+          (error, _stdout, stderr) => done({ code: error && typeof error.code === 'number' ? error.code : 0, stderr }));
+      });
+      assert.equal(result.code, 2, action);
+      assert.match(result.stderr, /CONDUCTOR_WORKSPACE_PATH is not set/);
+    }
+  });
+});

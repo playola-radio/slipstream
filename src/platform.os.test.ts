@@ -5,6 +5,8 @@
  * resolution or exclusion semantics ever diverge from the real watcher, one of
  * these two runs fails.
  */
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -26,6 +28,7 @@ const realHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
     ignore: ignore.map((d) => join(root, d)),
     onObservation: (abs) => observations.push(abs),
     onError: () => {},
+    onClosed: () => {},
   });
   let stopped = false;
   const stopObserving = async () => {
@@ -52,3 +55,27 @@ const realHarness = async ({ ignore = [] }: { ignore?: string[] }): Promise<Obse
 };
 
 describePlatformContract('real @parcel/watcher', realHarness);
+
+// The session detects a deleted root from the root's own delete event, because
+// @parcel/watcher stops its FSEvents stream silently when the root goes away.
+describe('real @parcel/watcher on a deleted root', () => {
+  it('reports the root path itself', async () => {
+    const scratch = await realpath(await mkdtemp(join(tmpdir(), 'slip-os-')));
+    const root = join(scratch, 'root');
+    await mkdir(root);
+    const observations: string[] = [];
+    const sub = await createPlatform().watch({
+      root, ignore: [], onObservation: (abs) => observations.push(abs), onError: () => {}, onClosed: () => {},
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 250));
+      await rm(root, { recursive: true });
+      const deadline = Date.now() + 5000;
+      while (!observations.includes(root) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(observations.includes(root), `expected an observation of ${root}, got ${JSON.stringify(observations)}`);
+    } finally {
+      await sub.close();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+});

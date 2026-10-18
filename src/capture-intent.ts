@@ -3,10 +3,10 @@ import type { CaptureMode } from './public-events.ts';
 
 /**
  * The daemon's capture and binding intent, in the shape of the durable intent
- * record (docs/autocapture/contracts.md §8). This PR keeps it in memory only;
- * persisting it is a later stage. Every function here is a synchronous mutation,
- * so a caller holding no await between its checks and the call gets the same
- * mutual exclusion the durable record's mutex will give.
+ * record (docs/autocapture/contracts.md §8), persisted by `intent-store.ts`.
+ * Every function here is a synchronous mutation, so a caller holding no await
+ * between its checks and the call gets the mutual exclusion the contract's
+ * mutex asks for; the caller then persists before it acknowledges.
  */
 
 /** Capture slots (spec D10). A slot is any `running` intent, whatever its state. */

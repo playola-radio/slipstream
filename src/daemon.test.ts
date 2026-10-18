@@ -14,6 +14,10 @@ import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import {
+  captureRow, chatOf, claimOf, controlCall, createRootsPlatform, linkChat, readLog, rec, waitForLog, waitForRow,
+  type Call, type CallRequest, type LogRecord,
+} from './test/daemon-harness.ts';
 import type { PublicEventInput } from './public-events.ts';
 import { defaultConfig, type ResolvedConfig } from './config.ts';
 import { createTranscriptScheduler } from './transcript/scheduler.ts';
@@ -26,52 +30,6 @@ const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const ASK_CONTEXT = {
   change_seq: '1', path: 'src/example.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
 };
-
-/** Read a field off a response envelope. Ok responses carry open-ended fields
- * that the typed union does not enumerate; a test reads them positionally. */
-function rec(res: ResponseEnvelope): Record<string, string> {
-  return res as unknown as Record<string, string>;
-}
-
-/** A control request without the protocol version the harness adds. */
-type CallRequest = { verb: string; [key: string]: unknown };
-type Call = (req: CallRequest) => Promise<ResponseEnvelope>;
-
-/** A control caller that behaves like the CLI: a chat attach that finds its
- * workspace's capture still queued or baselining polls `status` and resubmits
- * the same attach once the capture is recording (contracts.md §5). */
-function controlCall(socketPath: string, responseTimeoutMs = 5000): Call {
-  const send: Call = (req) => sendControlRequest({ socketPath, request: { v: 1 as const, ...req }, responseTimeoutMs });
-  return async (req) => {
-    let res = await send(req);
-    const chatAttach = req.verb === 'attach' && req.mode === undefined;
-    for (let i = 0; chatAttach && res.ok && rec(res).binding_generation === undefined
-      && ['queued', 'baselining'].includes(rec(res).state!) && i < 200; i++) {
-      const row = rec(await send({ verb: 'status', target: rec(res).session_id })).capture as unknown as Record<string, string>;
-      if (row.state !== 'queued' && row.state !== 'baselining') res = await send(req);
-      else await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    return res;
-  };
-}
-
-/** One capture's status row. */
-async function captureRow(call: Call, target: string): Promise<Record<string, unknown>> {
-  const res = await call({ verb: 'status', target });
-  assert.equal(res.ok, true, JSON.stringify(res));
-  return (res as unknown as { capture: Record<string, unknown> }).capture;
-}
-
-/** Poll one capture until `done` holds for its status row. */
-async function waitForRow(call: Call, target: string, done: (row: Record<string, unknown>) => boolean,
-  what = 'the expected capture state'): Promise<Record<string, unknown>> {
-  for (let i = 0; i < 300; i++) {
-    const row = await captureRow(call, target);
-    if (done(row)) return row;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`capture ${target} never reached ${what}: ${JSON.stringify(await captureRow(call, target))}`);
-}
 
 /** Attach a workspace with no chat and wait until it records. */
 async function attachWatchOnly(call: Call, worktree: string): Promise<string> {
@@ -1403,11 +1361,6 @@ it('reports a failed capture stop after store-lock loss without an unhandled rej
   }
 });
 
-type LogRecord = { seq: string; type: string; data: Record<string, unknown> };
-async function readLog(store: string, id: string): Promise<LogRecord[]> {
-  return (await readFile(sessionLogPath(store, id), 'utf8')).trim().split('\n').map(s => JSON.parse(s) as LogRecord);
-}
-
 /** A daemon with real enumeration (so detached edits reconcile) over a store the
  * test keeps across daemon restarts. */
 async function withResumeDaemon(
@@ -1831,26 +1784,6 @@ describe('daemon workspace resume concurrency', () => {
 
 /** A platform holding one fake subscription per watched root, so a test can
  * drive or break one capture's watcher while the others keep running. */
-function createRootsPlatform() {
-  const subs = new Map<string, { o: WatchOptions; closed: boolean }>();
-  const platform: Platform = {
-    watch: async (o) => {
-      const s = { o, closed: false };
-      subs.set(o.root, s);
-      return { close: async () => { s.closed = true; } };
-    },
-  };
-  const live = (root: string): WatchOptions => {
-    const s = subs.get(root);
-    assert.ok(s && !s.closed, `no live watch on ${root}`);
-    return s.o;
-  };
-  return {
-    platform,
-    observe: (root: string, path: string) => live(root).onObservation(join(root, path), Date.now()),
-    failWith: (root: string, err: Error) => live(root).onError(err),
-  };
-}
 
 /** A log whose store can be made to refuse every append and reopen with ENOSPC. */
 function fillableStore(): { full: boolean; createLog: typeof createLog } {
@@ -1898,31 +1831,6 @@ async function withCaptures(
     await rm(store, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
   }
-}
-
-/** Attach Claude chat `chat` to `worktree` through a verified root transcript. */
-async function linkChat(call: Call, store: string, worktree: string, chat: string): Promise<ResponseEnvelope> {
-  const transcript = join(store, `${chat}.jsonl`);
-  await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: chat, cwd: worktree,
-    version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
-  return call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: chat, root_transcript: transcript });
-}
-
-function chatOf(chat: string, worktree: string) {
-  return { harness: 'claude-code', harness_session_id: chat, worktree };
-}
-
-function claimOf(store: string, chat: string, worktree: string): CallRequest {
-  return { verb: 'claim_question', ...chatOf(chat, worktree), transcript_path: join(store, `${chat}.jsonl`) };
-}
-
-async function waitForLog(store: string, id: string, done: (log: LogRecord[]) => boolean): Promise<LogRecord[]> {
-  for (let i = 0; i < 300; i++) {
-    const log = await readLog(store, id);
-    if (done(log)) return log;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`session ${id} never logged the expected records`);
 }
 
 const CAPTURE_LIMIT_TEXT = 'CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. '
@@ -2132,6 +2040,20 @@ describe('daemon capture table', () => {
       assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
       await call({ verb: 'detach', target: ids[1]! });
       await waitForRow(call, ws[17]!, (row) => row.state === 'recording');
+    });
+  });
+
+  it('keeps a waiting workspace\'s place in line when it is attached again', async () => {
+    await withCaptures(async ({ call, roots }) => {
+      const ws = await roots(18);
+      const ids: string[] = [];
+      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
+      for (const root of [ws[16]!, ws[17]!, ws[16]!]) {
+        assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: root })), CAPTURE_LIMIT_TEXT);
+      }
+      await call({ verb: 'detach', target: ids[0]! });
+      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
+      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
     });
   });
 
