@@ -182,6 +182,39 @@ describe('delete_session beside running captures', () => {
       assert.equal((await captureRow(call, idB)).state, 'recording');
     }, { daemon: { workspaceLookup } });
   });
+
+  it('keeps a racing attach out when the tombstone landed but could not be made durable', async () => {
+    let hold = false;
+    let entered!: () => void; const entering = new Promise<void>((r) => { entered = r; });
+    let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
+    const workspaceLookup: typeof findWorkspaceSession = async (s, r) => {
+      const found = await findWorkspaceSession(s, r);
+      if (hold) { hold = false; entered(); await gate; }
+      return found;
+    };
+    await withStore(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachRecording(call, a!);
+      assert.equal((await call({ verb: 'detach', target: id })).ok, true);
+      hold = true;
+      const attaching = call({ verb: 'attach', mode: 'watch-only', worktree: a });
+      await entering;
+      // Write-only: the tombstone rename succeeds, the directory fsync cannot open it.
+      const dir = join(store, 'sessions', id);
+      await chmod(dir, 0o300);
+      try {
+        const res = await call({ verb: 'delete_session', session_id: id });
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+        assert.equal(await exists(tombstonePath(store, id)), true);
+        release();
+        const raced = await attaching;
+        assert.equal(raced.ok === false && raced.code, 'CAPTURE_NOT_READY', JSON.stringify(raced));
+      } finally {
+        release();
+        await chmod(dir, 0o700);
+      }
+    }, { daemon: { workspaceLookup } });
+  });
 });
 
 describe('gc as a maintenance transaction', () => {
@@ -421,6 +454,33 @@ describe('gc as a maintenance transaction', () => {
       assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
       await waitForRow(call, idB, recording);
     }, { deps: { createLog: disk.createLog }, stopError: true });
+  });
+
+  it('records no stop for a detach gc waited on once the store lock is lost', { timeout: 30_000 }, async () => {
+    await withStore(async ({ store, call, roots, holdClose }) => {
+      const [a] = await roots(1);
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      const hold = holdClose(a!);
+      const detaching = call({ verb: 'detach', target: id }).catch((err: Error) => err);
+      await hold.held;
+      const collecting = call({ verb: 'gc' }).catch((err: Error) => err);
+      const thief = join(store, 'thief');
+      await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+      await rename(thief, join(store, 'owner.lock'));
+      for (let i = 0; i < 300; i++) {
+        const res = await controlCall(join(store, 'control.sock'), 1000)({ verb: 'status' }).catch(() => undefined);
+        if (!res || (res.ok === false && res.code === 'STORAGE_UNAVAILABLE')) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      hold.release();
+      await Promise.all([detaching, collecting]);
+      for (let i = 0; i < 200 && await exists(join(store, 'sessions', id, 'owner.lock')); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const log = await readLog(store, id);
+      assert.ok(!log.some((r) => r.type === 'slipstream.capture.stopped.v1' || r.type === 'slipstream.agent.unlinked.v1'),
+        'no stop is recorded after the store lock is lost');
+    }, { stopError: true });
   });
 
   it('lets a detach during gc withdraw its capture, which then stays stopped', async () => {

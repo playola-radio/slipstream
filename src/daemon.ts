@@ -13,7 +13,7 @@ import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, STALE_MS, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
 import {
-  isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, WorkspaceLookupError,
+  isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, tombstonePath, WorkspaceLookupError,
 } from './store-reader.ts';
 import { CorruptLogError } from './recovery.ts';
 import { LogCorruptError } from './log-reader.ts';
@@ -682,6 +682,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   /** Record a capture as not recording. A transient failure is retried with
    * backoff, as a new activation. */
+  /** A stop is recorded only while the daemon holds the store lock. A shutdown
+   * keeps it, so only its loss makes a stop unrecordable. */
+  function assertStoreOwned(): void {
+    if (compromised) throw new Error('the daemon lost its store lock');
+  }
+
   function fail(c: Capture, reason: NotRecordingReason, message: string, opts: { retry: boolean }): void {
     c.lifecycle = 'failed';
     const entry = findCapture(intent, c.id);
@@ -1129,7 +1135,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
       if (c.session === session) c.session = undefined;
       try {
-        await session.stop({ reason });
+        await session.stop({ reason, assertOwnership: assertStoreOwned });
       } catch (err) {
         registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
         fail(c, 'storage-unavailable', `the capture stopped (${message}), but the stop could not be recorded: ${(err as Error).message}`,
@@ -1458,7 +1464,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // A link the log never named (a crash before its `agent.binding`) has no
       // unlink to record.
       const named = b && session.bindingRecorded(b.generation);
-      await session.stop(named ? { reason: why, unlinkGeneration: b.generation } : { reason: why });
+      await session.stop(named ? { reason: why, unlinkGeneration: b.generation, assertOwnership: assertStoreOwned }
+        : { reason: why, assertOwnership: assertStoreOwned });
       c.lifecycle = 'stopped';
     } catch (err) {
       c.closeError = err;
@@ -1764,12 +1771,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // history, so a crash in between leaves a session the reader already serves as
     // gone and a later gc finishes the cleanup. Nothing is committed yet, so a
     // failure here is a plain STORAGE_UNAVAILABLE — no rollback needed.
+    deleted.add(id);
     try {
       await publishTombstone(storeDir, id);
     } catch (err) {
+      // A rename that landed before a failed fsync leaves a tombstone the reader
+      // honours; keep attach out unless the tombstone is provably absent.
+      if (await tombstoneAbsent(id)) deleted.delete(id);
       return errFields('STORAGE_UNAVAILABLE', `could not durably record deletion of ${id}: ${(err as Error).message}`);
     }
-    deleted.add(id);
     // Now that the tombstone is durable, abort any in-flight follower of this
     // session so it re-resolves, re-reads the tombstone, and gets 410 rather than
     // streaming a log we are about to delete. The reader's installIfAbsent gives a
@@ -1794,6 +1804,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
     }
     return { session_id: id };
+  }
+
+  async function tombstoneAbsent(id: string): Promise<boolean> {
+    try {
+      await stat(tombstonePath(storeDir, id));
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
   }
 
   /** gc as one maintenance transaction (D9): close admission, stop every capture
@@ -1889,14 +1908,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       c.lifecycle = 'stopping';
       if (c.binding) c.binding.check = { state: 'setup_pending', checkId: randomUUID() };
       registry.setAgentConnection(c.id, 'none');
-      while (c.inflight.size) await Promise.allSettled([...c.inflight]);
       c.session = undefined;
       const freeze = () => registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
       try {
-        // A shutdown keeps the store lock, so only its loss makes the stop unrecordable.
-        await session.stop({ reason: 'maintenance', assertOwnership: () => {
-          if (compromised) throw new Error('the daemon lost its store lock');
-        } });
+        await session.stop({ reason: 'maintenance', assertOwnership: assertStoreOwned });
       } catch (err) {
         freeze();
         const message = (err as Error).message;
