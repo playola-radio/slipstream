@@ -272,9 +272,10 @@ Maintenance (D9, P4):
   reply and does not wait for recording.
 - gc returns `STORAGE_UNAVAILABLE` and sweeps nothing when any capture's stop
   could not be recorded, any session ownership lock is still being refreshed by
-  another process, or the store lock is lost. Captures still resume. Every store
-  writer holds the store lock: the daemon, offline intent writers, and standalone
-  `watch`/`serve`.
+  another process, or the store lock is lost. Captures still resume, unless the
+  store lock was lost: the daemon then shuts down instead, and whichever daemon
+  next holds the lock recovers them (P3). Every store writer holds the store lock:
+  the daemon, offline intent writers, and standalone `watch`/`serve`.
 
 ## 6. Public states
 
