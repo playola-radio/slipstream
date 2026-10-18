@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { createLog } from './log.ts';
+import { STALE_MS } from './lock.ts';
 import { loadIntent } from './intent-store.ts';
 import { blobPath, findWorkspaceSession, sessionLogPath, tombstonePath } from './store-reader.ts';
 import type { Platform } from './platform.ts';
@@ -103,6 +104,17 @@ async function seedBlob(store: string, sha: string): Promise<void> {
 }
 
 const DEAD = 'd'.repeat(64);
+
+/** Take a session's ownership lock as a process that has since stopped refreshing
+ * it: its holder loses the lock, and gc finds no fresh writer there. */
+async function stealSessionLock(store: string, id: string): Promise<void> {
+  const lock = join(store, 'sessions', id, 'owner.lock');
+  const thief = `${lock}.thief`;
+  await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+  const old = (Date.now() - STALE_MS - 5_000) / 1000;
+  await utimes(thief, old, old);
+  await rename(thief, lock);
+}
 
 function changedTo(sha: string) {
   return (log: LogRecord[]) => log.some((r) => r.type === 'slipstream.file.changed.v1'
@@ -376,6 +388,52 @@ describe('gc as a maintenance transaction', () => {
       await waitForLog(store, idA, changedTo(sha));
       assert.equal(await exists(blobPath(store, sha)), true, 'the resumed capture wrote the blob again');
     });
+  });
+
+  it('waits for a detach still draining when its session lock is lost, so no later event names a swept blob', { timeout: 30_000 }, async (t) => {
+    let holdAppend = false;
+    let entered!: () => void; const entering = new Promise<void>((r) => { entered = r; });
+    let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
+    const heldLog: typeof createLog = async (o) => {
+      const log = await createLog(o);
+      return { ...log, append: async (input) => {
+        if (holdAppend && input.type === 'slipstream.file.changed.v1') { holdAppend = false; entered(); await gate; }
+        return log.append(input);
+      } };
+    };
+    let lost!: () => void; const losing = new Promise<void>((r) => { lost = r; });
+    const error = console.error;
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      if (/lost its lock/.test(String(args[0]))) lost();
+      else error(...args);
+    });
+    await withStore(async ({ store, call, roots, fake, holdClose }) => {
+      const [a] = await roots(1);
+      const id = await attachRecording(call, a!);
+      await writeFile(join(a!, 'z.txt'), 'only the queued change names this');
+      const sha = sha256('only the queued change names this');
+      holdAppend = true;
+      fake.observe(a!, 'z.txt');
+      await entering;
+      // The detach's stop reaches the watcher, then drains the queued append.
+      const hold = holdClose(a!);
+      const detaching = call({ verb: 'detach', target: id });
+      await hold.held;
+      hold.release();
+      await stealSessionLock(store, id);
+      await losing;
+      const collecting = call({ verb: 'gc' });
+      await Promise.race([collecting, new Promise((r) => setTimeout(r, 300))]);
+      release();
+      await detaching;
+      const res = await collecting;
+      for (const r of await readLog(store, id)) {
+        const after = (r.data.after as { sha256?: string } | undefined)?.sha256;
+        if (after) assert.equal(await exists(blobPath(store, after)), true, `seq ${r.seq} names blob ${after}, which must be on disk`);
+      }
+      assert.ok(changedTo(sha)(await readLog(store, id)), 'the queued change landed');
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+    }, { deps: { createLog: heldLog }, stopError: true });
   });
 
   it('resumes every capture under its own id when the sweep fails', async () => {

@@ -289,7 +289,8 @@ interface Capture {
   activation?: Activation;
   /** The pending start job while queued for or holding the baseline slot. */
   starting?: Promise<void>;
-  /** A stop in flight (detach, or a halt after lock loss). */
+  /** A stop in flight (detach, maintenance, an ended activation, or a halt after
+   * lock loss); cleared once it settles. */
   closing?: Promise<void>;
   closeError?: unknown;
   /** The intent write of its latest unlink. */
@@ -1132,7 +1133,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   function endActivation(c: Capture, session: CaptureSession, { reason, message }: { reason: EndReason; message: string }): void {
     c.lifecycle = 'stopping';
     const prior = c.closing;
-    c.closing = (async () => {
+    setClosing(c, (async () => {
       await prior;
       while (c.inflight.size) await Promise.allSettled([...c.inflight]);
       if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
@@ -1153,7 +1154,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: scheduleRetry(c) };
         persistQuietly();
       }
-    })();
+    })());
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
@@ -1169,7 +1170,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   function halt(c: Capture, session: CaptureSession): void {
     registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
     const prior = c.closing;
-    c.closing = (async () => {
+    setClosing(c, (async () => {
       await prior;
       await Promise.allSettled([...c.inflight]);
       try {
@@ -1178,7 +1179,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         console.error(`slipstream daemon: session ${c.id} did not stop cleanly after losing its lock:`, err);
       }
       if (c.session === session) c.session = undefined;
-    })();
+    })());
+  }
+
+  /** Make `closing` the capture's stop in flight until it settles. */
+  function setClosing(c: Capture, closing: Promise<void>): void {
+    c.closing = closing;
+    const settle = () => { if (c.closing === closing) c.closing = undefined; };
+    closing.then(settle, settle);
   }
 
   // ---- attach / detach / unlink -------------------------------------------
@@ -1412,12 +1420,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         const prior = t.closing;
         // Set in this turn, so a concurrent detach waits for the same stop. A
         // withdrawal that is not durable stops nothing, and is never acknowledged.
-        t.closing = durable.then(() => {
+        setClosing(t, durable.then(() => {
           const promoted = promotedFor[i];
           const next = promoted && captures.get(promoted.session_id);
           if (next) enqueueStart(next);
           return closeCapture(t, prior, why);
-        }, (err: unknown) => { t.withdrawalError = err; });
+        }, (err: unknown) => { t.withdrawalError = err; }));
       }
     }
     const already = !pending.includes(c) && findCapture(intent, c.id)?.intent === 'withdrawn' && c.lifecycle === 'stopped';
@@ -1837,12 +1845,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const settled = (c: Capture) => {
         if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
       };
+      // A stop still settling counts whatever the lifecycle reads: a lock lost
+      // mid-detach marks the capture `failed` while its log is still draining.
+      const writing = (c: Capture) => c.session || c.lifecycle === 'stopping' || c.closing;
       for (;;) {
-        const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
+        const busy = [...captures.values()].filter(writing);
         if (busy.length === 0) break;
         const closings = busy.map((c) => c.closing);
         await Promise.allSettled(busy.map((c, i) => Promise.resolve(closings[i]).then(() => settled(c), () => settled(c))));
-        const stuck = busy.filter((c, i) => c.closing === closings[i] && (c.session || c.lifecycle === 'stopping'));
+        const stuck = busy.filter((c, i) => c.closing === closings[i] && writing(c));
         if (stuck.length === busy.length) {
           for (const c of stuck) unproven.set(c.id, `capture ${c.id} has not stopped`);
           break;
@@ -1881,7 +1892,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
    * connects afterwards. */
   function stopForMaintenance(c: Capture, stopped: Set<Capture>, unproven: Map<string, string>): void {
     const prior = c.closing;
-    c.closing = (async () => {
+    setClosing(c, (async () => {
       await prior;
       while (c.binding?.publishing || c.inflight.size) {
         if (c.binding) cancelRearm(c.binding);
@@ -1911,7 +1922,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       c.ended = 'maintenance';
       c.lifecycle = 'stopped';
       stopped.add(c);
-    })();
+    })());
   }
 
   /** A session ownership lock some other writer refreshed recently: the daemon's
