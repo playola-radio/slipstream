@@ -77,6 +77,7 @@ export function createRootsPlatform() {
     platform,
     observe: (root: string, path: string) => live(root).onObservation(join(root, path), Date.now()),
     failWith: (root: string, err: Error) => live(root).onError(err),
+    closeWith: (root: string, err: Error) => live(root).onClosed(err),
   };
 }
 

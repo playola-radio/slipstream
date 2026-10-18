@@ -34,6 +34,13 @@ export interface WatchOptions {
    * letting it vanish. Never a crash.
    */
   onError(err: Error): void;
+  /**
+   * Called when the subscription has ended and will deliver nothing more. The
+   * session ends the activation (contracts.md §2). `@parcel/watcher` never
+   * reports this: it ends its stream silently only when the root itself is
+   * deleted, which the session detects from the root's own delete event.
+   */
+  onClosed(err: Error): void;
 }
 
 /** The real boundary: `@parcel/watcher` (FSEvents on macOS). */

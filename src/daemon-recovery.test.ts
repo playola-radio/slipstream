@@ -20,7 +20,7 @@ import {
 async function withRestartableStore(fn: (ctx: {
   store: string;
   roots: (n: number) => Promise<string[]>;
-  start: (extra?: Partial<DaemonOptions>) => Promise<{ daemon: Daemon; call: Call }>;
+  start: (extra?: Partial<DaemonOptions>) => Promise<{ daemon: Daemon; call: Call; fake: ReturnType<typeof createRootsPlatform> }>;
   stop: () => Promise<void>;
 }) => Promise<void>): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-recover-'));
@@ -38,12 +38,13 @@ async function withRestartableStore(fn: (ctx: {
     return out;
   };
   const start = async (extra: Partial<DaemonOptions> = {}) => {
+    const fake = createRootsPlatform();
     daemon = await startDaemon({
       storeDir: store,
-      captureDependencies: { platform: createRootsPlatform().platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' },
+      captureDependencies: { platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' },
       ...extra,
     });
-    return { daemon, call: controlCall(daemon.socketPath) };
+    return { daemon, call: controlCall(daemon.socketPath), fake };
   };
   const stop = async () => {
     const d = daemon;
@@ -403,6 +404,119 @@ describe('linked chats across a daemon restart', () => {
       assert.equal((await loadIntent(store)).bindings[0]?.unavailable, null);
       await connect(call, store, 'chat-a', a!);
       assert.equal((await bindingState(call, id)).state, 'connected');
+    });
+  });
+});
+
+const lastType = (log: LogRecord[]) => log.at(-1)?.type;
+const stoppedFor = (log: LogRecord[]) => log.at(-1)?.type === 'slipstream.capture.stopped.v1' ? log.at(-1)?.data.reason : undefined;
+
+describe('a capture whose root or watcher goes away', () => {
+  it('stops with root-missing when its live root is deleted', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start();
+      const id = await attachRecording(call, a!);
+      await rm(a!, { recursive: true });
+      fake.observe(a!, '');
+      const log = await waitForLog(store, id, (l) => lastType(l) === 'slipstream.capture.stopped.v1');
+      assert.equal(stoppedFor(log), 'root-missing');
+      const row = await waitForRow(call, id, (r) => r.state === 'stopped');
+      assert.equal(row.reason, 'root-missing');
+    });
+  });
+
+  it('starts a new session for a root recreated at the same path, inheriting nothing', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start();
+      const id = await attachRecording(call, a!);
+      await rm(a!, { recursive: true });
+      await mkdir(a!);
+      fake.observe(a!, '');
+      await waitForLog(store, id, (l) => stoppedFor(l) === 'root-missing');
+      const again = await call({ verb: 'attach', mode: 'watch-only', worktree: a });
+      assert.equal(again.ok, true, JSON.stringify(again));
+      const fresh = rec(again).session_id!;
+      assert.notEqual(fresh, id);
+      await waitForRow(call, fresh, recording);
+      assert.equal((await readLog(store, fresh))[0]?.type, 'slipstream.session.started.v1');
+      assert.equal(stoppedFor(await readLog(store, id)), 'root-missing');
+      assert.equal((await captureRow(call, a!)).session_id, fresh);
+    });
+  });
+
+  it('lets a workspace inside a deleted root be captured', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start();
+      const id = await attachRecording(call, a!);
+      await rm(a!, { recursive: true });
+      fake.observe(a!, '');
+      await waitForLog(store, id, (l) => stoppedFor(l) === 'root-missing');
+      await mkdir(join(a!, 'inner'), { recursive: true });
+      const inner = await call({ verb: 'attach', mode: 'watch-only', worktree: join(a!, 'inner') });
+      assert.equal(inner.ok, true, JSON.stringify(inner));
+    });
+  });
+
+  it('records one watcher-error gap, then stops with watcher-failed, then retries', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start({ retryBackoff: { baseMs: 100, maxMs: 100 } });
+      const id = await attachRecording(call, a!);
+      fake.closeWith(a!, new Error('stream closed'));
+      const log = await waitForLog(store, id, (l) => l.some((r) => r.type === 'slipstream.capture.stopped.v1'));
+      const tail = log.slice(log.findIndex((r) => r.type === 'slipstream.capture.gap.v1' && r.data.reason === 'watcher-error'));
+      assert.deepEqual(tail.slice(0, 2).map((r) => r.type === 'slipstream.capture.stopped.v1' ? `stopped:${String(r.data.reason)}` : `gap:${String(r.data.reason)}`),
+        ['gap:watcher-error', 'stopped:watcher-failed']);
+      assert.equal(log.filter((r) => r.type === 'slipstream.capture.gap.v1' && r.data.reason === 'watcher-error').length, 1);
+      const resumed = await waitForLog(store, id, (l) => l.some((r) => r.type === 'slipstream.session.resumed.v1'));
+      assert.equal(resumed.filter((r) => r.type === 'slipstream.session.resumed.v1').length, 1);
+      await waitForRow(call, id, recording);
+    });
+  });
+
+  it('shows a watcher-failed capture as stopped with its retry scheduled', async () => {
+    await withRestartableStore(async ({ roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start({ retryBackoff: { baseMs: 60_000, maxMs: 60_000 } });
+      const id = await attachRecording(call, a!);
+      fake.closeWith(a!, new Error('stream closed'));
+      const row = await waitForRow(call, id, (r) => r.state === 'stopped');
+      assert.equal(row.reason, 'watcher-failed');
+    });
+  });
+
+  it('does not resume a capture whose root went missing while the daemon was down', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const id = await attachRecording(call, a!);
+      await stop();
+      const before = (await readLog(store, id)).length;
+      await rm(a!, { recursive: true });
+      ({ call } = await start());
+      const row = await waitForRow(call, id, (r) => r.state === 'not_recording');
+      assert.equal(row.reason, 'root-missing');
+      assert.equal((await readLog(store, id)).length, before);
+    });
+  });
+
+  it('does not resume a capture whose root was replaced while the daemon was down', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const id = await attachRecording(call, a!);
+      await stop();
+      const before = (await readLog(store, id)).length;
+      await rm(a!, { recursive: true });
+      await mkdir(a!);
+      ({ call } = await start());
+      const row = await waitForRow(call, id, (r) => r.state === 'not_recording');
+      assert.equal(row.reason, 'root-missing');
+      assert.match(String(row.message), /replaced/);
+      assert.equal((await readLog(store, id)).length, before);
     });
   });
 });

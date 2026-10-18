@@ -34,9 +34,9 @@ export function blobPath(storeDir: string, hex: string): string {
   return join(storeDir, 'blobs', 'sha256', hex.slice(0, 2), hex);
 }
 
-export interface FinalRecord { seq: bigint; time: unknown; type: unknown }
+export interface FinalRecord { seq: bigint; time: unknown; type: unknown; data: unknown }
 
-/** The last complete record's seq, time and type; undefined for a missing log or
+/** The last complete record's seq, time, type and data; undefined for a missing log or
  * one with no complete line. Torn trailing bytes are ignored. */
 export async function finalRecord(logPath: string): Promise<FinalRecord | undefined> {
   let handle;
@@ -72,7 +72,7 @@ export async function finalRecord(logPath: string): Promise<FinalRecord | undefi
     lastLine = Buffer.concat(pieces.reverse()).toString('utf8');
   } finally { await handle.close(); }
   if (lastLine === '') throw new LogCorruptError('high-water: blank final record');
-  let parsed: { seq?: unknown; time?: unknown; type?: unknown } | null;
+  let parsed: { seq?: unknown; time?: unknown; type?: unknown; data?: unknown } | null;
   try { parsed = JSON.parse(lastLine) as typeof parsed; }
   catch { throw new LogCorruptError('high-water: invalid JSON in final record'); }
   if (typeof parsed !== 'object' || parsed === null) {
@@ -81,7 +81,7 @@ export async function finalRecord(logPath: string): Promise<FinalRecord | undefi
   if (typeof parsed.seq !== 'string' || !SEQ_RE.test(parsed.seq)) {
     throw new LogCorruptError('high-water: final record has no valid decimal-string seq');
   }
-  return { seq: BigInt(parsed.seq), time: parsed.time, type: parsed.type };
+  return { seq: BigInt(parsed.seq), time: parsed.time, type: parsed.type, data: parsed.data };
 }
 
 export async function onDiskHighWater(logPath: string): Promise<bigint> {

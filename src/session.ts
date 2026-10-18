@@ -62,6 +62,12 @@ export interface CaptureOptions {
    * already stopped acknowledging by the time this fires; the daemon uses it to
    * wedge its state machine (decision 9). */
   onCompromised?: (reason: string) => void;
+  /** Notified once when this activation can no longer observe its root: the root
+   * was deleted or replaced (its device or inode changed), or the watcher
+   * subscription closed. A closed subscription has already disclosed its
+   * `capture.gap{watcher-error}`. The caller ends the activation with
+   * `stop({ reason })` (contracts.md §2). */
+  onTerminal?: (reason: 'root-missing' | 'watcher-failed', message: string) => void;
   /** The effective attribution policy for this session. Defaults to
    * {@link DEFAULT_ENRICHMENT_POLICY} (real sources `unconfigured`, since A1
    * wires no transcript adapters); the daemon drives coverage and timing as
@@ -228,6 +234,7 @@ export async function startCapture(
   // The native watcher reports realpaths; resolve symlinks in the root (e.g.
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
+  const rootStat = await stat(root, { bigint: true });
   // Validate the store before freezing anything, so a bad store directory fails
   // without leaving a frozen copy of the ignore rules behind.
   await mkdirpDurable(opts.storeDir);
@@ -531,7 +538,11 @@ export async function startCapture(
   const onObservation = (abs: string, observedAtMs: number): void => {
     if (isExcluded(abs)) return;
     const rel = relative(root, abs);
-    if (rel === '' || escapesBase(rel)) return;
+    if (rel === '') {
+      void checkRoot();
+      return;
+    }
+    if (escapesBase(rel)) return;
     if (live && scope.policy === 'filesystem') {
       engine.notify(rel, observedAtMs);
       return;
@@ -653,13 +664,38 @@ export async function startCapture(
 
   // A native-watcher error means delivery may have lapsed; disclose an honest
   // session-wide coverage gap instead of letting the miss vanish silently.
+  const watcherGap = (): Promise<unknown> => appendEvent({
+    type: 'slipstream.capture.gap.v1',
+    occurred_at_ms: Date.now(),
+    data: { scope: { kind: 'session' }, reason: 'watcher-error' },
+  }).catch(() => {});
   const onError = (err: Error): void => {
     console.error(`slipstream: watcher error: ${err.message}`);
-    void appendEvent({
-      type: 'slipstream.capture.gap.v1',
-      occurred_at_ms: Date.now(),
-      data: { scope: { kind: 'session' }, reason: 'watcher-error' },
-    }).catch(() => {});
+    if (terminal) return;
+    void watcherGap();
+    void checkRoot();
+  };
+
+  // The activation ends, once, when the root it watches is gone or the watcher
+  // can no longer deliver for it.
+  let terminal = false;
+  const end = (reason: 'root-missing' | 'watcher-failed', message: string): void => {
+    if (terminal || stopped) return;
+    terminal = true;
+    opts.onTerminal?.(reason, message);
+  };
+  const checkRoot = async (): Promise<boolean> => {
+    let now;
+    try { now = await stat(root, { bigint: true }); } catch { /* gone */ }
+    if (now?.isDirectory() && now.dev === rootStat.dev && now.ino === rootStat.ino) return false;
+    end('root-missing', now ? `the workspace root ${root} was replaced` : `the workspace root ${root} no longer exists`);
+    return true;
+  };
+  const onClosed = async (err: Error): Promise<void> => {
+    console.error(`slipstream: watcher subscription closed: ${err.message}`);
+    if (terminal || stopped || await checkRoot()) return;
+    await watcherGap();
+    end('watcher-failed', `the watcher stopped delivering changes for ${root}: ${err.message}`);
   };
 
   const priorFor = (path: string, unknownDirs: Set<string>): Snapshot =>
@@ -846,7 +882,8 @@ export async function startCapture(
   // scan is missed; buffered events reconcile against the baseline afterward.
   let subscription: Subscription | undefined;
   try {
-    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError });
+    subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError,
+      onClosed: (err) => { void onClosed(err); } });
 
     if (resuming) {
       // Replay barrier: rebuild the producer's projections and reconstruct

@@ -244,7 +244,21 @@ interface Binding {
 
 /** One start of a capture. A lock-loss callback acts only on the activation that
  * registered it, never on a later one. */
-interface Activation { session?: CaptureSession; lost: boolean }
+interface Activation {
+  session?: CaptureSession;
+  lost: boolean;
+  /** The session reported it can no longer observe its root (contracts.md §2). */
+  ended?: { reason: EndReason; message: string };
+}
+
+/** Why an activation ended on its own, with its capture intent still running. */
+type EndReason = 'root-missing' | 'watcher-failed';
+type RootIdentity = { dev: string; ino: string };
+
+const END_MESSAGES: Record<EndReason, string> = {
+  'root-missing': 'the workspace root was deleted or replaced; a directory recreated at that path is a new capture',
+  'watcher-failed': 'the watcher stopped delivering changes for this workspace',
+};
 
 /** A capture's runtime. Its intent (running / waiting / withdrawn, last failure)
  * lives in the intent record; this holds what only the live daemon knows. */
@@ -268,6 +282,9 @@ interface Capture {
   /** Consecutive transient start failures; reset by a successful activation. */
   attempts: number;
   retryTimer?: NodeJS.Timeout;
+  /** Its last activation ended on its own with `capture.stopped{reason}` while
+   * its intent stayed running; cleared when a new activation begins. */
+  ended?: EndReason;
 }
 
 const CAPTURE_LIMIT_MESSAGE = `${MAX_CAPTURES}/${MAX_CAPTURES} capture slots in use. This workspace is NOT recording. `
@@ -515,6 +532,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         : { state: 'not_recording', reason: 'stop-unconfirmed', message: 'detach was requested, but the capture could not be confirmed stopped' };
     }
     if (entry.intent === 'waiting') return { state: 'not_recording', reason: 'capture-limit-reached', message: CAPTURE_LIMIT_MESSAGE };
+    if (c.ended && ['queued', 'failed', 'stopped'].includes(c.lifecycle)) return { state: 'stopped', reason: c.ended, message: END_MESSAGES[c.ended] };
     if (entry.last_failure) return { state: 'not_recording', reason: entry.last_failure.reason, message: entry.last_failure.message };
     const health = c.session?.health.snapshot().state;
     if (health === 'failing' || health === 'recovering') {
@@ -606,12 +624,24 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     let root: string;
     try { root = await realpath(target); } catch { root = target; }
     const atRoot = [...captures.values()].filter((c) => c.root === root);
-    const found = atRoot.find(isLive) ?? atRoot.at(-1);
+    // A root recreated at the same path is a newer capture than the one it replaced.
+    const found = atRoot.findLast(isLive) ?? atRoot.at(-1);
     return found ?? errFields('TARGET_NOT_FOUND', `no capture of ${target}`);
   }
 
-  function liveCaptureAt(root: string): Capture | undefined {
-    return [...captures.values()].find((c) => c.root === root && isLive(c));
+  /** The live capture of the directory now at `root`. A capture of a directory
+   * that was deleted or replaced there is a different workspace, not a match. */
+  function liveCaptureAt(root: string, identity?: RootIdentity | null): Capture | undefined {
+    return [...captures.values()].find((c) => c.root === root && isLive(c) && sameRoot(c, identity));
+  }
+
+  function rootGone(c: Capture): boolean {
+    return c.ended === 'root-missing' || findCapture(intent, c.id)?.last_failure?.reason === 'root-missing';
+  }
+
+  function sameRoot(c: Capture, identity: RootIdentity | null | undefined): boolean {
+    const known = findCapture(intent, c.id)?.root_identity;
+    return !known || !identity || (known.dev === identity.dev && known.ino === identity.ino);
   }
 
   /** The capture a chat identity is linked to, store-wide (at most one). */
@@ -644,11 +674,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return Date.now() + delay;
   }
 
+  /** Not recording, and another activation may fix that. */
+  function retryable(c: Capture): boolean {
+    return c.lifecycle === 'failed' || (c.lifecycle === 'stopped' && c.ended !== undefined);
+  }
+
   async function retryScheduled(c: Capture): Promise<void> {
     await c.closing;
     const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
     const entry = findCapture(intent, c.id);
-    if (torn || compromised || c.lifecycle !== 'failed' || entry?.intent !== 'running' || !entry.last_failure) return;
+    if (torn || compromised || !retryable(c) || entry?.intent !== 'running' || !entry.last_failure) return;
     entry.last_failure.next_attempt_at_ms = null;
     persistQuietly();
     c.lifecycle = 'queued';
@@ -686,6 +721,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (c.resume) registry.freeze(id, last?.seq ?? 0n);
       else registry.reserve(id);
       if (entry.intent !== 'running') continue;
+      const stoppedFor = last?.type === 'slipstream.capture.stopped.v1' ? (last.data as { reason?: unknown } | null)?.reason : undefined;
+      if (stoppedFor === 'root-missing' || stoppedFor === 'watcher-failed') c.ended = stoppedFor;
       // Connection state is not persisted: a linked chat comes back pending and is
       // revalidated when its capture activates (contracts.md §8).
       const linked = intent.bindings.find((b) => b.session_id === id && b.intent === 'linked');
@@ -734,12 +771,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   interface Admitted { capture: Capture; created: boolean }
 
+  async function rootIdentityOf(root: string): Promise<RootIdentity | null> {
+    try {
+      const st = await stat(root, { bigint: true });
+      return { dev: st.dev.toString(), ino: st.ino.toString() };
+    } catch { return null; }
+  }
+
   /** Find or admit the capture of a canonical root. */
   async function admit(root: string): Promise<Admitted | ErrorFields> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     const refused = intentRefusal();
     if (refused) return refused;
-    const live = liveCaptureAt(root);
+    const identity = await rootIdentityOf(root);
+    const live = liveCaptureAt(root, identity);
     if (live) return retryIfFailed(live);
     const pending = admitting.get(root);
     if (pending) {
@@ -747,7 +792,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return isErrorFields(joined) ? joined : { capture: joined.capture, created: false };
     }
     // A withdrawn capture still watches its root until its stop completes.
-    const watching = [...captures.values()].filter((c) => isLive(c) || c.lifecycle === 'stopping');
+    // A capture whose root is gone watches nothing there any more.
+    const watching = [...captures.values()].filter((c) => (isLive(c) || c.lifecycle === 'stopping') && !rootGone(c));
     const other = [...watching.map((c) => c.root), ...admitting.keys()].find((r) => overlaps(r, root));
     if (other) {
       return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
@@ -755,7 +801,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // Admission and maintenance exclude each other: both claim their slot in the
     // same synchronous turn as this check.
     if (maintenanceInFlight) return errFields('CAPTURE_NOT_READY', 'a maintenance operation is running; retry shortly');
-    const p = admitNew(root);
+    const p = admitNew(root, identity);
     admitting.set(root, p);
     try {
       return await p;
@@ -764,7 +810,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
-  async function admitNew(root: string): Promise<Admitted | ErrorFields> {
+  async function admitNew(root: string, rootIdentity: RootIdentity | null): Promise<Admitted | ErrorFields> {
     let lookup;
     try {
       lookup = await workspaceLookup(storeDir, root);
@@ -778,26 +824,26 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     for (const s of lookup.skipped) {
       console.error(`slipstream daemon: skipped session ${s.id} while looking for ${root}'s session: ${s.reason}`);
     }
-    const id = lookup.match?.id ?? randomUUID();
+    // A session of a directory since deleted or replaced at this path is never
+    // resumed: the recreated root starts a session of its own.
+    const prev = lookup.match && findCapture(intent, lookup.match.id)?.root_identity;
+    const match = prev && rootIdentity && (prev.dev !== rootIdentity.dev || prev.ino !== rootIdentity.ino)
+      ? undefined : lookup.match;
+    const id = match?.id ?? randomUUID();
     // A detach of this same session may still be stopping it; its lock must be
     // released before the session can start again.
     const prior = captures.get(id);
     await prior?.closing;
-    let rootIdentity: { dev: string; ino: string } | null = null;
-    try {
-      const st = await stat(root, { bigint: true });
-      rootIdentity = { dev: st.dev.toString(), ino: st.ino.toString() };
-    } catch { /* recorded as unknown */ }
     if (torn || compromised) {
-      if (lookup.match) {
+      if (match) {
         return errFields('SESSION_RESUME_FAILED', `could not resume session ${id}: the daemon is shutting down or lost its store lock. ${RETRY_REMEDY}`);
       }
       return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     }
-    if (lookup.match) {
+    if (match) {
       // Pin the boundary at the durable high-water BEFORE the log can grow, and
       // hold it until activation: readers never see past it mid-resume.
-      registry.freeze(id, registry.get(id)?.boundary.current() ?? lookup.match.durableSeq);
+      registry.freeze(id, registry.get(id)?.boundary.current() ?? match.durableSeq);
     } else {
       // Reserve the registry entry (boundary 0) before startCapture creates the log
       // dir on disk, so the reader never over-publishes an uncommitted record.
@@ -811,19 +857,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', (err as Error).message);
     }
     const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set(), attempts: 0 };
-    Object.assign(c, { root, lifecycle: 'queued', resume: lookup.match !== undefined, closeError: undefined });
+    Object.assign(c, { root, lifecycle: 'queued', resume: match !== undefined, closeError: undefined });
     captures.set(id, c);
     if (entry.intent === 'running') enqueueStart(c);
     return { capture: c, created: true };
   }
 
-  /** Re-attaching a capture whose start or storage failed tries it again. */
+  /** Re-attaching a capture whose start or storage failed, or whose activation
+   * ended on its own, tries it again. */
   async function retryIfFailed(c: Capture): Promise<Admitted> {
-    if (c.lifecycle !== 'failed') return { capture: c, created: false };
+    if (!retryable(c)) return { capture: c, created: false };
     await c.closing;
     const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
     const entry = findCapture(intent, c.id);
-    if (c.lifecycle !== 'failed' || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
+    if (!retryable(c) || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
     clearTimeout(c.retryTimer);
     c.retryTimer = undefined;
     entry.last_failure = null;
@@ -847,8 +894,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function startOne(c: Capture): Promise<void> {
     if (torn || compromised || c.lifecycle !== 'queued' || !isRunning(c)) return;
     c.lifecycle = 'baselining';
+    const moved = await rootProblem(c);
+    if (c.lifecycle !== 'baselining') return;
+    if (moved) {
+      if (!c.resume) registry.freeze(c.id, 0n);
+      fail(c, 'root-missing', moved, { retry: false });
+      return;
+    }
     const activation: Activation = { lost: false };
     c.activation = activation;
+    c.ended = undefined;
     let session: CaptureSession;
     try {
       cas ??= await createCas(join(storeDir, 'blobs'));
@@ -860,6 +915,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           captureMode: 'watch-only',
           cas,
           onCompromised: (reason) => onSessionLockLost(c, activation, reason),
+          onTerminal: (reason, message) => onActivationEnded(c, activation, reason, message),
           ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
         },
         opts.captureDependencies,
@@ -898,6 +954,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     registry.activate(c.id, liveBoundary(session.health));
     registry.setAgentConnection(c.id, 'none');
+    if (activation.ended) {
+      endActivation(c, session, activation.ended);
+      return;
+    }
     // A chat stays linked across a restart of its capture, but `connected` is
     // re-earned only by a fresh round trip in the new activation.
     if (c.binding) {
@@ -936,6 +996,55 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       persistQuietly();
     }
     return publishBinding(c, b, { record: !session.bindingRecorded(b.generation), revokeOnFailure: false });
+  }
+
+  /** Whether a capture's root is still the directory it admitted. A root that is
+   * gone, or whose device or inode changed, is never captured as the same session. */
+  async function rootProblem(c: Capture): Promise<string | undefined> {
+    const known = findCapture(intent, c.id)?.root_identity;
+    let st;
+    try { st = await stat(c.root, { bigint: true }); } catch {
+      return `the workspace root ${c.root} no longer exists`;
+    }
+    if (st.isDirectory() && (!known || (st.dev.toString() === known.dev && st.ino.toString() === known.ino))) return undefined;
+    return `the workspace root ${c.root} was replaced; a directory recreated there is captured under a new session`;
+  }
+
+  function onActivationEnded(c: Capture, activation: Activation, reason: EndReason, message: string): void {
+    if (c.activation !== activation || activation.lost || activation.ended) return;
+    activation.ended = { reason, message };
+    console.error(`slipstream daemon: capture ${c.id} of ${c.root} stopped: ${message}`);
+    if (activation.session && c.lifecycle === 'recording') endActivation(c, activation.session, activation.ended);
+  }
+
+  /** Stop an activation that ended on its own, recording why. Its intent stays
+   * running: a failed watcher is retried with backoff as a new activation; a
+   * missing root is not, since it cannot come back as the same directory. */
+  function endActivation(c: Capture, session: CaptureSession, { reason, message }: { reason: EndReason; message: string }): void {
+    c.lifecycle = 'stopping';
+    const prior = c.closing;
+    c.closing = (async () => {
+      await prior;
+      while (c.inflight.size) await Promise.allSettled([...c.inflight]);
+      if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
+      if (c.session === session) c.session = undefined;
+      try {
+        await session.stop({ reason });
+      } catch (err) {
+        registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+        fail(c, 'storage-unavailable', `the capture stopped (${message}), but the stop could not be recorded: ${(err as Error).message}`,
+          { retry: true });
+        return;
+      }
+      registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+      c.ended = reason;
+      c.lifecycle = 'stopped';
+      const entry = findCapture(intent, c.id);
+      if (reason === 'watcher-failed' && entry?.intent === 'running' && !torn && !compromised) {
+        entry.last_failure = { reason, message, at_ms: Date.now(), next_attempt_at_ms: scheduleRetry(c) };
+        persistQuietly();
+      }
+    })();
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
@@ -1217,8 +1326,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
     if (!session) {
-      // Its storage failed earlier and it was halted without a durable stop.
-      c.lifecycle = c.activation ? 'failed' : 'stopped';
+      // Its activation already ended in a durable stop, or its storage failed
+      // earlier and it was halted without one.
+      c.lifecycle = c.ended || !c.activation ? 'stopped' : 'failed';
       return;
     }
     c.session = undefined;
