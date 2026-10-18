@@ -506,16 +506,74 @@ describe('linked chats across a daemon restart', () => {
       }));
       await enteredAppend;
       const unlink = call({ verb: 'unlink', session_id: id });
-      await Promise.race([
-        (async () => {
-          while ((await loadIntent(store)).bindings[0]?.intent !== 'revoked') await new Promise((resolve) => setTimeout(resolve, 5));
-        })(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('unlink waited for rearm publication')), 100)),
-      ]);
+      const deadline = Date.now() + 1_000;
+      while ((await loadIntent(store)).bindings[0]?.intent !== 'revoked') {
+        if (Date.now() > deadline) {
+          release();
+          assert.fail('unlink waited for rearm publication');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
       release();
       const result = await unlink;
       assert.equal(result.ok, true, JSON.stringify(result));
       assert.equal((await loadIntent(store)).bindings[0]?.intent, 'revoked');
+    });
+  });
+
+  it('does not acknowledge unlink before an in-flight recovered binding is revoked in the log', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const { id, generation } = await linkRecording(call, store, a!, 'chat-a');
+      await stop();
+      const log = await readLog(store, id);
+      const binding = log.findIndex((r) => r.type === 'slipstream.agent.binding.v1');
+      assert.ok(binding > 0);
+      await writeFile(sessionLogPath(store, id), log.slice(0, binding).map((r) => JSON.stringify(r) + '\n').join(''));
+
+      const fake = createRootsPlatform();
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredAppend = new Promise<void>((resolve) => { entered = resolve; });
+      const releaseAppend = new Promise<void>((resolve) => { release = resolve; });
+      ({ call } = await start({
+        captureDependencies: {
+          platform: fake.platform,
+          enumerate: async () => {},
+          readQuestionContext: async () => 'selected',
+          createLog: async (options) => {
+            const recovered = await createLog(options);
+            return {
+              ...recovered,
+              append: async (input) => {
+                if (input.type === 'slipstream.agent.binding.v1') {
+                  entered();
+                  await releaseAppend;
+                }
+                return recovered.append(input);
+              },
+            };
+          },
+        },
+      }));
+      await enteredAppend;
+      const unlink = call({ verb: 'unlink', session_id: id });
+      const acknowledgedEarly = await Promise.race([
+        unlink.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+      ]);
+      assert.equal(acknowledgedEarly, false);
+      assert.equal((await loadIntent(store)).bindings[0]?.intent, 'revoked');
+      release();
+      const result = await unlink;
+      assert.equal(result.ok, true, JSON.stringify(result));
+      const recoveredLog = await readLog(store, id);
+      assert.deepEqual(recoveredLog.slice(-2).map((r) => [r.type, r.data.binding_generation]), [
+        ['slipstream.agent.binding.v1', generation],
+        ['slipstream.agent.unlinked.v1', generation],
+      ]);
+      assert.equal((await bindingState(call, id)).state, 'unlinked');
     });
   });
 });

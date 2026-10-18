@@ -243,6 +243,9 @@ interface Binding {
   /** Set until `agent.binding` and `setup_pending` are durable; hooks and
    * forwarders do not see the binding before then. */
   publishing?: Promise<ErrorFields | undefined>;
+  /** A recovery publication that has entered the durable binding append. Unlink
+   * waits for only this append, never transcript retries or connection writes. */
+  bindingRecord?: Promise<unknown>;
   /** Its transcript failed revalidation on resume; the intent keeps the link and
    * its slot, and records why (contracts.md §4). */
   unavailable?: boolean;
@@ -1004,7 +1007,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   function startRearm(c: Capture, b: Binding, session: CaptureSession): void {
     const rearm: Promise<ErrorFields | undefined> = (async (): Promise<ErrorFields | undefined> => {
       for (;;) {
-        const failed = await rearmBinding(c, b, session);
+        let failed: ErrorFields | undefined;
+        try {
+          failed = await rearmBinding(c, b, session);
+        } catch (err) {
+          console.error(`slipstream daemon: revalidating the chat linked to ${c.id} failed:`, err);
+          failed = controlFailure(err);
+        }
         if (!failed) return;
         const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
         b.revalidations = (b.revalidations ?? 0) + 1;
@@ -1013,9 +1022,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
     })();
     b.publishing = rearm;
-    void rearm.finally(() => {
+    const clearPublishing = () => {
       if (b.publishing === rearm) b.publishing = undefined;
-    });
+    };
+    void rearm.then(clearPublishing, clearPublishing);
   }
 
   function waitForRearmDelay(b: Binding, delay: number): Promise<boolean> {
@@ -1328,9 +1338,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     let recorded = false;
     try {
       if (how.record) {
-        await session.recordAgent({ type: 'slipstream.agent.binding.v1', occurred_at_ms: Date.now(), data: {
+        const bindingRecord = session.recordAgent({ type: 'slipstream.agent.binding.v1', occurred_at_ms: Date.now(), data: {
           binding_generation: b.generation, target: { ...target, worktree: c.root }, verified_transcript_path: b.transcript } }, own);
-        recorded = true;
+        b.bindingRecord = bindingRecord;
+        try {
+          await bindingRecord;
+          recorded = true;
+        } finally {
+          if (b.bindingRecord === bindingRecord) b.bindingRecord = undefined;
+        }
       }
       await session.recordAgent({ type: 'slipstream.agent.connection.v1', occurred_at_ms: Date.now(), data: {
         state: 'setup_pending', binding_generation: b.generation, target } }, own);
@@ -1415,7 +1431,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // Detach already revoked the binding's intent with the withdrawal.
     const b = c.binding;
     c.binding = undefined;
-    if (b) cancelRearm(b);
+    if (b) {
+      cancelRearm(b);
+      await b.bindingRecord?.catch(() => undefined);
+    }
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
     if (!session) {
@@ -1470,6 +1489,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // promise before closing the log.
       await persisted;
       await Promise.allSettled(admitted);
+      await b.bindingRecord?.catch(() => undefined);
       if (!session.bindingRecorded(b.generation)) return;
       await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: Date.now(),
         data: { binding_generation: b.generation, reason: 'unlinked' } });
