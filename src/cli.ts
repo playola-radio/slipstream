@@ -39,6 +39,8 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
+import { acquireSessionLock, SessionOwnedError } from './lock.ts';
+import { mkdirpDurable } from './storage.ts';
 import { startReaderServer } from './http-reader.ts';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
@@ -844,10 +846,33 @@ async function main(): Promise<void> {
   // Standalone capture: never over a daemon-owned store.
   if (await isDaemonOwned(args.store)) return;
 
-  const session = await startCapture({ root: args.dir, storeDir: args.store });
+  // Hold the store lock for the whole capture, as the daemon does: gc and offline
+  // intent writers then know this store has a writer they must not run beside.
+  await mkdirpDurable(args.store);
+  let session: Awaited<ReturnType<typeof startCapture>> | undefined;
+  let storeLock;
+  try {
+    storeLock = await acquireSessionLock(args.store, { onCompromised: (reason) => {
+      console.error(`slipstream: lost the store lock (${reason}); stopping capture`);
+      void (session?.stop() ?? Promise.resolve()).finally(() => process.exit(1));
+    } });
+  } catch (err) {
+    if (!(err instanceof SessionOwnedError)) throw err;
+    console.error(`slipstream: ${args.store} is in use by another slipstream process (${err.message}).`);
+    console.error('slipstream: use `slipstream attach` to capture through the daemon, or choose another --store.');
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    session = await startCapture({ root: args.dir, storeDir: args.store });
+  } catch (err) {
+    await storeLock.release().catch(() => {});
+    throw err;
+  }
+  const captured = session;
   console.error(`slipstream: watching ${args.dir}`);
-  console.error(`slipstream: session ${session.sessionId}`);
-  console.error(`slipstream: log ${session.logPath}`);
+  console.error(`slipstream: session ${captured.sessionId}`);
+  console.error(`slipstream: log ${captured.logPath}`);
 
   // Shared clean-shutdown wiring for both watch and serve. `teardown` runs any
   // subsystem stop (e.g. the reader server) BEFORE capture stops, so both report
@@ -858,9 +883,10 @@ async function main(): Promise<void> {
       if (stopping) return;
       stopping = true;
       await teardown();
-      await session.stop();
-      const n = await countRecords(session.logPath);
-      console.error(`slipstream: stopped; ${n} record(s) committed to ${session.logPath}`);
+      await captured.stop();
+      await storeLock.release();
+      const n = await countRecords(captured.logPath);
+      console.error(`slipstream: stopped; ${n} record(s) committed to ${captured.logPath}`);
       process.exit(0);
     };
     process.on('SIGINT', stop);
@@ -879,11 +905,12 @@ async function main(): Promise<void> {
   try {
     server = await startReaderServer({
       storeDir: args.store,
-      active: { id: session.sessionId, health: session.health, logPath: session.logPath },
+      active: { id: captured.sessionId, health: captured.health, logPath: captured.logPath },
     });
   } catch (err) {
-    try { await session.stop(); }
+    try { await captured.stop(); }
     catch (stopError) { console.error('slipstream: capture cleanup failed', stopError); }
+    await storeLock.release().catch(() => {});
     throw err;
   }
   console.error(`slipstream: reader ${server.url}`);

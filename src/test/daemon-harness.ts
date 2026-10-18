@@ -3,6 +3,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { sendControlRequest } from '../control-client.ts';
 import { sessionLogPath } from '../store-reader.ts';
+import { createLog } from '../log.ts';
+import { StorageError } from '../storage.ts';
 import type { Platform, WatchOptions } from '../platform.ts';
 import type { ResponseEnvelope } from '../control-protocol.ts';
 
@@ -104,4 +106,49 @@ export async function waitForLog(store: string, id: string, done: (log: LogRecor
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail(`session ${id} never logged the expected records`);
+}
+
+/** Link a chat, waiting out a capture that is still starting. */
+export async function linkRecording(call: Call, store: string, root: string, chat: string): Promise<{ id: string; generation: string }> {
+  const linked = await linkChat(call, store, root, chat);
+  if (!linked.ok) {
+    await waitForRow(call, rec(linked).session_id ?? root, (row) => row.state === 'recording');
+    return linkRecording(call, store, root, chat);
+  }
+  return { id: rec(linked).session_id!, generation: rec(linked).binding_generation! };
+}
+
+/** Claim a chat's setup check, waiting out the moment its link is still being
+ * published (the hook would simply call again). */
+export async function claimCheck(call: Call, store: string, chat: string, root: string): Promise<{ check_id: string }> {
+  for (let i = 0; i < 100; i++) {
+    const res = await call(claimOf(store, chat, root));
+    if (res.ok) {
+      const check = (rec(res) as unknown as { setup_check?: { check_id: string } }).setup_check;
+      assert.ok(check, `expected a setup check for ${chat}`);
+      return check;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`${chat} could never claim its setup check`);
+}
+
+export async function connect(call: Call, store: string, chat: string, root: string): Promise<void> {
+  const check = await claimCheck(call, store, chat, root);
+  const ack = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: check.check_id, text: 'connected' });
+  assert.equal(ack.ok, true, JSON.stringify(ack));
+}
+
+/** A log whose store can be made to refuse every append and reopen with ENOSPC. */
+export function fillableStore(): { full: boolean; createLog: typeof createLog } {
+  const enospc = () => new StorageError('append', Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }));
+  const store: { full: boolean; createLog: typeof createLog } = {
+    full: false,
+    createLog: (async (o) => {
+      if (store.full) throw enospc();
+      const log = await createLog(o);
+      return { ...log, append: (input) => store.full ? Promise.reject(enospc()) : log.append(input) };
+    }) as typeof createLog,
+  };
+  return store;
 }

@@ -12,8 +12,8 @@ import { publishTombstone } from './maintenance.ts';
 import { sessionLogPath } from './store-reader.ts';
 import type { Platform } from './platform.ts';
 import {
-  captureRow, chatOf, claimOf, controlCall, createRootsPlatform, linkChat, readLog, rec, waitForLog, waitForRow,
-  type Call, type LogRecord,
+  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, linkChat, linkRecording, readLog, rec,
+  waitForLog, waitForRow, type Call, type LogRecord,
 } from './test/daemon-harness.ts';
 
 /** A store whose daemon can be stopped and started again, as a crash or a
@@ -319,36 +319,6 @@ function sinceResume(log: LogRecord[]): LogRecord[] {
 
 const pendingAfterResume = (log: LogRecord[]) => sinceResume(log)
   .some((r) => r.type === 'slipstream.agent.connection.v1' && r.data.state === 'setup_pending');
-
-async function linkRecording(call: Call, store: string, root: string, chat: string): Promise<{ id: string; generation: string }> {
-  const linked = await linkChat(call, store, root, chat);
-  if (!linked.ok) {
-    await waitForRow(call, rec(linked).session_id ?? root, recording);
-    return linkRecording(call, store, root, chat);
-  }
-  return { id: rec(linked).session_id!, generation: rec(linked).binding_generation! };
-}
-
-/** Claim a chat's setup check, waiting out the moment its link is still being
- * published (the hook would simply call again). */
-async function claimCheck(call: Call, store: string, chat: string, root: string): Promise<{ check_id: string }> {
-  for (let i = 0; i < 100; i++) {
-    const res = await call(claimOf(store, chat, root));
-    if (res.ok) {
-      const check = (rec(res) as unknown as { setup_check?: { check_id: string } }).setup_check;
-      assert.ok(check, `expected a setup check for ${chat}`);
-      return check;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`${chat} could never claim its setup check`);
-}
-
-async function connect(call: Call, store: string, chat: string, root: string): Promise<void> {
-  const check = await claimCheck(call, store, chat, root);
-  const ack = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: check.check_id, text: 'connected' });
-  assert.equal(ack.ok, true, JSON.stringify(ack));
-}
 
 async function bindingState(call: Call, id: string): Promise<Record<string, unknown>> {
   return (await captureRow(call, id)).binding as Record<string, unknown>;

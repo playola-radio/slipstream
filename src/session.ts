@@ -100,10 +100,12 @@ export class InvalidTitleError extends Error {
 /** Appends `capture.stopped{reason}` as the activation's final record; a stop
  * without options records nothing (daemon shutdown leaves the hole to the
  * heartbeat). `unlinkGeneration` names a binding withdrawn with the capture:
- * `agent.unlinked{reason}` is appended immediately before the stop. */
+ * `agent.unlinked{reason}` is appended immediately before the stop.
+ * `assertOwnership` runs immediately before each of those appends; a throw records
+ * nothing more. */
 export type StopOptions =
-  | { reason: 'detached' | 'archived'; unlinkGeneration?: string }
-  | { reason: Exclude<CaptureStopReason, 'detached' | 'archived'>; unlinkGeneration?: undefined };
+  | { reason: 'detached' | 'archived'; unlinkGeneration?: string; assertOwnership?: () => void }
+  | { reason: Exclude<CaptureStopReason, 'detached' | 'archived'>; unlinkGeneration?: undefined; assertOwnership?: () => void };
 
 type AgentInput = AgentConnectionInput | AgentBindingInput | AgentUnlinkedInput;
 type AgentEventFor<I extends AgentInput> = I extends AgentConnectionInput ? AgentConnectionEvent
@@ -1228,9 +1230,11 @@ export async function startCapture(
     } else if (opts && firstError === undefined) {
       try {
         if (opts.unlinkGeneration !== undefined) {
+          opts.assertOwnership?.();
           await appendEvent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: now(),
             data: { binding_generation: opts.unlinkGeneration, reason: opts.reason } });
         }
+        opts.assertOwnership?.();
         await appendEvent({ type: 'slipstream.capture.stopped.v1', occurred_at_ms: now(), data: { reason: opts.reason } });
       } catch (err) {
         record(err);

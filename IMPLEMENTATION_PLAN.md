@@ -169,12 +169,13 @@ transcript's header by file identity and size, so an idle cycle stats
 transcripts instead of reopening them; P5b counting tests) merged (#73). P3
 (durable capture and binding intent, restart recovery with fresh chat setup
 checks, root-missing and watcher-failed stops, the LaunchAgent, `slipstream
-conductor install|setup|archive|enroll`) is in review as #72 on
-`briankeane/autocapture-p3-recovery`. P4 and P6 Not Started.
+conductor install|setup|archive|enroll`) merged (#72). P4 (delete an inactive
+session while other captures record; gc stops every capture for maintenance,
+sweeps, and resumes each under its own id with linked chats back to setup
+pending; standalone `watch`/`serve` hold the store lock) is in review on
+`briankeane/autocapture-p4-maintenance`. P6 Not Started.
 
-Known later work: GC and session
-deletion while captures run (P4; today both still require every capture
-detached). After P5b an idle cycle still walks the Codex sessions tree once and
+Known later work: after P5b an idle cycle still walks the Codex sessions tree once and
 stats each transcript, but reopens none whose header it already has; whether
 that idle cost is acceptable is P6's real-use check.
 

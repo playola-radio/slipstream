@@ -1,6 +1,7 @@
 # Workspace auto-capture: event and control contracts (P1, design only)
 
-Status: design contract for P2 to P4. Nothing here is built. The spec this
+Status: contract for P2 to P4. P2, P3 and P5 are built; P4 (delete and gc
+beside running captures) is built on `briankeane/autocapture-p4-maintenance`. The spec this
 implements is `docs/superpowers/specs/2026-10-05-workspace-auto-capture-design.md`
 (revised 2026-10-17); where this file and the spec disagree, the spec wins and
 this file is the bug. Codex reviewed a first draft (Architect consult, recorded
@@ -253,6 +254,28 @@ New codes join `ControlErrorCode`:
 `SESSION_ACTIVE` stops being returned for "another workspace is being recorded"
 or "same workspace, another chat"; those become allowed or `BINDING_EXISTS`. It
 keeps its meaning for delete/GC against a live target.
+
+Maintenance (D9, P4):
+
+- `delete_session` runs while other captures record. It returns `SESSION_ACTIVE`
+  when the target's intent is `running` or `waiting`, or the target is still
+  starting or stopping. An attach whose lookup found the session before it was
+  deleted gets `CAPTURE_NOT_READY` and never writes into it; a retry starts a new
+  session.
+- `gc` stops every recording capture with `capture.stopped{maintenance}`, keeping
+  capture and binding intent, sweeps, then resumes each one it stopped whose
+  intent is still `running`: same session id, `session.resumed`,
+  `capture.gap{restart}`, and its linked chat back to `setup_pending` with a new
+  check. Waiting intents are untouched. While gc runs, `attach` and `unlink`
+  return `CAPTURE_NOT_READY`; `detach` still withdraws, and a withdrawn capture is
+  not resumed. `{removed}` means the sweep completed; resume is queued before the
+  reply and does not wait for recording.
+- gc returns `STORAGE_UNAVAILABLE` and sweeps nothing when any stop it stops or
+  waits on could not be recorded, any session ownership lock is still being refreshed by
+  another process, or the store lock is lost. Captures still resume, unless the
+  store lock was lost: the daemon then shuts down instead, and whichever daemon
+  next holds the lock recovers them (P3). Every store writer holds the store lock:
+  the daemon, offline intent writers, and standalone `watch`/`serve`.
 
 ## 6. Public states
 
