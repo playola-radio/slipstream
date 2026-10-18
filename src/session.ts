@@ -23,27 +23,7 @@ import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import { EVENT_TYPES, type AnyEvent, type EnrichmentPolicy, type EventInput, type HarnessName } from './event.ts';
 import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
 import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
-import { createCoverageRunner, type CoverageRunner } from './transcript/runner.ts';
-import type { DiscoveryIO } from './transcript/discovery.ts';
-import type { TranscriptFileIO } from './transcript/file-reader.ts';
-import { nodeDiscoveryIO, nodeTranscriptFileIO } from './transcript/fs-io.ts';
-
-/** How often the transcript watcher re-runs discovery and reads new records. */
-export const DEFAULT_TRANSCRIPT_POLL_MS = 2000;
-
-/** Transcript-reading settings for a session, resolved from the daemon config.
- * Absent (or an empty `harnesses`) means no transcript is read — capture behaves
- * exactly as before adapters existed (an `unknown` honestly means "nothing was
- * watched"). */
-export interface TranscriptRuntime {
-  /** The harnesses declared `configured`; only these are discovered and read. */
-  harnesses: readonly HarnessName[];
-  homes: Record<HarnessName, string>;
-  codexScanLimit: number;
-  pollIntervalMs?: number;
-  discoveryIO?: DiscoveryIO;
-  fileIO?: TranscriptFileIO;
-}
+import type { TranscriptScheduler } from './transcript/scheduler.ts';
 
 export interface CaptureOptions {
   root: string;
@@ -67,11 +47,11 @@ export interface CaptureOptions {
    * wires no transcript adapters); the daemon drives coverage and timing as
    * adapters are configured. Published once on startup and bound to each change. */
   enrichmentPolicy?: EnrichmentPolicy;
-  /** Transcript-reading settings. When present with configured harnesses, the
-   * session runs a coverage watcher that reads those harnesses' transcripts for
-   * this worktree, ingesting evidence and disclosing coverage. A capture started
-   * without it can begin reading later with {@link CaptureSession.startTranscripts}. */
-  transcript?: TranscriptRuntime;
+  /** The shared transcript scheduler, present only when enrichment is configured.
+   * The live session registers its worktree there, so configured harnesses'
+   * transcripts are read as evidence and their coverage disclosed. Absent means no
+   * transcript is read — an `unknown` honestly means "nothing was watched". */
+  transcript?: TranscriptScheduler;
   /** The store's blob store. A process running several captures over one store
    * must share one instance: it is what makes a blob another capture is still
    * publishing safe to trust. Absent means a private instance. */
@@ -144,9 +124,6 @@ export interface CaptureSession {
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
   recordAgent<I extends AgentInput>(input: I, assertOwnership?: () => void): Promise<AgentEventFor<I>>;
-  /** Start reading transcripts for this worktree if it is not already; a no-op
-   * once stopped, or when no harness is configured. */
-  startTranscripts(runtime: TranscriptRuntime): void;
   stop(opts?: StopOptions): Promise<void>;
 }
 
@@ -939,31 +916,18 @@ export async function startCapture(
   const ingestEvidence = (evidence: NormalizedEvidence): Promise<IngestOutcome> =>
     producer!.ingestEvidence(evidence);
 
-  // The transcript coverage watcher (A2): reads configured harnesses' transcripts
-  // for this worktree as revisable evidence. It never creates a change and its
-  // evidence flows through the same deduped, append-only producer path, so a
-  // re-read (including a late transcript after a restart) revises without
-  // duplicating. Runs only when a harness is actually configured.
-  let coverageRunner: CoverageRunner | undefined;
-  const startTranscripts = (tc: TranscriptRuntime): void => {
-    if (coverageRunner || stopped || tc.harnesses.length === 0) return;
-    coverageRunner = createCoverageRunner({
-      harnesses: tc.harnesses,
-      homes: tc.homes,
-      codexScanLimit: tc.codexScanLimit,
-      root,
-      sink: { ingest: ingestEvidence },
-      publish: async (data) => {
-        await appendEvent({ type: 'slipstream.enrichment.coverage.v1', occurred_at_ms: Date.now(), data });
-      },
-      discoveryIO: tc.discoveryIO ?? nodeDiscoveryIO,
-      fileIO: tc.fileIO ?? nodeTranscriptFileIO,
-      intervalMs: tc.pollIntervalMs ?? DEFAULT_TRANSCRIPT_POLL_MS,
-      onError: (err) => console.error(`slipstream: transcript watcher error: ${(err as Error).message}`),
-    });
-    coverageRunner.start();
-  };
-  if (opts.transcript) startTranscripts(opts.transcript);
+  // Transcript reading (A2): configured harnesses' transcripts for this worktree
+  // are read as revisable evidence on the shared scheduler. It never creates a
+  // change and its evidence flows through the same deduped, append-only producer
+  // path, so a re-read (including a late transcript after a restart) revises
+  // without duplicating.
+  const unregisterTranscripts = opts.transcript?.register({
+    root,
+    sink: { ingest: ingestEvidence },
+    publish: async (data) => {
+      await appendEvent({ type: 'slipstream.enrichment.coverage.v1', occurred_at_ms: Date.now(), data });
+    },
+  });
 
   const beginTask = async ({ title, requestId }: BeginTaskInput): Promise<BeginTaskResult> => {
     // Readiness: only a live, healthy, still-owned session may declare a task.
@@ -1172,9 +1136,9 @@ export async function startCapture(
     const record = (err: unknown): void => {
       if (firstError === undefined) firstError = err;
     };
-    // Stop the coverage watcher before the producer and log close: it appends
+    // Stop transcript reading before the producer and log close: it appends
     // evidence and coverage through both, and an append after close would throw.
-    await coverageRunner?.stop().catch(record);
+    await unregisterTranscripts?.().catch(record);
     await subscription?.close().catch(record);
     while (classifierRunning) await classifierDone;
     live = false;
@@ -1222,7 +1186,6 @@ export async function startCapture(
     claimQuestion,
     answerQuestion,
     recordAgent,
-    startTranscripts,
     ingestEvidence,
     stop: (opts) => (stopPromise ??= doStop(opts)),
   };
