@@ -230,6 +230,35 @@ describe('gc as a maintenance transaction', () => {
     });
   });
 
+  it('keeps a chat link whose publication was in flight when gc began', async () => {
+    let holdBinding = false;
+    let entered!: () => void; const entering = new Promise<void>((r) => { entered = r; });
+    let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
+    const heldLog: typeof createLog = async (o) => {
+      const log = await createLog(o);
+      return { ...log, append: async (input) => {
+        if (holdBinding && input.type === 'slipstream.agent.binding.v1') { holdBinding = false; entered(); await gate; }
+        return log.append(input);
+      } };
+    };
+    await withStore(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachRecording(call, a!);
+      holdBinding = true;
+      const linking = linkRecording(call, store, a!, 'chat-a');
+      await entering;
+      const collecting = call({ verb: 'gc' });
+      await new Promise((r) => setTimeout(r, 50));
+      release();
+      assert.equal((await linking).id, id);
+      assert.equal((await collecting).ok, true);
+      assert.equal((await loadIntent(store)).bindings.find((e) => e.session_id === id)?.intent, 'linked');
+      await waitForRow(call, id, recording);
+      assert.deepEqual(maintenanceCycle(await readLog(store, id)), MAINTENANCE_CYCLE);
+      await connect(call, store, 'chat-a', a!);
+    }, { deps: { createLog: heldLog } });
+  });
+
   it('leaves waiting captures waiting, in the same order', { timeout: 60_000 }, async () => {
     await withStore(async ({ store, call, roots }) => {
       const ws = await roots(18);
