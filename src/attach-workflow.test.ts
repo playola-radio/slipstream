@@ -175,7 +175,7 @@ describe('slipstream attach (one command)', () => {
         live: true, legacy: true, status: { state: 'detached' },
       }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /running daemon does not support chat setup checks/);
+      assert.match(f.err.join('\n'), /running daemon does not support multi-workspace capture and chat setup checks/);
       assert.match(f.err.join('\n'), new RegExp(`slipstream stop --store ${f.store}`));
       assert.equal(attachRequests(f).length, 0);
       await assert.rejects(stat(join(f.worktree, '.claude')));

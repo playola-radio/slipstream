@@ -206,7 +206,7 @@ function stillPending(worktree: string, id: string, deps: WaitDeps): number {
 function requireCaptureTable(status: Record<string, unknown>, store: string): void {
   const features = status.attach_features;
   if (Array.isArray(features) && features.includes('agent-connection-v1') && features.includes('capture-table-v1')) return;
-  throw new Refusal('the running daemon does not support chat setup checks. Run '
+  throw new Refusal('the running daemon does not support multi-workspace capture and chat setup checks. Run '
     + `\`slipstream stop --store ${shellWord(store)}\`, then \`slipstream attach --store ${shellWord(store)}\` again. Nothing was installed or recorded.`);
 }
 
