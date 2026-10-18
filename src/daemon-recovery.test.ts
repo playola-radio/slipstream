@@ -604,20 +604,24 @@ describe('linked chats across a daemon restart', () => {
       const { call } = await start({ captureDependencies: { platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' } });
       const id = await attachRecording(call, a!);
       holding = true;
-      const thief = join(store, 'thief');
-      await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
-      await rename(thief, join(store, 'owner.lock'));
-      // The daemon shuts down, held while stopping the capture; the successor owns intent.
-      await held;
-      const successor = await readFile(intentPath(store), 'utf8') + ' ';
-      await writeFile(intentPath(store), successor);
-      // A capture failure would record itself in intent, if intent were still ours.
-      const sessionThief = join(store, 'sessions', id, 'thief');
-      await writeFile(sessionThief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
-      await rename(sessionThief, join(store, 'sessions', id, 'owner.lock'));
-      await losing;
-      release();
-      await stop().catch(() => {});
+      let successor: string;
+      try {
+        const thief = join(store, 'thief');
+        await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+        await rename(thief, join(store, 'owner.lock'));
+        // The daemon shuts down, held while stopping the capture; the successor owns intent.
+        await held;
+        successor = await readFile(intentPath(store), 'utf8') + ' ';
+        await writeFile(intentPath(store), successor);
+        // A capture failure would record itself in intent, if intent were still ours.
+        const sessionThief = join(store, 'sessions', id, 'thief');
+        await writeFile(sessionThief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+        await rename(sessionThief, join(store, 'sessions', id, 'owner.lock'));
+        await losing;
+      } finally {
+        release();
+        await stop().catch(() => {});
+      }
       assert.equal(await readFile(intentPath(store), 'utf8'), successor);
     });
   });
@@ -791,7 +795,9 @@ describe('a capture whose root or watcher goes away', () => {
     });
   });
 
-  it('retries rather than abandons a capture whose root is momentarily unreadable', async () => {
+  it('retries rather than abandons a capture whose root is momentarily unreadable', {
+    skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'permission bits do not restrict this user' : false,
+  }, async () => {
     await withRestartableStore(async ({ store, roots, start }) => {
       const [a] = await roots(1);
       const { call, fake } = await start({ retryBackoff: { baseMs: 50, maxMs: 50 } });

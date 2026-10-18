@@ -418,25 +418,33 @@ describe('gc as a maintenance transaction', () => {
       await entering;
       // The detach's stop reaches the watcher, then drains the queued append.
       const hold = holdClose(a!);
-      const detaching = call({ verb: 'detach', target: id });
-      await hold.held;
-      hold.release();
-      await stealSessionLock(store, id);
-      await losing;
-      const holdB = holdClose(b!);
-      const collecting = call({ verb: 'gc' });
-      // gc is stopping B, so it has already found A's detach still draining.
-      await holdB.held;
-      holdB.release();
-      release();
-      await detaching;
-      const res = await collecting;
-      for (const r of await readLog(store, id)) {
-        const after = (r.data.after as { sha256?: string } | undefined)?.sha256;
-        if (after) assert.equal(await exists(blobPath(store, after)), true, `seq ${r.seq} names blob ${after}, which must be on disk`);
+      let releaseB: (() => void) | undefined;
+      try {
+        const detaching = call({ verb: 'detach', target: id });
+        await hold.held;
+        hold.release();
+        await stealSessionLock(store, id);
+        await losing;
+        const holdB = holdClose(b!);
+        releaseB = holdB.release;
+        const collecting = call({ verb: 'gc' });
+        // gc is stopping B, so it has already found A's detach still draining.
+        await holdB.held;
+        holdB.release();
+        release();
+        await detaching;
+        const res = await collecting;
+        for (const r of await readLog(store, id)) {
+          const after = (r.data.after as { sha256?: string } | undefined)?.sha256;
+          if (after) assert.equal(await exists(blobPath(store, after)), true, `seq ${r.seq} names blob ${after}, which must be on disk`);
+        }
+        assert.ok(changedTo(sha)(await readLog(store, id)), 'the queued change landed');
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      } finally {
+        hold.release();
+        releaseB?.();
+        release();
       }
-      assert.ok(changedTo(sha)(await readLog(store, id)), 'the queued change landed');
-      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
     }, { deps: { createLog: heldLog }, stopError: true });
   });
 
@@ -550,17 +558,23 @@ describe('gc as a maintenance transaction', () => {
       const collecting = call({ verb: 'gc' });
       // gc is stopping B, so it is already waiting on A's ended activation.
       await holdB.held;
-      disk.full = true;
-      holdA.release();
-      // A's stop went unrecorded, and its retry has requeued it behind gc.
-      await waitForRow(call, idA, (r) => r.reason === 'storage-unavailable' && r.retry === null, 'the requeued retry');
-      disk.full = false;
-      holdB.release();
-      const res = await collecting;
-      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
-      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
-      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
-      await waitForRow(call, idB, recording);
+      try {
+        disk.full = true;
+        holdA.release();
+        // A's stop went unrecorded, and its retry has requeued it behind gc.
+        await waitForRow(call, idA, (r) => r.reason === 'storage-unavailable' && r.retry === null, 'the requeued retry');
+        disk.full = false;
+        holdB.release();
+        const res = await collecting;
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+        assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+        assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+        await waitForRow(call, idB, recording);
+      } finally {
+        disk.full = false;
+        holdA.release();
+        holdB.release();
+      }
     }, { deps: { createLog: disk.createLog }, daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
   });
 
@@ -588,12 +602,17 @@ describe('gc as a maintenance transaction', () => {
       const collecting = call({ verb: 'gc' });
       // gc is stopping B, so it is already waiting on A's halt.
       await holdB.held;
-      holdA.release();
-      holdB.release();
-      const res = await collecting;
-      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
-      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
-      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      try {
+        holdA.release();
+        holdB.release();
+        const res = await collecting;
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+        assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+        assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      } finally {
+        holdA.release();
+        holdB.release();
+      }
     }, { daemon: { retryBackoff: { baseMs: 20, maxMs: 100 } }, stopError: true });
   });
 
