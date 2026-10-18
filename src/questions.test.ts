@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeAsk, selectSource, questionBody } from './questions.ts';
+import { normalizeAsk, selectSource, questionBody, normalizeExchange, exchangeBody } from './questions.ts';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -125,4 +125,73 @@ it('rejects unpaired surrogates instead of persisting strings strict clients can
     assert.throws(() => normalizeAsk({ ...request(), text }), code('INVALID_QUESTION'));
   }
   assert.throws(() => normalizeAsk({ ...request(), context: { ...request().context, path: 'a\ud800' } }), code('INVALID_CONTEXT'));
+});
+
+const exchange = () => ({
+  ...request(),
+  answer_text: 'Because it is.',
+  conversation: { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1' },
+});
+
+describe('question exchange normalization', () => {
+  it('normalizeExchange accepts a valid request and copies only contract fields', () => {
+    const result = normalizeExchange({ ...exchange(), selected_text: 'x', question_id: 'q', reported_by: 'me' });
+    assert.deepEqual(Object.keys(result).sort(), ['answer_text', 'context', 'conversation', 'request_id', 'session_id', 'text']);
+    assert.deepEqual(result.conversation, { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1' });
+    assert.equal(result.text, 'Why?');
+    assert.equal(result.answer_text, 'Because it is.');
+  });
+  it('normalizeExchange keeps a 200 KiB multi-byte answer byte-identical', () => {
+    const answer = 'é'.repeat(100 * 1024);
+    assert.equal(Buffer.byteLength(answer), 200 * 1024);
+    assert.equal(normalizeExchange({ ...exchange(), answer_text: answer }).answer_text, answer);
+    const padded = '  keep me \n';
+    assert.equal(normalizeExchange({ ...exchange(), answer_text: padded }).answer_text, padded);
+  });
+  it('normalizeExchange rejects answer_text that is missing, non-string, whitespace-only, or has a lone surrogate', () => {
+    const { answer_text: _omit, ...missing } = exchange();
+    assert.throws(() => normalizeExchange(missing), code('INVALID_ANSWER'));
+    for (const answer_text of [7, null, '', ' \n\t', '\uD800']) {
+      assert.throws(() => normalizeExchange({ ...exchange(), answer_text }), code('INVALID_ANSWER'));
+    }
+  });
+  it('normalizeExchange rejects bad conversation', () => {
+    const { conversation: _omit, ...missing } = exchange();
+    assert.throws(() => normalizeExchange(missing), code('PROTOCOL'));
+    const good = exchange().conversation;
+    const bad: unknown[] = [
+      null, [], 'x',
+      { ...good, harness: 'cursor' },
+      { ...good, parent_session_id: '' },
+      { ...good, fork_session_id: '' },
+      { ...good, parent_session_id: 'a'.repeat(257) },
+      { ...good, fork_session_id: 'a\nb' },
+      { ...good, parent_session_id: 'a\u0085b' },
+      { ...good, parent_session_id: 'a\u007Fb' },
+      { ...good, parent_session_id: 7 },
+      { ...good, fork_session_id: undefined },
+      { ...good, fork_session_id: good.parent_session_id },
+    ];
+    for (const conversation of bad) {
+      assert.throws(() => normalizeExchange({ ...exchange(), conversation }), code('PROTOCOL'));
+    }
+    const edge = { harness: 'codex', parent_session_id: 'a'.repeat(256), fork_session_id: 'b' };
+    assert.equal(normalizeExchange({ ...exchange(), conversation: edge }).conversation.harness, 'codex');
+  });
+  it('normalizeExchange inherits ask validation', () => {
+    assert.throws(() => normalizeExchange({ ...exchange(), request_id: 'nope' }), code('PROTOCOL'));
+    assert.throws(() => normalizeExchange({ ...exchange(), text: '   ' }), code('INVALID_QUESTION'));
+    assert.throws(() => normalizeExchange({ ...exchange(), context: { ...request().context, line_start: 5, line_end: 4 } }), code('INVALID_CONTEXT'));
+  });
+  it('exchangeBody differs when answer_text, conversation, or reply_to differs and is equal for identical requests', () => {
+    const base = exchangeBody(normalizeExchange(exchange()));
+    assert.equal(exchangeBody(normalizeExchange(exchange())), base);
+    assert.notEqual(exchangeBody(normalizeExchange({ ...exchange(), answer_text: 'Other.' })), base);
+    const conv = exchange().conversation;
+    for (const conversation of [{ ...conv, harness: 'codex' }, { ...conv, parent_session_id: 'p2' }, { ...conv, fork_session_id: 'f2' }]) {
+      assert.notEqual(exchangeBody(normalizeExchange({ ...exchange(), conversation })), base);
+    }
+    const reply = '33333333-3333-4333-8333-333333333333';
+    assert.notEqual(exchangeBody(normalizeExchange({ ...exchange(), reply_to_question_id: reply })), base);
+  });
 });
