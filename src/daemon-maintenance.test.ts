@@ -474,6 +474,26 @@ describe('gc as a maintenance transaction', () => {
     }, { deps: { createLog: disk.createLog }, stopError: true });
   });
 
+  it('sweeps nothing when a completed detach could not record its stop', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, call, roots }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachRecording(call, a!);
+      const idB = await attachRecording(call, b!);
+      await seedBlob(store, DEAD);
+      disk.full = true;
+      const detached = await call({ verb: 'detach', target: idA });
+      assert.equal(detached.ok === false && detached.code, 'STORAGE_UNAVAILABLE', JSON.stringify(detached));
+      disk.full = false;
+
+      const res = await call({ verb: 'gc' });
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
+      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      await waitForRow(call, idB, recording);
+    }, { deps: { createLog: disk.createLog }, stopError: true });
+  });
+
   it('records no stop for a detach gc waited on once the store lock is lost', { timeout: 30_000 }, async () => {
     await withStore(async ({ store, call, roots, holdClose }) => {
       const [a] = await roots(1);

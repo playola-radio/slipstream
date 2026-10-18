@@ -1839,6 +1839,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const settled = (c: Capture) => {
         if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
       };
+      for (const c of captures.values()) settled(c);
       for (;;) {
         const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
         if (busy.length === 0) break;
@@ -1921,7 +1922,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function freshSessionLock(): Promise<string | undefined> {
     for (const s of await listSessions(storeDir)) {
       let mtimeMs: number;
-      try { mtimeMs = (await stat(join(storeDir, 'sessions', s.id, 'owner.lock'))).mtimeMs; } catch { continue; }
+      try {
+        mtimeMs = (await stat(join(storeDir, 'sessions', s.id, 'owner.lock'))).mtimeMs;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw err;
+      }
       if (Date.now() - mtimeMs <= STALE_MS) return s.id;
     }
     return undefined;
