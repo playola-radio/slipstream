@@ -2,7 +2,8 @@
  * The daemon's one transcript discovery loop. Every capture that reads
  * transcripts registers here instead of running its own loop, so a cycle
  * enumerates the Codex sessions tree once and each Claude project directory once,
- * however many captures there are, and reads each transcript header once.
+ * however many captures there are, and reads each transcript header once. Headers
+ * are remembered across cycles, so an unchanged transcript is stat'ed, not reopened.
  *
  * Only discovery is shared. Each registration keeps its own watcher per harness —
  * its readers, offsets, backpressure, and coverage state — and the per-root
@@ -18,7 +19,7 @@
  * delays the next cycle for all of them.
  */
 import type { HarnessName } from '../event.ts';
-import { discoverRoots, type DiscoveryIO, type DiscoveryResult } from './discovery.ts';
+import { createDiscoveryMemory, discoverRoots, type DiscoveryIO, type DiscoveryResult } from './discovery.ts';
 import type { EvidenceSink, TranscriptFileIO } from './file-reader.ts';
 import { nodeDiscoveryIO, nodeTranscriptFileIO } from './fs-io.ts';
 import { createTranscriptWatcher, type CoveragePublish, type TranscriptWatcher } from './watcher.ts';
@@ -84,6 +85,7 @@ export function createTranscriptScheduler(opts: TranscriptSchedulerOptions): Tra
     }
   };
 
+  const memory = createDiscoveryMemory();
   const entries = new Set<Entry>();
   let chain: Promise<void> = Promise.resolve();
   let timer: TimerHandle | undefined;
@@ -101,7 +103,7 @@ export function createTranscriptScheduler(opts: TranscriptSchedulerOptions): Tra
       const due = [...entries];
       if (due.length === 0) return;
       const discover = (roots: string[]): Promise<Map<string, DiscoveryResult>> =>
-        discoverRoots(harness, discoveryIO, opts.homes[harness], roots, opts.codexScanLimit);
+        discoverRoots(harness, discoveryIO, opts.homes[harness], roots, opts.codexScanLimit, memory);
       let found: Map<string, DiscoveryResult>;
       try {
         found = await discover(due.map((e) => e.root));

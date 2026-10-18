@@ -18,6 +18,7 @@ function io(overrides: Partial<DiscoveryIO>): DiscoveryIO {
     listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
     readFirstLine: async () => ({ ok: false, reason: 'empty' }),
     readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+    stat: async () => undefined,
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
     ...overrides,
@@ -881,6 +882,7 @@ describe('shared discovery across several roots', () => {
       async listTreeJsonl() { return { paths: ['/c/v.jsonl'], truncated: false, incomplete: false }; }
       async readFirstLine() { return { ok: true as const, line: meta('vanished', '/work/proj/gone'), id: GEN }; }
       async readHeadLines() { return { ok: false as const, reason: 'inaccessible' as const }; }
+      async stat() { return undefined; }
       async realpath(p: string) { return ['/', '/work', '/work/proj'].includes(p) ? p : undefined; }
       async probe() { return { kind: 'absent' as const }; }
     }

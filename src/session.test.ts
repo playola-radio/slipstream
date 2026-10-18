@@ -888,6 +888,7 @@ describe('session', () => {
             listTreeJsonl: async () => ({ paths: [], truncated: false, incomplete: false }),
             readFirstLine: async () => ({ ok: false, reason: 'empty' }),
             readHeadLines: async () => ({ ok: true, lines: [], truncated: false, skipped: false, id: { dev: 1n, ino: 1n } }),
+            stat: async () => undefined,
             realpath: async (p: string) => p,
             probe: async () => ({ kind: 'absent' }),
           },

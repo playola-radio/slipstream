@@ -70,6 +70,7 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
       skipped: false,
       id: { dev: 1n, ino: 42n },
     }),
+    stat: async () => undefined,
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
   };
