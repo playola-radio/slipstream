@@ -148,7 +148,9 @@ export async function createCas(rootDir: string): Promise<Cas> {
 
     const pending = (async () => {
       if ((await storedSize(sha256)) === bytes.length
-        && createHash('sha256').update(await readFile(pathFor(sha256))).digest('hex') === sha256) {
+        && createHash('sha256').update(await readFile(pathFor(sha256)).catch((err: unknown) => {
+          throw new StorageError('read-blob', err);
+        })).digest('hex') === sha256) {
         await syncShardOnce(dirname(pathFor(sha256)));
         durable.add(sha256);
         return { sha256, size: bytes.length };

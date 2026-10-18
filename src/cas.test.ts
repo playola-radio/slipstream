@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { fstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createCas, StorageError } from './cas.ts';
+import { createReader } from './reader.ts';
 import { withCas, withTempDir } from './test/helpers.ts';
 
 describe('cas', () => {
@@ -89,6 +90,30 @@ describe('cas', () => {
         failDirs = false;
         await cas.put(Buffer.from(b));
         assert.ok(dirSyncs > 0, 'the retried blob is not durable until its shard directory is synced');
+      });
+    });
+
+    it('surfaces stored-blob read failures instead of unavailable source snapshots', async () => {
+      await withTempDir(async (dir) => {
+        const store = join(dir, 'store');
+        const bytes = Buffer.from('readable source');
+        await writeFile(join(dir, 'source.txt'), bytes);
+        const ref = await (await createCas(store)).put(bytes);
+        const cas = await createCas(store);
+        const path = cas.pathFor(ref.sha256);
+        const reader = createReader({ root: dir, cas });
+        await chmod(path, 0o000);
+        try {
+          for (const read of [() => cas.put(bytes), () => reader.read('source.txt')]) {
+            await assert.rejects(read, (err: unknown) => {
+              assert.ok(err instanceof StorageError, `expected StorageError, got ${err}`);
+              assert.equal(err.code, 'EACCES');
+              assert.equal(err.operation, 'read-blob');
+              return true;
+            });
+          }
+        } finally { await chmod(path, 0o600); }
+        assert.deepEqual(await reader.read('source.txt'), { kind: 'content', ...ref });
       });
     });
 
