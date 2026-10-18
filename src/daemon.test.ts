@@ -1823,3 +1823,342 @@ describe('daemon workspace resume concurrency', () => {
     } });
   });
 });
+
+/** A platform holding one fake subscription per watched root, so a test can
+ * drive or break one capture's watcher while the others keep running. */
+function createRootsPlatform() {
+  const subs = new Map<string, { o: WatchOptions; closed: boolean }>();
+  const platform: Platform = {
+    watch: async (o) => {
+      const s = { o, closed: false };
+      subs.set(o.root, s);
+      return { close: async () => { s.closed = true; } };
+    },
+  };
+  const live = (root: string): WatchOptions => {
+    const s = subs.get(root);
+    assert.ok(s && !s.closed, `no live watch on ${root}`);
+    return s.o;
+  };
+  return {
+    platform,
+    observe: (root: string, path: string) => live(root).onObservation(join(root, path), Date.now()),
+    failWith: (root: string, err: Error) => live(root).onError(err),
+  };
+}
+
+/** A daemon plus a supply of sibling workspace roots under one temp dir. */
+async function withCaptures(
+  fn: (ctx: { store: string; call: Call; daemon: Daemon; roots: (n: number) => Promise<string[]>;
+    fake: ReturnType<typeof createRootsPlatform> }) => Promise<void>,
+): Promise<void> {
+  const store = await mkdtemp(join(tmpdir(), 'slip-daemon-table-'));
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-table-roots-')));
+  const fake = createRootsPlatform();
+  const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+    platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
+  } });
+  let made = 0;
+  const roots = async (n: number): Promise<string[]> => {
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const root = join(base, `ws-${made++}`);
+      await mkdir(root);
+      out.push(root);
+    }
+    return out;
+  };
+  try {
+    await fn({ store, call: controlCall(daemon.socketPath), daemon, roots, fake });
+  } finally {
+    await daemon.stop();
+    await rm(store, { recursive: true, force: true });
+    await rm(base, { recursive: true, force: true });
+  }
+}
+
+/** Attach Claude chat `chat` to `worktree` through a verified root transcript. */
+async function linkChat(call: Call, store: string, worktree: string, chat: string): Promise<ResponseEnvelope> {
+  const transcript = join(store, `${chat}.jsonl`);
+  await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: chat, cwd: worktree,
+    version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+  return call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: chat, root_transcript: transcript });
+}
+
+function chatOf(chat: string, worktree: string) {
+  return { harness: 'claude-code', harness_session_id: chat, worktree };
+}
+
+function claimOf(store: string, chat: string, worktree: string): CallRequest {
+  return { verb: 'claim_question', ...chatOf(chat, worktree), transcript_path: join(store, `${chat}.jsonl`) };
+}
+
+async function waitForLog(store: string, id: string, done: (log: LogRecord[]) => boolean): Promise<LogRecord[]> {
+  for (let i = 0; i < 300; i++) {
+    const log = await readLog(store, id);
+    if (done(log)) return log;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`session ${id} never logged the expected records`);
+}
+
+const CAPTURE_LIMIT_TEXT = 'CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. '
+  + 'It starts automatically when another workspace is archived or detached.';
+const BINDING_LIMIT_TEXT = 'BINDING_LIMIT_REACHED: 10/10 chats linked. This workspace is still recording without '
+  + 'a linked chat. Unlink another chat to connect this one.';
+
+function refusal(res: ResponseEnvelope): string {
+  return res.ok === false ? `${res.code}: ${res.message}` : `ok ${JSON.stringify(res)}`;
+}
+
+describe('daemon capture table', () => {
+  it('records different workspaces side by side and stops each one on its own detach', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const ws = await roots(3);
+      const ids = await Promise.all(ws.map((root) => attachWatchOnly(call, root)));
+      assert.equal(new Set(ids).size, 3);
+      const table = rec(await call({ verb: 'status' })) as unknown as { captures: Array<{ session_id: string; state: string }> };
+      assert.deepEqual(table.captures.map((row) => row.state), ['recording', 'recording', 'recording']);
+      const stops = await Promise.all(ws.map((root) => call({ verb: 'detach', target: root })));
+      assert.deepEqual(stops.map((s) => s.ok && rec(s).state), ['stopped', 'stopped', 'stopped']);
+      for (const id of ids) {
+        const last = (await readLog(store, id)).at(-1)!;
+        assert.deepEqual([last.type, last.data.reason], ['slipstream.capture.stopped.v1', 'detached']);
+      }
+      assert.equal(rec(await call({ verb: 'detach', target: ws[0]! })).already_stopped, true);
+    });
+  });
+
+  it('joins concurrent attaches of the same workspace into one capture', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [root] = await roots(1);
+      const [x, y] = await Promise.all([1, 2].map(() => call({ verb: 'attach', mode: 'watch-only', worktree: root! })));
+      assert.equal(rec(x!).session_id, rec(y!).session_id);
+      assert.deepEqual([rec(x!).created, rec(y!).created].map(String).sort(), ['false', 'true']);
+      await waitForRow(call, rec(x!).session_id!, (row) => row.state === 'recording');
+      const again = await call({ verb: 'attach', mode: 'watch-only', worktree: root! });
+      assert.deepEqual([rec(again).session_id, rec(again).state, String(rec(again).created)], [rec(x!).session_id, 'recording', 'false']);
+      assert.equal((await readdir(join(store, 'sessions'))).length, 1);
+    });
+  });
+
+  it('refuses a workspace that contains or sits inside a recorded one, and allows siblings', async () => {
+    await withCaptures(async ({ call, roots }) => {
+      const [a, b] = await roots(2);
+      await mkdir(join(a!, 'sub'));
+      await mkdir(join(b!, 'sub'));
+      await attachWatchOnly(call, a!);
+      const inside = await call({ verb: 'attach', mode: 'watch-only', worktree: join(a!, 'sub') });
+      assert.equal(inside.ok === false && inside.code, 'ROOT_OVERLAP');
+      await attachWatchOnly(call, join(b!, 'sub'));
+      const around = await call({ verb: 'attach', mode: 'watch-only', worktree: b! });
+      assert.equal(around.ok === false && around.code, 'ROOT_OVERLAP');
+      // Overlap is by path component: `ws-0-sibling` is not inside `ws-0`.
+      await mkdir(`${a!}-sibling`);
+      await attachWatchOnly(call, `${a!}-sibling`);
+      assert.equal((rec(await call({ verb: 'status' })) as unknown as { captures: unknown[] }).captures.length, 3);
+    });
+  });
+
+  it('keeps the other captures recording when one loses its session lock', { timeout: 30_000 }, async () => {
+    await withCaptures(async ({ store, call, roots, fake }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      const lockPath = join(store, 'sessions', idA, 'owner.lock');
+      await writeFile(`${lockPath}.thief`, JSON.stringify({ pid: process.pid, nonce: 'thief-nonce' }), 'utf8');
+      await rename(`${lockPath}.thief`, lockPath);
+      const lost = await waitForRow(call, idA, (row) => row.state === 'not_recording');
+      assert.equal(lost.reason, 'storage-unavailable');
+      assert.equal((await captureRow(call, idB)).state, 'recording');
+      await writeFile(join(b!, 'after.ts'), 'still recorded');
+      fake.observe(b!, 'after.ts');
+      await waitForLog(store, idB, (log) => log.some((e) => e.type === 'slipstream.file.changed.v1' && e.data.path === 'after.ts'));
+    });
+  });
+
+  it('records a watcher error as a gap in that capture only', async () => {
+    await withCaptures(async ({ store, call, roots, fake }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      fake.failWith(a!, new Error('watcher hiccup'));
+      await waitForLog(store, idA, (log) => log.some((e) => e.type === 'slipstream.capture.gap.v1' && e.data.reason === 'watcher-error'));
+      assert.equal((await readLog(store, idB)).some((e) => e.type === 'slipstream.capture.gap.v1'), false);
+      assert.deepEqual([(await captureRow(call, idA)).state, (await captureRow(call, idB)).state], ['recording', 'recording']);
+    });
+  });
+
+  it('acts only on the capture a verb names', async () => {
+    await withCaptures(async ({ call, roots }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      assert.equal((await captureRow(call, a!)).session_id, idA);
+      assert.equal(rec(await call({ verb: 'detach', target: idB })).session_id, idB);
+      assert.deepEqual([(await captureRow(call, idA)).state, (await captureRow(call, idB)).state], ['recording', 'stopped']);
+      for (const target of [undefined, join(a!, 'nope'), ABSENT_ID]) {
+        const res = await call({ verb: 'detach', ...(target ? { target } : {}) });
+        assert.equal(res.ok === false && res.code, 'TARGET_NOT_FOUND', String(target));
+      }
+      assert.deepEqual(rec(await call({ verb: 'unlink', session_id: idA })), { v: 1, ok: true, session_id: idA, already_unlinked: true });
+      assert.equal((await captureRow(call, idA)).state, 'recording');
+    });
+  });
+
+  it('refuses tasks and questions on a watch-only capture', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      const task = await call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!) });
+      assert.equal(task.ok === false && task.code, 'AGENT_NOT_CONNECTED');
+      assert.match(task.ok === false ? task.message : '', /watch-only/);
+      const ask = await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(ask.ok === false && ask.code, 'AGENT_NOT_CONNECTED');
+      const types = (await readLog(store, id)).map((e) => e.type);
+      assert.equal(types.some((t) => t.startsWith('slipstream.task.') || t.startsWith('slipstream.question.')), false);
+    });
+  });
+
+  it('links a chat to a recording capture in place: same session, no new baseline, no resume', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      await writeFile(join(a!, 'f.ts'), 'x');
+      const id = await attachWatchOnly(call, a!);
+      const before = (await readLog(store, id)).length;
+      const linked = await linkChat(call, store, a!, 'c1');
+      assert.equal(rec(linked).session_id, id);
+      assert.equal(String(rec(linked).created), 'false');
+      assert.deepEqual((await readLog(store, id)).slice(before).map((e) => e.type),
+        ['slipstream.agent.binding.v1', 'slipstream.agent.connection.v1']);
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const task = await call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!) });
+      assert.equal(rec(task).session_id, id);
+    });
+  });
+
+  it('refuses an eleventh chat with BINDING_LIMIT_REACHED and keeps its workspace recording', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const ws = await roots(11);
+      for (const root of ws) await attachWatchOnly(call, root);
+      for (let i = 0; i < 10; i++) assert.equal((await linkChat(call, store, ws[i]!, `c${i}`)).ok, true);
+      const over = await linkChat(call, store, ws[10]!, 'c10');
+      assert.equal(refusal(over), BINDING_LIMIT_TEXT);
+      const row = await captureRow(call, ws[10]!);
+      assert.deepEqual([row.state, row.binding], ['recording', null]);
+      assert.deepEqual(rec(await call({ verb: 'status' })).binding_slots, { used: 10, limit: 10 } as unknown as string);
+      assert.equal((await call({ verb: 'unlink', session_id: (await captureRow(call, ws[0]!)).session_id })).ok, true);
+      assert.equal((await linkChat(call, store, ws[10]!, 'c10')).ok, true);
+    });
+  });
+
+  it('gives the tenth chat slot to exactly one of two racing chats', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const ws = await roots(11);
+      for (const root of ws) await attachWatchOnly(call, root);
+      for (let i = 0; i < 9; i++) assert.equal((await linkChat(call, store, ws[i]!, `c${i}`)).ok, true);
+      const raced = await Promise.all([linkChat(call, store, ws[9]!, 'c9'), linkChat(call, store, ws[10]!, 'c10')]);
+      assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
+      assert.equal(refusal(raced.find((r) => !r.ok)!), BINDING_LIMIT_TEXT);
+      assert.deepEqual(rec(await call({ verb: 'status' })).binding_slots, { used: 10, limit: 10 } as unknown as string);
+    });
+  });
+
+  it('holds a seventeenth workspace waiting and starts the oldest waiting one when a slot frees', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const ws = await roots(18);
+      const ids: string[] = [];
+      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
+      const over = await call({ verb: 'attach', mode: 'watch-only', worktree: ws[16]! });
+      assert.equal(refusal(over), CAPTURE_LIMIT_TEXT);
+      const waiting = await captureRow(call, ws[16]!);
+      assert.deepEqual([waiting.state, waiting.reason], ['not_recording', 'capture-limit-reached']);
+      assert.equal(refusal(await linkChat(call, store, ws[16]!, 'c1')), CAPTURE_LIMIT_TEXT);
+      assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: ws[17]! })), CAPTURE_LIMIT_TEXT);
+      await call({ verb: 'detach', target: ids[0]! });
+      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
+      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
+      await call({ verb: 'detach', target: ids[1]! });
+      await waitForRow(call, ws[17]!, (row) => row.state === 'recording');
+    });
+  });
+
+  it('gives the sixteenth capture slot to exactly one of two racing workspaces', async () => {
+    await withCaptures(async ({ call, roots }) => {
+      const ws = await roots(17);
+      for (const root of ws.slice(0, 15)) await attachWatchOnly(call, root);
+      const raced = await Promise.all(ws.slice(15).map((root) => call({ verb: 'attach', mode: 'watch-only', worktree: root })));
+      assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
+      assert.equal(refusal(raced.find((r) => !r.ok)!), CAPTURE_LIMIT_TEXT);
+    });
+  });
+
+  it('fences an unlinked chat: its old setup check and generation are refused after a relink', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      const g1 = rec(await linkChat(call, store, a!, 'c1')).binding_generation!;
+      const old = (rec(await call(claimOf(store, 'c1', a!))) as unknown as { setup_check: { check_id: string } }).setup_check;
+      assert.deepEqual(rec(await call({ verb: 'unlink', session_id: id })), { v: 1, ok: true, session_id: id, binding_generation: g1 });
+      assert.equal(rec(await call({ verb: 'unlink', session_id: id })).already_unlinked, true);
+      const orphan = await call({ verb: 'answer_question', ...chatOf('c1', a!), question_id: old.check_id, text: 'connected' });
+      assert.equal(orphan.ok, false);
+      const g2 = rec(await linkChat(call, store, a!, 'c1')).binding_generation!;
+      assert.ok(BigInt(g2) > BigInt(g1));
+      const replay = await call({ verb: 'answer_question', ...chatOf('c1', a!), question_id: old.check_id, text: 'connected' });
+      assert.equal(replay.ok, false, 'a check from the old generation cannot connect the new link');
+      assert.equal((await bindingOf(call, id))?.state, 'setup_pending');
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const stale = await call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!), binding_generation: g1 });
+      assert.equal(stale.ok === false && stale.code, 'STALE_BINDING');
+      const unlinked = (await readLog(store, id)).filter((e) => e.type === 'slipstream.agent.unlinked.v1');
+      assert.deepEqual(unlinked.map((e) => [e.data.binding_generation, e.data.reason]), [[g1, 'unlinked']]);
+    });
+  });
+
+  it('routes tasks, questions and answers by chat identity across captures', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      await linkChat(call, store, a!, 'c1');
+      await linkChat(call, store, b!, 'c2');
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      await connectAgent(call, claimOf(store, 'c2', b!));
+      assert.equal(rec(await call({ verb: 'begin_task', title: 'T', request_id: 'r', ...chatOf('c1', a!) })).session_id, idA);
+      const wrongRoot = await call({ verb: 'begin_task', title: 'T', request_id: 'r2', ...chatOf('c1', b!) });
+      assert.equal(wrongRoot.ok === false && wrongRoot.code, 'SESSION_NOT_SELECTED');
+      assert.equal((await readLog(store, idB)).some((e) => e.type === 'slipstream.task.started.v1'), false);
+
+      const asked = await call({ verb: 'ask', session_id: idA, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      const questionId = rec(asked).question_id!;
+      assert.equal(rec(await call(claimOf(store, 'c2', b!))).question, null, 'the other chat never receives it');
+      const subagent = await call({ ...claimOf(store, 'c1', a!), agent_id: 'child', agent_type: 'general-purpose' });
+      assert.equal(subagent.ok, false, 'a subagent callback never receives it');
+      const claimed = rec(await call(claimOf(store, 'c1', a!))).question as unknown as { question_id: string };
+      assert.equal(claimed.question_id, questionId);
+      const crossChat = await call({ verb: 'answer_question', ...chatOf('c2', b!), question_id: questionId, text: 'mine' });
+      assert.equal(crossChat.ok, false, 'another chat cannot answer it');
+      const answered = await call({ verb: 'answer_question', ...chatOf('c1', a!), question_id: questionId, text: 'because' });
+      assert.equal(rec(answered).session_id, idA);
+    });
+  });
+
+  it('lets independent readers follow each capture and lists every capture', async () => {
+    await withCaptures(async ({ store, daemon, call, roots, fake }) => {
+      const [a, b] = await roots(2);
+      const idA = await attachWatchOnly(call, a!);
+      const idB = await attachWatchOnly(call, b!);
+      await writeFile(join(a!, 'only-a.ts'), 'a');
+      fake.observe(a!, 'only-a.ts');
+      await waitForLog(store, idA, (log) => log.some((e) => e.data.path === 'only-a.ts'));
+      const auth = { headers: { authorization: `Bearer ${daemon.readerToken}` } };
+      const events = async (id: string) => (await (await fetch(`${daemon.readerUrl}/v1/sessions/${id}/events?after=0`, auth)).text())
+        .split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogRecord);
+      assert.ok((await events(idA)).some((e) => e.data.path === 'only-a.ts'));
+      assert.equal((await events(idB)).some((e) => e.data.path === 'only-a.ts'), false);
+      const listed = await (await fetch(`${daemon.readerUrl}/v1/captures`, auth)).json() as { captures: Array<{ session_id: string; state: string }> };
+      assert.deepEqual(listed.captures.map((r) => [r.session_id, r.state]).sort(), [[idA, 'recording'], [idB, 'recording']].sort());
+    });
+  });
+});
