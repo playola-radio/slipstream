@@ -41,7 +41,7 @@ import { MAX_MESSAGE_BYTES, type ResponseEnvelope } from './control-protocol.ts'
 import { QUESTION_TTL_MS } from './questions.ts';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
 import { runTui } from './tui.ts';
-import { runAttachWorkflow, runWatchOnlyAttach } from './attach-workflow.ts';
+import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -555,6 +555,23 @@ async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<
   }
 }
 
+async function runIdentity(store: string, request: Record<string, unknown> & { verb: 'attach'; worktree: string }): Promise<void> {
+  const socketPath = controlSocketPath(store);
+  try {
+    process.exitCode = await runIdentityAttach(request, {
+      out: (line) => console.log(line),
+      err: (line) => console.error(line),
+      control: (req) => sendControlRequest({ socketPath, request: { v: 1, ...req } }),
+      report: (res) => reportControl({ v: 1, ok: true, ...res }),
+    });
+  } catch (err) {
+    if (!(err instanceof OutcomeUnknownError)) throw err;
+    console.error(`slipstream: outcome unknown — ${err.message}`);
+    console.error(`slipstream: ${retryGuidance('attach')}`);
+    process.exitCode = 3;
+  }
+}
+
 /** `slipstream attach` without identity flags connects the chat it runs in. */
 async function runThisChatAttach(dir: string, store: string): Promise<void> {
   const socketPath = controlSocketPath(store);
@@ -685,7 +702,7 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'attach') {
-    await runControl(args.store, {
+    await runIdentity(args.store, {
       verb: 'attach',
       worktree: args.dir,
       harness: args.harness,

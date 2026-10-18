@@ -72,21 +72,10 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   // When the daemon is sure to refuse, its reply is the explanation; nothing is installed first.
   const changed = refusalExpected(status, chat, worktree) ? false : await applyAgentConfig(plan, worktree, deps);
 
-  const request = { verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
-    root_transcript: transcript };
-  const deadline = clock(deps) + ATTACH_WAIT_MS;
-  let res: Record<string, unknown>;
-  for (;;) {
-    const reply = await deps.control(request);
-    if (!reply.ok) throw new Refusal(`${reply.code}: ${reply.message}`);
-    res = reply;
-    if (res.binding_generation !== undefined) break;
-    if (res.state === 'not_recording') throw notRecording(worktree, res);
-    // Still starting: wait until it records, then link (attach is idempotent).
-    const row = await waitForCapture(String(res.session_id), deadline, deps);
-    if (row === null) return stillPending(worktree, String(res.session_id), deps);
-    if (row.state !== 'recording') throw notRecording(worktree, row);
-  }
+  const linked = await linkWhenRecording({ verb: 'attach', worktree, harness: chat.harness, harness_session_id: chat.id,
+    root_transcript: transcript }, deps);
+  if (typeof linked === 'number') return linked;
+  const res = linked;
   const connection = String(res.agent_connection);
   if (connection !== 'connected' && connection !== 'setup_pending') {
     throw new Refusal(`the daemon reported this chat as ${connection}; it is not connected.`);
@@ -103,6 +92,39 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   deps.out(`session_id: ${String(res.session_id)}`);
   deps.out(`agent_connection: ${connection}`);
   return 0;
+}
+
+/** `slipstream attach` with explicit identity flags: link that chat, waiting out a
+ * starting capture exactly as the chat-detecting form does. */
+export async function runIdentityAttach(request: Record<string, unknown> & { verb: 'attach'; worktree: string },
+  deps: WaitDeps & { report: (res: Record<string, unknown>) => void }): Promise<number> {
+  try {
+    const res = await linkWhenRecording(request, deps);
+    if (typeof res === 'number') return res;
+    deps.report(res);
+    return 0;
+  } catch (err) {
+    if (!(err instanceof Refusal)) throw err;
+    deps.err(`slipstream: ${err.message}`);
+    return 1;
+  }
+}
+
+/** Attach a chat. A capture that is still starting is polled until it records,
+ * then the same attach is resubmitted (it is idempotent). Returns the link reply,
+ * or the exit code after reporting that the capture is still pending. */
+async function linkWhenRecording(request: Record<string, unknown> & { verb: string; worktree: string },
+  deps: WaitDeps): Promise<Record<string, unknown> | number> {
+  const deadline = clock(deps) + ATTACH_WAIT_MS;
+  for (;;) {
+    const res = await deps.control(request);
+    if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
+    if (res.binding_generation !== undefined) return res;
+    if (res.state === 'not_recording') throw notRecording(request.worktree, res);
+    const row = await waitForCapture(String(res.session_id), deadline, deps);
+    if (row === null) return stillPending(request.worktree, String(res.session_id), deps);
+    if (row.state !== 'recording') throw notRecording(request.worktree, row);
+  }
 }
 
 /** `slipstream attach --watch-only`: record a workspace with no chat linked. */
@@ -126,7 +148,7 @@ export async function runWatchOnlyAttach(opts: { dir: string; wait: boolean }, d
       state = 'recording';
     }
     if (state !== 'recording') throw notRecording(opts.dir, res);
-    deps.out(`Recording ${opts.dir} (watch-only: no chat linked).`);
+    deps.out(`Recording ${opts.dir}; this command linked no chat.`);
     deps.out(`session_id: ${id}`);
     deps.out(`state: ${state}`);
     return 0;

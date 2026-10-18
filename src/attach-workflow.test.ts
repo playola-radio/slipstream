@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, stat, chmod, symlink
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAttachWorkflow, runWatchOnlyAttach, type AttachDeps } from './attach-workflow.ts';
+import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach, type AttachDeps } from './attach-workflow.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 
@@ -652,7 +652,7 @@ describe('slipstream attach --watch-only', () => {
     const r = await run([{ ok: true, session_id: 's1', state: 'recording', reason: null, created: true }], false);
     assert.equal(r.code, 0);
     assert.deepEqual(r.requests, [{ verb: 'attach', mode: 'watch-only', worktree: '/w' }]);
-    assert.match(r.out, /Recording \/w \(watch-only: no chat linked\)\.\nsession_id: s1\nstate: recording/);
+    assert.match(r.out, /Recording \/w; this command linked no chat\.\nsession_id: s1\nstate: recording/);
   });
 
   it('reports a starting capture honestly without --wait', async () => {
@@ -688,5 +688,35 @@ describe('slipstream attach --watch-only', () => {
     const r = await run([{ ok: false, code: 'CAPTURE_LIMIT_REACHED', message: text }], true);
     assert.equal(r.code, 1);
     assert.equal(r.err, `slipstream: CAPTURE_LIMIT_REACHED: ${text}`);
+  });
+});
+
+describe('slipstream attach with identity flags', () => {
+  const request = { verb: 'attach' as const, worktree: '/w', harness: 'codex', harness_session_id: 'c1', root_transcript: '/t.jsonl' };
+  const run = async (replies: Record<string, unknown>[], clock = { now: 0 }) => {
+    const err: string[] = []; const reported: Record<string, unknown>[] = []; const requests: Record<string, unknown>[] = [];
+    const code = await runIdentityAttach(request, {
+      out: () => {}, err: (l) => err.push(l), report: (res) => reported.push(res),
+      control: async (req) => { requests.push(req); return { v: 1, ...replies.shift()! } as ResponseEnvelope; },
+      now: () => clock.now, sleep: async (ms: number) => { clock.now += ms; }, pollIntervalMs: 5_000,
+    });
+    return { code, err: err.join('\n'), reported, requests };
+  };
+
+  it('links the chat once a starting capture records', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'queued', reason: null, created: true },
+      { ok: true, capture: { session_id: 's1', state: 'recording' } },
+      { ok: true, session_id: 's1', state: 'recording', binding_generation: '1', agent_connection: 'setup_pending' }]);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(r.requests.map((q) => q.verb), ['attach', 'status', 'attach']);
+    assert.equal(r.reported[0]!.binding_generation, '1');
+  });
+
+  it('says the outcome is unknown when the capture is still starting at its deadline', async () => {
+    const r = await run([{ ok: true, session_id: 's1', state: 'baselining', reason: null, created: true },
+      ...Array.from({ length: 50 }, () => ({ ok: true, capture: { session_id: 's1', state: 'baselining' } }))]);
+    assert.equal(r.code, 3);
+    assert.match(r.err, /still pending, outcome unknown/);
+    assert.equal(r.reported.length, 0);
   });
 });
