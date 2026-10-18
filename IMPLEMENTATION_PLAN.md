@@ -1225,7 +1225,12 @@ plan say the client may run the chat agent and the daemon never does.
 **Success Criteria**: one real `--fork-session` run in a watched worktree;
 recorded effect on "possibly agent" labels. If labels degrade, stop and report
 to Brian (attribution confidence is his call).
-**Status**: Not Started
+**Status**: Blocked — forked transcripts degrade attribution (2026-10-18 run:
+an edit made before the fork went from heuristic / single-candidate to
+ambiguous / multiple-candidates because the fork's transcript repeats the
+parent's tool calls under a new conversation id, with the same tool record
+ids; edits after the fork and manual edits were unaffected). Awaiting Brian's
+decision on copied evidence.
 
 ### Stage C1.3: `record_question_exchange` verb and event
 **Success Criteria**: per `docs/chat-console/DESIGN.md` Change 2, with its tests.
