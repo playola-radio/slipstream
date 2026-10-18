@@ -474,7 +474,7 @@ describe('gc as a maintenance transaction', () => {
     }, { deps: { createLog: disk.createLog }, stopError: true });
   });
 
-  it('sweeps nothing when a completed detach could not record its stop', async () => {
+  it('still sweeps after an earlier detach failed to record its stop, without recording one for it', async () => {
     const disk = fillableStore();
     await withStore(async ({ store, call, roots }) => {
       const [a, b] = await roots(2);
@@ -487,9 +487,10 @@ describe('gc as a maintenance transaction', () => {
       disk.full = false;
 
       const res = await call({ verb: 'gc' });
-      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
-      assert.match(res.ok === false ? res.message : '', new RegExp(`capture ${idA} stopped without recording its stop`));
-      assert.equal(await exists(blobPath(store, DEAD)), true, 'nothing is swept past an unrecorded stop');
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal(rec(res).removed, 1);
+      assert.equal(await exists(blobPath(store, DEAD)), false, 'the unreferenced blob is swept');
+      assert.ok(!(await readLog(store, idA)).some((r) => r.type === 'slipstream.capture.stopped.v1'), 'no stop is manufactured');
       await waitForRow(call, idB, recording);
     }, { deps: { createLog: disk.createLog }, stopError: true });
   });

@@ -270,8 +270,8 @@ Maintenance (D9, P4):
   return `CAPTURE_NOT_READY`; `detach` still withdraws, and a withdrawn capture is
   not resumed. `{removed}` means the sweep completed; resume is queued before the
   reply and does not wait for recording.
-- gc returns `STORAGE_UNAVAILABLE` and sweeps nothing when any capture's stop
-  could not be recorded, any session ownership lock is still being refreshed by
+- gc returns `STORAGE_UNAVAILABLE` and sweeps nothing when any stop it stops or
+  waits on could not be recorded, any session ownership lock is still being refreshed by
   another process, or the store lock is lost. Captures still resume, unless the
   store lock was lost: the daemon then shuts down instead, and whichever daemon
   next holds the lock recovers them (P3). Every store writer holds the store lock:

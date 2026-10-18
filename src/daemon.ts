@@ -1831,15 +1831,12 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       for (const c of captures.values()) {
         if (c.session && c.lifecycle === 'recording') stopForMaintenance(c, stopped, unproven);
       }
-      // A detach, a halt or an ended activation may own a stop too; every one of
-      // them must finish, and record its stop, before any blob is swept. A session
-      // no stop is pending for (a withdrawal that could not be saved) is a writer
-      // still running.
+      // A detach, a halt or an ended activation may own a stop too; every stop gc
+      // waits for must finish and record its stop before any blob is swept.
       // Read as each stop settles: a retry may requeue a failed capture later.
       const settled = (c: Capture) => {
         if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
       };
-      for (const c of captures.values()) settled(c);
       for (;;) {
         const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
         if (busy.length === 0) break;
