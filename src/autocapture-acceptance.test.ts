@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import type { Readable, Writable } from 'node:stream';
 import { probeSocket, startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import type { Platform } from './platform.ts';
 import { bothReaders, foldCaptures, comparable } from './test/captures-fold.ts';
@@ -56,7 +57,18 @@ async function withStore(fn: (ctx: {
   }
 }
 
+type Row = Record<string, unknown>;
 const recording = (row: Record<string, unknown>) => row.state === 'recording';
+
+/** The daemon shows a change before its intent record is written; the offline
+ * reader can only follow once the record is. */
+async function untilIntent(store: string, done: (intent: { captures: Row[]; bindings: Row[] }) => boolean): Promise<void> {
+  for (let i = 0; i < 300; i++) {
+    if (done(JSON.parse(await readFile(join(store, 'control', 'intent.json'), 'utf8')))) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail('the intent record never caught up');
+}
 
 async function attachRecording(call: Call, root: string): Promise<string> {
   const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
@@ -65,13 +77,12 @@ async function attachRecording(call: Call, root: string): Promise<string> {
   return rec(res).session_id!;
 }
 
-type Row = Record<string, unknown>;
 const rowOf = (table: Record<string, unknown>, id: string) =>
   (table.captures as Row[]).find((r) => r.session_id === id)!;
 const stateOf = (row: Row) => [row.state, row.reason, (row.binding as Row | null)?.state ?? null];
 
 describe('auto-capture acceptance: two independent readers', () => {
-  it('agree on every capture and binding state as the table fills, a slot frees, and a heartbeat goes stale', async () => {
+  it('agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing', async () => {
     await withStore(async ({ store, roots, start, stop }) => {
       const { daemon, call } = await start();
       const agree = async (what: string) => {
@@ -82,12 +93,13 @@ describe('auto-capture acceptance: two independent readers', () => {
       const ws = await roots(18);
       const ids: string[] = [];
       for (const root of ws.slice(0, 16)) ids.push(await attachRecording(call, root));
-      const waiting = [ws[16]!, ws[17]!].map(async (root) => {
+      const waiting: string[] = [];
+      for (const root of [ws[16]!, ws[17]!]) {
         const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
         assert.equal(res.ok === false && res.code, 'CAPTURE_LIMIT_REACHED');
-        return rec(await call({ verb: 'status', target: root })).capture as unknown as Row;
-      });
-      const [seventeenth, eighteenth] = (await Promise.all(waiting)).map((row) => row.session_id as string);
+        waiting.push((rec(await call({ verb: 'status', target: root })).capture as unknown as Row).session_id as string);
+      }
+      const [seventeenth, eighteenth] = waiting;
       await linkRecording(call, store, ws[0]!, 'chat-pending');
       await linkRecording(call, store, ws[1]!, 'chat-connected');
       await connect(call, store, 'chat-connected', ws[1]!);
@@ -115,17 +127,16 @@ describe('auto-capture acceptance: two independent readers', () => {
       assert.deepEqual(stateOf(rowOf(table, eighteenth!)), ['stopped', 'detached', null]);
 
       // The owner refreshes its heartbeat every 2 s; push it 60 s back and read at
-      // once. A refresh landing in between makes both readers see it live, so try again.
+      // once. A refresh landing before either read is over spoils the try, so try again.
       const lock = join(store, 'sessions', ids[4]!, 'owner.lock');
       let stale: Row | undefined;
       for (let i = 0; i < 5 && !stale; i++) {
-        const old = (Date.now() - 60_000) / 1000;
+        const old = Math.trunc(Date.now() / 1000) - 60;
         await utimes(lock, old, old);
         const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
-        const row = rowOf(projection, ids[4]!);
-        if (row.state === 'recording') continue;
+        if (Math.trunc((await stat(lock)).mtimeMs / 1000) !== old) continue;
         assert.deepEqual(fold, projection, 'a stale heartbeat');
-        stale = row;
+        stale = rowOf(projection, ids[4]!);
       }
       assert.deepEqual(stateOf(stale!), ['not_recording', 'daemon-unavailable', null]);
 
@@ -134,6 +145,78 @@ describe('auto-capture acceptance: two independent readers', () => {
       assert.deepEqual(stateOf(rowOf(offline, ids[0]!)), ['not_recording', 'daemon-unavailable', 'setup_pending'],
         'with no daemon, a running capture is not recording; its chat was never confirmed in a live activation');
       assert.deepEqual(stateOf(rowOf(offline, ids[3]!)), ['stopped', 'detached', null]);
+
+      await rm(join(store, 'chat-pending.jsonl'));
+      const restarted = await start();
+      for (const id of [...ids.filter((id) => id !== ids[3]), seventeenth!]) await waitForRow(restarted.call, id, recording);
+      await waitForRow(restarted.call, ids[0]!, (row) => (row.binding as Row).state === 'unavailable');
+      await untilIntent(store, (intent) => intent.bindings.some((b) => b.session_id === ids[0] && b.unavailable !== null));
+      const { projection, fold } = await bothReaders(store, restarted.daemon.readerUrl, restarted.daemon.readerToken);
+      assert.deepEqual(fold, projection, 'after a restart, with one chat transcript gone');
+      assert.deepEqual(stateOf(rowOf(projection, ids[0]!)), ['recording', null, 'unavailable']);
+    });
+  });
+});
+
+describe('auto-capture acceptance: a capture still baselining', () => {
+  it('reads as baselining to both readers until its baseline finishes', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+      const [a] = await roots(1);
+      const id = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: a! })).session_id!;
+      try {
+        // The daemon shows baselining a moment before the heartbeat and session.started
+        // that let an offline reader see it; compare once both are on disk.
+        const settled = (t: Record<string, unknown>) => rowOf(t, id).state === 'baselining';
+        let both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        for (let i = 0; i < 100 && !(settled(both.projection) && settled(both.fold)); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        }
+        assert.deepEqual(both.fold, both.projection);
+        assert.deepEqual(stateOf(rowOf(both.projection, id)), ['baselining', null, null]);
+      } finally {
+        release();
+      }
+      await waitForRow(call, id, recording);
+    });
+  });
+});
+
+describe('auto-capture acceptance: Ask Agent in two workspaces', () => {
+  it('delivers each workspace\'s question only to that workspace\'s chat, which alone can answer it', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { call } = await start();
+      const [a, b] = await roots(2);
+      const chats = [{ chat: 'chat-a', root: a! }, { chat: 'chat-b', root: b! }];
+      const ids: string[] = [];
+      for (const { chat, root } of chats) {
+        ids.push((await linkRecording(call, store, root, chat)).id);
+        await connect(call, store, chat, root);
+      }
+      const context = { change_seq: '1', path: 'x.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1 };
+      const questions = [];
+      for (const id of ids) {
+        const asked = await call({ verb: 'ask', session_id: id, request_id: randomUUID(), text: `About ${id}?`, context });
+        assert.equal(asked.ok, true, JSON.stringify(asked));
+        questions.push(rec(asked).question_id!);
+      }
+      for (const [i, { chat, root }] of chats.entries()) {
+        const other = chats[1 - i]!;
+        const crossed = await call({ verb: 'answer_question', ...chatOf(other.chat, other.root), question_id: questions[i]!, text: 'not mine' });
+        assert.equal(crossed.ok, false, `${other.chat} cannot answer ${chat}'s question`);
+        const claimed = rec(await call(claimOf(store, chat, root))).question as unknown as { question_id: string };
+        assert.equal(claimed.question_id, questions[i], `${chat} receives its own workspace's question`);
+        const answered = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: questions[i]!, text: 'mine' });
+        assert.equal(rec(answered).session_id, ids[i]);
+      }
+      for (const [i, id] of ids.entries()) {
+        const answers = (await readLog(store, id)).filter((r) => r.type === 'slipstream.question.answered.v1');
+        assert.deepEqual(answers.map((r) => r.data.question_id), [questions[i]], 'each session holds only its own answer');
+      }
     });
   });
 });
@@ -151,8 +234,9 @@ describe('auto-capture acceptance: failed setup', () => {
           return fake.platform.watch(o);
         },
       };
+      // Long enough that both readers see one failure, not a retry in progress.
       const { daemon, call } = await start({
-        retryBackoff: { baseMs: 100, maxMs: 100 },
+        retryBackoff: { baseMs: 1000, maxMs: 1000 },
         captureDependencies: { platform, readQuestionContext: async () => 'selected' },
       });
       const res = await call({ verb: 'attach', mode: 'watch-only', worktree: a! });
@@ -160,6 +244,7 @@ describe('auto-capture acceptance: failed setup', () => {
       const failed = await waitForRow(call, id, (row) => row.state === 'not_recording', 'the failed baseline');
       assert.equal(failed.reason, 'baseline-failed');
       assert.match(String(failed.message), /too many open files/);
+      await untilIntent(store, (intent) => intent.captures.some((c) => c.session_id === id && c.last_failure !== null));
       const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
       assert.deepEqual(fold, projection, 'a failed setup with no session log');
       assert.deepEqual(stateOf(rowOf(projection, id)), ['not_recording', 'baseline-failed', null]);
@@ -253,7 +338,9 @@ describe('auto-capture acceptance: races and recovery', () => {
       const [unlinked, relinked] = await Promise.all([call({ verb: 'unlink', session_id: id }), linkChat(call, store, a!, 'chat-a')]);
       assert.equal(unlinked.ok, true, JSON.stringify(unlinked));
       const binding = (await captureRow(call, id)).binding as Row;
-      if (relinked.ok) {
+      if (relinked.ok && rec(relinked).binding_generation === generation) {
+        assert.equal(binding.state, 'unlinked', 'the attach found the old link, and the unlink then revoked it');
+      } else if (relinked.ok) {
         assert.ok(BigInt(rec(relinked).binding_generation!) > BigInt(generation));
         if (binding.state === 'unlinked') assert.equal(binding.binding_generation, rec(relinked).binding_generation);
         else assert.deepEqual([binding.state, binding.binding_generation], ['setup_pending', rec(relinked).binding_generation]);
@@ -311,7 +398,7 @@ describe('auto-capture acceptance: races and recovery', () => {
 });
 
 describe('auto-capture acceptance: end to end through real processes', () => {
-  it('traces Conductor setup, the Codex refusal, a Claude attach, a setup check, and Ask Agent through to both readers', async () => {
+  it('traces Conductor setup, the Codex refusal, a Claude attach, a setup check, and Ask Agent through to both readers', { timeout: 120_000 }, async () => {
     const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-accept-e2e-')));
     const store = join(dir, 'store'); const wsA = join(dir, 'ws-a'); const wsB = join(dir, 'ws-b');
     const claudeChat = '11111111-2222-4333-8444-555555555555';
@@ -325,21 +412,36 @@ describe('auto-capture acceptance: end to end through real processes', () => {
         child.stdin?.end(input ?? '');
       });
     const daemon = spawn(process.execPath, ['src/cli.ts', 'start', '--store', store], { env: base, stdio: 'ignore' });
-    const forwarder = spawn(process.execPath, ['src/mcp-forwarder.ts', '--store', store], {
-      env: { ...base, CLAUDE_CODE_SESSION_ID: claudeChat, CLAUDE_PROJECT_DIR: wsA }, stdio: ['pipe', 'pipe', 'inherit'] });
-    const replies = createInterface({ input: forwarder.stdout });
+    let forwarder: ChildProcessByStdio<Writable, Readable, null> | undefined;
+    let replies: ReturnType<typeof createInterface> | undefined;
     const rpc = async (id: number, method: string, params: Record<string, unknown>) => {
-      const reply = new Promise<string>((resolve) => replies.once('line', resolve));
-      forwarder.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      const reply = new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`the MCP forwarder never answered ${method}`)), 10_000);
+        forwarder!.once('exit', (code) => reject(new Error(`the MCP forwarder exited (${code}) during ${method}`)));
+        replies!.once('line', (line) => { clearTimeout(timer); resolve(line); });
+      });
+      forwarder!.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
       return JSON.parse(await reply) as { result: { isError?: boolean; content?: { text: string }[] } };
+    };
+    const until = async (what: string, done: () => Promise<boolean>) => {
+      for (let i = 0; i < 200; i++) {
+        if (await done()) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.fail(what);
     };
     const answer = async (id: number, question_id: string, text: string) =>
       (await rpc(id, 'tools/call', { name: 'slipstream_answer_question', arguments: { question_id, text } })).result;
-    const hook = (chat: string, cwd: string) => run(['hook', 'claude-code', 'post-tool-use', '--store', store], {},
-      JSON.stringify({ hook_event_name: 'PostToolUse', session_id: chat, cwd,
+    // The hook command `slipstream attach` installed, run the way Claude Code runs it.
+    let hookCommand = '';
+    const hook = (chat: string, cwd: string) => new Promise<{ stdout: string; stderr: string }>((done, fail) => {
+      const child = execFile('/bin/sh', ['-c', hookCommand], { env: base, timeout: 30_000 },
+        (error, stdout, stderr) => (error ? fail(new Error(`${error.message}\n${stderr}`)) : done({ stdout, stderr })));
+      child.stdin?.end(JSON.stringify({ hook_event_name: 'PostToolUse', session_id: chat, cwd,
         transcript_path: join(dir, 'claude', 'projects', 'p', `${chat}.jsonl`) }));
+    });
     try {
-      while (await probeSocket(join(store, 'control.sock'), 200) !== 'live') await new Promise((r) => setTimeout(r, 50));
+      await until('the daemon never came up', async () => await probeSocket(join(store, 'control.sock'), 200) === 'live');
       const setup = async (ws: string) => {
         const res = await run(['conductor', 'setup', '--store', store], { CONDUCTOR_WORKSPACE_PATH: ws });
         assert.equal(res.code, 0, res.stderr);
@@ -390,6 +492,17 @@ describe('auto-capture acceptance: end to end through real processes', () => {
       assert.equal(/session_id: (\S+)/.exec(claude.stdout)?.[1], idA);
       assert.equal((rowOf(await readers(), idA).binding as Row).state, 'setup_pending');
 
+      // Start the answer tool and the hook exactly as attach installed them.
+      const installed = JSON.parse(await readFile(join(config, '.claude.json'), 'utf8')) as {
+        projects: Record<string, { mcpServers: { slipstream: { command: string; args: string[] } } }> };
+      const tool = Object.values(installed.projects)[0]!.mcpServers.slipstream;
+      forwarder = spawn(tool.command, tool.args, { env: { ...base, CLAUDE_CODE_SESSION_ID: claudeChat, CLAUDE_PROJECT_DIR: wsA },
+        stdio: ['pipe', 'pipe', 'inherit'] });
+      replies = createInterface({ input: forwarder.stdout });
+      const settings = JSON.parse(await readFile(join(wsA, '.claude', 'settings.local.json'), 'utf8')) as {
+        hooks: { PostToolUse: { hooks: { command: string }[] }[] } };
+      hookCommand = settings.hooks.PostToolUse.flatMap((group) => group.hooks).find((h) => h.command.includes(' hook '))!.command;
+
       // The chat's next tool call delivers the setup check; its MCP tool answers it.
       await rpc(1, 'initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'claude-code', version: '1' } });
       const offered = await hook(claudeChat, wsA);
@@ -433,10 +546,10 @@ describe('auto-capture acceptance: end to end through real processes', () => {
       table = await readers();
       assert.deepEqual(stateOf(rowOf(table, idB)), ['recording', null, null]);
     } finally {
-      replies.close();
-      forwarder.kill();
+      replies?.close();
+      forwarder?.kill();
       daemon.kill('SIGTERM');
-      while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      await until('the daemon never stopped', async () => await probeSocket(join(store, 'control.sock'), 200) !== 'live');
       await rm(dir, { recursive: true, force: true });
     }
   });

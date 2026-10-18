@@ -17,14 +17,22 @@ type CaptureIntent = { session_id: string; root: string; intent: string; withdra
 type BindingIntent = { session_id: string; harness: string; harness_session_id: string; binding_generation: string;
   intent: string; unavailable: { reason: string; message: string } | null };
 
+/** Only a file that does not exist is absent; any other read failure is not evidence of absence. */
+async function unlessMissing<T>(read: Promise<T>): Promise<T | null> {
+  try { return await read; } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
 async function logOf(store: string, id: string): Promise<Rec[] | null> {
-  let text: string;
-  try { text = await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8'); } catch { return null; }
-  return text.split('\n').filter(Boolean).map((line) => JSON.parse(line) as Rec);
+  const text = await unlessMissing(readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8'));
+  return text === null ? null : text.split('\n').filter(Boolean).map((line) => JSON.parse(line) as Rec);
 }
 
 async function heartbeatOf(store: string, id: string): Promise<number | null> {
-  try { return Math.trunc((await stat(join(store, 'sessions', id, 'owner.lock'))).mtimeMs); } catch { return null; }
+  const lock = await unlessMissing(stat(join(store, 'sessions', id, 'owner.lock')));
+  return lock === null ? null : Math.trunc(lock.mtimeMs);
 }
 
 const t = (name: string) => `slipstream.${name}.v1`;
