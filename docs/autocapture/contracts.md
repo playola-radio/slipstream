@@ -263,13 +263,14 @@ Public capture state:
 | `queued` | Admitted, waiting for the one baseline slot. | **None.** Queued is not coverage. |
 | `baselining` | Live owner; activation started, no `capture.ready` yet. | Partial; events may appear; not yet complete. |
 | `recording` | Live owner; `capture.ready` written in the current activation. | Observed states with explicit gaps. |
-| `stopped` | `capture.stopped` written; carries its reason. | None since the stop. |
+| `stopped` | `capture.stopped` written, or a withdrawn capture that never activated (fold rule 2); carries its reason. | None since the stop. |
 | `not_recording` | Capture intent exists but capture is not confirmed happening. Carries a readable reason. Exists even when the first append never succeeded. | None. |
 
 `not_recording` reasons (closed set for v1, each with a human message):
 `daemon-unavailable`, `root-overlap`, `root-missing`, `baseline-failed`,
 `storage-unavailable`, `watcher-failed`, `resume-failed`, `resource-limit`,
-`stop-unconfirmed` (intent withdrawn but no durable `capture.stopped`),
+`stop-unconfirmed` (intent withdrawn, an activation may have begun, and no
+durable `capture.stopped`),
 `capture-limit-reached` (intent `waiting` for one of the 16 slots). Retry is
 separate from the reason: a row may also carry `retry: {next_attempt_at_ms}` when
 recovery has scheduled another attempt.
@@ -285,8 +286,14 @@ heartbeat (7), in this precedence:
 
 1. Intent `withdrawn` and the last activation ends in `capture.stopped`:
    `stopped`.
-2. Intent `withdrawn` and no durable `capture.stopped`: `not_recording
-   {stop-unconfirmed}`. Never `stopped`, never `recording`.
+2. Intent `withdrawn` and no durable `capture.stopped`:
+   - The daemon knows no activation ever began (the capture was still `queued`
+     when it was withdrawn, or its session log does not exist): `stopped` with
+     the withdrawal reason (`detached` or `archived`). Nothing ran, so there is no
+     `capture.stopped` to write and none is claimed (Brian, 2026-10-18).
+   - Otherwise: `not_recording{stop-unconfirmed}`. This covers any capture that
+     activated but has no durable `capture.stopped`, and the offline CLI, which
+     cannot tell whether an activation began. Never `recording`.
 3. Intent `waiting`: `not_recording{capture-limit-reached}`. Waiting intents never
    have an activation.
 4. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
@@ -314,7 +321,8 @@ activation reads as `setup_pending`.
 |---|---|---|
 | admission intent written, first append | `not_recording{daemon-unavailable}` then `queued` once a daemon is live | Starts the capture under the persisted `session_id`. |
 | `session.started`/`resumed`, `capture.ready` | `not_recording{baseline-failed\|resume-failed}` while no owner; `baselining` once resumed | Resumes; `capture.gap{restart}` discloses the hole. |
-| withdrawal written, `capture.stopped` | `not_recording{stop-unconfirmed}` | Does not resume a withdrawn capture. Does **not** backfill `capture.stopped` as if it happened at the original time. |
+| withdrawal written, `capture.stopped` (the capture had activated) | `not_recording{stop-unconfirmed}` | Does not resume a withdrawn capture. Does **not** backfill `capture.stopped` as if it happened at the original time. |
+| withdrawal written, first append (never activated) | `stopped` with the withdrawal reason (fold rule 2) | Starts nothing; there is no stop to write. |
 | binding intent written, `agent.binding` | binding `setup_pending` from intent (no event yet) | Appends `agent.binding` and `setup_pending` at the stored generation on resume, then publishes. |
 | revoke written, `agent.unlinked` | binding `unlinked` (intent wins) | Does not restore the binding; does not backfill `agent.unlinked`. The next activation's `capture.gap{restart}` discloses the hole. |
 
@@ -428,7 +436,7 @@ draft: "not ready". Every material objection was accepted; none was overruled.
 |---|---|---|
 | 1 | Resumed readiness is not reproducible: nothing marks reconciliation complete. | New `capture.ready.v1` after the durability barrier on start and resume (1). |
 | 2 | "Recording" cannot be computed from intent plus logs; live and crashed daemons look identical. | The session `owner.lock` heartbeat is now the public liveness rule with `as_of_ms` (7); no-heartbeat reads as not confirmed live. |
-| 3 | Intent/event crash ordering undefined; withdrawn intent without a stop would show `stopped`. | Crash-point table and fold precedence (6); `not_recording{stop-unconfirmed}`. |
+| 3 | Intent/event crash ordering undefined; withdrawn intent without a stop would show `stopped`. | Crash-point table and fold precedence (6); `not_recording{stop-unconfirmed}` for a capture that activated. One that never activated reads `stopped` with its withdrawal reason (fold rule 2; Brian, 2026-10-18). |
 | 4 | "Unlinked is log-reproducible" contradicts revocation without an event. | Binding state is the fold of intent plus events; revoked intent wins (6). |
 | 5 | Nullable `session_id` breaks stable admission targeting. | `session_id` allocated and persisted at admission, never null (5, 8). |
 | 6 | Root identity: unrepresentable before start, unsafe integers, ambiguous after recreation. | Decimal-string `dev`/`ino`, nullable identity; the durable `session_id` allocated at admission is the stable key (8). |

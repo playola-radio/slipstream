@@ -6,14 +6,15 @@ import { join } from 'node:path';
 import { DaemonAlreadyRunningError, startDaemon, type Daemon } from './daemon.ts';
 import { acquireSessionLock } from './lock.ts';
 import { loadIntent } from './intent-store.ts';
+import type { Platform } from './platform.ts';
 import { controlCall, createRootsPlatform, linkChat, rec, waitForRow, type Call } from './test/daemon-harness.ts';
 
-async function withStore(fn: (ctx: { store: string; call: Call; roots: (n: number) => Promise<string[]> }) => Promise<void>): Promise<void> {
+async function withStore(fn: (ctx: { store: string; call: Call; roots: (n: number) => Promise<string[]> }) => Promise<void>,
+  platform: Platform = createRootsPlatform().platform): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-intent-daemon-'));
   const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-intent-roots-')));
-  const fake = createRootsPlatform();
   const daemon: Daemon = await startDaemon({ storeDir: store, captureDependencies: {
-    platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
+    platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
   } });
   let made = 0;
   const roots = async (n: number) => {
@@ -69,6 +70,28 @@ describe('daemon capture intent is durable before each acknowledgement', () => {
       assert.equal(entry?.intent, 'withdrawn');
       assert.equal(entry?.withdrawn_reason, 'detached');
     });
+  });
+
+  it('reads a capture detached before it ever started as stopped, with the detach reason', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const platform: Platform = {
+      watch: async () => {
+        if (first) { first = false; await held; }
+        return { close: async () => {} };
+      },
+    };
+    await withStore(async ({ call, roots }) => {
+      const [a, b] = await roots(2);
+      await call({ verb: 'attach', mode: 'watch-only', worktree: a });
+      const queued = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: b }));
+      assert.equal(queued.state, 'queued');
+      const detached = rec(await call({ verb: 'detach', target: queued.session_id }));
+      release();
+      assert.equal(detached.state, 'stopped');
+      assert.equal(detached.reason, 'detached');
+    }, platform);
   });
 
   it('records a linked chat and its unlink before each reply', async () => {
