@@ -30,6 +30,9 @@ export interface Invocation {
    * a given file — but its conflict is still disclosed when a sibling variant
    * names the change's path. */
   knownPaths: readonly string[];
+  /** Distinct normalized evidence facts, excluding conversation identity and
+   * log sequence. Forked calls are copies only when these full facts agree. */
+  signatures: readonly string[];
   /** True when records under this key contradict each other; such an invocation
    * is never counted as a candidate, only disclosed. */
   conflicted: boolean;
@@ -120,6 +123,7 @@ export function foldEvidence(events: readonly AnyEvent[]): Map<string, Invocatio
       minAtMs,
       maxAtMs,
       knownPaths: [...paths].sort(),
+      signatures: [...group.variants.keys()].sort(),
       conflicted,
       evidenceSeqs,
     });

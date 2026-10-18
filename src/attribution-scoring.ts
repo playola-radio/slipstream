@@ -43,6 +43,7 @@ function touchesPath(inv: Invocation, path: string): boolean {
 }
 
 function isExactCopy(a: Invocation, b: Invocation): boolean {
+  if (!sameStringSet(a.signatures, b.signatures)) return false;
   const pa = [...a.knownPaths].sort();
   const pb = [...b.knownPaths].sort();
   return (

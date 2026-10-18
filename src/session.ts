@@ -280,6 +280,13 @@ export async function startCapture(
   const committedExchanges = new Map<string, { body: string; result: QuestionExchangeAccepted }>();
   const inflightExchanges = new Map<string, { body: string; promise: Promise<QuestionExchangeAccepted> }>();
   const exchangesById = new Map<string, QuestionContext>();
+  const sourceContext = (context: QuestionContext): QuestionContext => ({
+    change_seq: context.change_seq,
+    path: context.path,
+    snapshot_sha256: context.snapshot_sha256,
+    line_start: context.line_start,
+    line_end: context.line_end,
+  });
   // Questions not yet attempted. Removed once dispatch is attempted (durably
   // consumed either way) so eligibility counting and claim lookup scan only
   // outstanding questions, not every question ever queued by a long-lived capture.
@@ -315,7 +322,7 @@ export async function startCapture(
     committedExchanges.clear(); exchangesById.clear();
     for (const event of rec.questionExchanges) {
       committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
-      exchangesById.set(event.data.question_id, event.data.context);
+      exchangesById.set(event.data.question_id, sourceContext(event.data.context));
     }
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
@@ -363,7 +370,7 @@ export async function startCapture(
       if (event.type === 'slipstream.question.answered.v1') {
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
-      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, event.data.context);
+      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, sourceContext(event.data.context));
       if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
   };

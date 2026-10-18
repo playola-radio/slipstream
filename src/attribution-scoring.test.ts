@@ -25,6 +25,7 @@ describe('attribution scoring', () => {
       minAtMs: 1000,
       maxAtMs: 1000,
       knownPaths: ['src/a.ts'],
+      signatures: ['copy'],
       conflicted: false,
       evidenceSeqs: [1n],
       ...over,
@@ -105,6 +106,19 @@ describe('attribution scoring', () => {
 
     it('copies with different timestamps are not collapsed', () => {
       const r = run([copyA(), { ...copyB(), minAtMs: 1500, maxAtMs: 1500 }]);
+      assert.equal(r.status, 'ambiguous');
+      assert.equal(r.reason, 'multiple-candidates');
+    });
+
+    it('copies with different normalized evidence signatures are not collapsed', () => {
+      // Conversation identity and log sequence differ for forked copies, but a
+      // different tool assertion must remain a distinct attribution candidate.
+      const withSignatures = (candidate: Invocation, signatures: readonly string[]): Invocation =>
+        ({ ...candidate, signatures } as Invocation);
+      const r = run([
+        withSignatures(copyA(), ['["Write","message",1000,{"kind":"paths","paths":["src/a.ts"]}]']),
+        withSignatures(copyB(), ['["Edit","message",1000,{"kind":"paths","paths":["src/a.ts"]}]']),
+      ]);
       assert.equal(r.status, 'ambiguous');
       assert.equal(r.reason, 'multiple-candidates');
     });
