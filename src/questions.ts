@@ -185,8 +185,9 @@ export interface QuestionExchangeRequest extends QuestionRequest {
 }
 
 function conversationId(value: unknown, name: string): string {
-  if (typeof value !== 'string' || value.length < 1 || value.length > 256 || CONTROL_CHARS.test(value)) {
-    throw new QuestionError('PROTOCOL', `${name} must be 1–256 characters with no control characters`);
+  if (typeof value !== 'string' || value.length < 1 || value.length > 256 || CONTROL_CHARS.test(value)
+    || /[\uD800-\uDFFF]/u.test(value)) {
+    throw new QuestionError('PROTOCOL', `${name} must be 1–256 characters with no control characters or unpaired surrogates`);
   }
   return value;
 }

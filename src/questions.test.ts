@@ -168,6 +168,8 @@ describe('question exchange normalization', () => {
       { ...good, fork_session_id: 'a\nb' },
       { ...good, parent_session_id: 'a\u0085b' },
       { ...good, parent_session_id: 'a\u007Fb' },
+      { ...good, parent_session_id: 'a\uD800b' },
+      { ...good, fork_session_id: 'a\uDC00' },
       { ...good, parent_session_id: 7 },
       { ...good, fork_session_id: undefined },
       { ...good, fork_session_id: good.parent_session_id },
@@ -177,6 +179,8 @@ describe('question exchange normalization', () => {
     }
     const edge = { harness: 'codex', parent_session_id: 'a'.repeat(256), fork_session_id: 'b' };
     assert.equal(normalizeExchange({ ...exchange(), conversation: edge }).conversation.harness, 'codex');
+    const paired = { ...good, parent_session_id: 'a😀b' };
+    assert.equal(normalizeExchange({ ...exchange(), conversation: paired }).conversation.parent_session_id, 'a😀b');
   });
   it('normalizeExchange inherits ask validation', () => {
     assert.throws(() => normalizeExchange({ ...exchange(), request_id: 'nope' }), code('PROTOCOL'));
