@@ -7,7 +7,8 @@ Status: approved to build (Brian, after Codex adversarial review)
 
 A **live feed of code changes as an agent makes them**, watched alongside the
 agent in a browser. Conductor stays the launcher. Slipstream rides in via user-level
-MCP + skill config.
+MCP + skill config. (Amended 2026-10-18: Conductor still creates workspaces, but
+the Slipstream client may run the chat agent — see "C1: Chat console" below.)
 
 ## What the MVP promises — and does not
 
@@ -1205,3 +1206,27 @@ Plan: `docs/superpowers/plans/2026-10-14-workspace-stream-resume.md`.
 
 **Status**: In Progress — implementation complete on
 `briankeane/daemon-workspace-stream-resume`; awaiting review.
+
+## C1: Chat console in the Slipstream window (2026-10-18)
+
+**Goal:** the agent chat sits next to the stream in the Swift client, switched by
+one workspace picker. The client runs the chat agent itself (Claude first, then
+Codex); the daemon still never launches agents. Ask-at-a-line answers come from a
+branch-off copy of the tab's conversation, which hands change requests to the
+main chat; threads are saved in the log through a new daemon verb.
+Design: `docs/chat-console/DESIGN.md`. Client work lives in the client repo.
+
+### Stage C1.1: Amend the launch rule
+**Success Criteria**: `CLAUDE.md` (and `AGENTS.md`, a symlink to it) and this
+plan say the client may run the chat agent and the daemon never does.
+**Status**: Complete
+
+### Stage C1.2: Check forked transcripts against attribution
+**Success Criteria**: one real `--fork-session` run in a watched worktree;
+recorded effect on "possibly agent" labels. If labels degrade, stop and report
+to Brian (attribution confidence is his call).
+**Status**: Not Started
+
+### Stage C1.3: `record_question_exchange` verb and event
+**Success Criteria**: per `docs/chat-console/DESIGN.md` Change 2, with its tests.
+**Status**: Not Started
