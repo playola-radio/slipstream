@@ -2396,14 +2396,16 @@ describe('daemon transcript enrichment follows configuration, not chat linking',
         }
         await scheduler.tick();
         counted.reset();
+        await codexRollout(home, ws[0]!, 'x-new');
         await scheduler.tick();
         assert.equal(counted.counts.listTree, 1, 'one Codex sessions scan for three captures');
         assert.deepEqual([...counted.counts.listDir.keys()].sort(),
           ws.map((root) => join(home, '.claude', 'projects', claudeSlug(root))).sort());
         assert.deepEqual([...counted.counts.listDir.values()], [1, 1, 1]);
-        assert.equal(counted.counts.firstLine.size, 6, 'three rollouts and three Claude transcripts');
-        assert.deepEqual([...counted.counts.firstLine.values()], [1, 1, 1, 1, 1, 1], 'each first line read once');
-        assert.deepEqual([...counted.counts.headLines.values()], [1, 1, 1], 'each Claude header read once');
+        assert.deepEqual([...counted.counts.firstLine.entries()],
+          [[join(home, '.codex', 'sessions', '2026', '10', '17', 'rollout-x-new.jsonl'), 1]],
+          'only the new rollout is read; unchanged transcripts are not reopened');
+        assert.equal(counted.counts.headLines.size, 0, 'no unchanged Claude header is reread');
       }, {}, undefined, { config, transcriptScheduler: scheduler });
     } finally {
       await rm(home, { recursive: true, force: true });

@@ -41,6 +41,29 @@ describe('nodeDiscoveryIO.probe', () => {
   });
 });
 
+describe('nodeDiscoveryIO.stat', () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'ss-stat-'));
+    await writeFile(join(dir, 'r.jsonl'), '{"type":"session_meta"}\n');
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('reports the same generation a read stamps, and the size', async () => {
+    const path = join(dir, 'r.jsonl');
+    const read = await nodeDiscoveryIO.readFirstLine(path);
+    assert.deepEqual(await nodeDiscoveryIO.stat(path), { id: read.ok ? read.id : undefined, size: 24 });
+  });
+
+  it('reports a missing file as undefined', async () => {
+    assert.equal(await nodeDiscoveryIO.stat(join(dir, 'missing.jsonl')), undefined);
+  });
+});
+
 describe('nodeDiscoveryIO.readFirstLine', () => {
   let dir: string;
 

@@ -64,6 +64,12 @@ export type HeadLinesResult =
   | { ok: true; lines: string[]; truncated: boolean; skipped: boolean; id: FileId }
   | { ok: false; reason: 'inaccessible' | 'empty' };
 
+/** A file's generation and size, from a stat that opens nothing. */
+export interface FileStat {
+  id: FileId;
+  size: number;
+}
+
 export interface DiscoveryIO {
   /** Absolute paths of `*.jsonl` files directly in `dir` (Claude). */
   listDir(dir: string): Promise<ListResult>;
@@ -76,6 +82,8 @@ export interface DiscoveryIO {
    * cwd-less preamble (ai-title, queue-operation, attachments) to the first record
    * that declares the working directory. */
   readHeadLines(path: string): Promise<HeadLinesResult>;
+  /** The generation and size of a file, or undefined if it cannot be stat'ed. */
+  stat(path: string): Promise<FileStat | undefined>;
   /** Canonicalize a path, or undefined if it does not resolve. */
   realpath(path: string): Promise<string | undefined>;
   /** Inspect a single path component WITHOUT resolving it, so a dangling symlink,
@@ -343,6 +351,79 @@ async function resolveClaudeCwd(
   return { kind: 'none' };
 }
 
+/** A header derived from one file generation, and the size that generation had. */
+interface Remembered<T> {
+  id: FileId;
+  size: number;
+  header: T;
+}
+
+interface SessionMeta {
+  id: string;
+  cwd: string;
+}
+
+/**
+ * Transcript headers remembered across discovery cycles, so an unchanged
+ * transcript costs one stat instead of an open and read. A header is reused only
+ * while the path still holds the same generation (dev, ino) at no smaller a size:
+ * a replaced file is a new generation and a shrunk one was rewritten, so both are
+ * re-read. Like the reader, this assumes an append-only writer: a file truncated
+ * and regrown in place past its last size between two cycles is not noticed.
+ * Only a header that established a cwd is remembered; anything else (unreadable,
+ * malformed, still a preamble) is re-read, and so re-disclosed, every cycle. The
+ * cwd is still classified against each root every cycle. Entries for paths a
+ * cycle no longer lists are forgotten.
+ */
+export interface DiscoveryMemory {
+  codex: Map<string, Remembered<SessionMeta>>;
+  claude: Map<string, Remembered<string>>;
+}
+
+export function createDiscoveryMemory(): DiscoveryMemory {
+  return { codex: new Map(), claude: new Map() };
+}
+
+type HeaderRead<T, F> = { ok: true; header: T; id: FileId } | ({ ok: false } & F);
+
+function sameFile(a: FileId, b: FileId): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+/**
+ * `read`'s result for `path`, or the remembered header if the file is unchanged.
+ * A permission change keeps the header: the bytes it came from are unchanged,
+ * and a bound transcript that turns unreadable is still disclosed by its reader.
+ */
+async function readRemembered<T, F>(
+  io: DiscoveryIO,
+  memory: Map<string, Remembered<T>> | undefined,
+  path: string,
+  read: () => Promise<HeaderRead<T, F>>,
+): Promise<HeaderRead<T, F>> {
+  if (memory === undefined) return read();
+  // Stat BEFORE reading, so the remembered size is never larger than the
+  // generation that was actually read.
+  const now = await io.stat(path);
+  const known = memory.get(path);
+  if (now !== undefined && known !== undefined && sameFile(now.id, known.id) && now.size >= known.size) {
+    known.size = now.size;
+    return { ok: true, header: known.header, id: known.id };
+  }
+  const result = await read();
+  if (result.ok && now !== undefined && sameFile(now.id, result.id)) {
+    memory.set(path, { id: result.id, size: now.size, header: result.header });
+  } else {
+    memory.delete(path);
+  }
+  return result;
+}
+
+function forgetUnlisted(memory: Map<string, unknown> | undefined, listed: ReadonlySet<string>): void {
+  if (memory === undefined) return;
+  for (const path of memory.keys()) if (!listed.has(path)) memory.delete(path);
+}
+
 /** One result per distinct root, each with its own arrays. */
 function emptyResults(roots: readonly string[]): Map<string, DiscoveryResult> {
   return new Map([...new Set(roots)].map((root) => [root, { bindings: [], issues: [] }]));
@@ -362,9 +443,11 @@ export async function discoverClaudeRoots(
   io: DiscoveryIO,
   home: string,
   roots: readonly string[],
+  memory?: DiscoveryMemory,
 ): Promise<Map<string, DiscoveryResult>> {
   const results = emptyResults(roots);
   const resolver = createCwdResolver(io);
+  const listedPaths = new Set<string>();
   const byDir = new Map<string, string[]>();
   for (const root of results.keys()) {
     const dir = `${home}/projects/${claudeSlug(root)}`;
@@ -377,6 +460,7 @@ export async function discoverClaudeRoots(
       continue;
     }
     for (const path of listed.paths) {
+      listedPaths.add(path);
       const sessionId = baseName(path).slice(0, -'.jsonl'.length);
       // The slug directory alone cannot establish membership: two distinct roots can
       // collide onto one slug (e.g. /work/a-b and /work/a/b). So a transcript is bound
@@ -388,31 +472,20 @@ export async function discoverClaudeRoots(
       //     landing before confirmation can never be credited to this root);
       //   - a transcript whose membership cannot be confirmed (unreadable/oversized or
       //     truncated head, or an in-root cwd that will not resolve) is disclosed.
-      const head = await io.readFirstLine(path);
-      if (!head.ok) {
-        if (head.reason === 'empty') continue; // not yet written: withhold, stays pending
-        // A first line that exists but could not be read (malformed, e.g. invalid
-        // UTF-8 or an unbounded line; or inaccessible): disclose the gap.
-        discloseTo(results, group, { kind: head.reason, detail: `claude transcript ${path}` });
+      const resolution = await readRemembered(io, memory?.claude, path, () => readClaudeHeader(io, path));
+      if (!resolution.ok) {
+        if (resolution.issue !== undefined) discloseTo(results, group, resolution.issue);
         continue;
       }
-      const resolution = await resolveClaudeCwd(io, path, head.line, head.id);
-      if (resolution.kind === 'none') continue; // a cwd-less preamble so far: withhold, pending
-      if (resolution.kind === 'unconfirmed') {
-        discloseTo(results, group, {
-          kind: resolution.reason,
-          detail: `claude transcript ${path} membership unconfirmed: ${resolution.detail}`,
-        });
-        continue;
-      }
+      const cwd = resolution.header;
       for (const root of group) {
         const result = results.get(root)!;
-        const cls = await classifyCwd(resolver, root, resolution.cwd);
+        const cls = await classifyCwd(resolver, root, cwd);
         if (cls.kind === 'out-of-root') continue; // a slug-colliding other worktree
         if (cls.kind === 'unresolved-in-root') {
           result.issues.push({
             kind: 'inaccessible',
-            detail: `claude transcript ${path} cwd ${resolution.cwd} could not be resolved`,
+            detail: `claude transcript ${path} cwd ${cwd} could not be resolved`,
           });
           continue;
         }
@@ -431,14 +504,39 @@ export async function discoverClaudeRoots(
       }
     }
   }
+  forgetUnlisted(memory?.claude, listedPaths);
   return results;
+}
+
+/** A Claude transcript's recorded cwd, or the issue to disclose (none: withhold it
+ * as pending, to be re-checked next cycle). */
+async function readClaudeHeader(
+  io: DiscoveryIO,
+  path: string,
+): Promise<HeaderRead<string, { issue?: CoverageIssue }>> {
+  const head = await io.readFirstLine(path);
+  if (!head.ok) {
+    if (head.reason === 'empty') return { ok: false }; // not yet written: withhold, stays pending
+    // A first line that exists but could not be read (malformed, e.g. invalid
+    // UTF-8 or an unbounded line; or inaccessible): disclose the gap.
+    return { ok: false, issue: { kind: head.reason, detail: `claude transcript ${path}` } };
+  }
+  const resolution = await resolveClaudeCwd(io, path, head.line, head.id);
+  if (resolution.kind === 'none') return { ok: false }; // a cwd-less preamble so far: withhold, pending
+  if (resolution.kind === 'unconfirmed') {
+    return {
+      ok: false,
+      issue: { kind: resolution.reason, detail: `claude transcript ${path} membership unconfirmed: ${resolution.detail}` },
+    };
+  }
+  return { ok: true, header: resolution.cwd, id: resolution.id };
 }
 
 export async function discoverClaude(io: DiscoveryIO, home: string, root: string): Promise<DiscoveryResult> {
   return (await discoverClaudeRoots(io, home, [root])).get(root)!;
 }
 
-function parseSessionMeta(line: string): { id: string; cwd: string } | undefined {
+function parseSessionMeta(line: string): SessionMeta | undefined {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
     if (obj.type !== 'session_meta') return undefined;
@@ -469,12 +567,14 @@ export async function discoverCodexRoots(
   home: string,
   roots: readonly string[],
   limit: number,
+  memory?: DiscoveryMemory,
 ): Promise<Map<string, DiscoveryResult>> {
   const results = emptyResults(roots);
   const all = [...results.keys()];
   const dir = `${home}/sessions`;
   const listed = await io.listTreeJsonl(dir, limit);
   if ('ok' in listed && listed.ok === false) {
+    memory?.codex.clear();
     discloseTo(results, all, { kind: listed.reason, detail: `codex sessions dir ${dir}` });
     return results;
   }
@@ -495,24 +595,18 @@ export async function discoverCodexRoots(
       detail: `some codex session subdirectories under ${dir} were unreadable`,
     });
   }
+  forgetUnlisted(memory?.codex, new Set(paths));
   const resolver = createCwdResolver(io);
   for (const path of paths) {
     // A file we cannot read or parse is a candidate we cannot rule out, so it is
     // disclosed as an issue — never silently skipped (which would let a readable
     // sibling conceal it and report coverage as clean).
-    const head = await io.readFirstLine(path);
+    const head = await readRemembered(io, memory?.codex, path, () => readCodexHeader(io, path));
     if (!head.ok) {
-      discloseTo(results, all, {
-        kind: head.reason === 'inaccessible' ? 'inaccessible' : 'malformed',
-        detail: `codex rollout ${path}`,
-      });
+      discloseTo(results, all, head.issue);
       continue;
     }
-    const meta = parseSessionMeta(head.line);
-    if (!meta) {
-      discloseTo(results, all, { kind: 'malformed', detail: `codex rollout ${path} has no session_meta` });
-      continue;
-    }
+    const meta = head.header;
     for (const root of all) {
       const result = results.get(root)!;
       const cls = await classifyCwd(resolver, root, meta.cwd);
@@ -543,6 +637,20 @@ export async function discoverCodexRoots(
   return results;
 }
 
+/** A Codex rollout's `session_meta`, or the issue to disclose. */
+async function readCodexHeader(io: DiscoveryIO, path: string): Promise<HeaderRead<SessionMeta, { issue: CoverageIssue }>> {
+  const head = await io.readFirstLine(path);
+  if (!head.ok) {
+    return {
+      ok: false,
+      issue: { kind: head.reason === 'inaccessible' ? 'inaccessible' : 'malformed', detail: `codex rollout ${path}` },
+    };
+  }
+  const meta = parseSessionMeta(head.line);
+  if (!meta) return { ok: false, issue: { kind: 'malformed', detail: `codex rollout ${path} has no session_meta` } };
+  return { ok: true, header: meta, id: head.id };
+}
+
 export async function discoverCodex(
   io: DiscoveryIO,
   home: string,
@@ -553,17 +661,18 @@ export async function discoverCodex(
 }
 
 /** One harness's discovery for every given capture root, sharing enumeration and
- * header reads across them. */
+ * header reads across them, and with `memory`, across cycles. */
 export async function discoverRoots(
   harness: HarnessName,
   io: DiscoveryIO,
   home: string,
   roots: readonly string[],
   codexScanLimit: number,
+  memory?: DiscoveryMemory,
 ): Promise<Map<string, DiscoveryResult>> {
   return harness === 'claude-code'
-    ? discoverClaudeRoots(io, home, roots)
-    : discoverCodexRoots(io, home, roots, codexScanLimit);
+    ? discoverClaudeRoots(io, home, roots, memory)
+    : discoverCodexRoots(io, home, roots, codexScanLimit, memory);
 }
 
 export async function discover(

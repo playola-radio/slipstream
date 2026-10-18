@@ -4,11 +4,13 @@ import {
   readdir,
   readlink as fsReadlink,
   realpath as fsRealpath,
+  stat as fsStat,
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FileId, TranscriptFileIO, TranscriptReadResult } from './file-reader.ts';
 import type {
   DiscoveryIO,
+  FileStat,
   FirstLineResult,
   HeadLinesResult,
   ListResult,
@@ -245,6 +247,15 @@ export const nodeDiscoveryIO: DiscoveryIO = {
       return { ok: false, reason: 'inaccessible' };
     } finally {
       await handle.close();
+    }
+  },
+
+  async stat(path: string): Promise<FileStat | undefined> {
+    try {
+      const s = await fsStat(path, { bigint: true });
+      return { id: { dev: s.dev, ino: s.ino }, size: Number(s.size) };
+    } catch {
+      return undefined;
     }
   },
 

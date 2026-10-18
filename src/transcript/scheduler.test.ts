@@ -39,7 +39,7 @@ function codexMeta(id: string, cwd: string): string {
 /** A fake transcript filesystem: Claude dirs and Codex rollouts with fixed bytes,
  * counting every enumeration and header read discovery makes. */
 function fakeHomes(files: { claude?: Record<string, string>; codex?: Record<string, string>; truncated?: boolean }) {
-  const counts = { listDir: new Map<string, number>(), listTree: 0, firstLine: new Map<string, number>() };
+  const counts = { listDir: new Map<string, number>(), listTree: 0, firstLine: new Map<string, number>(), headLines: new Map<string, number>() };
   const claude = files.claude ?? {};
   const codex = files.codex ?? {};
   const bump = (m: Map<string, number>, k: string): void => { m.set(k, (m.get(k) ?? 0) + 1); };
@@ -61,9 +61,14 @@ function fakeHomes(files: { claude?: Record<string, string>; codex?: Record<stri
       return { ok: true, line: text.split('\n')[0]!, id: GEN };
     },
     readHeadLines: async (path) => {
+      bump(counts.headLines, path);
       const text = all[path];
       if (text === undefined) return { ok: false, reason: 'inaccessible' };
       return { ok: true, lines: text.split('\n').filter((l) => l !== ''), truncated: false, skipped: false, id: GEN };
+    },
+    stat: async (path) => {
+      const text = all[path];
+      return text === undefined ? undefined : { id: GEN, size: Buffer.byteLength(text) };
     },
     realpath: async (p) => p,
     probe: async () => ({ kind: 'absent' }),
@@ -116,6 +121,29 @@ describe('shared transcript discovery scheduler', () => {
     assert.deepEqual(b.sink.appended.map((e) => e.evidence_key.record_id), ['toolu_1']);
     await ua();
     await ub();
+  });
+
+  it('opens no transcript again on a cycle where nothing changed', async () => {
+    const root = '/work/a';
+    const codex: Record<string, string> = {};
+    for (let i = 0; i < 5; i += 1) codex[`/home/.codex/sessions/2026/10/17/r${i}.jsonl`] = `${codexMeta(`t${i}`, root)}\n`;
+    const preamble = JSON.stringify({ type: 'queue-operation' });
+    const { io, fileIO, counts } = fakeHomes({
+      codex,
+      claude: { [`${claudeDir(root)}/s.jsonl`]: `${preamble}\n${JSON.stringify({ type: 'user', cwd: root })}\n` },
+    });
+    const c = capture(root);
+    const scheduler = createTranscriptScheduler(options(io, fileIO));
+    const unregister = scheduler.register(c);
+    await scheduler.tick();
+    assert.equal(counts.firstLine.size, 6, 'every transcript is read on its first cycle');
+    counts.firstLine.clear();
+    counts.headLines.clear();
+    counts.listTree = 0;
+    await scheduler.tick();
+    assert.deepEqual([counts.firstLine.size, counts.headLines.size], [0, 0], 'an idle cycle opens no transcript');
+    assert.equal(counts.listTree, 1, 'the sessions tree is still enumerated every cycle');
+    await unregister();
   });
 
   it('keeps evidence from every eligible chat in the same worktree', async () => {

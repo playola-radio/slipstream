@@ -164,16 +164,19 @@ chat linking up to 10, unlink and generation fencing, targeted `status` and
 blobs on start, P2 counting tests) merged (#70). P5 (one daemon-wide transcript
 scheduler: each cycle scans `~/.codex/sessions` once and each Claude project
 folder once for every capture; transcript reading follows configuration, not
-chat linking; P5 counting tests) merged (#71). P3 (durable capture and binding
-intent, restart recovery with fresh chat setup checks, root-missing and
-watcher-failed stops, the LaunchAgent, `slipstream conductor
-install|setup|archive|enroll`) is in review as #72 on
+chat linking; P5 counting tests) merged (#71). P5b (discovery remembers each
+transcript's header by file identity and size, so an idle cycle stats
+transcripts instead of reopening them; P5b counting tests) merged (#73). P3
+(durable capture and binding intent, restart recovery with fresh chat setup
+checks, root-missing and watcher-failed stops, the LaunchAgent, `slipstream
+conductor install|setup|archive|enroll`) is in review as #72 on
 `briankeane/autocapture-p3-recovery`. P4 and P6 Not Started.
 
 Known later work: GC and session
 deletion while captures run (P4; today both still require every capture
-detached). After P5 one shared Codex scan per cycle remains; whether its idle
-cost is acceptable is P6's real-use check.
+detached). After P5b an idle cycle still walks the Codex sessions tree once and
+stats each transcript, but reopens none whose header it already has; whether
+that idle cost is acceptable is P6's real-use check.
 
 Auto-connect findings (2026-09-27 research, not decisions): split "capture the
 worktree" (needs no harness identity; a workspace-folder watch can trigger it)
