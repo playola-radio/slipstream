@@ -14,6 +14,8 @@ import { acquireSessionLock, SessionOwnedError } from './lock.ts';
 export const LAUNCH_AGENT_LABEL = 'radio.playola.slipstream';
 /** git is on it, for the daemon's ignore-rule checks. */
 export const DAEMON_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin';
+const SHUTDOWN_WAIT_MS = 2_000;
+const SHUTDOWN_POLL_MS = 50;
 
 export type Run = (command: string, args: string[]) => Promise<{ code: number | null; output: string }>;
 
@@ -166,14 +168,19 @@ export async function installLaunchAgent(o: EntryPaths & { home: string; store: 
   // launchd can stop only the process it owns. Prove no manual or legacy daemon
   // still owns this shared store before saying the managed one was installed.
   await mkdirpDurable(o.store);
-  try {
-    const ownership = await acquireSessionLock(o.store);
-    await ownership.release();
-  } catch (err) {
-    if (err instanceof SessionOwnedError) {
-      throw new InstallError(`another daemon still owns ${o.store}; stop it before installing the managed daemon`);
+  const shutdownDeadline = Date.now() + SHUTDOWN_WAIT_MS;
+  for (;;) {
+    try {
+      const ownership = await acquireSessionLock(o.store);
+      await ownership.release();
+      break;
+    } catch (err) {
+      if (!(err instanceof SessionOwnedError)) throw err;
+      if (Date.now() >= shutdownDeadline) {
+        throw new InstallError(`another daemon still owns ${o.store}; stop it before installing the managed daemon`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, SHUTDOWN_POLL_MS));
     }
-    throw err;
   }
   // launchd finishes a bootout asynchronously; a bootstrap right behind it can
   // fail until the old instance is gone.

@@ -7,6 +7,7 @@ import {
   InstallError, entryPaths, installLaunchAgent, kickstartLaunchAgent, plistPath, readManagedInstall, renderPlist, writeManagedInstall,
   type ManagedInstall, type Run,
 } from './launch-agent.ts';
+import { acquireSessionLock } from './lock.ts';
 
 async function withHome(fn: (home: string) => Promise<void>): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'slip-launch-'));
@@ -105,6 +106,27 @@ describe('the LaunchAgent', () => {
       const res = await installLaunchAgent({ ...paths, home, store: join(home, '.slipstream'), uid: 501 }, l.run);
       assert.equal(res.reloaded, true);
       assert.equal(l.verbs().filter((v) => v === 'bootstrap').length, 3);
+    });
+  });
+
+  it('waits for the outgoing daemon to release the store before loading an upgrade', async () => {
+    await withHome(async (home) => {
+      const store = join(home, '.slipstream');
+      await mkdir(store, { mode: 0o700 });
+      const held = await acquireSessionLock(store);
+      const l = fakeLaunchctl();
+      const run: Run = async (command, args) => {
+        const result = await l.run(command, args);
+        if (args[0] === 'bootout') setTimeout(() => void held.release(), 30);
+        return result;
+      };
+      try {
+        const res = await installLaunchAgent({ ...paths, home, store, uid: 501 }, run);
+        assert.equal(res.reloaded, true);
+        assert.deepEqual(l.verbs().slice(-2), ['bootout', 'bootstrap']);
+      } finally {
+        await held.release();
+      }
     });
   });
 
