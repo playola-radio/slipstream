@@ -723,6 +723,16 @@ describe('session', () => {
         const recs = await waitForRecords(s1.logPath, (r) => changesFor(r, 'c.ts').length >= 1);
         assert.equal(changesFor(recs, 'c.ts')[0]!.data.task_hint_id, undefined);
         await s1.stop();
+        const platform2 = createFakePlatform();
+        const s2 = await startCapture({ root, storeDir: store, resumeSessionId: s1.sessionId }, { platform: platform2 });
+        try {
+          await writeFile(join(root, 'd.ts'), 'v1');
+          platform2.observe('d.ts');
+          const after = await waitForRecords(s2.logPath, (r) => changesFor(r, 'd.ts').length >= 1);
+          assert.equal(changesFor(after, 'd.ts')[0]!.data.task_hint_id, undefined);
+        } finally {
+          await s2.stop();
+        }
       });
     });
 
