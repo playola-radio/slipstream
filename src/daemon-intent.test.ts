@@ -101,6 +101,18 @@ describe('daemon capture intent is durable before each acknowledgement', () => {
       assert.deepEqual((await loadIntent(store)).captures.map((c) => [c.root, c.intent]), [[a, 'running']]);
     });
   });
+
+  it('does not report a second unlink as done while the first is not saved', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      const linked = await linkChat(call, store, ws!, 'chat-1');
+      assert.equal(linked.ok, true, JSON.stringify(linked));
+      await chmod(join(store, 'control'), 0o500);
+      const session_id = rec(linked).session_id;
+      const both = await Promise.all([call({ verb: 'unlink', session_id }), call({ verb: 'unlink', session_id })]);
+      assert.deepEqual(both.map((r) => r.ok), [false, false], JSON.stringify(both));
+    });
+  });
 });
 
 describe('daemon start beside an offline withdrawal', () => {

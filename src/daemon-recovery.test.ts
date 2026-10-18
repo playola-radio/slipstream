@@ -253,6 +253,40 @@ describe('daemon crash points (contracts.md §6)', () => {
     });
   });
 
+  it('starts afresh a capture whose first start crashed before it recorded anything', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const id = await attachRecording(call, a!);
+      await stop();
+      await writeFile(sessionLogPath(store, id), '');
+      ({ call } = await start());
+      await waitForRow(call, id, recording);
+      assert.equal((await readLog(store, id))[0]?.type, 'slipstream.session.started.v1');
+    });
+  });
+
+  it('recovers a first start whose watcher failed, under the same session id', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const fake = createRootsPlatform();
+      let failures = 1;
+      const platform: Platform = {
+        watch: async (o) => {
+          if (failures-- > 0) throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+          return fake.platform.watch(o);
+        },
+      };
+      const { call } = await start({
+        retryBackoff: { baseMs: 100, maxMs: 100 },
+        captureDependencies: { platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' },
+      });
+      const id = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: a })).session_id!;
+      await waitForRow(call, id, recording, 'recording after its retry');
+      assert.equal((await readLog(store, id))[0]?.type, 'slipstream.session.started.v1');
+    });
+  });
+
   it('forgets a capture whose session was deleted just before a crash', async () => {
     await withRestartableStore(async ({ store, roots, start, stop }) => {
       const [a] = await roots(1);
@@ -406,6 +440,24 @@ describe('linked chats across a daemon restart', () => {
       assert.equal((await bindingState(call, id)).state, 'connected');
     });
   });
+
+  it('reconnects a link whose transcript comes back, without the chat attaching again', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      await stop();
+      const transcript = join(store, 'chat-a.jsonl');
+      const saved = await readFile(transcript, 'utf8');
+      await rm(transcript);
+      ({ call } = await start({ retryBackoff: { baseMs: 50, maxMs: 50 } }));
+      await waitForRow(call, id, (row) => (row.binding as Record<string, unknown>).state === 'unavailable');
+      await writeFile(transcript, saved);
+      await waitForRow(call, id, (row) => (row.binding as Record<string, unknown>).state === 'setup_pending');
+      await connect(call, store, 'chat-a', a!);
+      assert.equal((await bindingState(call, id)).state, 'connected');
+    });
+  });
 });
 
 const lastType = (log: LogRecord[]) => log.at(-1)?.type;
@@ -517,6 +569,65 @@ describe('a capture whose root or watcher goes away', () => {
       assert.equal(row.reason, 'root-missing');
       assert.match(String(row.message), /replaced/);
       assert.equal((await readLog(store, id)).length, before);
+    });
+  });
+
+  it('does not resume onto a root replaced while its watcher was being installed', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const id = await attachRecording(call, a!);
+      await stop();
+      const before = (await readLog(store, id)).length;
+      const fake = createRootsPlatform();
+      const platform: Platform = {
+        watch: async (o) => {
+          await rm(a!, { recursive: true });
+          await mkdir(a!);
+          return fake.platform.watch(o);
+        },
+      };
+      ({ call } = await start({ captureDependencies: { platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' } }));
+      const row = await waitForRow(call, id, (r) => r.state === 'not_recording');
+      assert.equal(row.reason, 'root-missing');
+      assert.equal((await readLog(store, id)).length, before);
+    });
+  });
+
+  it('archives every capture recorded at a path whose root was replaced', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start();
+      const old = await attachRecording(call, a!);
+      await rm(a!, { recursive: true });
+      await mkdir(a!);
+      fake.observe(a!, '');
+      await waitForLog(store, old, (l) => stoppedFor(l) === 'root-missing');
+      const fresh = await attachRecording(call, a!);
+      const res = await call({ verb: 'detach', target: a, reason: 'archived' });
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const entries = (await loadIntent(store)).captures;
+      assert.deepEqual(entries.map((c) => [c.session_id, c.intent, c.withdrawn_reason]).sort(),
+        [[old, 'withdrawn', 'archived'], [fresh, 'withdrawn', 'archived']].sort());
+    });
+  });
+
+  it('refuses to archive a stopped capture when the withdrawal cannot be saved', async () => {
+    await withRestartableStore(async ({ store, roots, start }) => {
+      const [a] = await roots(1);
+      const { call, fake } = await start();
+      const id = await attachRecording(call, a!);
+      await rm(a!, { recursive: true });
+      fake.observe(a!, '');
+      await waitForRow(call, id, (r) => r.state === 'stopped');
+      await chmod(join(store, 'control'), 0o500);
+      try {
+        const res = await call({ verb: 'detach', target: id, reason: 'archived' });
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      } finally {
+        await chmod(join(store, 'control'), 0o700);
+      }
+      assert.equal((await loadIntent(store)).captures[0]?.intent, 'running');
     });
   });
 });

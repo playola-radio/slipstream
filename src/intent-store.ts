@@ -77,8 +77,6 @@ export async function saveIntent(storeDir: string, record: IntentRecord): Promis
 export interface OfflineWithdrawal {
   /** Session ids whose intent this call withdrew (empty when all were already withdrawn). */
   withdrawn: string[];
-  /** Session ids promoted from waiting to running; the next daemon starts them. */
-  promoted: string[];
 }
 
 /**
@@ -100,13 +98,12 @@ export async function withdrawOffline(
     const entries = 'sessionId' in target
       ? record.captures.filter((c) => c.session_id === target.sessionId)
       : record.captures.filter((c) => c.root === target.root);
-    const result: OfflineWithdrawal = { withdrawn: [], promoted: [] };
+    const result: OfflineWithdrawal = { withdrawn: [] };
     for (const entry of entries) {
       if (entry.intent === 'withdrawn') continue;
-      const promoted = withdrawCapture(record, entry.session_id, reason);
+      withdrawCapture(record, entry.session_id, reason);
       revokeBinding(record, entry.session_id);
       result.withdrawn.push(entry.session_id);
-      if (promoted) result.promoted.push(promoted.session_id);
     }
     if (entries.length === 0) {
       throw new NoCaptureError(`no capture is recorded for ${'sessionId' in target ? target.sessionId : target.root}`);

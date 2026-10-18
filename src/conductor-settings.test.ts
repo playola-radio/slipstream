@@ -21,11 +21,20 @@ describe('reading Conductor scripts', () => {
     ['a quoted key', '[scripts]\n"setup" = "npm ci"\n'],
     ['a repeated table', '[scripts]\nsetup = "a"\n[scripts]\narchive = "b"\n'],
     ['a non-string value', '[scripts]\nsetup = 3\n'],
+    ['a double-quoted scripts header', '["scripts"]\nsetup = "npm ci"\n'],
+    ['a single-quoted scripts header', "[ 'scripts' ]\narchive = 'rm -rf tmp'\n"],
+    ['a multi-line string elsewhere in the file', '[notes]\ntext = \'\'\'\n[scripts]\nsetup = "x"\n\'\'\'\n'],
+    ['a multi-line basic string elsewhere in the file', '[notes]\ntext = \"\"\"\nsetup = "x"\n\"\"\"\n[ui]\nx = 1\n'],
   ] as const) {
     it(`refuses ${name} rather than guess`, () => {
       assert.throws(() => readTomlScripts(text, P), (err: Error) => err instanceof SettingsError && err.message.startsWith(`${P}:`));
     });
   }
+
+  it('still reads a file whose other tables merely resemble scripts', () => {
+    const text = '[scripts.extra]\nsetup = "not ours"\n[scripts]\nsetup = "npm ci"\n';
+    assert.deepEqual(readTomlScripts(text, P), { setup: 'npm ci' });
+  });
 
   it('reads a legacy conductor.json', () => {
     assert.deepEqual(readLegacyScripts('{"scripts":{"setup":"npm ci","run":"npm start","archive":7}}', '/r/conductor.json'), { setup: 'npm ci' });

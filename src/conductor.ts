@@ -35,13 +35,13 @@ export function chainScript(ours: string, own: string | null): string {
 }
 
 const WORD = String.raw`(?:[\w@%+=:,./-]+|'[^']*'(?:\\''[^']*')*)`;
-const CHAINED = new RegExp(String.raw`^${WORD} ${WORD} conductor (setup|archive) --store ${WORD}(?: && \{\n([\s\S]*)\n\})?$`);
+const CHAINED = new RegExp(String.raw`^${WORD} ${WORD} conductor (?:setup|archive) --store ${WORD}(?: && \{\n([\s\S]*)\n\})?$`);
 
 /** The command a Slipstream chain runs after its own, or undefined when `value`
  * is not a Slipstream chain. */
-export function chainedOwn(value: string): { kind: ScriptKind; own: string | null } | undefined {
+export function chainedOwn(value: string): { own: string | null } | undefined {
   const m = CHAINED.exec(value);
-  return m ? { kind: m[1] as ScriptKind, own: m[2] ?? null } : undefined;
+  return m ? { own: m[1] ?? null } : undefined;
 }
 
 async function readText(path: string): Promise<string | null> {
@@ -179,9 +179,7 @@ async function install(deps: InstallDeps): Promise<number> {
   const upgraded = prior !== null && (prior.package_version !== deps.packageVersion || prior.node !== paths.node);
   const agent = await installLaunchAgent({ ...paths, home: deps.home, store: deps.store, uid: deps.uid, restart: upgraded }, deps.run);
   for (const w of writes) await writeAtomic(w.path, w.text);
-  await writeManagedInstall({
-    version: 1, package_version: deps.packageVersion, ...paths, store: deps.store, plist: agent.plist, log: agent.log, repos,
-  });
+  await writeManagedInstall(deps.store, { version: 1, package_version: deps.packageVersion, ...paths, log: agent.log, repos });
 
   deps.out(`LaunchAgent: ${agent.plist}${agent.reloaded ? ' (loaded; the daemon was started on these paths)' : ' (unchanged)'}`);
   deps.out(`Daemon log: ${agent.log}`);

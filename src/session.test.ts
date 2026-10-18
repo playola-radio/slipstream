@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { startCapture, InvalidTitleError, type TranscriptRuntime } from './session.ts';
+import { startCapture, InvalidTitleError, RootChangedError, type TranscriptRuntime } from './session.ts';
 import { createCas, type Cas } from './cas.ts';
 import { createLog, type Log } from './log.ts';
 import { StorageError } from './storage.ts';
@@ -136,6 +136,15 @@ describe('session', () => {
       );
       assert.equal(watcherClosed, true);
       assert.equal(logClosed, true);
+    });
+  });
+
+  it('refuses a root that is not the directory its capture was admitted for', async () => {
+    await withTempPair(async (root, store) => {
+      await assert.rejects(
+        startCapture({ root, storeDir: store, rootIdentity: { dev: '0', ino: '0' } }, { platform: createFakePlatform(), enumerate: async () => {} }),
+        RootChangedError,
+      );
     });
   });
 

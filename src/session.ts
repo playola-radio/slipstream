@@ -1,4 +1,4 @@
-import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readdir, readFile, realpath, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
@@ -12,7 +12,7 @@ import { acquireSessionLock, type SessionLock } from './lock.ts';
 import { recoverSession, type RecoveredSession } from './recovery.ts';
 import { StorageError, assertOwnerOnly, mkdirpDurable } from './storage.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
-import { isValidSessionId } from './store-reader.ts';
+import { finalRecord, isValidSessionId } from './store-reader.ts';
 import { createPlatform, type Platform, type Subscription } from './platform.ts';
 import {
   createAttributionProducer,
@@ -56,6 +56,10 @@ export interface CaptureOptions {
    * disk (D3). Mutually exclusive with {@link resumeSessionId}. A fresh id whose
    * log already exists is rejected — appending fresh would corrupt its sequence. */
   sessionId?: string;
+  /** The device and inode the root had when its capture was admitted. A root
+   * that no longer has them, before or after the watcher is installed, is a
+   * different directory: the start fails with {@link RootChangedError}. */
+  rootIdentity?: { dev: string; ino: string };
   /** Recorded on this activation's `session.started`/`session.resumed`. */
   captureMode?: CaptureMode;
   /** Notified once if this session loses its lock to another owner. Capture has
@@ -103,6 +107,8 @@ export interface BeginTaskResult {
 
 /** A `request_id` was reused with a different title — a caller mistake, not a
  * retry, so it never commits a second declaration. */
+export class RootChangedError extends Error {}
+
 export class InvalidTitleError extends Error {
   readonly code = 'INVALID_TITLE';
   constructor(message: string) {
@@ -235,6 +241,12 @@ export async function startCapture(
   // macOS /var -> /private/var) so relative-path math against events matches.
   const root = await realpath(opts.root);
   const rootStat = await stat(root, { bigint: true });
+  const expected = opts.rootIdentity;
+  const replaced = (st: { dev: bigint; ino: bigint } | undefined): boolean => expected !== undefined
+    && (st?.dev.toString() !== expected.dev || st.ino.toString() !== expected.ino);
+  if (replaced(rootStat)) {
+    throw new RootChangedError(`the workspace root ${root} was replaced; a directory recreated there is captured under a new session`);
+  }
   // Validate the store before freezing anything, so a bad store directory fails
   // without leaving a frozen copy of the ignore rules behind.
   await mkdirpDurable(opts.storeDir);
@@ -389,8 +401,12 @@ export async function startCapture(
     // duplicates seqs. Resuming existing history requires resumeSessionId. The
     // check runs while we hold the session lock so a concurrent caller cannot
     // create then release the same id between the check and log creation.
+    // A log holding no complete record (a first start that failed before its
+    // `session.started` became durable) recorded nothing, so it starts afresh.
     const logExists = await access(logPath).then(() => true, () => false);
-    if (logExists) {
+    const unstarted = logExists && await finalRecord(logPath).then((r) => r === undefined, () => false);
+    if (unstarted) await truncate(logPath, 0);
+    if (logExists && !unstarted) {
       await lock.release();
       if (frozenSlip) await rm(frozenSlip.dir, { recursive: true, force: true }).catch(() => {});
       throw new Error(
@@ -884,6 +900,12 @@ export async function startCapture(
   try {
     subscription = await deps.platform.watch({ root, ignore: excluded, onObservation, onError,
       onClosed: (err) => { void onClosed(err); } });
+    // The root may have been swapped between its first stat and the watcher's
+    // install; nothing is written for a directory this session never watched.
+    const watched = await stat(root, { bigint: true }).catch(() => undefined);
+    if (!watched || watched.dev !== rootStat.dev || watched.ino !== rootStat.ino) {
+      throw new RootChangedError(watched ? `the workspace root ${root} was replaced` : `the workspace root ${root} no longer exists`);
+    }
 
     if (resuming) {
       // Replay barrier: rebuild the producer's projections and reconstruct

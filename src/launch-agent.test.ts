@@ -1,10 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  InstallError, entryPaths, installLaunchAgent, kickstartLaunchAgent, plistPath, renderPlist, type Run,
+  InstallError, entryPaths, installLaunchAgent, kickstartLaunchAgent, plistPath, readManagedInstall, renderPlist, writeManagedInstall,
+  type ManagedInstall, type Run,
 } from './launch-agent.ts';
 
 async function withHome(fn: (home: string) => Promise<void>): Promise<void> {
@@ -112,6 +113,30 @@ describe('the LaunchAgent', () => {
     const settled = await Promise.race([ok.exited.then(() => true), new Promise((r) => setTimeout(() => r(false), 50))]);
     assert.equal(settled, false);
     assert.equal(await kickstartLaunchAgent(501, async () => ({ code: 113, output: '' })).exited, 113);
+  });
+});
+
+describe('the install record', () => {
+  const install: ManagedInstall = { version: 1, package_version: '0.3.0', ...paths, log: '/l/daemon.log', repos: [] };
+
+  it('creates an absent store and its control directory owner-only', async () => {
+    await withHome(async (home) => {
+      const store = join(home, '.slipstream');
+      await writeManagedInstall(store, install);
+      assert.equal((await stat(store)).mode & 0o777, 0o700);
+      assert.equal((await stat(join(store, 'control'))).mode & 0o777, 0o700);
+      assert.deepEqual(await readManagedInstall(store), install);
+    });
+  });
+
+  it('refuses an existing store that other users can read', async () => {
+    await withHome(async (home) => {
+      const store = join(home, '.slipstream');
+      await mkdir(store);
+      await chmod(store, 0o755);
+      await assert.rejects(writeManagedInstall(store, install), /insecure-path/);
+      assert.equal(await readManagedInstall(store), null);
+    });
   });
 });
 

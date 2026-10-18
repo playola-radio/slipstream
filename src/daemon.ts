@@ -2,7 +2,7 @@ import { createServer, connect, type Server, type Socket } from 'node:net';
 import { chmod, lstat, unlink, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, sep } from 'node:path';
-import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
+import { startCapture, InvalidTitleError, RootChangedError, type CaptureSession, type TranscriptRuntime } from './session.ts';
 import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
@@ -240,6 +240,8 @@ interface Binding {
   /** Its transcript failed revalidation on resume; the intent keeps the link and
    * its slot, and records why (contracts.md §4). */
   unavailable?: boolean;
+  /** Failed revalidations in this activation; the next retry backs off by it. */
+  revalidations?: number;
 }
 
 /** One start of a capture. A lock-loss callback acts only on the activation that
@@ -277,6 +279,10 @@ interface Capture {
   /** A stop in flight (detach, or a halt after lock loss). */
   closing?: Promise<void>;
   closeError?: unknown;
+  /** The intent write of its latest unlink. */
+  unlinking?: Promise<void>;
+  /** Its withdrawal could not be made durable, so no detach of it is acknowledged. */
+  withdrawalError?: unknown;
   binding?: Binding;
   inflight: Set<Promise<unknown>>;
   /** Consecutive transient start failures; reset by a successful activation. */
@@ -681,7 +687,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function retryScheduled(c: Capture): Promise<void> {
     await c.closing;
-    const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
+    const resume = c.resume || await hasHistory(c.id);
     const entry = findCapture(intent, c.id);
     if (torn || compromised || !retryable(c) || entry?.intent !== 'running' || !entry.last_failure) return;
     entry.last_failure.next_attempt_at_ms = null;
@@ -689,6 +695,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     c.lifecycle = 'queued';
     c.resume = resume;
     enqueueStart(c);
+  }
+
+  /** Whether a session's log holds a complete record to resume from. A log a
+   * failed first start left without one starts afresh under the same id; an
+   * unreadable log is resumed, so it fails visibly. */
+  async function hasHistory(id: string): Promise<boolean> {
+    try { return await finalRecord(sessionLogPath(storeDir, id)) !== undefined; } catch { return true; }
   }
 
   /** Rebuild the capture table from the intent record after a restart. Every
@@ -868,7 +881,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function retryIfFailed(c: Capture): Promise<Admitted> {
     if (!retryable(c)) return { capture: c, created: false };
     await c.closing;
-    const resume = c.resume || await sessionExists(storeDir, c.id).catch(() => false);
+    const resume = c.resume || await hasHistory(c.id);
     const entry = findCapture(intent, c.id);
     if (!retryable(c) || entry?.intent !== 'running' || torn || compromised) return { capture: c, created: false };
     clearTimeout(c.retryTimer);
@@ -901,6 +914,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       fail(c, 'root-missing', moved, { retry: false });
       return;
     }
+    const identity = findCapture(intent, c.id)?.root_identity;
     const activation: Activation = { lost: false };
     c.activation = activation;
     c.ended = undefined;
@@ -912,6 +926,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           root: c.root,
           storeDir,
           ...(c.resume ? { resumeSessionId: c.id } : { sessionId: c.id }),
+          ...(identity ? { rootIdentity: identity } : {}),
           captureMode: 'watch-only',
           cas,
           onCompromised: (reason) => onSessionLockLost(c, activation, reason),
@@ -926,6 +941,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // session keeps the boundary pinned at its pre-resume high-water.
       if (!c.resume) registry.freeze(c.id, 0n);
       if (activation.lost || c.lifecycle !== 'baselining') return;
+      if (err instanceof RootChangedError) {
+        fail(c, 'root-missing', err.message, { retry: false });
+        return;
+      }
       if (c.resume) {
         const corrupt = err instanceof CorruptLogError || err instanceof LogCorruptError;
         fail(c, 'resume-failed', `could not resume session ${c.id}: ${(err as Error).message}. `
@@ -961,16 +980,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // A chat stays linked across a restart of its capture, but `connected` is
     // re-earned only by a fresh round trip in the new activation.
     if (c.binding) {
-      const b = c.binding;
-      b.check = { state: 'setup_pending', checkId: randomUUID() };
-      const rearm = rearmBinding(c, b, session);
-      b.publishing = rearm;
-      c.inflight.add(rearm);
-      void rearm.finally(() => {
-        c.inflight.delete(rearm);
-        if (b.publishing === rearm) b.publishing = undefined;
-      });
+      c.binding.check = { state: 'setup_pending', checkId: randomUUID() };
+      c.binding.revalidations = 0;
+      startRearm(c, c.binding, session);
     }
+  }
+
+  function startRearm(c: Capture, b: Binding, session: CaptureSession): void {
+    const rearm = rearmBinding(c, b, session);
+    b.publishing = rearm;
+    c.inflight.add(rearm);
+    void rearm.finally(() => {
+      c.inflight.delete(rearm);
+      if (b.publishing === rearm) b.publishing = undefined;
+    });
   }
 
   /** Revalidate a linked chat's transcript in a new activation, then publish it
@@ -988,6 +1011,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         persistQuietly();
       }
       console.error(`slipstream daemon: the chat linked to ${c.id} is unavailable: ${err.message}`);
+      // A transcript that comes back reconnects without another attach, while
+      // this binding is still the capture's in this activation.
+      const delay = Math.min(backoff.baseMs * 2 ** (b.revalidations ?? 0), backoff.maxMs);
+      b.revalidations = (b.revalidations ?? 0) + 1;
+      setTimeout(() => {
+        if (c.binding === b && b.unavailable && c.session === session && c.lifecycle === 'recording' && !torn && !compromised) {
+          startRearm(c, b, session);
+        }
+      }, delay).unref();
       return undefined;
     }
     b.unavailable = false;
@@ -1279,24 +1311,38 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const c = await resolveTarget(req.target);
     if (isErrorFields(c)) return c;
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    const entry = findCapture(intent, c.id);
-    if (entry && entry.intent !== 'withdrawn') {
+    // A path withdraws every capture recorded at it, as the offline path does: an
+    // older capture of a replaced root would otherwise keep its slot.
+    const targets = captures.has(req.target as string) ? [c] : [...captures.values()].filter((x) => x.root === c.root);
+    const pending = targets.filter((t) => {
+      const entry = findCapture(intent, t.id);
+      return entry !== undefined && entry.intent !== 'withdrawn';
+    });
+    if (pending.length > 0) {
       const refused = intentRefusal();
       if (refused) return refused;
-      const promoted = withdrawCapture(intent, c.id, why);
-      revokeBinding(intent, c.id);
-      const prior = c.closing;
-      // Set in this turn, so a concurrent detach waits for the same stop. A
-      // withdrawal that is not durable stops nothing.
-      c.closing = persistIntent().then(() => {
-        const next = promoted && captures.get(promoted.session_id);
-        if (next) enqueueStart(next);
-        return closeCapture(c, prior, why);
-      }, () => {});
+      const promotedFor = pending.map((t) => {
+        const promoted = withdrawCapture(intent, t.id, why);
+        revokeBinding(intent, t.id);
+        return promoted;
+      });
+      const durable = persistIntent();
+      for (const [i, t] of pending.entries()) {
+        const prior = t.closing;
+        // Set in this turn, so a concurrent detach waits for the same stop. A
+        // withdrawal that is not durable stops nothing, and is never acknowledged.
+        t.closing = durable.then(() => {
+          const promoted = promotedFor[i];
+          const next = promoted && captures.get(promoted.session_id);
+          if (next) enqueueStart(next);
+          return closeCapture(t, prior, why);
+        }, (err: unknown) => { t.withdrawalError = err; });
+      }
     }
-    const already = entry?.intent === 'withdrawn' && c.lifecycle === 'stopped';
-    await c.closing;
-    if (intentBroken && !['stopped', 'failed'].includes(c.lifecycle)) return intentRefusal()!;
+    const already = !pending.includes(c) && findCapture(intent, c.id)?.intent === 'withdrawn' && c.lifecycle === 'stopped';
+    await Promise.all(targets.map((t) => t.closing));
+    const undurable = targets.find((t) => t.withdrawalError);
+    if (undurable) return errFields('STORAGE_UNAVAILABLE', `the withdrawal was not saved: ${(undurable.withdrawalError as Error).message}`);
     if (c.closeError) {
       return errFields('STORAGE_UNAVAILABLE', `detach did not stop cleanly: ${(c.closeError as Error).message}`);
     }
@@ -1353,13 +1399,18 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     await c.binding?.publishing;
     const b = c.binding;
-    if (!b) return { session_id: c.id, already_unlinked: true };
+    if (!b) {
+      // An unlink still being saved is not yet acknowledged to anyone.
+      if (c.unlinking && !await c.unlinking.then(() => true, () => false)) return intentRefusal()!;
+      return { session_id: c.id, already_unlinked: true };
+    }
     const refused = intentRefusal();
     if (refused) return refused;
     c.binding = undefined;
     revokeBinding(intent, c.id);
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const persisted = persistIntent();
+    c.unlinking = persisted;
     const session = c.session;
     if (!session || !['recording', 'stopping'].includes(c.lifecycle)) {
       await persisted.catch(() => {});

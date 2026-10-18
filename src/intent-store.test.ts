@@ -71,7 +71,7 @@ describe('withdrawal while no daemon runs', () => {
 
     const result = await withdrawOffline(dir, { root: '/w/3' }, 'archived');
 
-    assert.deepEqual(result, { withdrawn: ['s3'], promoted: ['s16'] });
+    assert.deepEqual(result, { withdrawn: ['s3'] });
     const after = await loadIntent(dir);
     assert.deepEqual(after.captures.find((c) => c.session_id === 's3'),
       { ...capture(3), intent: 'withdrawn', withdrawn_reason: 'archived', capture_mode: 'watch-only', last_failure: null });
@@ -86,7 +86,7 @@ describe('withdrawal while no daemon runs', () => {
     admitCapture(record, capture(1));
     await saveIntent(dir, record);
     await withdrawOffline(dir, { sessionId: 's1' }, 'detached');
-    assert.deepEqual(await withdrawOffline(dir, { sessionId: 's1' }, 'archived'), { withdrawn: [], promoted: [] });
+    assert.deepEqual(await withdrawOffline(dir, { sessionId: 's1' }, 'archived'), { withdrawn: [] });
     assert.equal((await loadIntent(dir)).captures[0]?.withdrawn_reason, 'detached');
   });
 

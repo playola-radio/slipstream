@@ -1,9 +1,10 @@
 /**
  * Read and edit the `[scripts] setup` / `archive` entries of a Conductor
  * settings file, keeping every other line as written. Only the plain forms are
- * handled: a `[scripts]` table with single-line string values. Anything else
- * (dotted keys, inline tables, multi-line strings) is refused, so a file is
- * never rewritten on a guess.
+ * handled: a plainly written `[scripts]` table with single-line string values.
+ * Anything else (dotted keys, inline tables, a quoted `["scripts"]` header, a
+ * multi-line string anywhere in the file) is refused, so a file is never
+ * rewritten on a guess.
  */
 
 export type ScriptKind = 'setup' | 'archive';
@@ -23,7 +24,6 @@ function unsupported(path: string, line: number, why: string): SettingsError {
 
 function parseValue(raw: string, path: string, line: number): string {
   const text = raw.trim();
-  if (text.startsWith('"""') || text.startsWith("'''")) throw unsupported(path, line, 'uses a multi-line string');
   let value: string;
   let rest: string;
   if (text.startsWith('"')) {
@@ -55,10 +55,12 @@ function locate(text: string, path: string): Located {
   let table: string | null = '';
   let found: number | undefined;
   for (const [i, line] of lines.entries()) {
+    if (line.includes('"""') || line.includes("'''")) throw unsupported(path, i + 1, 'uses a multi-line string');
     if (ARRAY_HEADER.test(line)) { table = null; continue; }
     const header = HEADER.exec(line);
     if (header) {
       table = header[1]!;
+      if (/^(["'])scripts\1$/.test(table)) throw unsupported(path, i + 1, 'quotes the [scripts] table name');
       if (table === 'scripts') {
         if (found !== undefined) throw unsupported(path, i + 1, 'repeats the [scripts] table');
         found = i;

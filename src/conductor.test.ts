@@ -79,8 +79,8 @@ describe('the Slipstream chain in a Conductor script', () => {
 
   it('recognizes its own chain and what it wraps, and nothing else', () => {
     const ours = slipstreamCommand('setup', P);
-    assert.deepEqual(chainedOwn(chainScript(ours, 'npm ci\nnpm run build')), { kind: 'setup', own: 'npm ci\nnpm run build' });
-    assert.deepEqual(chainedOwn(ours), { kind: 'setup', own: null });
+    assert.deepEqual(chainedOwn(chainScript(ours, 'npm ci\nnpm run build')), { own: 'npm ci\nnpm run build' });
+    assert.deepEqual(chainedOwn(ours), { own: null });
     assert.equal(chainedOwn('npm ci'), undefined);
     assert.equal(chainedOwn(`echo hi && ${ours}`), undefined);
   });

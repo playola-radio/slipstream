@@ -8,6 +8,7 @@
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { assertOwnerOnly, mkdirpDurable } from './storage.ts';
 
 export const LAUNCH_AGENT_LABEL = 'radio.playola.slipstream';
 /** git is on it, for the daemon's ignore-rule checks. */
@@ -30,8 +31,6 @@ export interface ManagedInstall {
   package_version: string;
   node: string;
   cli: string;
-  store: string;
-  plist: string;
   log: string;
   repos: ManagedRepo[];
 }
@@ -125,8 +124,12 @@ export async function readManagedInstall(store: string): Promise<ManagedInstall 
   return parsed;
 }
 
-export async function writeManagedInstall(install: ManagedInstall): Promise<void> {
-  await writeAtomic(manifestPath(install.store), JSON.stringify(install, null, 2) + '\n', 0o600);
+export async function writeManagedInstall(store: string, install: ManagedInstall): Promise<void> {
+  const control = dirname(manifestPath(store));
+  await mkdirpDurable(control);
+  await assertOwnerOnly(store, 'dir');
+  await assertOwnerOnly(control, 'dir');
+  await writeAtomic(manifestPath(store), JSON.stringify(install, null, 2) + '\n', 0o600);
 }
 
 export interface LaunchAgentResult { plist: string; log: string; reloaded: boolean }
