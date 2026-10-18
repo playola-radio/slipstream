@@ -64,6 +64,19 @@ const answered = (questionId: string, attemptSeq: string, text = 'Because.'): Ev
   occurred_at_ms: 6,
   data: { question_id: questionId, attempt_seq: attemptSeq, text, answered_at_ms: 6 },
 });
+const exchange = (questionId: string, answerText = 'Because.'): EventInput => ({
+  type: 'slipstream.question.exchange_recorded.v1',
+  occurred_at_ms: 7,
+  data: {
+    question_id: questionId,
+    request_id: questionId,
+    text: 'Why?',
+    context: { change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1, selected_text: 'a' },
+    answer_text: answerText,
+    recorded_at_ms: 7,
+    conversation: { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1', reported_by: 'client' },
+  },
+});
 
 describe('recovery', () => {
   it('recovers through the last complete record and discards a torn trailing suffix', async () => {
@@ -141,6 +154,36 @@ describe('recovery', () => {
       assert.equal(rec.recoveredThroughSeq, 3n);
     });
   });
+
+  it('collects exchange_recorded events in order', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first'), exchange(OTHER_QUESTION, 'second')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual(rec.questionExchanges.map(e => [e.seq, e.data.question_id, e.data.answer_text]),
+        [['2', QUESTION, 'first'], ['3', OTHER_QUESTION, 'second']]);
+    });
+  });
+
+  for (const [name, mutate] of [
+    ['an exchange whose subject does not match its question_id',
+      (e: Record<string, unknown>) => { e.subject = `question/${OTHER_QUESTION}`; }],
+    ['a schema-invalid exchange_recorded event',
+      (e: Record<string, unknown>) => { delete (e.data as Record<string, unknown>).answer_text; }],
+  ] as Array<[string, (e: Record<string, unknown>) => void]>) {
+    it(`recovery rejects ${name}`, async () => {
+      await withTempDir(async (dir) => {
+        const cas = await createCas(join(dir, 'blobs'));
+        const path = await seedLog(dir, [started, exchange(QUESTION)]);
+        const lines = (await readFile(path, 'utf8')).trimEnd().split('\n');
+        const last = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
+        mutate(last);
+        lines[lines.length - 1] = JSON.stringify(last);
+        await writeFile(path, lines.join('\n') + '\n');
+        await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError);
+      });
+    });
+  }
 
   for (const [name, inputs, mutate] of [
     ['a subject that disagrees with the question id', [queued(QUESTION), attempted(QUESTION, '2'), answered(QUESTION, '3')],

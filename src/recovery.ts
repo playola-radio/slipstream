@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
 import { fsyncDir } from './storage.ts';
 import { sourceFor, type AnyEvent } from './event.ts';
-import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent } from './public-events.ts';
+import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent, type QuestionExchangeRecordedEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
@@ -53,6 +53,7 @@ export interface RecoveredSession {
   questions: QuestionQueuedEvent[];
   questionAttempts: QuestionDispatchAttemptedEvent[];
   questionAnswers: QuestionAnsweredEvent[];
+  questionExchanges: QuestionExchangeRecordedEvent[];
   /** Generations with a durable `agent.binding` record, so a resume can append
    * one a crash interrupted (contracts.md §6). */
   bindingGenerations: Set<string>;
@@ -130,6 +131,7 @@ export async function recoverSession(
   const questions: QuestionQueuedEvent[] = [];
   const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const questionAnswers: QuestionAnsweredEvent[] = [];
+  const questionExchanges: QuestionExchangeRecordedEvent[] = [];
   // Keep the ordered event arrays for callers, while replay validation uses
   // indexes so a long-lived session is replayed in one pass.
   const queuedSeqsByQuestion = new Map<string, Set<string>>();
@@ -306,6 +308,11 @@ export async function recoverSession(
         answeredQuestionIds.add(event.data.question_id);
         break;
       }
+      case 'slipstream.question.exchange_recorded.v1': {
+        if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
+        questionExchanges.push(event);
+        break;
+      }
       case 'slipstream.task.started.v1': {
         // Replayed in order: the last committed declaration is the current task,
         // and its request_id indexes the committed result so a replayed duplicate
@@ -370,6 +377,7 @@ export async function recoverSession(
     questions,
     questionAttempts,
     questionAnswers,
+    questionExchanges,
     bindingGenerations,
   };
 }
