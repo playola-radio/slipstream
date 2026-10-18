@@ -13,7 +13,7 @@ import { StorageError, mkdirpDurable, assertOwnerOnly } from './storage.ts';
 import { acquireSessionLock, SessionOwnedError, STALE_MS, type SessionLock } from './lock.ts';
 import { startReaderServer, type ReaderServer } from './http-reader.ts';
 import {
-  isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, tombstonePath, WorkspaceLookupError,
+  isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, WorkspaceLookupError,
 } from './store-reader.ts';
 import { CorruptLogError } from './recovery.ts';
 import { LogCorruptError } from './log-reader.ts';
@@ -381,11 +381,13 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** A gc is stopping, sweeping or resuming: no capture is admitted or started
    * and no chat is linked or unlinked until it is done. */
   let quiescing = false;
-  /** The session a delete_session is removing, for the whole operation, and every
-   * session deleted in this run: neither is ever resumed by an attach whose lookup
-   * found it first. */
+  /** The session a delete_session is removing, and the count of delete_sessions
+   * finished so far with the count at which each session's last one finished. An
+   * attach never resumes a session being deleted, or one whose delete finished
+   * after its lookup began; a later lookup reads the tombstone itself. */
   let deleting: string | undefined;
-  const deleted = new Set<string>();
+  let deletesDone = 0;
+  const deleteDoneAt = new Map<string, number>();
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
@@ -853,6 +855,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   async function admitNew(root: string, rootIdentity: RootIdentity | null): Promise<Admitted | ErrorFields> {
+    const lookedUpAt = deletesDone;
     let lookup;
     try {
       lookup = await workspaceLookup(storeDir, root);
@@ -883,7 +886,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     }
     // Checked in the same turn as the intent entry below, which a delete checks.
-    if (match && (deleting === id || deleted.has(id))) {
+    if (match && (deleting === id || (deleteDoneAt.get(id) ?? 0) > lookedUpAt)) {
       return errFields('CAPTURE_NOT_READY', `session ${id} was deleted while this attach looked it up; retry attach`);
     }
     if (match) {
@@ -1755,6 +1758,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         return await deleteInactive(id);
       } finally {
         deleting = undefined;
+        deleteDoneAt.set(id, ++deletesDone);
       }
     });
   }
@@ -1771,13 +1775,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // history, so a crash in between leaves a session the reader already serves as
     // gone and a later gc finishes the cleanup. Nothing is committed yet, so a
     // failure here is a plain STORAGE_UNAVAILABLE — no rollback needed.
-    deleted.add(id);
     try {
       await publishTombstone(storeDir, id);
     } catch (err) {
-      // A rename that landed before a failed fsync leaves a tombstone the reader
-      // honours; keep attach out unless the tombstone is provably absent.
-      if (await tombstoneAbsent(id)) deleted.delete(id);
       return errFields('STORAGE_UNAVAILABLE', `could not durably record deletion of ${id}: ${(err as Error).message}`);
     }
     // Now that the tombstone is durable, abort any in-flight follower of this
@@ -1804,15 +1804,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('STORAGE_UNAVAILABLE', `${committed}: ${(err as Error).message}`);
     }
     return { session_id: id };
-  }
-
-  async function tombstoneAbsent(id: string): Promise<boolean> {
-    try {
-      await stat(tombstonePath(storeDir, id));
-      return false;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === 'ENOENT';
-    }
   }
 
   /** gc as one maintenance transaction (D9): close admission, stop every capture
@@ -1844,21 +1835,20 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // them must finish, and record its stop, before any blob is swept. A session
       // no stop is pending for (a withdrawal that could not be saved) is a writer
       // still running.
-      const waited = new Set<Capture>();
+      // Read as each stop settles: a retry may requeue a failed capture later.
+      const settled = (c: Capture) => {
+        if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
+      };
       for (;;) {
         const busy = [...captures.values()].filter((c) => c.session || c.lifecycle === 'stopping');
         if (busy.length === 0) break;
-        for (const c of busy) waited.add(c);
         const closings = busy.map((c) => c.closing);
-        await Promise.allSettled(closings);
+        await Promise.allSettled(busy.map((c, i) => Promise.resolve(closings[i]).then(() => settled(c), () => settled(c))));
         const stuck = busy.filter((c, i) => c.closing === closings[i] && (c.session || c.lifecycle === 'stopping'));
         if (stuck.length === busy.length) {
           for (const c of stuck) unproven.set(c.id, `capture ${c.id} has not stopped`);
           break;
         }
-      }
-      for (const c of waited) {
-        if (c.lifecycle === 'failed' && !unproven.has(c.id)) unproven.set(c.id, `capture ${c.id} stopped without recording its stop`);
       }
       if (torn || compromised) throw new StorageError('gc-aborted', new Error('the daemon is shutting down or lost its store lock'));
       if (unproven.size > 0) return errFields('STORAGE_UNAVAILABLE', `gc swept nothing: ${[...unproven.values()].join('; ')}`);

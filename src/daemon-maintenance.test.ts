@@ -215,6 +215,24 @@ describe('delete_session beside running captures', () => {
       }
     }, { daemon: { workspaceLookup } });
   });
+
+  it('leaves a session resumable when its delete could not write a tombstone', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachRecording(call, a!);
+      assert.equal((await call({ verb: 'detach', target: id })).ok, true);
+      const dir = join(store, 'sessions', id);
+      await chmod(dir, 0o600);
+      try {
+        const res = await call({ verb: 'delete_session', session_id: id });
+        assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+      } finally {
+        await chmod(dir, 0o700);
+      }
+      assert.equal(await exists(tombstonePath(store, id)), false);
+      assert.equal(await attachRecording(call, a!), id);
+    });
+  });
 });
 
 describe('gc as a maintenance transaction', () => {
