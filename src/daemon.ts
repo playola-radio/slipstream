@@ -2,7 +2,8 @@ import { createServer, connect, type Server, type Socket } from 'node:net';
 import { chmod, lstat, unlink, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, sep } from 'node:path';
-import { startCapture, InvalidTitleError, type CaptureSession, type TranscriptRuntime } from './session.ts';
+import { startCapture, InvalidTitleError, type CaptureSession } from './session.ts';
+import { createTranscriptScheduler, type TranscriptScheduler } from './transcript/scheduler.ts';
 import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
@@ -72,22 +73,27 @@ export interface DaemonOptions {
   /** The resolved enrichment + transcript config (Fork 4). Absent means built-in
    * defaults: no harness is `configured`, so no transcript is read. */
   config?: ResolvedConfig;
+  /** Replaces the transcript scheduler the config would build, so a test can count
+   * one shared discovery cycle across captures. */
+  transcriptScheduler?: TranscriptScheduler;
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
 class RootIdentityError extends Error {}
 
-/** Build the per-session transcript runtime from resolved config: only harnesses
- * the operator declared `configured` are read. */
-function transcriptRuntimeFrom(config: ResolvedConfig | undefined): TranscriptRuntime | undefined {
+/** Build the daemon's one transcript scheduler from resolved config: only harnesses
+ * the operator declared `configured` are read, and with none there is no scheduler.
+ * Whether a chat is linked plays no part (spec unit 8). */
+function transcriptSchedulerFrom(config: ResolvedConfig | undefined): TranscriptScheduler | undefined {
   if (!config) return undefined;
   const harnesses = HARNESSES.filter((h) => config.policy.sources[h] === 'configured');
   if (harnesses.length === 0) return undefined;
-  return {
+  return createTranscriptScheduler({
     harnesses,
     homes: config.transcript.homes,
     codexScanLimit: config.transcript.codexScanLimit,
-  };
+    onError: (err) => console.error(`slipstream: transcript watcher error: ${(err as Error).message}`),
+  });
 }
 
 export interface Daemon {
@@ -248,6 +254,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const storeDir = opts.storeDir;
   const identityRealpath = opts.identityRealpath ?? realpath;
   const workspaceLookup = opts.workspaceLookup ?? findWorkspaceSession;
+  const transcripts = opts.transcriptScheduler ?? transcriptSchedulerFrom(opts.config);
   const socketPath = join(storeDir, 'control.sock');
 
   await mkdirpDurable(storeDir);
@@ -665,6 +672,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           cas,
           onCompromised: (reason) => onSessionLockLost(c, activation, reason),
           ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
+          ...(transcripts ? { transcript: transcripts } : {}),
         },
         opts.captureDependencies,
       );
@@ -891,8 +899,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return controlFailure(err);
     }
     registry.setAgentConnection(c.id, 'setup_pending');
-    const transcripts = transcriptRuntimeFrom(opts.config);
-    if (transcripts) session.startTranscripts(transcripts);
     return undefined;
   }
 

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startCapture, type TranscriptRuntime } from '../session.ts';
+import { startCapture } from '../session.ts';
+import { createTranscriptScheduler, type TranscriptScheduler } from './scheduler.ts';
 import { createFakePlatform } from '../test/fake-platform.ts';
 import { changesFor, readRecords, waitForRecords, type LoggedRecord } from '../test/helpers.ts';
 import { claudeSlug, type DiscoveryIO, type ListResult } from './discovery.ts';
@@ -48,7 +49,7 @@ function attributionsFor(recs: LoggedRecord[], changeSeq: string): ChangeAttribu
 }
 
 /** Discovery + file IO that serve one Claude transcript from a MemTranscript. */
-function transcriptRuntime(root: string, path: string, mem: MemTranscript): TranscriptRuntime {
+function transcriptRuntime(root: string, path: string, mem: MemTranscript): TranscriptScheduler {
   const dir = `${HOME}/projects/${claudeSlug(root)}`;
   // Membership is confirmed by a recorded cwd; the session's cwd is the worktree
   // root. (Real transcripts carry it on an early user record, not the tool_use
@@ -84,7 +85,7 @@ function transcriptRuntime(root: string, path: string, mem: MemTranscript): Tran
     },
   };
   const homes: Record<HarnessName, string> = { 'claude-code': HOME, codex: HOME };
-  return { harnesses: ['claude-code'], homes, codexScanLimit: 1000, pollIntervalMs: 15, discoveryIO, fileIO };
+  return createTranscriptScheduler({ harnesses: ['claude-code'], homes, codexScanLimit: 1000, pollIntervalMs: 15, discoveryIO, fileIO });
 }
 
 const EVIDENCE = 'slipstream.harness.evidence.v1';

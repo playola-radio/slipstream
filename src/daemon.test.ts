@@ -15,6 +15,10 @@ import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import type { PublicEventInput } from './public-events.ts';
+import { defaultConfig, type ResolvedConfig } from './config.ts';
+import { createTranscriptScheduler } from './transcript/scheduler.ts';
+import { claudeSlug, type DiscoveryIO } from './transcript/discovery.ts';
+import { nodeDiscoveryIO } from './transcript/fs-io.ts';
 
 const IDENTITY = { harness: 'claude-code', harness_session_id: 'abc123' };
 const ASK_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -1868,11 +1872,12 @@ async function withCaptures(
     fake: ReturnType<typeof createRootsPlatform> }) => Promise<void>,
   deps: Parameters<typeof startDaemon>[0]['captureDependencies'] = {},
   expectedStopError?: RegExp,
+  extra: Pick<Parameters<typeof startDaemon>[0], 'config' | 'transcriptScheduler'> = {},
 ): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-daemon-table-'));
   const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-table-roots-')));
   const fake = createRootsPlatform();
-  const daemon = await startDaemon({ storeDir: store, captureDependencies: {
+  const daemon = await startDaemon({ ...extra, storeDir: store, captureDependencies: {
     platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', ...deps,
   } });
   let made = 0;
@@ -2356,4 +2361,130 @@ it('shutdown reports a saved detach stop failure after releasing the store lock'
     await rm(store, { recursive: true, force: true });
     await rm(worktree, { recursive: true, force: true });
   }
+});
+
+const COVERAGE = 'slipstream.enrichment.coverage.v1';
+
+/** Config reading only the given harnesses from transcript homes under `home`. */
+function configured(home: string, harnesses: Array<'claude-code' | 'codex'>): ResolvedConfig {
+  const config = defaultConfig(home);
+  for (const h of harnesses) config.policy.sources[h] = 'configured';
+  return config;
+}
+
+/** A Claude chat transcript in `root`'s project dir that wrote one file, behind a
+ * cwd-less preamble so discovery reads past the first line. */
+async function claudeTranscript(home: string, root: string, chat: string): Promise<void> {
+  const dir = join(home, '.claude', 'projects', claudeSlug(root));
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `${chat}.jsonl`), [
+    { type: 'queue-operation', sessionId: chat },
+    { type: 'user', sessionId: chat, cwd: root, timestamp: '2026-10-17T12:00:00.000Z' },
+    { type: 'assistant', sessionId: chat, cwd: root, timestamp: '2026-10-17T12:00:01.000Z',
+      message: { content: [{ type: 'tool_use', id: `tu-${chat}`, name: 'Write', input: { file_path: join(root, 'a.ts') } }] } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+
+/** A Codex rollout whose session ran in `cwd`. */
+async function codexRollout(home: string, cwd: string, id: string): Promise<void> {
+  const dir = join(home, '.codex', 'sessions', '2026', '10', '17');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `rollout-${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id, cwd } }) + '\n');
+}
+
+/** The real discovery IO, counting each enumeration and header read by path. */
+function countingDiscoveryIO() {
+  const counts = { listDir: new Map<string, number>(), listTree: 0, firstLine: new Map<string, number>(), headLines: new Map<string, number>() };
+  const bump = (m: Map<string, number>, k: string): void => { m.set(k, (m.get(k) ?? 0) + 1); };
+  const io: DiscoveryIO = {
+    ...nodeDiscoveryIO,
+    listDir: (dir) => { bump(counts.listDir, dir); return nodeDiscoveryIO.listDir(dir); },
+    listTreeJsonl: (dir, limit) => { counts.listTree += 1; return nodeDiscoveryIO.listTreeJsonl(dir, limit); },
+    readFirstLine: (path) => { bump(counts.firstLine, path); return nodeDiscoveryIO.readFirstLine(path); },
+    readHeadLines: (path) => { bump(counts.headLines, path); return nodeDiscoveryIO.readHeadLines(path); },
+  };
+  const reset = (): void => {
+    counts.listDir.clear(); counts.firstLine.clear(); counts.headLines.clear(); counts.listTree = 0;
+  };
+  return { io, counts, reset };
+}
+
+describe('daemon transcript enrichment follows configuration, not chat linking', () => {
+  it('reads transcripts for a configured harness while no chat is linked', async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-home-')));
+    try {
+      await withCaptures(async ({ store, call, roots }) => {
+        const [a] = await roots(1);
+        const id = await attachWatchOnly(call, a!);
+        const log = await waitForLog(store, id, (records) => records.some((r) => r.type === COVERAGE));
+        assert.deepEqual(log.filter((r) => r.type === COVERAGE).map((r) => r.data.harness), ['claude-code']);
+      }, {}, undefined, { config: configured(home, ['claude-code']) });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps reading after a chat links and unlinks', async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-home-')));
+    const config = configured(home, ['claude-code']);
+    const scheduler = createTranscriptScheduler({ harnesses: ['claude-code'], homes: config.transcript.homes,
+      codexScanLimit: config.transcript.codexScanLimit, pollIntervalMs: 60_000 });
+    try {
+      await withCaptures(async ({ store, call, roots }) => {
+        const [a] = await roots(1);
+        const id = await attachWatchOnly(call, a!);
+        await linkChat(call, store, a!, 'c1');
+        assert.equal((await call({ verb: 'unlink', session_id: id })).ok, true);
+        await scheduler.tick();
+        const before = (await readLog(store, id)).filter((r) => r.type === COVERAGE).length;
+        await claudeTranscript(home, a!, 'c1');
+        await scheduler.tick();
+        const after = (await readLog(store, id)).filter((r) => r.type === COVERAGE);
+        assert.equal(after.length, before + 1, 'the new transcript changed coverage after unlink');
+      }, {}, undefined, { config, transcriptScheduler: scheduler });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reads no transcripts for a linked chat when no harness is configured, and Ask Agent still works', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = rec(await linkChat(call, store, a!, 'c1')).session_id!;
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const ask = await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
+      assert.equal(ask.ok, true, JSON.stringify(ask));
+      assert.equal((await readLog(store, id)).filter((r) => r.type === COVERAGE).length, 0);
+    });
+  });
+
+  it('enumerates each transcript directory once per cycle across several linked chats', async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'slip-daemon-home-')));
+    const config = configured(home, ['claude-code', 'codex']);
+    const counted = countingDiscoveryIO();
+    const scheduler = createTranscriptScheduler({ harnesses: ['claude-code', 'codex'], homes: config.transcript.homes,
+      codexScanLimit: config.transcript.codexScanLimit, pollIntervalMs: 60_000, discoveryIO: counted.io });
+    try {
+      await withCaptures(async ({ store, call, roots }) => {
+        const ws = await roots(3);
+        for (const [i, root] of ws.entries()) {
+          await claudeTranscript(home, root, `c${i}`);
+          await codexRollout(home, root, `x${i}`);
+          assert.equal((await linkChat(call, store, root, `c${i}`)).ok, true);
+        }
+        await scheduler.tick();
+        counted.reset();
+        await scheduler.tick();
+        assert.equal(counted.counts.listTree, 1, 'one Codex sessions scan for three captures');
+        assert.deepEqual([...counted.counts.listDir.keys()].sort(),
+          ws.map((root) => join(home, '.claude', 'projects', claudeSlug(root))).sort());
+        assert.deepEqual([...counted.counts.listDir.values()], [1, 1, 1]);
+        assert.equal(counted.counts.firstLine.size, 6, 'three rollouts and three Claude transcripts');
+        assert.deepEqual([...counted.counts.firstLine.values()], [1, 1, 1, 1, 1, 1], 'each first line read once');
+        assert.deepEqual([...counted.counts.headLines.values()], [1, 1, 1], 'each Claude header read once');
+      }, {}, undefined, { config, transcriptScheduler: scheduler });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });
