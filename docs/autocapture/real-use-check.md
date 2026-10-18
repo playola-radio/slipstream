@@ -112,10 +112,12 @@ frees the slot the new workspace needs):
   `root-missing`. `root-missing` means Conductor removed the folder before
   Slipstream's archive step stopped the capture.
 - **First edit.** Create one new workspace and have its agent's first action be
-  creating a new file that isn't in the repo. A file that existed before
-  recording began appears as `file.baselined`; one created after appears as
-  `file.changed` with no earlier content. So if the new file's first event is
-  `file.baselined`, recording started after the agent created it, and its
-  creation was recorded only as the starting state. That is honest but worth
-  knowing. (Editing an existing file can't answer this: it is baselined either
-  way.)
+  creating a new file that isn't in the repo, then look at that file's first
+  event. `file.baselined` means the file already existed when its folder was
+  read for the starting state, so recording started after the agent created
+  it, and its creation was recorded only as the starting state. That is honest
+  but worth knowing. `file.changed` does not settle it: a file created while
+  the starting state was still being read, after its folder had been read,
+  also appears as `file.changed`, even after `capture.ready`. So
+  `file.changed` means only that this check was inconclusive; note it as such.
+  (Editing an existing file can't answer this: it is baselined either way.)

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, spawn, type ChildProcessByStdio } from 'node:child_process';
+import { execFile, spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
+import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -62,6 +63,15 @@ const recording = (row: Record<string, unknown>) => row.state === 'recording';
 
 /** The daemon shows a change before its intent record is written; the offline
  * reader can only follow once the record is. */
+async function stopped(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit');
+  child.kill('SIGTERM');
+  const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+  await exited;
+  clearTimeout(timer);
+}
+
 async function untilIntent(store: string, done: (intent: { captures: Row[]; bindings: Row[] }) => boolean): Promise<void> {
   for (let i = 0; i < 300; i++) {
     if (done(JSON.parse(await readFile(join(store, 'control', 'intent.json'), 'utf8')))) return;
@@ -206,10 +216,10 @@ describe('auto-capture acceptance: Ask Agent in two workspaces', () => {
       }
       for (const [i, { chat, root }] of chats.entries()) {
         const other = chats[1 - i]!;
-        const crossed = await call({ verb: 'answer_question', ...chatOf(other.chat, other.root), question_id: questions[i]!, text: 'not mine' });
-        assert.equal(crossed.ok, false, `${other.chat} cannot answer ${chat}'s question`);
         const claimed = rec(await call(claimOf(store, chat, root))).question as unknown as { question_id: string };
         assert.equal(claimed.question_id, questions[i], `${chat} receives its own workspace's question`);
+        const crossed = await call({ verb: 'answer_question', ...chatOf(other.chat, other.root), question_id: questions[i]!, text: 'not mine' });
+        assert.equal(crossed.ok, false, `${other.chat} cannot answer ${chat}'s question`);
         const answered = await call({ verb: 'answer_question', ...chatOf(chat, root), question_id: questions[i]!, text: 'mine' });
         assert.equal(rec(answered).session_id, ids[i]);
       }
@@ -547,9 +557,7 @@ describe('auto-capture acceptance: end to end through real processes', () => {
       assert.deepEqual(stateOf(rowOf(table, idB)), ['recording', null, null]);
     } finally {
       replies?.close();
-      forwarder?.kill();
-      daemon.kill('SIGTERM');
-      await until('the daemon never stopped', async () => await probeSocket(join(store, 'control.sock'), 200) !== 'live');
+      await Promise.all([forwarder, daemon].map((child) => child && stopped(child)));
       await rm(dir, { recursive: true, force: true });
     }
   });
