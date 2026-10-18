@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { openLogCursor } from './log-reader.ts';
 import { blobPath } from './store-reader.ts';
 import { sourceFor, type HarnessName } from './event.ts';
-import type { QuestionAnsweredEvent, QuestionQueuedEvent } from './public-events.ts';
+import type { QuestionAnsweredEvent, QuestionExchangeRecordedEvent, QuestionQueuedEvent } from './public-events.ts';
 export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
@@ -217,6 +217,34 @@ export function normalizeExchange(value: unknown): QuestionExchangeRequest {
 export function exchangeBody(req: QuestionExchangeRequest): string {
   const c = req.conversation;
   return JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+}
+
+export interface QuestionExchangeAccepted {
+  session_id: string;
+  request_id: string;
+  question_id: string;
+  seq: string;
+  duplicate: boolean;
+}
+export function exchangeResult(event: QuestionExchangeRecordedEvent): QuestionExchangeAccepted {
+  const d = event.data;
+  return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
+    seq: event.seq, duplicate: false });
+}
+
+/** A follow-up must restate its parent's exact source context. */
+export function sameSourceContext(parent: QuestionContext | undefined, c: QuestionContext): boolean {
+  return parent !== undefined && parent.change_seq === c.change_seq && parent.path === c.path && parent.snapshot_sha256 === c.snapshot_sha256
+    && parent.line_start === c.line_start && parent.line_end === c.line_end;
+}
+
+/** Rebuild the request an exchange event was recorded from, so recovery reproduces its idempotency fingerprint. */
+export function exchangeRequestOf(event: QuestionExchangeRecordedEvent): QuestionExchangeRequest {
+  const d = event.data;
+  const { selected_text: _selected, ...context } = d.context;
+  const { reported_by: _reportedBy, ...conversation } = d.conversation;
+  return { session_id: d.session_id, request_id: d.request_id, text: d.text, context, answer_text: d.answer_text, conversation,
+    ...(d.reply_to_question_id !== undefined ? { reply_to_question_id: d.reply_to_question_id } : {}) };
 }
 
 export interface AnswerAccepted {
