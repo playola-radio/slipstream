@@ -146,3 +146,55 @@ describe('slipstream.question.queued.v1 schema', () => {
     });
   }
 });
+
+describe('slipstream.question.exchange_recorded.v1 schema', () => {
+  const TYPE = 'slipstream.question.exchange_recorded.v1';
+  const buildExchange = (patch: Record<string, unknown> = {}, answerText = 'Because the cache was stale.') => buildPublicEnvelope({
+    type: TYPE,
+    occurred_at_ms: 1789657200123,
+    data: {
+      question_id: QUESTION,
+      request_id: REQUEST,
+      text: 'Why did this change?',
+      context: { change_seq: '4', path: 'src/a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 3, line_end: 5, selected_text: 'const answer = 42;' },
+      answer_text: answerText,
+      recorded_at_ms: 1789657200123,
+      conversation: { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1', reported_by: 'client' },
+      ...patch,
+    },
+  }, 7n, SESSION);
+
+  it('exchange_recorded envelope validates against its schema', async () => {
+    const event = buildExchange();
+    assert.equal(event.subject, `question/${QUESTION}`);
+    assert.equal(event.data.session_id, SESSION);
+    assert.deepEqual(validate(await loadSchema(event.type), event), []);
+  });
+
+  it('exchange_recorded schema has no maxLength on answer_text', async () => {
+    const event = buildExchange({}, 'a'.repeat(200 * 1024));
+    assert.deepEqual(validate(await loadSchema(event.type), event), []);
+  });
+
+  const withData = (mutate: (data: Record<string, any>) => void) => (event: Record<string, any>) => mutate(event.data);
+  for (const [name, mutate] of [
+    ['a missing answer_text', withData((d) => { delete d.answer_text; })],
+    ['an empty answer_text', withData((d) => { d.answer_text = ''; })],
+    ['a missing conversation.reported_by', withData((d) => { delete d.conversation.reported_by; })],
+    ['reported_by daemon', withData((d) => { d.conversation.reported_by = 'daemon'; })],
+    ['the cursor harness', withData((d) => { d.conversation.harness = 'cursor'; })],
+    ['a missing context.selected_text', withData((d) => { delete d.context.selected_text; })],
+    ['a bad subject', (event: Record<string, any>) => { event.subject = 'question/ABC'; }],
+  ] as Array<[string, (event: Record<string, any>) => void]>) {
+    it(`rejects an exchange with ${name}`, async () => {
+      const event = structuredClone(buildExchange()) as Record<string, any>;
+      mutate(event);
+      assert.ok(validate(await loadSchema(TYPE), event).length > 0);
+    });
+  }
+
+  it('foldDisplay ignores exchange_recorded', () => {
+    assert.deepEqual(foldDisplay([buildExchange()]), { contract: 'display-fold.v1', result: 'ok',
+      state: { attributions: [], coverage: [], evidence: [], gaps: [] } });
+  });
+});

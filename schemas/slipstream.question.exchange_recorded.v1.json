@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.question.exchange_recorded.v1.json",
+  "title": "slipstream.question.exchange_recorded.v1",
+  "$comment": "A question asked at a code line together with the answer the client's own forked chat produced, recorded by the daemon without dispatch. The conversation ids are client-reported and unverified (reported_by is always client); they are never a binding and never authorship. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "subject", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "source": { "type": "string", "pattern": "^urn:slipstream:session:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "type": { "const": "slipstream.question.exchange_recorded.v1" },
+    "datacontenttype": { "const": "application/json" },
+    "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "time": { "type": "string", "format": "date-time" },
+    "subject": { "type": "string", "pattern": "^question/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "data": {
+      "type": "object",
+      "required": ["session_id", "question_id", "request_id", "text", "context", "answer_text", "recorded_at_ms", "conversation"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/uuid" },
+        "question_id": { "$ref": "#/$defs/uuid" },
+        "request_id": { "$ref": "#/$defs/uuid" },
+        "text": { "type": "string", "minLength": 1 },
+        "context": {
+          "type": "object",
+          "required": ["change_seq", "path", "snapshot_sha256", "line_start", "line_end", "selected_text"],
+          "properties": {
+            "change_seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+            "path": { "type": "string", "minLength": 1 },
+            "snapshot_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "line_start": { "type": "integer", "minimum": 1 },
+            "line_end": { "type": "integer", "minimum": 1 },
+            "selected_text": { "type": "string" }
+          }
+        },
+        "answer_text": { "type": "string", "minLength": 1 },
+        "recorded_at_ms": { "type": "integer", "minimum": 0 },
+        "reply_to_question_id": { "$ref": "#/$defs/uuid" },
+        "conversation": {
+          "type": "object",
+          "required": ["harness", "parent_session_id", "fork_session_id", "reported_by"],
+          "properties": {
+            "harness": { "enum": ["claude-code", "codex"] },
+            "parent_session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "fork_session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "reported_by": { "const": "client" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+  }
+}
