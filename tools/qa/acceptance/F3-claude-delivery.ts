@@ -34,7 +34,7 @@ export const f3ClaudeDelivery: AcceptanceModule = {
       handle = await startQaDaemon({ root });
       const { store, worktree, url, token } = handle.env;
       const reader = createReaderClient(url, token);
-      await cli(['detach', '--store', store]);
+      await cli(['detach', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `claude-root-${randomUUID()}.jsonl`);
       const otherTranscript = join(store, `other-root-${randomUUID()}.jsonl`);
@@ -111,7 +111,7 @@ export const f3ClaudeDelivery: AcceptanceModule = {
             const pending = await cli(['ask', '--store', store, '--session', sessionId,
               '--request-id', randomUUID(), '--input', inputPath]);
             if (pending.code !== 0) throw new Error('could not queue a stale-hook control');
-            const detached = await cli(['detach', '--store', store]);
+            const detached = await cli(['detach', worktree, '--store', store]);
             if (detached.code !== 0) throw new Error('could not detach Claude acceptance capture');
             const stale = await cli(['hook', 'claude-code', 'post-tool-use', '--store', store], callback);
             if (stale.code !== 0 || stale.stdout !== '') throw new Error('stale Claude hook emitted after detach');

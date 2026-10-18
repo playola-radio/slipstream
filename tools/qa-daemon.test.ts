@@ -104,12 +104,13 @@ describe('markStopped run_id guard', () => {
 });
 
 describe('attachedDurableSeq', () => {
-  it('requires a successful status response with a non-negative integer durable sequence', () => {
-    assert.equal(attachedDurableSeq({ v: 1, ok: true, durable_seq: '42' }), 42n);
+  it('requires a successful targeted status response with a non-negative integer durable sequence', () => {
+    assert.equal(attachedDurableSeq({ v: 1, ok: true, capture: { durable_seq: '42' } }), 42n);
     assert.throws(() => attachedDurableSeq({ v: 1, ok: false, code: 'DAEMON_UNAVAILABLE', message: 'closed' }), /status failed/);
     assert.throws(() => attachedDurableSeq({ v: 1, ok: true }), /missing or invalid durable_seq/);
-    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, durable_seq: '-1' }), /missing or invalid durable_seq/);
-    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, durable_seq: 'not-a-number' }), /missing or invalid durable_seq/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, durable_seq: '42' }), /missing or invalid durable_seq/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, capture: { durable_seq: '-1' } }), /missing or invalid durable_seq/);
+    assert.throws(() => attachedDurableSeq({ v: 1, ok: true, capture: { durable_seq: 'not-a-number' } }), /missing or invalid durable_seq/);
   });
 });
 

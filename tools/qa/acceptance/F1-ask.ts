@@ -181,7 +181,7 @@ async function runLive(signal: AbortSignal, live: {
     // qa-daemon's normal `qa` harness is deliberately not a D1 target. Rebind
     // this disposable capture through public control with a supported identity.
     const { store, worktree, reader } = live;
-    await cli(['detach', '--store', store]);
+    await cli(['detach', worktree, '--store', store]);
     const harnessSessionId = `f1-${randomUUID()}`;
     const transcript = join(store, `f1-root-${randomUUID()}.jsonl`);
     await writeFile(transcript, JSON.stringify({ type: 'session_meta', payload: {

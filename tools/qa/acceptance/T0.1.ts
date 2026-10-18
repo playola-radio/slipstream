@@ -276,7 +276,7 @@ async function withBaselinedSession<T>(signal: AbortSignal, body: (ctx: Acceptan
       }
       const socketPath = controlSocketPath(seed.env.store);
       signal.throwIfAborted();
-      const detached = await sendControlRequest({ socketPath, request: { v: 1, verb: 'detach' } });
+      const detached = await sendControlRequest({ socketPath, request: { v: 1, verb: 'detach', target: seed.env.session_id } });
       signal.throwIfAborted();
       if (!detached.ok) fail(`could not detach the seed session: ${detached.code} ${detached.message}`);
       signal.throwIfAborted();

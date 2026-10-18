@@ -33,7 +33,7 @@ export const f2Delivery: AcceptanceModule = {
       handle = await startQaDaemon({ root });
       const { store, worktree, url, token } = handle.env;
       const reader = createReaderClient(url, token);
-      await cli(['detach', '--store', store]);
+      await cli(['detach', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `root-${randomUUID()}.jsonl`);
       const worktreeAlias = join(store, `alias-${randomUUID()}`);
@@ -98,7 +98,7 @@ export const f2Delivery: AcceptanceModule = {
           const pendingAtDetach = await cli(['ask', '--store', store, '--session', sessionId,
             '--request-id', randomUUID(), '--input', inputPath]);
           if (pendingAtDetach.code !== 0) throw new Error('could not queue stale-hook control');
-          const detached = await cli(['detach', '--store', store]);
+          const detached = await cli(['detach', worktree, '--store', store]);
           if (detached.code !== 0) throw new Error('could not detach stale-hook control');
           const stale = await cli(['hook', 'codex', 'post-tool-use', '--store', store], callback);
           if (stale.code !== 0 || stale.stdout !== '') throw new Error('stale hook emitted after detach');
