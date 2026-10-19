@@ -12,7 +12,7 @@ import { probeSocket, startDaemon, type Daemon, type DaemonOptions } from './dae
 import type { Platform } from './platform.ts';
 import { bothReaders, foldCaptures, comparable } from './test/captures-fold.ts';
 import {
-  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, linkChat, linkRecording, readLog, rec, waitForLog,
+  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, fillableStore, linkChat, linkRecording, readLog, rec, waitForLog,
   waitForRow, type Call,
 } from './test/daemon-harness.ts';
 
@@ -87,6 +87,23 @@ async function attachRecording(call: Call, root: string): Promise<string> {
   return rec(res).session_id!;
 }
 
+/** Push heartbeats 60 s back and read both readers at once. Their owners refresh
+ * every 2 s; a refresh landing before both reads are over spoils the try, so try
+ * again. */
+async function readStale<T = undefined>(store: string, daemon: Daemon, locks: string[], extraRead?: () => Promise<T>): Promise<{ projection: Record<string, unknown>; extra: T }> {
+  for (let i = 0; i < 5; i++) {
+    const old = Math.trunc(Date.now() / 1000) - 60;
+    for (const lock of locks) await utimes(lock, old, old);
+    const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    const extra = await extraRead?.();
+    const held = await Promise.all(locks.map(async (lock) => Math.trunc((await stat(lock)).mtimeMs / 1000) === old));
+    if (!held.every(Boolean)) continue;
+    assert.deepEqual(fold, projection, 'stale heartbeats');
+    return { projection, extra: extra as T };
+  }
+  assert.fail('a heartbeat refresh spoiled every try');
+}
+
 const rowOf = (table: Record<string, unknown>, id: string) =>
   (table.captures as Row[]).find((r) => r.session_id === id)!;
 const stateOf = (row: Row) => [row.state, row.reason, (row.binding as Row | null)?.state ?? null];
@@ -136,19 +153,12 @@ describe('auto-capture acceptance: two independent readers', () => {
       assert.deepEqual(stateOf(rowOf(table, seventeenth!)), ['recording', null, null]);
       assert.deepEqual(stateOf(rowOf(table, eighteenth!)), ['stopped', 'detached', null]);
 
-      // The owner refreshes its heartbeat every 2 s; push it 60 s back and read at
-      // once. A refresh landing before either read is over spoils the try, so try again.
-      const lock = join(store, 'sessions', ids[4]!, 'owner.lock');
-      let stale: Row | undefined;
-      for (let i = 0; i < 5 && !stale; i++) {
-        const old = Math.trunc(Date.now() / 1000) - 60;
-        await utimes(lock, old, old);
-        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
-        if (Math.trunc((await stat(lock)).mtimeMs / 1000) !== old) continue;
-        assert.deepEqual(fold, projection, 'a stale heartbeat');
-        stale = rowOf(projection, ids[4]!);
-      }
-      assert.deepEqual(stateOf(stale!), ['not_recording', 'daemon-unavailable', null]);
+      const owner = join(store, 'sessions', ids[4]!, 'owner.lock');
+      table = (await readStale(store, daemon, [owner])).projection;
+      assert.deepEqual(stateOf(rowOf(table, ids[4]!)), ['queued', null, null],
+        'no live owner, but a live daemon: not recording, waiting on the daemon');
+      table = (await readStale(store, daemon, [owner, join(store, 'owner.lock')])).projection;
+      assert.deepEqual(stateOf(rowOf(table, ids[4]!)), ['not_recording', 'daemon-unavailable', null]);
 
       await stop();
       const offline = comparable(await foldCaptures(store, Date.now()));
@@ -194,6 +204,220 @@ describe('auto-capture acceptance: a capture still baselining', () => {
       await waitForRow(call, id, recording);
     });
   });
+});
+
+describe('auto-capture acceptance: a capture waiting for the baseline slot', () => {
+  /** Hold every baseline, admit two captures, and run `fn` with the second one
+   * still waiting behind the first. */
+  async function withQueued(fn: (ctx: { store: string; daemon: Daemon; queued: string; stop: () => Promise<void> }) => Promise<void>) {
+    await withStore(async ({ store, roots, start, stop }) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      try {
+        const { daemon, call } = await start({ captureDependencies: {
+          platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+        const [a, b] = await roots(2);
+        const first = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: a! })).session_id!;
+        await waitForRow(call, first, (row) => row.state === 'baselining');
+        const queued = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: b! })).session_id!;
+        await untilIntent(store, (intent) => intent.captures.some((c) => c.session_id === queued));
+        await fn({ store, daemon, queued, stop: async () => { const stopping = stop(); release(); await stopping; } });
+      } finally {
+        release();
+      }
+    });
+  }
+
+  it('reads as queued to both readers while the daemon holds the store', async () => {
+    await withQueued(async ({ store, daemon, queued }) => {
+      const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+      assert.deepEqual(fold, projection);
+      assert.deepEqual(stateOf(rowOf(projection, queued)), ['queued', null, null]);
+    });
+  });
+
+  it('reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone', async () => {
+    await withQueued(async ({ store, daemon, queued, stop }) => {
+      const table = (await readStale(store, daemon, [join(store, 'owner.lock')])).projection;
+      assert.deepEqual(stateOf(rowOf(table, queued)), ['not_recording', 'daemon-unavailable', null]);
+
+      await stop();
+      await assert.rejects(stat(join(store, 'sessions', queued, 'events.jsonl')), { code: 'ENOENT' }, 'it never began');
+      const offline = comparable(await foldCaptures(store, Date.now()));
+      assert.deepEqual(stateOf(rowOf(offline, queued)), ['not_recording', 'daemon-unavailable', null]);
+    });
+  });
+
+  it('reads a restarted capture still waiting to resume as queued to both readers', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const first = await start();
+      const [a, b] = await roots(2);
+      await attachRecording(first.call, a!);
+      const waiting = await attachRecording(first.call, b!);
+      await stop();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+      try {
+        const resuming = (await captureRow(call, waiting)).state === 'queued' ? waiting : undefined;
+        assert.ok(resuming, 'the second capture waits while the first resumes');
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        assert.deepEqual(stateOf(rowOf(projection, waiting)), ['queued', null, null]);
+      } finally {
+        release();
+      }
+    });
+  });
+
+  it('reads a connected chat as setup pending to both readers once its session heartbeat goes stale under a live daemon', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { daemon, call } = await start();
+      const [a] = await roots(1);
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      await connect(call, store, 'chat-a', a!);
+      const { projection: table, extra: status } = await readStale(store, daemon, [join(store, 'sessions', id, 'owner.lock')],
+        async () => rec(await call({ verb: 'status', target: id })).capture as unknown as Row);
+      assert.deepEqual(stateOf(rowOf(table, id)), ['queued', null, 'setup_pending']);
+      assert.deepEqual(stateOf(status), ['queued', null, 'setup_pending'],
+        'control status applies the same heartbeat rule as the public reader');
+    });
+  });
+
+  it('reads a chat connected before the restart as setup pending to both readers while its capture waits to resume', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const first = await start();
+      const [a, b] = await roots(2);
+      await attachRecording(first.call, a!);
+      const { id: waiting } = await linkRecording(first.call, store, b!, 'chat-b');
+      await connect(first.call, store, 'chat-b', b!);
+      await stop();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+      try {
+        assert.equal((await captureRow(call, waiting)).state, 'queued', 'the linked capture waits while the first resumes');
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        assert.deepEqual(stateOf(rowOf(projection, waiting)), ['queued', null, 'setup_pending']);
+      } finally {
+        release();
+      }
+    });
+  });
+});
+
+describe('auto-capture acceptance: failure states', () => {
+  /** The daemon shows a failure a moment before the files that let an offline
+   * reader see it; compare once they have caught up. */
+  async function agreeOnce(store: string, daemon: Daemon, settled: (table: Record<string, unknown>) => boolean, what: string) {
+    let both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    for (let i = 0; i < 150 && !(settled(both.projection) && settled(both.fold)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    }
+    assert.deepEqual(both.fold, both.projection, what);
+    return both.projection;
+  }
+
+  it('read root-missing, watcher-failed and storage-unavailable the same to both readers', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, roots, start }) => {
+      const fake = createRootsPlatform();
+      const { daemon, call } = await start({ retryBackoff: { baseMs: 60_000, maxMs: 60_000 }, captureDependencies: {
+        platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', createLog: disk.createLog } });
+      const [gone, closed, full] = await roots(3);
+      const ids = { gone: await attachRecording(call, gone!), closed: await attachRecording(call, closed!), full: await attachRecording(call, full!) };
+
+      await rm(gone!, { recursive: true });
+      fake.observe(gone!, '');
+      fake.closeWith(closed!, new Error('stream closed'));
+      let table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.gone).state === 'stopped' && rowOf(t, ids.closed).retry !== null,
+        'a deleted root and a closed watcher');
+      assert.deepEqual(stateOf(rowOf(table, ids.gone)), ['stopped', 'root-missing', null]);
+      assert.deepEqual(stateOf(rowOf(table, ids.closed)), ['stopped', 'watcher-failed', null]);
+      assert.equal(typeof (rowOf(table, ids.closed).retry as Row | null)?.next_attempt_at_ms, 'number');
+
+      await writeFile(join(full!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(full!, 'x.ts');
+      await waitForRow(call, ids.full, (row) => row.reason === 'storage-unavailable', 'the full store to be reported');
+      table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.full).reason === 'storage-unavailable', 'a store that refuses appends');
+      assert.deepEqual(stateOf(rowOf(table, ids.full)), ['not_recording', 'storage-unavailable', null]);
+      disk.full = false;
+      await waitForRow(call, ids.full, (row) => row.state === 'recording', 'the store to recover');
+      table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.full).state === 'recording', 'a store that recovered');
+      assert.deepEqual(stateOf(rowOf(table, ids.full)), ['recording', null, null]);
+    });
+  });
+  it('keeps showing a recovered outage to both readers while the intent record cannot be written', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, roots, start }) => {
+      const fake = createRootsPlatform();
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', createLog: disk.createLog } });
+      const [full, next] = await roots(2);
+      const id = await attachRecording(call, full!);
+      await writeFile(join(full!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(full!, 'x.ts');
+      await waitForRow(call, id, (row) => row.reason === 'storage-unavailable', 'the full store to be reported');
+      await untilIntent(store, (i) => (i.captures[0]?.last_failure as Row | null)?.reason === 'storage-unavailable');
+      const control = join(store, 'control');
+      await chmod(control, 0o500);
+      try {
+        disk.full = false;
+        await waitForLog(store, id, (log) => log.some((r) => r.type === 'slipstream.capture.gap.v1' && r.data.reason === 'storage'));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        assert.deepEqual(stateOf(rowOf(projection, id)), ['not_recording', 'storage-unavailable', null]);
+      } finally {
+        await chmod(control, 0o700);
+      }
+      const attached = await call({ verb: 'attach', mode: 'watch-only', worktree: next! });
+      assert.equal(attached.ok, true, 'a failed background notice never permanently refuses later lifecycle controls');
+    });
+  });
+});
+
+describe('auto-capture acceptance: a Codex chat after a restart', () => {
+  const codexMeta = (root: string, version: string) => JSON.stringify({ type: 'session_meta', payload: {
+    session_id: 'codex-chat', cwd: root, originator: 'codex_sdk_ts', source: 'exec', cli_version: version } }) + '\n';
+
+  async function linkCodex(call: Call, root: string, transcript: string): Promise<string> {
+    for (let i = 0; i < 300; i++) {
+      const res = await call({ verb: 'attach', worktree: root, harness: 'codex', harness_session_id: 'codex-chat', root_transcript: transcript });
+      if (res.ok) return rec(res).session_id!;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.fail('the Codex chat never linked');
+  }
+
+  for (const { what, change, reason } of [
+    { what: 'whose transcript vanished', change: (t: string) => rm(t), reason: 'transcript-missing' },
+    { what: 'whose Codex version changed', change: (t: string, root: string) => writeFile(t, codexMeta(root, '9.9.9')), reason: 'identity-changed' },
+  ]) {
+    it(`reads a link ${what} as unavailable to both readers`, async () => {
+      await withStore(async ({ store, roots, start, stop }) => {
+        const [a] = await roots(1);
+        const transcript = join(store, 'codex-chat.jsonl');
+        await writeFile(transcript, codexMeta(a!, '0.154.0'));
+        const id = await linkCodex((await start()).call, a!, transcript);
+        await stop();
+        await change(transcript, a!);
+        const { daemon, call } = await start();
+        await waitForRow(call, id, (row) => (row.binding as Row).state === 'unavailable');
+        await untilIntent(store, (i) => (i.bindings[0]?.unavailable as Row | null)?.reason === reason);
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        const binding = rowOf(projection, id).binding as Row;
+        assert.deepEqual([binding.harness, binding.state, binding.reason], ['codex', 'unavailable', reason]);
+      });
+    });
+  }
 });
 
 describe('auto-capture acceptance: Ask Agent in two workspaces', () => {

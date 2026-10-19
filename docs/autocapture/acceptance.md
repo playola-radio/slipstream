@@ -3,13 +3,13 @@
 Each acceptance requirement in the
 [design spec](../superpowers/specs/2026-10-05-workspace-auto-capture-design.md#pr-graph)
 ("Acceptance requirements"), with the tests that prove it. Every named test was
-run for this table, in `npm test`, on 2026-10-18. Rows that no test can prove
+run for this table, in `npm test`, on 2026-10-19. Rows that no test can prove
 say so.
 
 The native app's half (P6a) and the real-use day are not proven here. Neither is
 marked done.
 
-Files: `A` = `src/autocapture-acceptance.test.ts` (added in this PR),
+Files: `A` = `src/autocapture-acceptance.test.ts`,
 `D` = `src/daemon.test.ts`, `R` = `src/daemon-recovery.test.ts`,
 `M` = `src/daemon-maintenance.test.ts`, `C` = `src/cli.test.ts`,
 `W` = `src/attach-workflow.test.ts`.
@@ -25,12 +25,12 @@ Files: `A` = `src/autocapture-acceptance.test.ts` (added in this PR),
 | Concurrent attempts for the tenth slot | D `gives the tenth chat slot to exactly one of two racing chats` | Covered |
 | Same-id chat resume | D `reports the same capture when the same chat attaches again, re-arming a pending check`; C `starts a stopped daemon, records once, and reuses the capture on a repeat` | Covered |
 | New-chat refusal | D `refuses another chat in the same workspace with BINDING_EXISTS and keeps the existing link` | Covered |
-| Missing transcripts | R `keeps a link whose transcript vanished as unavailable, holding its slot, until the chat attaches again`; R `reconnects a link whose transcript comes back, without the chat attaching again`; W `refuses when the chat transcript cannot be found` | Covered for Claude links. A Codex link whose transcript vanishes after a restart has no test. |
+| Missing transcripts | R `keeps a link whose transcript vanished as unavailable, holding its slot, until the chat attaches again`; R `reconnects a link whose transcript comes back, without the chat attaching again`; W `refuses when the chat transcript cannot be found` ; A `reads a link whose transcript vanished as unavailable to both readers` and A `reads a link whose Codex version changed as unavailable to both readers` (a Codex link after a restart: `transcript-missing` and `identity-changed`, the same in `/v1/captures` and the offline fold) | Covered |
 | Archive during recovery | R `honors an archive recorded while no daemon ran: not resumed, and the stop is not backfilled`; R `stops a capture with reason archived when the archive reaches a running daemon`; M `lets a detach during gc withdraw its capture, which then stays stopped`; A `honors an archive that arrives while a restarted capture is still failing to resume` (no further start attempt, the log untouched, the chat unlinked, shown as `not_recording`/`stop-unconfirmed` rather than cleanly stopped) | Covered |
 | Lost setup-check responses | R `offers an unanswered setup check again after its throttle`; D `starts a bound capture setup-pending and refuses questions until the setup check returns`; A `connects a chat exactly once when its setup-check answer is lost and it answers the re-offered check` | Covered |
 | Failed setup stays visible | D `does not report a failed baseline as cleanly stopped after detach`; R `retries a transient start failure with backoff and shows when it will retry`; A `stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history` (`baseline-failed` with its retry time in `status`, `/v1/captures` and the offline fold; the failure message appears in `status` only, since `/v1/captures` carries no message) | Covered |
 | Later readiness baselines current bytes without presenting earlier edits as captured history | A `stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history` (a file edited and a file created while failing appear only as `file.baselined` with the current bytes' hash; zero `file.changed`) | Covered |
-| Public-reader parity | A `agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing` (`/v1/captures` equals an independent fold of `control/intent.json`, the session logs and the heartbeats, for `recording`, `capture-limit-reached`, `stopped`/`detached`, `daemon-unavailable`, and chats `setup_pending`, `connected`, `unlinked` and `unavailable`; the `status` verb shows the same states); A `reads as baselining to both readers until its baseline finishes`; D `lets independent readers follow each capture and lists every capture` | **Not met for `queued`** (see "Found while testing"). Every other state compared agrees. |
+| Public-reader parity | A `agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing` (`/v1/captures` equals an independent fold of `control/intent.json`, the session logs and the heartbeats, for `recording`, `capture-limit-reached`, `stopped`/`detached`, `queued` and `daemon-unavailable` as heartbeats go stale, and chats `setup_pending`, `connected`, `unlinked` and `unavailable`; the `status` verb shows the same states); A `reads as baselining to both readers until its baseline finishes`; A `reads as queued to both readers while the daemon holds the store`; A `reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone`; A `reads a restarted capture still waiting to resume as queued to both readers`; A `read root-missing, watcher-failed and storage-unavailable the same to both readers` (including recovery back to `recording`); A `keeps showing a recovered outage to both readers while the intent record cannot be written`; A `reads a chat connected before the restart as setup pending to both readers while its capture waits to resume`; A `reads a connected chat as setup pending to both readers once its session heartbeat goes stale under a live daemon`; the two Codex tests above; D `lets independent readers follow each capture and lists every capture` | Covered |
 | Native parity | none | P6a (native client), not this PR |
 | Real-use overhead check at 16 captures with linked chats (the D8 verdict) | none; [real-use-check.md](real-use-check.md) is the runbook | Real-use day, not run |
 | The 17th workspace is visibly NOT recording (`capture-limit-reached`) | D `holds a seventeenth workspace waiting and starts the oldest waiting one when a slot frees`; A `agree on capture and binding states …` (in `status`, `/v1/captures` and the fold) | Covered |
@@ -44,26 +44,50 @@ Files: `A` = `src/autocapture-acceptance.test.ts` (added in this PR),
 
 - **Native-app flip and native parity**: P6a.
 - **The real-use day (D8 verdict)**: not run; see [real-use-check.md](real-use-check.md).
-- **A Codex link whose transcript vanishes or changes version after a restart**:
-  no test. Claude links are covered.
-- **Parity for `queued`**: the two readers disagree; see "Found while testing".
-- **Parity for other failure states**: `root-missing`, `watcher-failed`,
-  `storage-unavailable` and the like have their own daemon tests but are not
-  compared across both readers.
+
+## Known gap: Conductor starts the agent before setup finishes
+
+Edits the agent makes before the first starting state is read appear as that
+starting state (`file.baselined`), not as changes. Accepted as is: no hook, no
+second capture source, no wait. The timings observed on 2026-10-18 are in the
+README ("Capture every Conductor workspace").
 
 ## Found while testing
 
-No product code was changed.
+Product code changed in P6d; each change was a test seen failing first.
 
-- **A queued capture reads differently to the two readers.** While a capture
-  waits for the one baseline slot, `/v1/captures` and `status` say `queued`,
-  but a reader applying contracts §6 to the files sees
-  `not_recording`/`daemon-unavailable`. A queued capture has no `owner.lock`
-  yet, and rule 6 (no live heartbeat) comes before rule 7 (`queued`), so
-  `queued` is reachable only through the daemon. Fixing it means either the
-  daemon publishing a heartbeat at admission or the contract changing. That is
-  a contract decision, left open. Reproduced by holding one capture's baseline
-  and admitting a second.
+- **A queued capture read differently to the two readers** (fixed in P6d). While
+  a capture waited for the one baseline slot, or after a restart waited to
+  resume, `/v1/captures` said `queued` but a reader applying contracts §6 to the
+  files saw `not_recording`/`daemon-unavailable`: it had no session `owner.lock`
+  yet. Contracts §6 rules 6–8 and §7 now use the store's `owner.lock` heartbeat
+  for a running capture with no live session owner: live → `queued`, stale →
+  `daemon-unavailable` (Brian, 2026-10-18 and 2026-10-19). No new lock file and
+  no new on-disk state.
+- **Who holds the store's `owner.lock`** (audited in P6d; the holders are listed
+  in contracts §7). Standalone `watch`/`serve` pointed at a daemon's store
+  could have made a waiting capture read `queued`; they now refuse a store that
+  has `control/intent.json`.
+- **A chat connected before a restart read `connected` offline while its
+  capture waited to resume** (fixed in P6d). The daemon shows it
+  `setup_pending`; the fold took `connected` from the previous activation. A
+  capture read `queued` under §6 rule 7 has no current activation, so both
+  readers now read a connected binding there as `setup_pending`, including the
+  daemon when a live capture's session heartbeat goes stale.
+- **A store failing mid-recording read as `recording` offline** (fixed in P6d).
+  The daemon showed `storage-unavailable` from the session's live health but
+  wrote nothing to disk. It now records the outage as the capture's
+  `last_failure` in the intent record and clears it when the session recovers,
+  unless the capture is already stopping or the clear cannot be written (then
+  both readers keep showing the outage). If the intent record cannot be written
+  when the outage begins, an offline reader cannot see it; the session's
+  `capture.gap{storage}` appended on recovery discloses it. A clear whose file
+  was renamed into place but whose directory sync then failed reads `recording`
+  offline while the daemon still shows the outage, until the daemon restarts;
+  that errs toward showing less coverage, and is left as is.
+- **A changed Codex version reads `identity-changed`, not
+  `runtime-unsupported`.** Codex transcript verification does not tell the two
+  apart. Both readers agree; the reason is just less specific than for Claude.
 - **The daemon is a moment ahead of the files.** When a capture fails or starts
   baselining, `/v1/captures` and `status` show it a few milliseconds before the
   intent record, heartbeat or `session.started` that let an offline reader see

@@ -639,6 +639,30 @@ it('watch refuses a store another slipstream process holds the lock of', async (
   }
 });
 
+for (const command of ['watch', 'serve']) {
+  it(`${command} refuses a store that holds auto-capture intent, leaving its lock free`, async () => {
+    const { mkdtemp, mkdir, readdir, rm, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFile } = await import('node:child_process');
+    const dir = await mkdtemp(join(tmpdir(), 'slip-cli-intent-'));
+    const root = join(dir, 'work'); const store = join(dir, 'store');
+    await mkdir(root); await mkdir(join(store, 'control'), { recursive: true, mode: 0o700 });
+    await writeFile(join(store, 'control', 'intent.json'), JSON.stringify({ version: 1, next_binding_generation: '1', captures: [], bindings: [] }));
+    try {
+      const result = await new Promise<{ code: number; stderr: string }>(resolve => {
+        execFile(process.execPath, ['src/cli.ts', command, root, '--store', store],
+          { timeout: 5000 }, (error, _stdout, stderr) => resolve({ code: error ? Number(error.code) : 0, stderr }));
+      });
+      assert.equal(result.code, 2);
+      assert.match(result.stderr, /belongs to the slipstream daemon/);
+      assert.deepEqual((await readdir(store)).sort(), ['control'], 'no lock taken and nothing captured');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 it('rejects two attach worktrees and accepts one with identity flags', () => {
   assert.equal(parseArgs(['attach', 'a', 'b', '--harness', 'x', '--harness-session-id', 'y']), null);
   const parsed = parseArgs(['attach', 'a', '--harness', 'x', '--harness-session-id', 'y']);

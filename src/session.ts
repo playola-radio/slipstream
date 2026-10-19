@@ -52,6 +52,10 @@ export interface CaptureOptions {
    * `capture.gap{watcher-error}`. The caller ends the activation with
    * `stop({ reason })` (contracts.md §2). */
   onTerminal?: (reason: 'root-missing' | 'watcher-failed', message: string) => void;
+  /** Notified when a storage outage begins (`failing`, once per outage) and when
+   * recovery ends it (`healthy`). The daemon records the outage in its intent so
+   * offline readers see it too (contracts.md §6). */
+  onStorage?: (state: 'failing' | 'healthy', failure?: HealthFailure) => void;
   /** The effective attribution policy for this session. Defaults to
    * {@link DEFAULT_ENRICHMENT_POLICY} (real sources `unconfigured`, since A1
    * wires no transcript adapters); the daemon drives coverage and timing as
@@ -474,9 +478,11 @@ export async function startCapture(
   // never be laundered into a fabricated `unavailable` snapshot.
   const enterFailing = (failure: HealthFailure): void => {
     if (surrendered) return; // ownership lost: do not fight the new owner
+    const newOutage = outageEpisodeId === undefined;
     outageEpisodeId ??= randomUUID();
     const alreadySupervising = supervising;
     health.markFailing(failure);
+    if (newOutage) opts.onStorage?.('failing', failure);
     // Capture the loop's promise only when starting a fresh one, so `stop()` can
     // await the recovery in progress. runSupervisor sets `supervising` in its
     // synchronous prefix, so a concurrent kick sees it and no-ops.
@@ -887,6 +893,7 @@ export async function startCapture(
       goLive();
       health.markHealthy();
       outageEpisodeId = undefined; // outage resolved; a later fault opens a new episode
+      opts.onStorage?.('healthy');
       return true;
     } catch {
       // Recovery failed. Restore the failing state (the original failure is

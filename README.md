@@ -196,7 +196,7 @@ setup builds container images, setup ran for about 100 seconds and the agent
 made 14 tool calls before it ended. Slipstream runs first in setup, but whether
 recording is ready before the agent's first edit was not measured. If the agent
 edits first, the first recorded state is whatever was there when recording
-started, and those earlier edits are not shown as changes.
+started, and those earlier edits are not shown as changes. This is a known gap, accepted as is: Slipstream does not add a hook, a second capture source, or a wait to close it.
 
 Conductor removes an archived workspace's folder. Archive scripts were seen to
 run while the folder was still there (they could still use files in it), but

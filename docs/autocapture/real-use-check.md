@@ -101,6 +101,12 @@ verdict is recorded with the P6 closeout, not in this file.
 
 ## Two checks of Conductor's order
 
+**Known gap.** Conductor starts the agent before setup finishes (timings in the
+README). Edits made before the first starting state is read appear as that
+starting state, not as changes. This is accepted; Slipstream adds no hook, no
+second capture source and no wait to close it, so the First edit check below
+records what happens rather than a pass or fail.
+
 Conductor's launch order was observed on 2026-10-18 (README, "Capture every
 Conductor workspace"). It starts the agent without waiting for setup, and it
 removes an archived workspace's folder. Two things were not observed directly.
