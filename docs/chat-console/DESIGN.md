@@ -98,15 +98,16 @@ be a recorded exchange in the same capture with identical source context (as
 follow-up to a hook-delivered question goes through `ask`, a follow-up to an
 exchange through `record_question_exchange`.
 
-### Open risk — forked transcripts and attribution (needs Brian)
+### Resolved risk — forked transcripts and attribution (Brian, 2026-10-18)
 
 A fork (`--fork-session`) writes a new transcript in the same folder that
 copies the parent's history under a new conversation ID. The daemon discovers
 transcripts by folder, so the parent's past edit tool calls may appear twice as
 evidence, from two conversations. That could turn a clear "possibly agent"
-label into "ambiguous". Before Change 2 is built: run one real fork and check
-what attribution does with it. If it degrades, how to treat copied evidence is
-an attribution-confidence decision reserved to Brian. Do not quietly filter it.
+label into "ambiguous". The 2026-10-18 run confirmed this. Brian ruled that
+exact copies of one tool call count once (`src/attribution-scoring.ts`).
+Differing or conflicting copies are not merged. See Stage C1.2 in
+`IMPLEMENTATION_PLAN.md`.
 
 ### Not changing
 
