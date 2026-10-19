@@ -348,7 +348,8 @@ Binding state is a fold of binding intent plus binding events; revoked intent
 wins over a missing `agent.unlinked` event. `unavailable` comes only from intent.
 `setup_pending` and `connected` come from the latest `agent.connection` at the
 current generation in the current activation; a `connected` from an earlier
-activation reads as `setup_pending`.
+activation reads as `setup_pending`. A capture read `queued` under rule 7 has no
+current activation yet.
 
 ### Crash points
 

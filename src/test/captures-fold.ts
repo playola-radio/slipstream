@@ -49,6 +49,7 @@ export async function foldCaptures(store: string, asOfMs: number): Promise<Recor
     const stop = activation.findLast((r) => r.type === t('capture.stopped'));
     const live = isLive(await heartbeatOf(join(store, 'sessions', c.session_id, 'owner.lock')));
     let state: string; let reason: string | null = null;
+    let current = activation;
     if (c.intent === 'withdrawn') {
       if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
       else if (log === null) [state, reason] = ['stopped', c.withdrawn_reason];
@@ -56,13 +57,17 @@ export async function foldCaptures(store: string, asOfMs: number): Promise<Recor
     } else if (c.intent === 'waiting') [state, reason] = ['not_recording', 'capture-limit-reached'];
     else if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
     else if (c.last_failure) [state, reason] = ['not_recording', c.last_failure.reason];
-    else if (!live) [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
+    else if (!live && daemonLive) {
+      // Waiting to start or resume: the logged activation is a previous one (§6).
+      state = 'queued';
+      current = [];
+    } else if (!live) [state, reason] = ['not_recording', 'daemon-unavailable'];
     else if (begun < 0) state = 'queued';
     else state = activation.some((r) => r.type === t('capture.ready')) ? 'recording' : 'baselining';
     const next = c.intent === 'running' ? c.last_failure?.next_attempt_at_ms : null;
     return { session_id: c.session_id, root: c.root, state, reason,
       retry: typeof next === 'number' ? { next_attempt_at_ms: next } : null,
-      capture_mode: c.capture_mode, binding: bindingOf(intent.bindings, c.session_id, activation) };
+      capture_mode: c.capture_mode, binding: bindingOf(intent.bindings, c.session_id, current) };
   }));
   return { binding_slots: { used: intent.bindings.filter((b) => b.intent === 'linked').length, limit: 10 }, captures };
 }

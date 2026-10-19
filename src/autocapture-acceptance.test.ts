@@ -269,6 +269,29 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
       }
     });
   });
+
+  it('reads a chat connected before the restart as setup pending to both readers while its capture waits to resume', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const first = await start();
+      const [a, b] = await roots(2);
+      await attachRecording(first.call, a!);
+      const { id: waiting } = await linkRecording(first.call, store, b!, 'chat-b');
+      await connect(first.call, store, 'chat-b', b!);
+      await stop();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+      try {
+        assert.equal((await captureRow(call, waiting)).state, 'queued', 'the linked capture waits while the first resumes');
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        assert.deepEqual(stateOf(rowOf(projection, waiting)), ['queued', null, 'setup_pending']);
+      } finally {
+        release();
+      }
+    });
+  });
 });
 
 describe('auto-capture acceptance: failure states', () => {
@@ -296,7 +319,7 @@ describe('auto-capture acceptance: failure states', () => {
       await rm(gone!, { recursive: true });
       fake.observe(gone!, '');
       fake.closeWith(closed!, new Error('stream closed'));
-      let table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.gone).state === 'stopped' && rowOf(t, ids.closed).state === 'stopped',
+      let table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.gone).state === 'stopped' && rowOf(t, ids.closed).retry !== null,
         'a deleted root and a closed watcher');
       assert.deepEqual(stateOf(rowOf(table, ids.gone)), ['stopped', 'root-missing', null]);
       assert.deepEqual(stateOf(rowOf(table, ids.closed)), ['stopped', 'watcher-failed', null]);
@@ -312,6 +335,33 @@ describe('auto-capture acceptance: failure states', () => {
       await waitForRow(call, ids.full, (row) => row.state === 'recording', 'the store to recover');
       table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.full).state === 'recording', 'a store that recovered');
       assert.deepEqual(stateOf(rowOf(table, ids.full)), ['recording', null, null]);
+    });
+  });
+  it('keeps showing a recovered outage to both readers while the intent record cannot be written', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, roots, start }) => {
+      const fake = createRootsPlatform();
+      const { daemon, call } = await start({ captureDependencies: {
+        platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', createLog: disk.createLog } });
+      const [full] = await roots(1);
+      const id = await attachRecording(call, full!);
+      await writeFile(join(full!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(full!, 'x.ts');
+      await waitForRow(call, id, (row) => row.reason === 'storage-unavailable', 'the full store to be reported');
+      await untilIntent(store, (i) => (i.captures[0]?.last_failure as Row | null)?.reason === 'storage-unavailable');
+      const control = join(store, 'control');
+      await chmod(control, 0o500);
+      try {
+        disk.full = false;
+        await waitForLog(store, id, (log) => log.some((r) => r.type === 'slipstream.capture.gap.v1' && r.data.reason === 'storage'));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        assert.deepEqual(stateOf(rowOf(projection, id)), ['not_recording', 'storage-unavailable', null]);
+      } finally {
+        await chmod(control, 0o700);
+      }
     });
   });
 });

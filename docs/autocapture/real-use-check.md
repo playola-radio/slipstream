@@ -101,9 +101,8 @@ verdict is recorded with the P6 closeout, not in this file.
 
 ## Two checks of Conductor's order
 
-**Known gap.** Conductor starts the agent before setup finishes: about 10–15
-seconds to the agent's first tool call, and a 100-second setup overlapped 14
-tool calls. Edits made before the first starting state is read appear as that
+**Known gap.** Conductor starts the agent before setup finishes (timings in the
+README). Edits made before the first starting state is read appear as that
 starting state, not as changes. This is accepted; Slipstream adds no hook, no
 second capture source and no wait to close it, so the First edit check below
 records what happens rather than a pass or fail.

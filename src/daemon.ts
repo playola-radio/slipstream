@@ -1173,12 +1173,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (state === 'failing' && !entry.last_failure) {
       entry.last_failure = { reason: 'storage-unavailable', at_ms: Date.now(), next_attempt_at_ms: null,
         message: `the store cannot accept events (${failure?.operation ?? 'append'}: ${failure?.code ?? 'error'}); capture resumes when it recovers` };
-    } else if (state === 'healthy' && entry.last_failure?.reason === 'storage-unavailable' && entry.last_failure.next_attempt_at_ms === null) {
-      entry.last_failure = null;
-    } else {
+      persistQuietly();
       return;
     }
-    persistQuietly();
+    // A recovery that lands while the capture is stopping keeps the outage until
+    // the stop replaces it, and a clear that cannot be written is not shown.
+    const outage = entry.last_failure;
+    if (state !== 'healthy' || c.lifecycle !== 'recording' || outage?.reason !== 'storage-unavailable'
+      || outage.next_attempt_at_ms !== null) return;
+    entry.last_failure = null;
+    persistIntent().catch(() => { entry.last_failure ??= outage; });
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
