@@ -1543,15 +1543,25 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   // ---- chat-facing verbs --------------------------------------------------
 
+  /** Capture-level ownership check run immediately before an append: nothing
+   * about any chat, only that this capture still holds its storage. */
+  function ownsCapture(c: Capture): () => void {
+    return () => {
+      const live = c.lifecycle === 'recording' || c.lifecycle === 'stopping';
+      if (compromised || torn || !live || c.activation?.lost) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
+      }
+    };
+  }
+
   /** Ownership check run immediately before an append on a chat's behalf. A
    * stopping capture still accepts work it admitted: the stop drains it before
    * revoking the binding. */
   function owns(c: Capture, b: Binding): () => void {
+    const capture = ownsCapture(c);
     return () => {
-      const live = c.lifecycle === 'recording' || c.lifecycle === 'stopping';
-      if (compromised || torn || c.binding !== b || !live || c.activation?.lost) {
-        throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
-      }
+      capture();
+      if (c.binding !== b) throw new QuestionError('STORAGE_UNAVAILABLE', 'the selected capture lost storage ownership');
     };
   }
 
@@ -1645,6 +1655,19 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return track(c, c.session!.askQuestion(req, {
       harness: b.harness, harness_session_id: b.harnessSessionId, worktree: c.root,
     }, owns(c, b)), (r) => ({ ...r }));
+  }
+
+  /** Record a question and the answer the client's own forked chat produced. The
+   * client is the writer, so there is no binding, chat or connection to check:
+   * the capture only has to be recording. The conversation ids it reports are
+   * stored as client-reported and are never used to bind or attribute. */
+  async function recordExchange(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'daemon storage ownership is unavailable');
+    const c = nonEmptyString(req.session_id) ? captures.get(req.session_id) : undefined;
+    if (!c || !isLive(c)) return errFields('SESSION_NOT_SELECTED', 'no capture with that session id is running');
+    if (c.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    if (c.lifecycle !== 'recording' || !isRunning(c)) return errFields('CAPTURE_NOT_READY', 'the capture is not recording yet');
+    return track(c, c.session!.recordQuestionExchange(req, ownsCapture(c)), (r) => ({ ...r }));
   }
 
   /** The question hook asks for this chat's next question (or its setup check).
@@ -1989,6 +2012,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'unlink': outcome = await unlinkChat(req); break;
       case 'begin_task': outcome = await beginTask(req); break;
       case 'ask': outcome = await ask(req); break;
+      case 'record_question_exchange': outcome = await recordExchange(req); break;
       case 'claim_question': outcome = await claimQuestion(req); break;
       case 'answer_question': outcome = await answerQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;

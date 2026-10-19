@@ -4,8 +4,8 @@ import { open } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { openLogCursor } from './log-reader.ts';
 import { blobPath } from './store-reader.ts';
-import { sourceFor } from './event.ts';
-import type { QuestionAnsweredEvent, QuestionQueuedEvent } from './public-events.ts';
+import { sourceFor, type HarnessName } from './event.ts';
+import type { QuestionAnsweredEvent, QuestionExchangeRecordedEvent, QuestionQueuedEvent } from './public-events.ts';
 export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
@@ -163,11 +163,84 @@ export function questionResult(event: QuestionQueuedEvent): QuestionAccepted {
 
 /** Answer text is stored verbatim, so it is checked but never trimmed. Unpaired
  * surrogates are refused for the same reason as in question text. */
-export function assertAnswerText(text: unknown): asserts text is string {
+export function assertAnswerText(text: unknown, maxBytes: number = MAX_ANSWER_BYTES): asserts text is string {
   if (typeof text !== 'string' || !/\S/u.test(text) || /[\uD800-\uDFFF]/u.test(text)
-    || Buffer.byteLength(text, 'utf8') > MAX_ANSWER_BYTES) {
-    throw new QuestionError('INVALID_ANSWER', `answer text must contain a non-whitespace character and be at most ${MAX_ANSWER_BYTES} UTF-8 bytes`);
+    || Buffer.byteLength(text, 'utf8') > maxBytes) {
+    const limit = Number.isFinite(maxBytes) ? ` and be at most ${maxBytes} UTF-8 bytes` : '';
+    throw new QuestionError('INVALID_ANSWER', `answer text must contain a non-whitespace character${limit}`);
   }
+}
+
+const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
+
+export interface ExchangeConversation {
+  harness: HarnessName;
+  parent_session_id: string;
+  fork_session_id: string;
+}
+export interface QuestionExchangeRequest extends QuestionRequest {
+  answer_text: string;
+  conversation: ExchangeConversation;
+}
+
+function conversationId(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 256 || CONTROL_CHARS.test(value)
+    || /[\uD800-\uDFFF]/u.test(value)) {
+    throw new QuestionError('PROTOCOL', `${name} must be 1–256 characters with no control characters or unpaired surrogates`);
+  }
+  return value;
+}
+
+/** Client-reported conversation ids are unverified: only their shape is checked. The answer is never trimmed or capped. */
+export function normalizeExchange(value: unknown): QuestionExchangeRequest {
+  const ask = normalizeAsk(value);
+  const req = record(value);
+  assertAnswerText(req.answer_text, Infinity);
+  const conv = req.conversation;
+  if (typeof conv !== 'object' || conv === null || Array.isArray(conv)) {
+    throw new QuestionError('PROTOCOL', 'exchange requires a conversation object');
+  }
+  const c = conv as Record<string, unknown>;
+  if (!HARNESSES.includes(c.harness as HarnessName)) {
+    throw new QuestionError('PROTOCOL', `conversation.harness must be one of ${HARNESSES.join(', ')}`);
+  }
+  const parent = conversationId(c.parent_session_id, 'conversation.parent_session_id');
+  const fork = conversationId(c.fork_session_id, 'conversation.fork_session_id');
+  if (parent === fork) throw new QuestionError('PROTOCOL', 'conversation parent and fork ids must differ');
+  return { ...ask, answer_text: req.answer_text, conversation: {
+    harness: c.harness as HarnessName, parent_session_id: parent, fork_session_id: fork,
+  } };
+}
+
+/**
+ * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer and the
+ * reported conversation. A digest, not the JSON itself, so the capture does not retain every answer
+ * (up to ~1 MiB each) for its lifetime.
+ */
+export function exchangeBody(req: QuestionExchangeRequest): string {
+  const c = req.conversation;
+  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+  return createHash('sha256').update(json).digest('hex');
+}
+
+export interface QuestionExchangeAccepted {
+  session_id: string;
+  request_id: string;
+  question_id: string;
+  seq: string;
+  duplicate: boolean;
+}
+export function exchangeResult(event: QuestionExchangeRecordedEvent): QuestionExchangeAccepted {
+  const d = event.data;
+  return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
+    seq: event.seq, duplicate: false });
+}
+
+/** A follow-up must restate its parent's exact source context. */
+export function sameSourceContext(parent: QuestionContext | undefined, c: QuestionContext): boolean {
+  return parent !== undefined && parent.change_seq === c.change_seq && parent.path === c.path && parent.snapshot_sha256 === c.snapshot_sha256
+    && parent.line_start === c.line_start && parent.line_end === c.line_end;
 }
 
 export interface AnswerAccepted {

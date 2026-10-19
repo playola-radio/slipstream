@@ -4,6 +4,7 @@
  * `attribution.ts` so the display fold's code boundary covers display code only.
  */
 import type {
+  AnyEvent,
   AttributionReason,
   AttributionStatus,
   ChangeAttributionData,
@@ -11,7 +12,29 @@ import type {
   EvidenceKey,
   ObservedInterval,
 } from './event.ts';
-import { evidenceKeyString, type Invocation } from './attribution.ts';
+import { evidenceKeyString, foldEvidence, variantSignature, type Invocation } from './attribution.ts';
+
+/** An invocation plus the distinct evidence facts its records assert. Kept here,
+ * not on {@link Invocation}, so the frozen display-fold closure stays unchanged. */
+export interface ScoredInvocation extends Invocation {
+  signatures: readonly string[];
+}
+
+/** {@link foldEvidence} plus each invocation's sorted, distinct variant signatures. */
+export function foldScoredEvidence(events: readonly AnyEvent[]): ScoredInvocation[] {
+  const signatures = new Map<string, Set<string>>();
+  for (const e of events) {
+    if (e.type !== 'slipstream.harness.evidence.v1') continue;
+    const keyStr = evidenceKeyString(e.data.evidence_key);
+    const set = signatures.get(keyStr) ?? new Set<string>();
+    set.add(variantSignature(e.data));
+    signatures.set(keyStr, set);
+  }
+  return [...foldEvidence(events).values()].map((inv) => ({
+    ...inv,
+    signatures: [...(signatures.get(inv.keyStr) ?? [])].sort(),
+  }));
+}
 
 export interface EvaluationInput {
   path: string;
@@ -19,7 +42,7 @@ export interface EvaluationInput {
   interval: ObservedInterval | undefined;
   /** The policy bound to this change (by sequence). */
   policy: EnrichmentPolicy;
-  invocations: Iterable<Invocation>;
+  invocations: Iterable<ScoredInvocation>;
 }
 
 export interface EvaluationResult {
@@ -42,11 +65,66 @@ function touchesPath(inv: Invocation, path: string): boolean {
   return inv.knownPaths.includes(path);
 }
 
+function isExactCopy(a: ScoredInvocation, b: ScoredInvocation): boolean {
+  if (!sameStringSet(a.signatures, b.signatures)) return false;
+  const pa = [...a.knownPaths].sort();
+  const pb = [...b.knownPaths].sort();
+  return (
+    a.minAtMs === b.minAtMs &&
+    a.maxAtMs === b.maxAtMs &&
+    a.evidenceSeqs.length === b.evidenceSeqs.length &&
+    pa.length === pb.length &&
+    pa.every((p, i) => p === pb[i])
+  );
+}
+
+/**
+ * Split invocations into eligible candidates and conflicts. Groups are formed
+ * over ALL invocations sharing `(harness, record_id)` before relevance, so a
+ * differing or conflicted copy that is irrelevant to this change still stops
+ * the rest collapsing. A group of 2+ non-conflicted exact copies becomes one
+ * candidate citing every copy's evidence (if relevant); any other group is
+ * handled member by member, relevant members only.
+ */
+function partitionInvocations(
+  invocations: Iterable<ScoredInvocation>,
+  isRelevant: (inv: ScoredInvocation) => boolean,
+): { eligible: ScoredInvocation[]; conflicts: ScoredInvocation[] } {
+  const groups = new Map<string, ScoredInvocation[]>();
+  for (const inv of invocations) {
+    const id = `${inv.key.harness}\u0000${inv.key.record_id}`;
+    const group = groups.get(id);
+    if (group === undefined) groups.set(id, [inv]);
+    else group.push(inv);
+  }
+  const eligible: ScoredInvocation[] = [];
+  const conflicts: ScoredInvocation[] = [];
+  for (const group of groups.values()) {
+    const [first] = group as [ScoredInvocation, ...ScoredInvocation[]];
+    const collapsible =
+      group.length >= 2 && group.every((inv) => !inv.conflicted && isExactCopy(first, inv));
+    if (collapsible) {
+      if (isRelevant(first)) {
+        eligible.push({ ...first, evidenceSeqs: group.flatMap((inv) => inv.evidenceSeqs) });
+      }
+      continue;
+    }
+    for (const inv of group) {
+      if (!isRelevant(inv)) continue;
+      (inv.conflicted ? conflicts : eligible).push(inv);
+    }
+  }
+  return { eligible, conflicts };
+}
+
 /**
  * Match one change against the known invocations under its bound policy. An
  * unavailable interval resolves to `unknown` with its own distinct reason — never
  * conflated with "we looked and found nothing". Each eligible invocation
  * contributes one candidate; conflicts are excluded and disclosed, never counted.
+ * Copies from forked transcripts repeat a tool call verbatim (same id, tool
+ * timestamps, paths), so identical copies count once; copies that differ or are
+ * conflicted are not collapsed, so a contradiction is never hidden.
  */
 export function evaluateChange(input: EvaluationInput): EvaluationResult {
   const { interval } = input;
@@ -63,16 +141,12 @@ export function evaluateChange(input: EvaluationInput): EvaluationResult {
     };
   }
 
-  const eligible: Invocation[] = [];
-  const conflicts: Invocation[] = [];
-  for (const inv of input.invocations) {
-    const relevant =
+  const { eligible, conflicts } = partitionInvocations(
+    input.invocations,
+    (inv) =>
       touchesPath(inv, input.path) &&
-      windowOverlaps(inv, interval.start_ms, interval.end_ms, input.policy.window_ms);
-    if (!relevant) continue;
-    if (inv.conflicted) conflicts.push(inv);
-    else eligible.push(inv);
-  }
+      windowOverlaps(inv, interval.start_ms, interval.end_ms, input.policy.window_ms),
+  );
 
   const evidenceSeqs = eligible
     .flatMap((inv) => inv.evidenceSeqs)

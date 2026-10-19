@@ -1,9 +1,9 @@
 /** Additive public events outside the byte-frozen display-fold.v1 dependencies. */
 import { EVENT_TYPES, buildEnvelope, sourceFor, SPEC_VERSION, DATA_CONTENT_TYPE, type AnyEvent, type EventInput, type HarnessName } from './event.ts';
-import type { QuestionContext } from './questions.ts';
+import type { ExchangeConversation, QuestionContext } from './questions.ts';
 
 export const PUBLIC_EVENT_TYPES = [...EVENT_TYPES, 'slipstream.question.queued.v1', 'slipstream.question.dispatch_attempted.v1',
-  'slipstream.question.answered.v1', 'slipstream.capture.scope.v1', 'slipstream.agent.connection.v1',
+  'slipstream.question.answered.v1', 'slipstream.question.exchange_recorded.v1', 'slipstream.capture.scope.v1', 'slipstream.agent.connection.v1',
   'slipstream.capture.ready.v1', 'slipstream.capture.stopped.v1', 'slipstream.agent.binding.v1',
   'slipstream.agent.unlinked.v1'] as const;
 export interface QuestionQueuedData {
@@ -56,6 +56,30 @@ export interface QuestionAnsweredEvent {
   time: string;
   subject: string;
   data: QuestionAnsweredData;
+}
+/** A question and the answer the client's own forked chat produced. The
+ * conversation ids are client-reported and unverified; never authorship. */
+export interface QuestionExchangeRecordedData {
+  session_id: string;
+  question_id: string;
+  request_id: string;
+  text: string;
+  context: QuestionContext & { selected_text: string };
+  answer_text: string;
+  recorded_at_ms: number;
+  reply_to_question_id?: string;
+  conversation: ExchangeConversation & { reported_by: 'client' };
+}
+export interface QuestionExchangeRecordedEvent {
+  specversion: typeof SPEC_VERSION;
+  id: string;
+  source: string;
+  type: 'slipstream.question.exchange_recorded.v1';
+  datacontenttype: typeof DATA_CONTENT_TYPE;
+  seq: string;
+  time: string;
+  subject: string;
+  data: QuestionExchangeRecordedData;
 }
 /** Which paths capture follows, and whether that filter is currently working.
  * `git`: paths git would not merge (ignored and untracked) are out of scope.
@@ -141,12 +165,15 @@ export type CaptureStoppedInput = { type: 'slipstream.capture.stopped.v1'; occur
 export type AgentBindingInput = { type: 'slipstream.agent.binding.v1'; occurred_at_ms: number; data: Omit<AgentBindingData, 'session_id'> };
 export type AgentUnlinkedInput = { type: 'slipstream.agent.unlinked.v1'; occurred_at_ms: number; data: Omit<AgentUnlinkedData, 'session_id'> };
 type LifecycleInput = CaptureScopeInput | AgentConnectionInput | CaptureReadyInput | CaptureStoppedInput | AgentBindingInput | AgentUnlinkedInput;
-export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent | CaptureScopeEvent
+export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttemptedEvent | QuestionAnsweredEvent | QuestionExchangeRecordedEvent
+  | CaptureScopeEvent
   | AgentConnectionEvent | CaptureReadyEvent | CaptureStoppedEvent | AgentBindingEvent | AgentUnlinkedEvent;
 export type QuestionQueuedInput = { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
 export type QuestionDispatchAttemptedInput = { type: 'slipstream.question.dispatch_attempted.v1'; occurred_at_ms: number; data: { question_id: string; queued_seq: string; attempted_at_ms: number } };
 export type QuestionAnsweredInput = { type: 'slipstream.question.answered.v1'; occurred_at_ms: number; data: Omit<QuestionAnsweredData, 'session_id'> };
-export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput | LifecycleInput;
+export type QuestionExchangeRecordedInput = { type: 'slipstream.question.exchange_recorded.v1'; occurred_at_ms: number; data: Omit<QuestionExchangeRecordedData, 'session_id'> };
+export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput
+  | QuestionExchangeRecordedInput | LifecycleInput;
 const LIFECYCLE_TYPES = new Set<string>(['slipstream.capture.scope.v1', 'slipstream.agent.connection.v1', 'slipstream.capture.ready.v1',
   'slipstream.capture.stopped.v1', 'slipstream.agent.binding.v1', 'slipstream.agent.unlinked.v1']);
 const isLifecycleInput = (input: PublicEventInput): input is LifecycleInput => LIFECYCLE_TYPES.has(input.type);
@@ -157,13 +184,18 @@ export function buildPublicEnvelope(input: PublicEventInput, seq: bigint, sessio
     data: { ...input.data, session_id: sessionId },
   } as PublicEvent;
   if (input.type !== 'slipstream.question.queued.v1' && input.type !== 'slipstream.question.dispatch_attempted.v1'
-    && input.type !== 'slipstream.question.answered.v1') return buildEnvelope(input, seq, sessionId);
+    && input.type !== 'slipstream.question.answered.v1' && input.type !== 'slipstream.question.exchange_recorded.v1') return buildEnvelope(input, seq, sessionId);
   if (input.type === 'slipstream.question.dispatch_attempted.v1') return {
     specversion: SPEC_VERSION, id: seq.toString(), source: sourceFor(sessionId), type: input.type,
     datacontenttype: DATA_CONTENT_TYPE, seq: seq.toString(), time: new Date(input.occurred_at_ms).toISOString(),
     subject: `question/${input.data.question_id}`, data: { ...input.data, session_id: sessionId },
   };
   if (input.type === 'slipstream.question.answered.v1') return {
+    specversion: SPEC_VERSION, id: seq.toString(), source: sourceFor(sessionId), type: input.type,
+    datacontenttype: DATA_CONTENT_TYPE, seq: seq.toString(), time: new Date(input.occurred_at_ms).toISOString(),
+    subject: `question/${input.data.question_id}`, data: { ...input.data, session_id: sessionId },
+  };
+  if (input.type === 'slipstream.question.exchange_recorded.v1') return {
     specversion: SPEC_VERSION, id: seq.toString(), source: sourceFor(sessionId), type: input.type,
     datacontenttype: DATA_CONTENT_TYPE, seq: seq.toString(), time: new Date(input.occurred_at_ms).toISOString(),
     subject: `question/${input.data.question_id}`, data: { ...input.data, session_id: sessionId },

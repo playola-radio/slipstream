@@ -21,8 +21,8 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import { EVENT_TYPES, type AnyEvent, type EnrichmentPolicy, type EventInput, type HarnessName } from './event.ts';
-import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent } from './public-events.ts';
-import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted } from './questions.ts';
+import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent, QuestionExchangeRecordedInput, QuestionExchangeRecordedEvent } from './public-events.ts';
+import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted, normalizeExchange, exchangeBody, exchangeResult, sameSourceContext, type QuestionExchangeAccepted, type QuestionContext } from './questions.ts';
 import type { TranscriptScheduler } from './transcript/scheduler.ts';
 
 export interface CaptureOptions {
@@ -134,6 +134,8 @@ export interface CaptureSession {
    */
   ingestEvidence(evidence: NormalizedEvidence): Promise<IngestOutcome>;
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
+  /** Record a question and the answer the client's own forked chat produced; appends exactly one event. */
+  recordQuestionExchange(input: unknown, assertOwnership?: () => void): Promise<QuestionExchangeAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
@@ -275,6 +277,18 @@ export async function startCapture(
   const committedQuestions = new Map<string, { body: string; result: QuestionAccepted }>();
   const inflightQuestions = new Map<string, { body: string; promise: Promise<QuestionAccepted> }>();
   const reservedQuestions = new Set<string>();
+  // Exchanges are a separate namespace: they never queue, expire, count against
+  // QUESTION_LIMIT, or appear in the ask follow-up lookup.
+  const committedExchanges = new Map<string, { body: string; result: QuestionExchangeAccepted }>();
+  const inflightExchanges = new Map<string, { body: string; promise: Promise<QuestionExchangeAccepted> }>();
+  const exchangesById = new Map<string, QuestionContext>();
+  const sourceContext = (context: QuestionContext): QuestionContext => ({
+    change_seq: context.change_seq,
+    path: context.path,
+    snapshot_sha256: context.snapshot_sha256,
+    line_start: context.line_start,
+    line_end: context.line_end,
+  });
   // Questions not yet attempted. Removed once dispatch is attempted (durably
   // consumed either way) so eligibility counting and claim lookup scan only
   // outstanding questions, not every question ever queued by a long-lived capture.
@@ -307,6 +321,11 @@ export async function startCapture(
     for (const event of rec.questions) questionsById.set(event.data.question_id, event.data);
     for (const event of rec.questionAttempts) attemptSeqs.set(event.data.question_id, event.seq);
     for (const event of rec.questionAnswers) committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
+    committedExchanges.clear(); exchangesById.clear();
+    for (const event of rec.questionExchanges) {
+      committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
+      exchangesById.set(event.data.question_id, sourceContext(event.data.context));
+    }
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -353,6 +372,7 @@ export async function startCapture(
       if (event.type === 'slipstream.question.answered.v1') {
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       }
+      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, sourceContext(event.data.context));
       if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
   };
@@ -470,6 +490,7 @@ export async function startCapture(
   function appendEvent(input: QuestionQueuedInput): Promise<QuestionQueuedEvent>;
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
+  function appendEvent(input: QuestionExchangeRecordedInput): Promise<QuestionExchangeRecordedEvent>;
   function appendEvent<I extends AgentInput>(input: I): Promise<AgentEventFor<I>>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
@@ -1092,10 +1113,7 @@ export async function startCapture(
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
     if (req.reply_to_question_id !== undefined) {
-      const parent = questionsById.get(req.reply_to_question_id)?.context;
-      const c = req.context;
-      if (!parent || parent.change_seq !== c.change_seq || parent.path !== c.path || parent.snapshot_sha256 !== c.snapshot_sha256
-        || parent.line_start !== c.line_start || parent.line_end !== c.line_end) {
+      if (!sameSourceContext(questionsById.get(req.reply_to_question_id)?.context, req.context)) {
         throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to a question in this capture about the same source');
       }
     }
@@ -1129,6 +1147,45 @@ export async function startCapture(
     inflightQuestions.set(req.request_id, { body, promise });
     try { return await promise; }
     finally { inflightQuestions.delete(req.request_id); }
+  };
+
+  const recordQuestionExchange = async (input: unknown, assertOwnership: () => void = () => {}): Promise<QuestionExchangeAccepted> => {
+    const req = normalizeExchange(input);
+    if (req.session_id !== sessionId) throw new QuestionError('SESSION_NOT_SELECTED', 'exchange addresses a different capture');
+    assertOwnership();
+    questionReady();
+    const body = exchangeBody(req);
+    const settled = committedExchanges.get(req.request_id);
+    const pending = inflightExchanges.get(req.request_id);
+    const existing = settled ?? pending;
+    if (existing && existing.body !== body) throw new QuestionError('REQUEST_CONFLICT', 'request_id was used for a different exchange or context');
+    if (settled) return { ...settled.result, duplicate: true };
+    if (pending) return { ...await pending.promise, duplicate: true };
+    if (req.reply_to_question_id !== undefined
+      && !sameSourceContext(exchangesById.get(req.reply_to_question_id), req.context)) {
+      throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to an exchange in this capture about the same source');
+    }
+    // Defer starting I/O until the in-flight reservation is installed synchronously.
+    const promise = Promise.resolve().then(async (): Promise<QuestionExchangeAccepted> => {
+      const selected_text = await deps.readQuestionContext({ storeDir, logPath, sessionId,
+        boundary: BigInt(health.snapshot().durable_seq), context: req.context });
+      assertOwnership();
+      questionReady();
+      const recorded_at_ms = now();
+      const event = await appendEvent({ type: 'slipstream.question.exchange_recorded.v1', occurred_at_ms: recorded_at_ms,
+        data: { question_id: randomUUID(), request_id: req.request_id, text: req.text,
+          context: { ...req.context, selected_text }, answer_text: req.answer_text, recorded_at_ms,
+          conversation: { ...req.conversation, reported_by: 'client' },
+          ...(req.reply_to_question_id !== undefined ? { reply_to_question_id: req.reply_to_question_id } : {}) } });
+      if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+      assertOwnership();
+      const result = exchangeResult(event);
+      committedExchanges.set(req.request_id, { body, result });
+      return result;
+    });
+    inflightExchanges.set(req.request_id, { body, promise });
+    try { return await promise; }
+    finally { inflightExchanges.delete(req.request_id); }
   };
 
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {
@@ -1222,7 +1279,7 @@ export async function startCapture(
     // Fence the attribution generation and flush its in-flight appends before the
     // log closes: a stale evaluation must never append after the log is gone.
     await producer?.stop().catch(record);
-    await Promise.allSettled([...inflightQuestions.values(), ...inflightAnswers.values()].map(q => q.promise));
+    await Promise.allSettled([...inflightQuestions.values(), ...inflightExchanges.values(), ...inflightAnswers.values()].map(q => q.promise));
     // Never manufactured: after a lost lock or during a storage outage the stop
     // stays unrecorded and stop() rejects, so no caller can report it stopped.
     if (opts && firstError === undefined && (surrendered || health.snapshot().state !== 'healthy')) {
@@ -1257,6 +1314,7 @@ export async function startCapture(
     health,
     beginTask,
     askQuestion,
+    recordQuestionExchange,
     claimQuestion,
     answerQuestion,
     recordAgent,
