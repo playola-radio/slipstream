@@ -328,7 +328,11 @@ session ownership heartbeats (7), in this precedence:
 5. Intent `running` with a recorded `last_failure`: `not_recording` with that
    reason, whether or not its heartbeat is fresh. A storage failure therefore
    never reads as `recording`; when the store cannot accept another event, the
-   reader uses the durable intent record's `last_failure`.
+   reader uses the durable intent record's `last_failure`. That includes an
+   outage while recording: the daemon records it when it begins and clears it
+   when the session recovers. If the intent record cannot be written either, an
+   offline reader cannot see the outage until the recovered session's
+   `capture.gap{storage}` discloses it.
 6. Intent `running`, session owner live: `recording` if the current activation
    has `capture.ready`, `baselining` if it has none, `queued` if no activation
    has begun.

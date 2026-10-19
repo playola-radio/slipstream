@@ -3,6 +3,7 @@ import { chmod, lstat, unlink, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, sep } from 'node:path';
 import { startCapture, InvalidTitleError, RootChangedError, type CaptureSession } from './session.ts';
+import type { HealthFailure } from './health.ts';
 import { createTranscriptScheduler, type TranscriptScheduler } from './transcript/scheduler.ts';
 import { QuestionError, assertAnswerText } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
@@ -974,6 +975,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
           cas,
           onCompromised: (reason) => onSessionLockLost(c, activation, reason),
           onTerminal: (reason, message) => onActivationEnded(c, activation, reason, message),
+          onStorage: (state, failure) => onStorageChanged(c, activation, state, failure),
           ...(opts.config ? { enrichmentPolicy: opts.config.policy } : {}),
           ...(transcripts ? { transcript: transcripts } : {}),
         },
@@ -1161,6 +1163,22 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         persistQuietly();
       }
     })());
+  }
+
+  /** Record a live activation's storage outage in the intent, and clear it on
+   * recovery, so offline readers agree with this daemon (contracts.md §6). */
+  function onStorageChanged(c: Capture, activation: Activation, state: 'failing' | 'healthy', failure?: HealthFailure): void {
+    const entry = findCapture(intent, c.id);
+    if (c.activation !== activation || activation.lost || entry?.intent !== 'running') return;
+    if (state === 'failing' && !entry.last_failure) {
+      entry.last_failure = { reason: 'storage-unavailable', at_ms: Date.now(), next_attempt_at_ms: null,
+        message: `the store cannot accept events (${failure?.operation ?? 'append'}: ${failure?.code ?? 'error'}); capture resumes when it recovers` };
+    } else if (state === 'healthy' && entry.last_failure?.reason === 'storage-unavailable' && entry.last_failure.next_attempt_at_ms === null) {
+      entry.last_failure = null;
+    } else {
+      return;
+    }
+    persistQuietly();
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {

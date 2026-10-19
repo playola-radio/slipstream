@@ -12,7 +12,7 @@ import { probeSocket, startDaemon, type Daemon, type DaemonOptions } from './dae
 import type { Platform } from './platform.ts';
 import { bothReaders, foldCaptures, comparable } from './test/captures-fold.ts';
 import {
-  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, linkChat, linkRecording, readLog, rec, waitForLog,
+  captureRow, chatOf, claimCheck, claimOf, connect, controlCall, createRootsPlatform, fillableStore, linkChat, linkRecording, readLog, rec, waitForLog,
   waitForRow, type Call,
 } from './test/daemon-harness.ts';
 
@@ -267,6 +267,51 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
       } finally {
         release();
       }
+    });
+  });
+});
+
+describe('auto-capture acceptance: failure states', () => {
+  /** The daemon shows a failure a moment before the files that let an offline
+   * reader see it; compare once they have caught up. */
+  async function agreeOnce(store: string, daemon: Daemon, settled: (table: Record<string, unknown>) => boolean, what: string) {
+    let both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    for (let i = 0; i < 150 && !(settled(both.projection) && settled(both.fold)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      both = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    }
+    assert.deepEqual(both.fold, both.projection, what);
+    return both.projection;
+  }
+
+  it('read root-missing, watcher-failed and storage-unavailable the same to both readers', async () => {
+    const disk = fillableStore();
+    await withStore(async ({ store, roots, start }) => {
+      const fake = createRootsPlatform();
+      const { daemon, call } = await start({ retryBackoff: { baseMs: 60_000, maxMs: 60_000 }, captureDependencies: {
+        platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', createLog: disk.createLog } });
+      const [gone, closed, full] = await roots(3);
+      const ids = { gone: await attachRecording(call, gone!), closed: await attachRecording(call, closed!), full: await attachRecording(call, full!) };
+
+      await rm(gone!, { recursive: true });
+      fake.observe(gone!, '');
+      fake.closeWith(closed!, new Error('stream closed'));
+      let table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.gone).state === 'stopped' && rowOf(t, ids.closed).state === 'stopped',
+        'a deleted root and a closed watcher');
+      assert.deepEqual(stateOf(rowOf(table, ids.gone)), ['stopped', 'root-missing', null]);
+      assert.deepEqual(stateOf(rowOf(table, ids.closed)), ['stopped', 'watcher-failed', null]);
+      assert.equal(typeof (rowOf(table, ids.closed).retry as Row | null)?.next_attempt_at_ms, 'number');
+
+      await writeFile(join(full!, 'x.ts'), 'x');
+      disk.full = true;
+      fake.observe(full!, 'x.ts');
+      await waitForRow(call, ids.full, (row) => row.reason === 'storage-unavailable', 'the full store to be reported');
+      table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.full).reason === 'storage-unavailable', 'a store that refuses appends');
+      assert.deepEqual(stateOf(rowOf(table, ids.full)), ['not_recording', 'storage-unavailable', null]);
+      disk.full = false;
+      await waitForRow(call, ids.full, (row) => row.state === 'recording', 'the store to recover');
+      table = await agreeOnce(store, daemon, (t) => rowOf(t, ids.full).state === 'recording', 'a store that recovered');
+      assert.deepEqual(stateOf(rowOf(table, ids.full)), ['recording', null, null]);
     });
   });
 });
