@@ -614,19 +614,22 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return row;
   }
 
-  /** `GET /v1/captures` (contracts.md §9). Heartbeats are read from the session
-   * ownership locks, exactly as an offline client would. */
+  /** `GET /v1/captures` (contracts.md §9). Heartbeats are read from the store and
+   * session ownership locks, exactly as an offline client would. */
   async function capturesProjection(): Promise<Record<string, unknown>> {
     const asOf = Date.now();
+    const heartbeatOf = async (lockPath: string): Promise<number | null> => {
+      try { return Math.trunc((await stat(lockPath)).mtimeMs); } catch { return null; /* no owner */ }
+    };
+    const isLive = (heartbeat: number | null) => heartbeat !== null && asOf - heartbeat <= STALE_MS;
+    const daemonLive = isLive(await heartbeatOf(join(storeDir, 'owner.lock')));
     const rows = await Promise.all([...captures.values()].map(async (c) => {
       let { state, reason } = publicState(c);
-      let heartbeat: number | null = null;
-      try { heartbeat = Math.trunc((await stat(join(storeDir, 'sessions', c.id, 'owner.lock'))).mtimeMs); } catch { /* no owner */ }
-      // A live owner is the public liveness rule (contracts.md §7): an owned state
-      // without a fresh heartbeat is not confirmed live.
-      if ((state === 'recording' || state === 'baselining') && (heartbeat === null || asOf - heartbeat > STALE_MS)) {
-        state = 'not_recording';
-        reason = 'daemon-unavailable';
+      const heartbeat = await heartbeatOf(join(storeDir, 'sessions', c.id, 'owner.lock'));
+      // The public liveness rule (contracts.md §6, §7): a capture with no live
+      // session owner is waiting on a live daemon, or not confirmed live at all.
+      if (['queued', 'baselining', 'recording'].includes(state) && !isLive(heartbeat)) {
+        [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
       }
       return { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only', heartbeat_ms: heartbeat,
         binding: bindingRow(c) };

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 /**
  * A second, independent reader of the capture table: the contracts.md §6 fold
  * computed only from what a client without the daemon can read — the intent
- * record (§8), each session log, and each ownership heartbeat (§7). It shares no
+ * record (§8), each session log, and the store and session heartbeats (§7). It shares no
  * code with the daemon's projection, so agreement between the two is evidence
  * that the public files alone carry every public state.
  */
@@ -30,8 +30,8 @@ async function logOf(store: string, id: string): Promise<Rec[] | null> {
   return text === null ? null : text.split('\n').filter(Boolean).map((line) => JSON.parse(line) as Rec);
 }
 
-async function heartbeatOf(store: string, id: string): Promise<number | null> {
-  const lock = await unlessMissing(stat(join(store, 'sessions', id, 'owner.lock')));
+async function heartbeatOf(lockPath: string): Promise<number | null> {
+  const lock = await unlessMissing(stat(lockPath));
   return lock === null ? null : Math.trunc(lock.mtimeMs);
 }
 
@@ -40,13 +40,14 @@ const t = (name: string) => `slipstream.${name}.v1`;
 export async function foldCaptures(store: string, asOfMs: number): Promise<Record<string, unknown>> {
   const intent = JSON.parse(await readFile(join(store, 'control', 'intent.json'), 'utf8')) as {
     captures: CaptureIntent[]; bindings: BindingIntent[] };
+  const isLive = (heartbeat: number | null) => heartbeat !== null && asOfMs - heartbeat <= STALE_MS;
+  const daemonLive = isLive(await heartbeatOf(join(store, 'owner.lock')));
   const captures = await Promise.all(intent.captures.map(async (c) => {
     const log = await logOf(store, c.session_id);
     const begun = log?.findLastIndex((r) => r.type === t('session.started') || r.type === t('session.resumed')) ?? -1;
     const activation = log && begun >= 0 ? log.slice(begun) : [];
     const stop = activation.findLast((r) => r.type === t('capture.stopped'));
-    const heartbeat = await heartbeatOf(store, c.session_id);
-    const live = heartbeat !== null && asOfMs - heartbeat <= STALE_MS;
+    const live = isLive(await heartbeatOf(join(store, 'sessions', c.session_id, 'owner.lock')));
     let state: string; let reason: string | null = null;
     if (c.intent === 'withdrawn') {
       if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
@@ -55,7 +56,7 @@ export async function foldCaptures(store: string, asOfMs: number): Promise<Recor
     } else if (c.intent === 'waiting') [state, reason] = ['not_recording', 'capture-limit-reached'];
     else if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
     else if (c.last_failure) [state, reason] = ['not_recording', c.last_failure.reason];
-    else if (!live) [state, reason] = ['not_recording', 'daemon-unavailable'];
+    else if (!live) [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
     else if (begun < 0) state = 'queued';
     else state = activation.some((r) => r.type === t('capture.ready')) ? 'recording' : 'baselining';
     const next = c.intent === 'running' ? c.last_failure?.next_attempt_at_ms : null;

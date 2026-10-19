@@ -9,8 +9,8 @@ at the end); this version carries those resolutions.
 
 The event schema is the public interface. Every state a client needs (capture
 lifecycle, NOT recording, binding state) is reachable from documented on-disk
-records: the session logs, the intent record (8), and the session ownership
-heartbeat (7). The reader serves a projection of exactly those records. Private
+records: the session logs, the intent record (8), and the store and session
+ownership heartbeats (7). The reader serves a projection of exactly those records. Private
 control status is a convenience for the CLI, never the only place a state lives.
 
 Honesty rules that apply to every item below:
@@ -41,9 +41,11 @@ in the log: the activation's opening `session.started`/`session.resumed` event a
 the envelope's `time`.
 
 An activation with `session.started`/`session.resumed` but no `capture.ready` is
-`baselining` (if its owner is live) or `not_recording{reason: "baseline-failed" |
-"resume-failed"}` (if not). Events before `capture.ready` in that activation are
-still real observations; they are just not yet a complete picture.
+`baselining` while its session owner is live. Otherwise the fold in 6 decides:
+its recorded failure (`baseline-failed`, `resume-failed`, …), `queued` while the
+daemon is live, or `not_recording{daemon-unavailable}`. Events before
+`capture.ready` in that activation are still real observations; they are just not
+yet a complete picture.
 
 ## 2. New public event: `slipstream.capture.stopped.v1`
 
@@ -283,7 +285,7 @@ Public capture state:
 
 | State | Means | Coverage |
 |---|---|---|
-| `queued` | Admitted, waiting for the one baseline slot. | **None.** Queued is not coverage. |
+| `queued` | The daemon is live, and the capture has no live session owner yet: admitted and waiting for the one baseline slot, or, after a restart, waiting to resume. | **None.** Queued is not coverage. |
 | `baselining` | Live owner; activation started, no `capture.ready` yet. | Partial; events may appear; not yet complete. |
 | `recording` | Live owner; `capture.ready` written in the current activation. | Observed states with explicit gaps. |
 | `stopped` | `capture.stopped` written, or a withdrawn capture that never activated (fold rule 2); carries its reason. | None since the stop. |
@@ -304,8 +306,8 @@ Public binding state: `setup_pending` (optional reason `config-missing`),
 
 ### How each state is computed
 
-Capture state is a fold of intent (8), the session log, and the ownership
-heartbeat (7), in this precedence:
+Capture state is a fold of intent (8), the session log, and the store and
+session ownership heartbeats (7), in this precedence:
 
 1. Intent `withdrawn` and the last activation ends in `capture.stopped`:
    `stopped`.
@@ -327,10 +329,16 @@ heartbeat (7), in this precedence:
    reason, whether or not its heartbeat is fresh. A storage failure therefore
    never reads as `recording`; when the store cannot accept another event, the
    reader uses the durable intent record's `last_failure`.
-6. Intent `running`, heartbeat not live: `not_recording{daemon-unavailable}`.
-7. Intent `running`, heartbeat live, no activation yet: `queued`.
-8. Heartbeat live, current activation has `capture.ready`: `recording`; without
-   it: `baselining`.
+6. Intent `running`, session owner live: `recording` if the current activation
+   has `capture.ready`, `baselining` if it has none, `queued` if no activation
+   has begun.
+7. Intent `running`, session owner not live, store owner live: `queued`. The
+   capture is waiting for the daemon to start it, or to resume it after a
+   restart. A live daemon records `last_failure` (rule 5) whenever a capture
+   loses its owner any other way, so a running capture with neither owner nor
+   failure is one the daemon has yet to start (Brian, 2026-10-18 for a capture
+   that never began; 2026-10-19 for one waiting to resume).
+8. Intent `running`, neither owner live: `not_recording{daemon-unavailable}`.
 
 Binding state is a fold of binding intent plus binding events; revoked intent
 wins over a missing `agent.unlinked` event. `unavailable` comes only from intent.
@@ -343,20 +351,41 @@ activation reads as `setup_pending`.
 | Crash between | What a reader sees | What recovery does |
 |---|---|---|
 | admission intent written, first append | `not_recording{daemon-unavailable}` then `queued` once a daemon is live | Starts the capture under the persisted `session_id`. |
-| `session.started`/`resumed`, `capture.ready` | `not_recording{baseline-failed\|resume-failed}` while no owner; `baselining` once resumed | Resumes; `capture.gap{restart}` discloses the hole. |
+| `session.started`/`resumed`, `capture.ready` | `not_recording{daemon-unavailable}` while no daemon; `queued` once a daemon is live; `baselining` once resumed | Resumes; `capture.gap{restart}` discloses the hole. |
 | withdrawal written, `capture.stopped` (the capture had activated) | `not_recording{stop-unconfirmed}` | Does not resume a withdrawn capture. Does **not** backfill `capture.stopped` as if it happened at the original time. |
 | withdrawal written, first append (never activated) | `stopped` with the withdrawal reason (fold rule 2) | Starts nothing; there is no stop to write. |
 | binding intent written, `agent.binding` | binding `setup_pending` from intent (no event yet) | Appends `agent.binding` and `setup_pending` at the stored generation on resume, then publishes. |
 | revoke written, `agent.unlinked` | binding `unlinked` (intent wins) | Does not restore the binding; does not backfill `agent.unlinked`. The next activation's `capture.gap{restart}` discloses the hole. |
 
-## 7. Liveness: the session ownership heartbeat
+## 7. Liveness: the ownership heartbeats
 
-Each live capture holds `<store>/sessions/<id>/owner.lock`, and its owner refreshes
-the lock's mtime every 2 s (`src/lock.ts`, staleness horizon 12 s). This becomes
-part of the public contract: a session's owner is **live** when its `owner.lock`
-exists and its mtime is within 12 s of the reader's clock. Projections report the
-heartbeat time they used as `as_of_ms`. An offline client applies the same rule;
-it cannot do better than "live as of the last heartbeat".
+Two lock files carry liveness. Each holder refreshes its lock's mtime every 2 s
+(`src/lock.ts`, staleness horizon 12 s). This is part of the public contract: a
+lock's owner is **live** when the lock exists and its mtime is within 12 s of the
+reader's clock. Projections report the reader clock they used as `as_of_ms`. An
+offline client applies the same rule; it cannot do better than "live as of the
+last heartbeat".
+
+- **Session owner**, `<store>/sessions/<id>/owner.lock`: held by a capture's
+  owner for the whole activation. Only a live session owner lets a capture read
+  `baselining` or `recording`.
+- **Store owner**, `<store>/owner.lock`: held by the daemon for as long as it
+  runs. It answers one question only: for a running capture with no live session
+  owner and no recorded failure, is a daemon there to start or resume it? Live:
+  `queued`. Not live: `not_recording{daemon-unavailable}` (6, rules 7 and 8). It
+  never makes a capture `baselining` or `recording`.
+
+The store lock records only a process id and a nonce, so a reader cannot tell
+the daemon from any other holder. The other holders (P6d audit, 2026-10-19):
+
+- Standalone `slipstream watch` and `serve` hold it for a whole capture. They
+  refuse a store that has an intent record (`control/intent.json`), so they never
+  hold a daemon store's lock past that check.
+- The offline `detach`/`unlink` writers (8) and the LaunchAgent install check
+  hold it for milliseconds, and only while no daemon runs. A reader in that
+  window, or within 12 s of one of them dying while holding it, can read a
+  waiting capture as `queued` with no daemon. That is the same bound as a session
+  owner that dies: live as of the last heartbeat.
 
 ## 8. Durable intent record (P3 persists it)
 
