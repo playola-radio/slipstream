@@ -316,6 +316,43 @@ describe('auto-capture acceptance: failure states', () => {
   });
 });
 
+describe('auto-capture acceptance: a Codex chat after a restart', () => {
+  const codexMeta = (root: string, version: string) => JSON.stringify({ type: 'session_meta', payload: {
+    session_id: 'codex-chat', cwd: root, originator: 'codex_sdk_ts', source: 'exec', cli_version: version } }) + '\n';
+
+  async function linkCodex(call: Call, root: string, transcript: string): Promise<string> {
+    for (let i = 0; i < 300; i++) {
+      const res = await call({ verb: 'attach', worktree: root, harness: 'codex', harness_session_id: 'codex-chat', root_transcript: transcript });
+      if (res.ok) return rec(res).session_id!;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.fail('the Codex chat never linked');
+  }
+
+  for (const { what, change, reason } of [
+    { what: 'whose transcript vanished', change: (t: string) => rm(t), reason: 'transcript-missing' },
+    { what: 'whose Codex version changed', change: (t: string, root: string) => writeFile(t, codexMeta(root, '9.9.9')), reason: 'identity-changed' },
+  ]) {
+    it(`reads a link ${what} as unavailable to both readers`, async () => {
+      await withStore(async ({ store, roots, start, stop }) => {
+        const [a] = await roots(1);
+        const transcript = join(store, 'codex-chat.jsonl');
+        await writeFile(transcript, codexMeta(a!, '0.154.0'));
+        const id = await linkCodex((await start()).call, a!, transcript);
+        await stop();
+        await change(transcript, a!);
+        const { daemon, call } = await start();
+        await waitForRow(call, id, (row) => (row.binding as Row).state === 'unavailable');
+        await untilIntent(store, (i) => (i.bindings[0]?.unavailable as Row | null)?.reason === reason);
+        const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+        assert.deepEqual(fold, projection);
+        const binding = rowOf(projection, id).binding as Row;
+        assert.deepEqual([binding.harness, binding.state, binding.reason], ['codex', 'unavailable', reason]);
+      });
+    });
+  }
+});
+
 describe('auto-capture acceptance: Ask Agent in two workspaces', () => {
   it('delivers each workspace\'s question only to that workspace\'s chat, which alone can answer it', async () => {
     await withStore(async ({ store, roots, start }) => {
