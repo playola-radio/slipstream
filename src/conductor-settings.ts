@@ -2,7 +2,7 @@
  * Read and edit the `[scripts] setup` / `archive` entries of a Conductor
  * settings file, keeping every other line as written. Only the plain forms are
  * handled: a plainly written `[scripts]` table with single-line string values.
- * Anything else (dotted keys, inline tables, a quoted `["scripts"]` header, a
+ * Anything else (dotted keys, inline tables, a quoted `["scripts"]` header or key, a
  * multi-line string anywhere in the file) is refused, so a file is never
  * rewritten on a guess.
  */
@@ -64,6 +64,15 @@ function usesMultilineString(line: string): boolean {
   return false;
 }
 
+/** Whether a line's leading quoted key could name `scripts`. A key whose
+ * escapes don't decode is assumed to, so it is refused rather than guessed. */
+function mayQuoteScripts(line: string): boolean {
+  const key = /^\s*("(?:[^"\\]|\\.)*"|'[^']*')/.exec(line)?.[1];
+  if (key === undefined) return true;
+  if (key.startsWith("'")) return key.slice(1, -1) === 'scripts';
+  try { return JSON.parse(key) === 'scripts'; } catch { return true; }
+}
+
 function locate(text: string, path: string): Located {
   const lines = text.split('\n');
   const scripts: Scripts = {};
@@ -83,7 +92,9 @@ function locate(text: string, path: string): Located {
       }
       continue;
     }
-    if (table === '' && /^\s*["']/.test(line)) throw unsupported(path, i + 1, 'quotes a top-level key');
+    if (table === '' && /^\s*["']/.test(line) && mayQuoteScripts(line)) {
+      throw unsupported(path, i + 1, 'quotes a top-level scripts key');
+    }
     if (table === '' && /^\s*scripts\s*[.=]/.test(line)) throw unsupported(path, i + 1, 'sets scripts outside a [scripts] table');
     if (table !== 'scripts') continue;
     if (/^\s*["']/.test(line)) throw unsupported(path, i + 1, 'quotes a script key');
