@@ -212,14 +212,14 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
     await withStore(async ({ store, roots, start, stop }) => {
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
-      const { daemon, call } = await start({ captureDependencies: {
-        platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
-      const [a, b] = await roots(2);
-      const first = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: a! })).session_id!;
-      await waitForRow(call, first, (row) => row.state === 'baselining');
-      const queued = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: b! })).session_id!;
-      await untilIntent(store, (intent) => intent.captures.some((c) => c.session_id === queued));
       try {
+        const { daemon, call } = await start({ captureDependencies: {
+          platform: createRootsPlatform().platform, enumerate: async () => held, readQuestionContext: async () => 'selected' } });
+        const [a, b] = await roots(2);
+        const first = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: a! })).session_id!;
+        await waitForRow(call, first, (row) => row.state === 'baselining');
+        const queued = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: b! })).session_id!;
+        await untilIntent(store, (intent) => intent.captures.some((c) => c.session_id === queued));
         await fn({ store, daemon, queued, stop: async () => { const stopping = stop(); release(); await stopping; } });
       } finally {
         release();
@@ -278,6 +278,9 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
       await connect(call, store, 'chat-a', a!);
       const table = await readStale(store, daemon, [join(store, 'sessions', id, 'owner.lock')]);
       assert.deepEqual(stateOf(rowOf(table, id)), ['queued', null, 'setup_pending']);
+      const status = rec(await call({ verb: 'status', target: id })).capture as unknown as Row;
+      assert.deepEqual(stateOf(status), ['queued', null, 'setup_pending'],
+        'control status applies the same heartbeat rule as the public reader');
     });
   });
 
@@ -348,13 +351,13 @@ describe('auto-capture acceptance: failure states', () => {
       assert.deepEqual(stateOf(rowOf(table, ids.full)), ['recording', null, null]);
     });
   });
-  it('keeps showing a recovered outage to both readers while the intent record cannot be written', async () => {
+  it('retries a background outage notice after recovery without disabling controls', async () => {
     const disk = fillableStore();
     await withStore(async ({ store, roots, start }) => {
       const fake = createRootsPlatform();
       const { daemon, call } = await start({ captureDependencies: {
         platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected', createLog: disk.createLog } });
-      const [full] = await roots(1);
+      const [full, next] = await roots(2);
       const id = await attachRecording(call, full!);
       await writeFile(join(full!, 'x.ts'), 'x');
       disk.full = true;
@@ -373,6 +376,8 @@ describe('auto-capture acceptance: failure states', () => {
       } finally {
         await chmod(control, 0o700);
       }
+      const attached = await call({ verb: 'attach', mode: 'watch-only', worktree: next! });
+      assert.equal(attached.ok, true, 'a failed background notice never permanently refuses later lifecycle controls');
     });
   });
 });

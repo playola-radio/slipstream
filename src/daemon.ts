@@ -605,47 +605,47 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return { ...row, state: live?.check.state ?? 'setup_pending', reason: null };
   }
 
-  function statusRow(c: Capture): Record<string, unknown> {
-    const { state, reason, message } = publicState(c);
-    const row: Record<string, unknown> = { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only' };
-    if (message) row.message = message;
-    if (c.session) row.durable_seq = c.session.health.snapshot().durable_seq;
-    row.binding = bindingRow(c);
-    if (c.binding) row.binding = { ...row.binding as object, root_transcript: c.binding.transcript };
-    return row;
+  async function statusRows(asOf: number, includeRuntimeDetails = false): Promise<Record<string, unknown>[]> {
+    const heartbeatOf = async (lockPath: string): Promise<number | null> => {
+      try { return Math.trunc((await stat(lockPath)).mtimeMs); } catch { return null; /* no owner */ }
+    };
+    const heartbeatLive = (heartbeat: number | null) => heartbeat !== null && asOf - heartbeat <= STALE_MS;
+    const daemonLive = heartbeatLive(await heartbeatOf(join(storeDir, 'owner.lock')));
+    return Promise.all([...captures.values()].map(async (c) => {
+      let { state, reason, message } = publicState(c);
+      let binding = bindingRow(c);
+      const heartbeat = await heartbeatOf(join(storeDir, 'sessions', c.id, 'owner.lock'));
+      // The public liveness rule (contracts.md §6, §7): a capture with no live
+      // session owner is waiting on a live daemon, or not confirmed live at all.
+      // Waiting, it has no current activation, so no chat is connected in it.
+      if (['queued', 'baselining', 'recording'].includes(state) && !heartbeatLive(heartbeat)) {
+        [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
+        message = undefined;
+        if (daemonLive && binding?.state === 'connected') binding = { ...binding, state: 'setup_pending' };
+      }
+      const row: Record<string, unknown> = { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only' };
+      if (includeRuntimeDetails && message) row.message = message;
+      if (includeRuntimeDetails && c.session) row.durable_seq = c.session.health.snapshot().durable_seq;
+      if (!includeRuntimeDetails) row.heartbeat_ms = heartbeat;
+      row.binding = binding;
+      if (includeRuntimeDetails && c.binding) row.binding = { ...row.binding as object, root_transcript: c.binding.transcript };
+      return row;
+    }));
   }
 
   /** `GET /v1/captures` (contracts.md §9). Heartbeats are read from the store and
    * session ownership locks, exactly as an offline client would. */
   async function capturesProjection(): Promise<Record<string, unknown>> {
     const asOf = Date.now();
-    const heartbeatOf = async (lockPath: string): Promise<number | null> => {
-      try { return Math.trunc((await stat(lockPath)).mtimeMs); } catch { return null; /* no owner */ }
-    };
-    const isLive = (heartbeat: number | null) => heartbeat !== null && asOf - heartbeat <= STALE_MS;
-    const daemonLive = isLive(await heartbeatOf(join(storeDir, 'owner.lock')));
-    const rows = await Promise.all([...captures.values()].map(async (c) => {
-      let { state, reason } = publicState(c);
-      let binding = bindingRow(c);
-      const heartbeat = await heartbeatOf(join(storeDir, 'sessions', c.id, 'owner.lock'));
-      // The public liveness rule (contracts.md §6, §7): a capture with no live
-      // session owner is waiting on a live daemon, or not confirmed live at all.
-      // Waiting, it has no current activation, so no chat is connected in it.
-      if (['queued', 'baselining', 'recording'].includes(state) && !isLive(heartbeat)) {
-        [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
-        if (daemonLive && binding?.state === 'connected') binding = { ...binding, state: 'setup_pending' };
-      }
-      return { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only', heartbeat_ms: heartbeat,
-        binding };
-    }));
+    const rows = await statusRows(asOf);
     return { as_of_ms: asOf, binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS }, captures: rows };
   }
 
-  function statusFields(): Record<string, unknown> {
+  async function statusFields(): Promise<Record<string, unknown>> {
     return {
       reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'],
       binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS },
-      captures: [...captures.values()].map(statusRow),
+      captures: await statusRows(Date.now(), true),
     };
   }
 
@@ -653,7 +653,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (req.target === undefined) return statusFields();
     const c = await resolveTarget(req.target);
     if (isErrorFields(c)) return c;
-    return { reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], capture: statusRow(c) };
+    const capture = (await statusRows(Date.now(), true)).find((row) => row.session_id === c.id)!;
+    return { reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], capture };
   }
 
   /** A target is a session id or a root path. The id is authoritative; a path
@@ -795,7 +796,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   /** Make the in-memory intent durable (contracts.md §8). Mutations are synchronous,
    * so slot counts and the write they back cannot interleave; a lifecycle verb
    * awaits this before it acts or replies. */
-  function persistIntent(): Promise<void> {
+  function persistIntent(opts: { refuseOnFailure?: boolean } = {}): Promise<void> {
+    const refuseOnFailure = opts.refuseOnFailure ?? true;
     if (intentBroken) return Promise.reject(intentBroken);
     if (compromised) return Promise.reject(new Error('the store lock was lost; the intent record belongs to another daemon'));
     intentFlush ??= intentTail.then(async () => {
@@ -805,19 +807,25 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       try {
         await saveIntent(storeDir, intent);
       } catch (err) {
-        intentBroken ??= new IntentWriteError(err);
-        console.error(`slipstream daemon: ${intentBroken.message}`);
-        throw intentBroken;
+        throw new IntentWriteError(err);
       }
     });
     const flush = intentFlush;
     intentTail = flush.catch(() => {});
-    return flush;
+    return flush.catch((err) => {
+      if (!refuseOnFailure) {
+        console.error(`slipstream daemon: background capture-state update was not recorded; it will retry after storage recovers (${(err as Error).message})`);
+        throw err;
+      }
+      intentBroken ??= err instanceof IntentWriteError ? err : new IntentWriteError(err);
+      console.error(`slipstream daemon: ${intentBroken.message}`);
+      throw intentBroken;
+    });
   }
 
   /** Persist a change no acknowledgement depends on (a recorded failure). */
   function persistQuietly(): void {
-    persistIntent().catch(() => {});
+    persistIntent({ refuseOnFailure: false }).catch(() => {});
   }
 
   function intentRefusal(): ErrorFields | undefined {
@@ -1184,8 +1192,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const outage = entry.last_failure;
     if (state !== 'healthy' || c.lifecycle !== 'recording' || outage?.reason !== 'storage-unavailable'
       || outage.next_attempt_at_ms !== null) return;
-    entry.last_failure = null;
-    persistIntent().catch(() => { entry.last_failure ??= outage; });
+    // First make the outage visible if its original best-effort write lost the
+    // disk race. Only then clear it; neither background write can poison later
+    // attach, detach, or unlink controls.
+    persistIntent({ refuseOnFailure: false }).then(() => {
+      if (entry.last_failure !== outage) return;
+      entry.last_failure = null;
+      persistQuietly();
+    }).catch(() => {});
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {
