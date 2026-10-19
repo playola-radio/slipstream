@@ -21,8 +21,7 @@
  * Clock and timers are injected so tests drive them deterministically. A single
  * timer is armed for the nearest pending deadline.
  */
-import { foldEvidence } from './attribution.ts';
-import { evaluateChange, attributionResultsEqual } from './attribution-scoring.ts';
+import { evaluateChange, attributionResultsEqual, foldScoredEvidence } from './attribution-scoring.ts';
 import type { AnyEvent, ChangeAttributionData, EnrichmentPolicy, ObservedInterval } from './event.ts';
 
 export type TimerHandle = unknown;
@@ -116,7 +115,7 @@ export function createAttributionEngine(opts: AttributionEngineOptions): Attribu
     if (stopped) return;
     const c = changes.get(changeSeq);
     if (!c) return;
-    const invocations = foldEvidence(readEvents()).values();
+    const invocations = foldScoredEvidence(readEvents());
     const result = evaluateChange({
       path: c.path,
       interval: c.interval,

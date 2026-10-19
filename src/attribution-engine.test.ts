@@ -222,6 +222,18 @@ describe('attribution engine', () => {
     assert.deepEqual(h.results()[0]?.excluded_conflicts, [key('r1')]);
   });
 
+  it('keeps forked copies of one call apart when their tools differ', async () => {
+    const fork = { ...key('r1'), harness_session_id: 'h2' };
+    const h = harness([
+      evidenceEvent(1n, key('r1'), { at_ms: 1500, tool_name: 'Write' }),
+      evidenceEvent(2n, fork, { at_ms: 1500, tool_name: 'Edit' }),
+    ]);
+    h.engine.onChangeCommitted(change(10n, { start_ms: 1000, end_ms: 1000 }));
+    h.sched.advance(6000);
+    await h.engine.drain();
+    assert.equal(h.results()[0]?.status, 'ambiguous');
+  });
+
   it('is idempotent for a repeated change commit', async () => {
     const h = harness();
     const c = change(10n, { unavailable: true, reason: 'reconciliation' });

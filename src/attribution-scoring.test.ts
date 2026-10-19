@@ -1,8 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EnrichmentPolicy, EvidenceKey } from './event.ts';
-import type { Invocation } from './attribution.ts';
-import { attributionResultsEqual, evaluateChange } from './attribution-scoring.ts';
+import { attributionResultsEqual, evaluateChange, type ScoredInvocation as Invocation } from './attribution-scoring.ts';
 
 const SESSION = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -114,7 +113,7 @@ describe('attribution scoring', () => {
       // Conversation identity and log sequence differ for forked copies, but a
       // different tool assertion must remain a distinct attribution candidate.
       const withSignatures = (candidate: Invocation, signatures: readonly string[]): Invocation =>
-        ({ ...candidate, signatures } as Invocation);
+        ({ ...candidate, signatures });
       const r = run([
         withSignatures(copyA(), ['["Write","message",1000,{"kind":"paths","paths":["src/a.ts"]}]']),
         withSignatures(copyB(), ['["Edit","message",1000,{"kind":"paths","paths":["src/a.ts"]}]']),

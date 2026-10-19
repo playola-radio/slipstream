@@ -4,6 +4,7 @@
  * `attribution.ts` so the display fold's code boundary covers display code only.
  */
 import type {
+  AnyEvent,
   AttributionReason,
   AttributionStatus,
   ChangeAttributionData,
@@ -11,7 +12,29 @@ import type {
   EvidenceKey,
   ObservedInterval,
 } from './event.ts';
-import { evidenceKeyString, type Invocation } from './attribution.ts';
+import { evidenceKeyString, foldEvidence, variantSignature, type Invocation } from './attribution.ts';
+
+/** An invocation plus the distinct evidence facts its records assert. Kept here,
+ * not on {@link Invocation}, so the frozen display-fold closure stays unchanged. */
+export interface ScoredInvocation extends Invocation {
+  signatures: readonly string[];
+}
+
+/** {@link foldEvidence} plus each invocation's sorted, distinct variant signatures. */
+export function foldScoredEvidence(events: readonly AnyEvent[]): ScoredInvocation[] {
+  const signatures = new Map<string, Set<string>>();
+  for (const e of events) {
+    if (e.type !== 'slipstream.harness.evidence.v1') continue;
+    const keyStr = evidenceKeyString(e.data.evidence_key);
+    const set = signatures.get(keyStr) ?? new Set<string>();
+    set.add(variantSignature(e.data));
+    signatures.set(keyStr, set);
+  }
+  return [...foldEvidence(events).values()].map((inv) => ({
+    ...inv,
+    signatures: [...(signatures.get(inv.keyStr) ?? [])].sort(),
+  }));
+}
 
 export interface EvaluationInput {
   path: string;
@@ -19,7 +42,7 @@ export interface EvaluationInput {
   interval: ObservedInterval | undefined;
   /** The policy bound to this change (by sequence). */
   policy: EnrichmentPolicy;
-  invocations: Iterable<Invocation>;
+  invocations: Iterable<ScoredInvocation>;
 }
 
 export interface EvaluationResult {
@@ -42,7 +65,7 @@ function touchesPath(inv: Invocation, path: string): boolean {
   return inv.knownPaths.includes(path);
 }
 
-function isExactCopy(a: Invocation, b: Invocation): boolean {
+function isExactCopy(a: ScoredInvocation, b: ScoredInvocation): boolean {
   if (!sameStringSet(a.signatures, b.signatures)) return false;
   const pa = [...a.knownPaths].sort();
   const pb = [...b.knownPaths].sort();
@@ -64,20 +87,20 @@ function isExactCopy(a: Invocation, b: Invocation): boolean {
  * handled member by member, relevant members only.
  */
 function partitionInvocations(
-  invocations: Iterable<Invocation>,
-  isRelevant: (inv: Invocation) => boolean,
-): { eligible: Invocation[]; conflicts: Invocation[] } {
-  const groups = new Map<string, Invocation[]>();
+  invocations: Iterable<ScoredInvocation>,
+  isRelevant: (inv: ScoredInvocation) => boolean,
+): { eligible: ScoredInvocation[]; conflicts: ScoredInvocation[] } {
+  const groups = new Map<string, ScoredInvocation[]>();
   for (const inv of invocations) {
     const id = `${inv.key.harness}\u0000${inv.key.record_id}`;
     const group = groups.get(id);
     if (group === undefined) groups.set(id, [inv]);
     else group.push(inv);
   }
-  const eligible: Invocation[] = [];
-  const conflicts: Invocation[] = [];
+  const eligible: ScoredInvocation[] = [];
+  const conflicts: ScoredInvocation[] = [];
   for (const group of groups.values()) {
-    const [first] = group as [Invocation, ...Invocation[]];
+    const [first] = group as [ScoredInvocation, ...ScoredInvocation[]];
     const collapsible =
       group.length >= 2 && group.every((inv) => !inv.conflicted && isExactCopy(first, inv));
     if (collapsible) {
