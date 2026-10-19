@@ -1188,18 +1188,15 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return;
     }
     // A recovery that lands while the capture is stopping keeps the outage until
-    // the stop replaces it, and a clear that cannot be written is not shown.
+    // the stop replaces it. Clear synchronously so another outage records a
+    // fresh marker while this clear is still being written.
     const outage = entry.last_failure;
     if (state !== 'healthy' || c.lifecycle !== 'recording' || outage?.reason !== 'storage-unavailable'
       || outage.next_attempt_at_ms !== null) return;
-    // First make the outage visible if its original best-effort write lost the
-    // disk race. Only then clear it; neither background write can poison later
-    // attach, detach, or unlink controls.
-    persistIntent({ refuseOnFailure: false }).then(() => {
-      if (entry.last_failure !== outage) return;
-      entry.last_failure = null;
-      persistQuietly();
-    }).catch(() => {});
+    entry.last_failure = null;
+    // If the clear cannot reach disk, retain the outage for both readers. A
+    // newer outage wins over this recovery if it arrives before the write fails.
+    persistIntent({ refuseOnFailure: false }).catch(() => { entry.last_failure ??= outage; });
   }
 
   function onSessionLockLost(c: Capture, activation: Activation, reason: string): void {

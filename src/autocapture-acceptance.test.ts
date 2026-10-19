@@ -90,15 +90,16 @@ async function attachRecording(call: Call, root: string): Promise<string> {
 /** Push heartbeats 60 s back and read both readers at once. Their owners refresh
  * every 2 s; a refresh landing before both reads are over spoils the try, so try
  * again. */
-async function readStale(store: string, daemon: Daemon, locks: string[]): Promise<Record<string, unknown>> {
+async function readStale<T = undefined>(store: string, daemon: Daemon, locks: string[], extraRead?: () => Promise<T>): Promise<{ projection: Record<string, unknown>; extra: T }> {
   for (let i = 0; i < 5; i++) {
     const old = Math.trunc(Date.now() / 1000) - 60;
     for (const lock of locks) await utimes(lock, old, old);
     const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+    const extra = await extraRead?.();
     const held = await Promise.all(locks.map(async (lock) => Math.trunc((await stat(lock)).mtimeMs / 1000) === old));
     if (!held.every(Boolean)) continue;
     assert.deepEqual(fold, projection, 'stale heartbeats');
-    return projection;
+    return { projection, extra: extra as T };
   }
   assert.fail('a heartbeat refresh spoiled every try');
 }
@@ -153,10 +154,10 @@ describe('auto-capture acceptance: two independent readers', () => {
       assert.deepEqual(stateOf(rowOf(table, eighteenth!)), ['stopped', 'detached', null]);
 
       const owner = join(store, 'sessions', ids[4]!, 'owner.lock');
-      table = await readStale(store, daemon, [owner]);
+      table = (await readStale(store, daemon, [owner])).projection;
       assert.deepEqual(stateOf(rowOf(table, ids[4]!)), ['queued', null, null],
         'no live owner, but a live daemon: not recording, waiting on the daemon');
-      table = await readStale(store, daemon, [owner, join(store, 'owner.lock')]);
+      table = (await readStale(store, daemon, [owner, join(store, 'owner.lock')])).projection;
       assert.deepEqual(stateOf(rowOf(table, ids[4]!)), ['not_recording', 'daemon-unavailable', null]);
 
       await stop();
@@ -237,7 +238,7 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
 
   it('reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone', async () => {
     await withQueued(async ({ store, daemon, queued, stop }) => {
-      const table = await readStale(store, daemon, [join(store, 'owner.lock')]);
+      const table = (await readStale(store, daemon, [join(store, 'owner.lock')])).projection;
       assert.deepEqual(stateOf(rowOf(table, queued)), ['not_recording', 'daemon-unavailable', null]);
 
       await stop();
@@ -276,9 +277,9 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
       const [a] = await roots(1);
       const { id } = await linkRecording(call, store, a!, 'chat-a');
       await connect(call, store, 'chat-a', a!);
-      const table = await readStale(store, daemon, [join(store, 'sessions', id, 'owner.lock')]);
+      const { projection: table, extra: status } = await readStale(store, daemon, [join(store, 'sessions', id, 'owner.lock')],
+        async () => rec(await call({ verb: 'status', target: id })).capture as unknown as Row);
       assert.deepEqual(stateOf(rowOf(table, id)), ['queued', null, 'setup_pending']);
-      const status = rec(await call({ verb: 'status', target: id })).capture as unknown as Row;
       assert.deepEqual(stateOf(status), ['queued', null, 'setup_pending'],
         'control status applies the same heartbeat rule as the public reader');
     });
@@ -351,7 +352,7 @@ describe('auto-capture acceptance: failure states', () => {
       assert.deepEqual(stateOf(rowOf(table, ids.full)), ['recording', null, null]);
     });
   });
-  it('retries a background outage notice after recovery without disabling controls', async () => {
+  it('keeps showing a recovered outage to both readers while the intent record cannot be written', async () => {
     const disk = fillableStore();
     await withStore(async ({ store, roots, start }) => {
       const fake = createRootsPlatform();
