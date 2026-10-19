@@ -626,14 +626,17 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const daemonLive = isLive(await heartbeatOf(join(storeDir, 'owner.lock')));
     const rows = await Promise.all([...captures.values()].map(async (c) => {
       let { state, reason } = publicState(c);
+      let binding = bindingRow(c);
       const heartbeat = await heartbeatOf(join(storeDir, 'sessions', c.id, 'owner.lock'));
       // The public liveness rule (contracts.md §6, §7): a capture with no live
       // session owner is waiting on a live daemon, or not confirmed live at all.
+      // Waiting, it has no current activation, so no chat is connected in it.
       if (['queued', 'baselining', 'recording'].includes(state) && !isLive(heartbeat)) {
         [state, reason] = daemonLive ? ['queued', null] : ['not_recording', 'daemon-unavailable'];
+        if (daemonLive && binding?.state === 'connected') binding = { ...binding, state: 'setup_pending' };
       }
       return { session_id: c.id, root: c.root, state, reason, retry: retryOf(c), capture_mode: 'watch-only', heartbeat_ms: heartbeat,
-        binding: bindingRow(c) };
+        binding };
     }));
     return { as_of_ms: asOf, binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS }, captures: rows };
   }

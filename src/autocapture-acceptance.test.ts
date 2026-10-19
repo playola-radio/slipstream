@@ -270,6 +270,17 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
     });
   });
 
+  it('reads a connected chat as setup pending to both readers once its session heartbeat goes stale under a live daemon', async () => {
+    await withStore(async ({ store, roots, start }) => {
+      const { daemon, call } = await start();
+      const [a] = await roots(1);
+      const { id } = await linkRecording(call, store, a!, 'chat-a');
+      await connect(call, store, 'chat-a', a!);
+      const table = await readStale(store, daemon, [join(store, 'sessions', id, 'owner.lock')]);
+      assert.deepEqual(stateOf(rowOf(table, id)), ['queued', null, 'setup_pending']);
+    });
+  });
+
   it('reads a chat connected before the restart as setup pending to both readers while its capture waits to resume', async () => {
     await withStore(async ({ store, roots, start, stop }) => {
       const first = await start();

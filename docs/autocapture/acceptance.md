@@ -30,7 +30,7 @@ Files: `A` = `src/autocapture-acceptance.test.ts`,
 | Lost setup-check responses | R `offers an unanswered setup check again after its throttle`; D `starts a bound capture setup-pending and refuses questions until the setup check returns`; A `connects a chat exactly once when its setup-check answer is lost and it answers the re-offered check` | Covered |
 | Failed setup stays visible | D `does not report a failed baseline as cleanly stopped after detach`; R `retries a transient start failure with backoff and shows when it will retry`; A `stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history` (`baseline-failed` with its retry time in `status`, `/v1/captures` and the offline fold; the failure message appears in `status` only, since `/v1/captures` carries no message) | Covered |
 | Later readiness baselines current bytes without presenting earlier edits as captured history | A `stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history` (a file edited and a file created while failing appear only as `file.baselined` with the current bytes' hash; zero `file.changed`) | Covered |
-| Public-reader parity | A `agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing` (`/v1/captures` equals an independent fold of `control/intent.json`, the session logs and the heartbeats, for `recording`, `capture-limit-reached`, `stopped`/`detached`, `queued` and `daemon-unavailable` as heartbeats go stale, and chats `setup_pending`, `connected`, `unlinked` and `unavailable`; the `status` verb shows the same states); A `reads as baselining to both readers until its baseline finishes`; A `reads as queued to both readers while the daemon holds the store`; A `reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone`; A `reads a restarted capture still waiting to resume as queued to both readers`; A `read root-missing, watcher-failed and storage-unavailable the same to both readers` (including recovery back to `recording`); A `keeps showing a recovered outage to both readers while the intent record cannot be written`; A `reads a chat connected before the restart as setup pending to both readers while its capture waits to resume`; the two Codex tests above; D `lets independent readers follow each capture and lists every capture` | Covered |
+| Public-reader parity | A `agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing` (`/v1/captures` equals an independent fold of `control/intent.json`, the session logs and the heartbeats, for `recording`, `capture-limit-reached`, `stopped`/`detached`, `queued` and `daemon-unavailable` as heartbeats go stale, and chats `setup_pending`, `connected`, `unlinked` and `unavailable`; the `status` verb shows the same states); A `reads as baselining to both readers until its baseline finishes`; A `reads as queued to both readers while the daemon holds the store`; A `reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone`; A `reads a restarted capture still waiting to resume as queued to both readers`; A `read root-missing, watcher-failed and storage-unavailable the same to both readers` (including recovery back to `recording`); A `keeps showing a recovered outage to both readers while the intent record cannot be written`; A `reads a chat connected before the restart as setup pending to both readers while its capture waits to resume`; A `reads a connected chat as setup pending to both readers once its session heartbeat goes stale under a live daemon`; the two Codex tests above; D `lets independent readers follow each capture and lists every capture` | Covered |
 | Native parity | none | P6a (native client), not this PR |
 | Real-use overhead check at 16 captures with linked chats (the D8 verdict) | none; [real-use-check.md](real-use-check.md) is the runbook | Real-use day, not run |
 | The 17th workspace is visibly NOT recording (`capture-limit-reached`) | D `holds a seventeenth workspace waiting and starts the oldest waiting one when a slot frees`; A `agree on capture and binding states …` (in `status`, `/v1/captures` and the fold) | Covered |
@@ -71,8 +71,9 @@ Product code changed in P6d; each change was a test seen failing first.
 - **A chat connected before a restart read `connected` offline while its
   capture waited to resume** (fixed in P6d). The daemon shows it
   `setup_pending`; the fold took `connected` from the previous activation. A
-  capture read `queued` under §6 rule 7 has no current activation, so the fold
-  now reads its binding as `setup_pending` too.
+  capture read `queued` under §6 rule 7 has no current activation, so both
+  readers now read a connected binding there as `setup_pending`, including the
+  daemon when a live capture's session heartbeat goes stale.
 - **A store failing mid-recording read as `recording` offline** (fixed in P6d).
   The daemon showed `storage-unavailable` from the session's live health but
   wrote nothing to disk. It now records the outage as the capture's
@@ -80,7 +81,10 @@ Product code changed in P6d; each change was a test seen failing first.
   unless the capture is already stopping or the clear cannot be written (then
   both readers keep showing the outage). If the intent record cannot be written
   when the outage begins, an offline reader cannot see it; the session's
-  `capture.gap{storage}` appended on recovery discloses it.
+  `capture.gap{storage}` appended on recovery discloses it. A clear whose file
+  was renamed into place but whose directory sync then failed reads `recording`
+  offline while the daemon still shows the outage, until the daemon restarts;
+  that errs toward showing less coverage, and is left as is.
 - **A changed Codex version reads `identity-changed`, not
   `runtime-unsupported`.** Codex transcript verification does not tell the two
   apart. Both readers agree; the reason is just less specific than for Claude.
