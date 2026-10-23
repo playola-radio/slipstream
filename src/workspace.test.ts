@@ -17,7 +17,8 @@ function fake(opts: {
   record?: number;
   withdraw?: number;
   script?: number;
-  realpath?: (path: string) => string;
+  recordError?: Error;
+  scriptsError?: Error;
 } = {}) {
   const calls: string[] = [];
   const out: string[] = [];
@@ -29,12 +30,20 @@ function fake(opts: {
       calls.push(`git ${key} @${cwd}`);
       return opts.git?.[key] ?? { code: 0, output: '' };
     },
-    record: async (dir) => { calls.push(`record ${dir}`); return opts.record ?? 0; },
+    record: async (dir) => {
+      calls.push(`record ${dir}`);
+      if (opts.recordError) throw opts.recordError;
+      return opts.record ?? 0;
+    },
     withdraw: async (dir) => { calls.push(`withdraw ${dir}`); return opts.withdraw ?? 0; },
-    scripts: async (dir) => { calls.push(`scripts ${dir}`); return opts.scripts ?? { setup: 'make setup', archive: 'make clean' }; },
+    scripts: async (dir) => {
+      calls.push(`scripts ${dir}`);
+      if (opts.scriptsError) throw opts.scriptsError;
+      return opts.scripts ?? { setup: 'make setup', archive: 'make clean' };
+    },
     runScript: async (script, cwd, env) => { calls.push(`run ${script} @${cwd} ${JSON.stringify(env)}`); return opts.script ?? 0; },
     exists: async (path) => (opts.existing ?? []).includes(path),
-    realpath: async (path) => (opts.realpath ? opts.realpath(path) : path),
+    realpath: async (path) => path,
     out: (line) => out.push(line),
     err: (line) => err.push(line),
   };
@@ -42,10 +51,11 @@ function fake(opts: {
 }
 
 const NO_BRANCH: Reply = { code: 1, output: '' };
+const REV_PARSE = 'rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir';
 
 function createGit(extra: Record<string, Reply> = {}): Record<string, Reply> {
   return {
-    'rev-parse --show-toplevel': { code: 0, output: `${ROOT}\n` },
+    [REV_PARSE]: { code: 0, output: `${ROOT}\n${ROOT}/.git\n${ROOT}/.git\n` },
     'remote get-url origin': { code: 0, output: 'git@github.com:o/repo.git\n' },
     'show-ref --verify --quiet refs/remotes/origin/develop': { code: 0, output: '' },
     'show-ref --verify --quiet refs/heads/slipstream/workspace-1': NO_BRANCH,
@@ -60,17 +70,17 @@ describe('runWorkspaceCreate', () => {
     const f = fake({ git: createGit() });
     assert.equal(await runWorkspaceCreate('/src/repo', f.deps), 0);
     assert.deepEqual(f.calls, [
-      'git rev-parse --show-toplevel @/src/repo',
+      `git ${REV_PARSE} @/src/repo`,
       `git remote get-url origin @${ROOT}`,
       `git fetch origin @${ROOT}`,
       `git show-ref --verify --quiet refs/remotes/origin/develop @${ROOT}`,
       `git show-ref --verify --quiet refs/heads/slipstream/workspace-1 @${ROOT}`,
-      `git worktree add -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`,
+      `git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`,
       `record ${WS}`,
       `scripts ${WS}`,
       `run make setup @${WS} ${JSON.stringify(SETUP_ENV)}`,
     ]);
-    assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
+    assert.deepEqual(f.out.slice(-2), ['', `workspace_path: ${WS}`]);
   });
 
   it('falls back to origin/HEAD when there is no origin/develop', async () => {
@@ -79,7 +89,7 @@ describe('runWorkspaceCreate', () => {
       'symbolic-ref --short refs/remotes/origin/HEAD': { code: 0, output: 'origin/main\n' },
     }) });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
-    assert.ok(f.calls.includes(`git worktree add -b slipstream/workspace-1 ${WS} origin/main @${ROOT}`), f.calls.join('\n'));
+    assert.ok(f.calls.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/main @${ROOT}`), f.calls.join('\n'));
   });
 
   it('creates nothing when the repo has no origin', async () => {
@@ -102,10 +112,10 @@ describe('runWorkspaceCreate', () => {
   });
 
   it('creates nothing when the folder is not in a git repo', async () => {
-    const f = fake({ git: { 'rev-parse --show-toplevel': { code: 128, output: 'fatal: not a git repository\n' } } });
+    const f = fake({ git: { [REV_PARSE]: { code: 128, output: 'fatal: not a git repository\n' } } });
     assert.equal(await runWorkspaceCreate('/tmp/plain', f.deps), 1);
     assert.match(f.err.join('\n'), /not inside a git repository/);
-    assert.deepEqual(f.calls, ['git rev-parse --show-toplevel @/tmp/plain']);
+    assert.deepEqual(f.calls, [`git ${REV_PARSE} @/tmp/plain`]);
   });
 
   it('picks the next free number when the folder or the branch is taken', async () => {
@@ -115,14 +125,38 @@ describe('runWorkspaceCreate', () => {
     });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
     assert.ok(f.calls.includes(
-      `git worktree add -b slipstream/workspace-3 /h/slipstream/workspaces/repo/workspace-3 origin/develop @${ROOT}`), f.calls.join('\n'));
+      `git worktree add --no-track -b slipstream/workspace-3 /h/slipstream/workspaces/repo/workspace-3 origin/develop @${ROOT}`), f.calls.join('\n'));
   });
 
   it('a subfolder of a repo uses the repo top level', async () => {
     const f = fake({ git: createGit() });
     assert.equal(await runWorkspaceCreate('/src/repo/packages/app', f.deps), 0);
-    assert.equal(f.calls[0], 'git rev-parse --show-toplevel @/src/repo/packages/app');
-    assert.ok(f.calls.includes(`git worktree add -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`), f.calls.join('\n'));
+    assert.equal(f.calls[0], `git ${REV_PARSE} @/src/repo/packages/app`);
+    assert.ok(f.calls.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`), f.calls.join('\n'));
+  });
+
+  it('a linked worktree branches from its main checkout', async () => {
+    const f = fake({ git: createGit({
+      [REV_PARSE]: { code: 0, output: `/src/other-wt\n${ROOT}/.git/worktrees/other-wt\n${ROOT}/.git\n` },
+    }) });
+    assert.equal(await runWorkspaceCreate('/src/other-wt', f.deps), 0);
+    assert.ok(f.calls.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`), f.calls.join('\n'));
+    assert.ok(f.calls.includes(`run make setup @${WS} ${JSON.stringify(SETUP_ENV)}`), f.calls.join('\n'));
+  });
+
+  it('a recording error still runs setup and prints the path', async () => {
+    const f = fake({ git: createGit(), recordError: new Error('control socket closed') });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.match(f.err.join('\n'), /control socket closed/);
+    assert.ok(f.calls.some((c) => c.startsWith('run make setup')));
+    assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
+  });
+
+  it('an unreadable conductor.json still prints the path', async () => {
+    const f = fake({ git: createGit(), scriptsError: new Error('EISDIR: illegal operation on a directory') });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.match(f.err.join('\n'), /EISDIR/);
+    assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
   });
 
   it('setup still runs when recording fails, and the exit says so', async () => {
@@ -148,7 +182,6 @@ describe('runWorkspaceCreate', () => {
   });
 });
 
-const REV_PARSE = 'rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir';
 const ARCHIVE_ENV = { CONDUCTOR_ROOT_PATH: ROOT, CONDUCTOR_WORKSPACE_PATH: WS };
 
 function archiveGit(extra: Record<string, Reply> = {}): Record<string, Reply> {

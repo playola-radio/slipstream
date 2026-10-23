@@ -35,7 +35,7 @@ describe('slipstream workspace against real git and a disposable daemon', () => 
       await mkdir(seed);
       await git(['init', '-b', 'develop'], seed);
       await writeFile(join(seed, 'conductor.json'), JSON.stringify({
-        scripts: { setup: 'echo set > setup-ran.txt; echo SETUP-DONE', archive: 'echo ARCHIVE-DONE' },
+        scripts: { setup: 'echo set > setup-ran.txt; printf SETUP-DONE', archive: 'echo ARCHIVE-DONE' },
       }));
       await writeFile(join(seed, '.gitignore'), 'setup-ran.txt\n');
       await git(['add', '.'], seed);

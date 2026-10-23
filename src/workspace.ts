@@ -1,5 +1,5 @@
 import { basename, dirname, join, relative, sep } from 'node:path';
-import { SettingsError, type ScriptKind, type Scripts } from './conductor-settings.ts';
+import { type ScriptKind, type Scripts } from './conductor-settings.ts';
 
 /**
  * `slipstream workspace create|archive`: git worktree workspaces for people who
@@ -26,14 +26,17 @@ export function workspacesRoot(home: string): string {
 }
 
 const BRANCH_PREFIX = 'slipstream/';
+const REV_PARSE = ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'];
 
 export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Promise<number> {
-  const top = await deps.git(['rev-parse', '--show-toplevel'], repo);
-  if (top.code !== 0) {
+  const where = await deps.git(REV_PARSE, repo);
+  const [top, gitDir, commonDir] = where.output.replace(/\n$/, '').split('\n');
+  if (where.code !== 0 || !top || !commonDir) {
     deps.err(`slipstream: ${repo} is not inside a git repository.`);
     return 1;
   }
-  const root = top.output.trim();
+  // A linked worktree branches from, and runs scripts against, its main checkout.
+  const root = gitDir === commonDir ? top : dirname(commonDir);
   if ((await deps.git(['remote', 'get-url', 'origin'], root)).code !== 0) {
     deps.err(`slipstream: ${root} has no "origin" remote to branch from.`);
     return 1;
@@ -53,15 +56,20 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
   while (await deps.exists(join(parent, `workspace-${n}`))
     || (await deps.git(['show-ref', '--verify', '--quiet', `refs/heads/${BRANCH_PREFIX}workspace-${n}`], root)).code === 0) n++;
   const branch = `${BRANCH_PREFIX}workspace-${n}`;
-  const add = await deps.git(['worktree', 'add', '-b', branch, join(parent, `workspace-${n}`), base], root);
+  const add = await deps.git(['worktree', 'add', '--no-track', '-b', branch, join(parent, `workspace-${n}`), base], root);
   if (add.code !== 0) {
     deps.err(`slipstream: git worktree add failed:\n${add.output.trim()}`);
     return 1;
   }
   const path = await deps.realpath(join(parent, `workspace-${n}`));
   deps.out(`created ${path} on ${branch} from ${base}`);
-  const recorded = await deps.record(path);
+  const recorded = await deps.record(path).catch((err: unknown) => {
+    deps.err(`slipstream: couldn't record ${path}: ${errorMessage(err)}`);
+    return 1;
+  });
   const setUp = await runRepoScript('setup', root, path, deps);
+  // Ends any unterminated line the setup script left, so the path stays on a line of its own.
+  deps.out('');
   deps.out(`workspace_path: ${path}`);
   return recorded === 0 && setUp ? 0 : 1;
 }
@@ -74,7 +82,7 @@ export async function runWorkspaceArchive(dir: string, deps: WorkspaceDeps): Pro
     deps.err(`slipstream: workspace archive only archives folders under ${workspacesRoot(deps.home)}/<repo>/<name>.`);
     return 1;
   }
-  const where = await deps.git(['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'], path);
+  const where = await deps.git(REV_PARSE, path);
   const [top, gitDir, commonDir] = where.output.trim().split('\n');
   if (where.code !== 0 || top !== path || !commonDir || gitDir === commonDir) {
     deps.err(`slipstream: ${path} is not a git worktree.`);
@@ -108,8 +116,7 @@ async function baseBranch(root: string, deps: WorkspaceDeps): Promise<string | n
 async function runRepoScript(kind: ScriptKind, root: string, path: string, deps: WorkspaceDeps): Promise<boolean> {
   let scripts: Scripts;
   try { scripts = await deps.scripts(path); } catch (err) {
-    if (!(err instanceof SettingsError)) throw err;
-    deps.err(`slipstream: ${err.message}`);
+    deps.err(`slipstream: ${errorMessage(err)}`);
     return false;
   }
   const script = scripts[kind];
@@ -117,4 +124,8 @@ async function runRepoScript(kind: ScriptKind, root: string, path: string, deps:
   const code = await deps.runScript(script, path, { CONDUCTOR_ROOT_PATH: root, CONDUCTOR_WORKSPACE_PATH: path });
   if (code !== 0) deps.err(`slipstream: the ${kind} script exited ${code}.`);
   return code === 0;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
