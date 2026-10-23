@@ -735,6 +735,22 @@ for (const kind of ['file', 'stale socket'] as const) {
   }
 }
 
+describe('cli workspace', () => {
+  it('parses create and archive with a folder and an optional store', () => {
+    for (const action of ['create', 'archive']) {
+      assert.deepEqual(parseArgs(['workspace', action, 'rel/dir', '--store', '/s']),
+        { command: 'workspace', action, dir: resolve('rel/dir'), store: '/s' });
+      assert.equal((parseArgs(['workspace', action, '/d']) as { store: string }).store.length > 0, true);
+    }
+  });
+  it('refuses a missing folder, extra arguments and unknown actions', () => {
+    assert.equal(parseArgs(['workspace', 'create']), null);
+    assert.equal(parseArgs(['workspace', 'create', '/a', '/b']), null);
+    assert.equal(parseArgs(['workspace', 'create', '/a', '--force']), null);
+    assert.equal(parseArgs(['workspace', 'delete', '/a']), null);
+  });
+});
+
 describe('cli conductor', () => {
   it('parses each conductor action with an optional store', () => {
     for (const action of ['install', 'setup', 'archive', 'enroll']) {
