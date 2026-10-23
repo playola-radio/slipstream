@@ -52,7 +52,7 @@ import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-h
 import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
 import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
-import { ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
+import { DaemonUnavailableError, ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
 import {
   InventoryError, readConductorInventory, runConductorArchive, runConductorEnroll, runConductorInstall, runConductorSetup,
@@ -596,6 +596,19 @@ async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<
   }
 }
 
+/** Watch-only attach that first starts this store's daemon when none is running. */
+async function watchOnlyWithDaemon(dir: string, store: string, wait: boolean): Promise<number> {
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  try {
+    await ensureDaemon(store, await daemonStarter(store, cliPath));
+  } catch (err) {
+    if (!(err instanceof DaemonUnavailableError)) throw err;
+    console.error(`slipstream: ${err.message}`);
+    return 1;
+  }
+  return runWatchOnly(dir, store, wait);
+}
+
 const runCommand: Run = (command, commandArgs) => new Promise((done) => {
   execFile(command, commandArgs, { timeout: 30_000 }, (err, stdout, stderr) => {
     const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
@@ -801,7 +814,7 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'attach' && args.watchOnly) {
-    process.exitCode = await runWatchOnly(args.dir, args.store, args.wait === true);
+    process.exitCode = await watchOnlyWithDaemon(args.dir, args.store, args.wait === true);
     return;
   }
 
