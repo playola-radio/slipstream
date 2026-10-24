@@ -231,6 +231,33 @@ Slipstream still records filesystem states but leaves that attribution unavailab
 Everything about `attach`, including exactly which files it edits:
 [docs/connect-agent-chat.md](docs/connect-agent-chat.md).
 
+### Workspaces without Conductor
+
+```sh
+slipstream workspace create ~/code/myrepo
+slipstream workspace archive ~/slipstream/workspaces/myrepo/workspace-1
+```
+
+`create` makes a git worktree at `~/slipstream/workspaces/<repo>/workspace-N` on
+a new branch `slipstream/workspace-N`, using the smallest N that is free. It
+fetches `origin` and starts from `origin/develop`, or from origin's default
+branch when there is no `develop`. A repo with no `origin` is refused. Then it
+starts the daemon if needed, starts recording the workspace, and runs the repo's
+committed setup script (`.conductor/settings.toml` or `conductor.json`, the same
+files Conductor reads). It waits for setup to finish. Its last line is
+`workspace_path: <folder>`, printed whenever the folder was made, even if
+recording or setup then failed; a failed setup leaves the workspace in place.
+
+`archive` only works on a folder directly under `~/slipstream/workspaces/<repo>/`.
+It refuses a workspace with uncommitted or untracked changes (ignored files are
+fine). Otherwise it stops the recording, runs the repo's archive script, and
+removes the worktree. The branch is kept. If the archive script fails, the
+worktree stays and you can run `archive` again.
+
+Both scripts run in the workspace with `CONDUCTOR_ROOT_PATH` (the repo's main
+checkout) and `CONDUCTOR_WORKSPACE_PATH` (the workspace) set, so scripts written
+for Conductor work unchanged.
+
 ## Group changes by task
 
 An agent can label its work so the feed groups changes under titles like "Fix
@@ -364,6 +391,7 @@ The full decision record is in [NOTES-architecture.md](NOTES-architecture.md).
 | `status` / `detach` | Show or stop the active recording |
 | `conductor install` / `conductor enroll` | Keep the daemon running and capture every Conductor workspace |
 | `conductor setup` / `conductor archive` | Run by Conductor's setup and archive scripts |
+| `workspace create <repo>` / `workspace archive <folder>` | Make a worktree workspace, set it up and record it / remove it |
 | `view --store dir [--session id] [--changes] [--context N] [--full] [--disk]` | List sessions, or follow one live in the terminal |
 | `ask --store dir --session id --request-id uuid --input file` | Queue a question for the agent (experimental) |
 | `hook <codex\|claude-code> post-tool-use` | The hook command agents run to receive questions |

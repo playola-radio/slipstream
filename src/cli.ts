@@ -28,6 +28,12 @@
  *
  *   slipstream conductor install|setup|archive|enroll [--store <dir>]
  *
+ * Workspaces without Conductor: a git worktree under ~/slipstream/workspaces,
+ * set up and recorded, and later archived.
+ *
+ *   slipstream workspace create <repo-dir> [--store <dir>]
+ *   slipstream workspace archive <workspace-dir> [--store <dir>]
+ *
  * Maintenance of retained sessions (only while the daemon is detached):
  *
  *   slipstream delete <session-id> [--store <dir>]
@@ -52,11 +58,13 @@ import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-h
 import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
 import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
-import { ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
+import { DaemonUnavailableError, ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
 import {
   InventoryError, readConductorInventory, runConductorArchive, runConductorEnroll, runConductorInstall, runConductorSetup,
+  sharedScripts,
 } from './conductor.ts';
+import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -83,10 +91,13 @@ type Args =
   | { command: 'ask'; store: string; sessionId: string; requestId: string; inputPath: string }
   | { command: 'delete'; store: string; sessionId: string }
   | { command: 'gc'; store: string }
-  | { command: 'conductor'; action: ConductorAction; store: string };
+  | { command: 'conductor'; action: ConductorAction; store: string }
+  | { command: 'workspace'; action: WorkspaceAction; dir: string; store: string };
 
 const CONDUCTOR_ACTIONS = ['install', 'setup', 'archive', 'enroll'] as const;
 type ConductorAction = typeof CONDUCTOR_ACTIONS[number];
+const WORKSPACE_ACTIONS = ['create', 'archive'] as const;
+type WorkspaceAction = typeof WORKSPACE_ACTIONS[number];
 const CONDUCTOR_DB = join(homedir(), 'Library', 'Application Support', 'com.conductor.app', 'conductor.db');
 
 /** The shared daemon's default store lives under the home dir, not the worktree:
@@ -347,6 +358,12 @@ export function parseArgs(argv: string[]): Args | null {
     const store = parseStoreOnly(argv.slice(2));
     return store === null ? null : { command, action: argv[1] as ConductorAction, store };
   }
+  if (command === 'workspace' && (WORKSPACE_ACTIONS as readonly string[]).includes(argv[1] ?? '')) {
+    const dir = argv[2];
+    if (dir === undefined || dir.startsWith('--')) return null;
+    const store = parseStoreOnly(argv.slice(3));
+    return store === null ? null : { command, action: argv[1] as WorkspaceAction, dir: resolve(dir), store };
+  }
   if (command === 'view') return { command: 'view' };
   return null;
 }
@@ -372,6 +389,8 @@ function usage(): void {
   console.error('       slipstream conductor install [--store <dir>]   (LaunchAgent + Conductor setup/archive scripts)');
   console.error('       slipstream conductor enroll  [--store <dir>]   (capture every existing Conductor workspace)');
   console.error('       slipstream conductor setup|archive [--store <dir>]   (run by Conductor\'s scripts)');
+  console.error('       slipstream workspace create <repo-dir> [--store <dir>]   (new worktree under ~/slipstream/workspaces)');
+  console.error('       slipstream workspace archive <workspace-dir> [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
   console.error('       slipstream delete <session-id> [--store <dir>]');
   console.error('       slipstream gc     [--store <dir>]');
@@ -596,6 +615,19 @@ async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<
   }
 }
 
+/** Watch-only attach that first starts this store's daemon when none is running. */
+async function watchOnlyWithDaemon(dir: string, store: string, wait: boolean): Promise<number> {
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  try {
+    await ensureDaemon(store, await daemonStarter(store, cliPath));
+  } catch (err) {
+    if (!(err instanceof DaemonUnavailableError)) throw err;
+    console.error(`slipstream: ${err.message}`);
+    return 1;
+  }
+  return runWatchOnly(dir, store, wait);
+}
+
 const runCommand: Run = (command, commandArgs) => new Promise((done) => {
   execFile(command, commandArgs, { timeout: 30_000 }, (err, stdout, stderr) => {
     const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
@@ -672,6 +704,33 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
     err(`slipstream: ${retryGuidance('attach')}`);
     return 3;
   }
+}
+
+async function runWorkspace(action: WorkspaceAction, dir: string, store: string): Promise<number> {
+  const deps: WorkspaceDeps = {
+    home: homedir(),
+    git: (args, cwd) => new Promise((done) => {
+      execFile('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (err, stdout, stderr) => {
+        done({ code: err ? (typeof err.code === 'number' ? err.code : null) : 0, output: `${stdout}${stderr}` });
+      });
+    }),
+    record: (path) => watchOnlyWithDaemon(path, store, true),
+    withdraw: async (path) => {
+      await runWithdrawal(store, (w) => runWithdraw({ target: path, reason: 'archived', missingOk: true }, w), 'detach');
+      return Number(process.exitCode ?? 0);
+    },
+    scripts: sharedScripts,
+    runScript: (script, cwd, env) => new Promise((done) => {
+      const child = spawn('/bin/sh', ['-c', script], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'inherit', 'inherit'] });
+      child.once('exit', (code) => done(code ?? 1));
+      child.once('error', () => done(1));
+    }),
+    exists: (path) => lstat(path).then(() => true, () => false),
+    realpath: (path) => realpath(path),
+    out: (line) => console.log(line),
+    err: (line) => console.error(line),
+  };
+  return action === 'create' ? runWorkspaceCreate(dir, deps) : runWorkspaceArchive(dir, deps);
 }
 
 async function runIdentity(store: string, request: Record<string, unknown> & { verb: 'attach'; worktree: string }): Promise<void> {
@@ -801,12 +860,17 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'attach' && args.watchOnly) {
-    process.exitCode = await runWatchOnly(args.dir, args.store, args.wait === true);
+    process.exitCode = await watchOnlyWithDaemon(args.dir, args.store, args.wait === true);
     return;
   }
 
   if (args.command === 'conductor') {
     process.exitCode = await runConductor(args.action, args.store);
+    return;
+  }
+
+  if (args.command === 'workspace') {
+    process.exitCode = await runWorkspace(args.action, args.dir, args.store);
     return;
   }
 

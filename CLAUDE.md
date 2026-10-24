@@ -37,8 +37,8 @@ tool lie to its user, which is worse than missing a feature.
   and append-only. A failed parse degrades the view; it never drops an event.
 - **Durability ordering.** Blobs are written and durably published *before* the
   events referencing them are appended. `fsync` the file and its directory.
-- **The daemon does not launch agents.** Conductor creates and sets up
-  workspaces. The Slipstream client may run the chat agent inside a watched
+- **The daemon does not launch agents.** Conductor, or the
+  `slipstream workspace` command (Brian, 2026-10-23), creates and sets up workspaces. The Slipstream client may run the chat agent inside a watched
   workspace (Brian, 2026-10-18; `docs/chat-console/DESIGN.md`). A client-run
   chat is never a capture source and never emits file-change events. Chats
   Conductor runs still arrive through user-level MCP and skill config.

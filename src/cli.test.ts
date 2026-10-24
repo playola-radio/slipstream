@@ -465,6 +465,36 @@ describe('cli conductor scripts against a running daemon', () => {
   });
 });
 
+describe('cli attach --watch-only without a running daemon', () => {
+  it('starts the daemon, then records the folder', async () => {
+    const { mkdtemp, mkdir, readFile, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFile } = await import('node:child_process');
+    const { probeSocket } = await import('./daemon.ts');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-watch-ensure-')));
+    const work = join(dir, 'work'); const store = join(dir, 'store');
+    await mkdir(work);
+    try {
+      const result = await new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+        execFile(process.execPath, ['src/cli.ts', 'attach', '--watch-only', '--wait', work, '--store', store],
+          { env: { PATH: process.env.PATH, HOME: dir }, cwd: process.cwd(), timeout: 30_000 },
+          (error, stdout, stderr) => done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /state: recording/);
+      assert.equal(await probeSocket(join(store, 'control.sock'), 200), 'live');
+    } finally {
+      const lock = await readFile(join(store, 'owner.lock'), 'utf8').catch(() => null);
+      if (lock) {
+        process.kill((JSON.parse(lock) as { pid: number }).pid, 'SIGTERM');
+        while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
     assert.deepEqual(parseArgs(['start', '--store', '/s']), {
@@ -704,6 +734,22 @@ for (const kind of ['file', 'stale socket'] as const) {
     });
   }
 }
+
+describe('cli workspace', () => {
+  it('parses create and archive with a folder and an optional store', () => {
+    for (const action of ['create', 'archive']) {
+      assert.deepEqual(parseArgs(['workspace', action, 'rel/dir', '--store', '/s']),
+        { command: 'workspace', action, dir: resolve('rel/dir'), store: '/s' });
+      assert.equal((parseArgs(['workspace', action, '/d']) as { store: string }).store.length > 0, true);
+    }
+  });
+  it('refuses a missing folder, extra arguments and unknown actions', () => {
+    assert.equal(parseArgs(['workspace', 'create']), null);
+    assert.equal(parseArgs(['workspace', 'create', '/a', '/b']), null);
+    assert.equal(parseArgs(['workspace', 'create', '/a', '--force']), null);
+    assert.equal(parseArgs(['workspace', 'delete', '/a']), null);
+  });
+});
 
 describe('cli conductor', () => {
   it('parses each conductor action with an optional store', () => {
