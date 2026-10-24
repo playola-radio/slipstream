@@ -293,14 +293,17 @@ export async function startCapture(
     line_start: context.line_start,
     line_end: context.line_end,
   });
-  // Questions not yet attempted. Removed once dispatch is attempted (durably
-  // consumed either way) so eligibility counting and claim lookup scan only
-  // outstanding questions, not every question ever queued by a long-lived capture.
-  const unattemptedQuestions = new Map<string, QuestionQueuedEvent>();
+  // Questions a chat may claim. Removed once dispatch is attempted (durably
+  // consumed either way) or answered, so eligibility counting and claim lookup
+  // scan only outstanding questions, not every question ever queued by a
+  // long-lived capture. An unlink re-arms the unanswered ones for the next chat.
+  const claimableQuestions = new Map<string, QuestionQueuedEvent>();
   // Kept for the capture's lifetime: a question stays answerable after it
-  // leaves the unattempted queue or passes its claim TTL.
-  const questionsById = new Map<string, QuestionQueuedData>();
-  const attemptSeqs = new Map<string, string>();
+  // leaves the claimable queue or passes its claim TTL.
+  const questionsById = new Map<string, QuestionQueuedEvent>();
+  // Every chat a question was handed to, in attempt order.
+  const attemptsById = new Map<string, Array<{ target: QuestionQueuedData['target']; seq: string }>>();
+  let latestResumeSeq = 0n;
   const committedAnswers = new Map<string, { text: string; result: AnswerAccepted }>();
   const inflightAnswers = new Map<string, { text: string; promise: Promise<AnswerAccepted> }>();
   let currentTaskId: string | undefined;
@@ -312,19 +315,30 @@ export async function startCapture(
   // durably-committed change/evidence/policy reaches it exactly once, in order.
   let producer: AttributionProducer | undefined;
 
+  const noteAttempt = (event: QuestionDispatchAttemptedEvent): void => {
+    const id = event.data.question_id;
+    // An attempt written before attempts recorded their chat went to the queued target.
+    const target = event.data.target ?? questionsById.get(id)!.data.target;
+    attemptsById.set(id, [...attemptsById.get(id) ?? [], { target, seq: event.seq }]);
+  };
+
   const seedTaskState = (rec: RecoveredSession): void => {
-    committedQuestions.clear();
-    unattemptedQuestions.clear();
+    committedQuestions.clear(); claimableQuestions.clear(); questionsById.clear(); attemptsById.clear(); committedAnswers.clear();
+    latestResumeSeq = rec.resumeSeq;
     for (const event of rec.questions) {
       committedQuestions.set(event.data.request_id, { body: questionBody(event.data), result: questionResult(event) });
+      questionsById.set(event.data.question_id, event);
       // Questions queued before the latest resume stay history only (D2).
-      if (BigInt(event.seq) > rec.taskResetSeq) unattemptedQuestions.set(event.data.question_id, event);
+      if (BigInt(event.seq) > rec.resumeSeq) claimableQuestions.set(event.data.question_id, event);
     }
-    for (const event of rec.questionAttempts) unattemptedQuestions.delete(event.data.question_id);
-    questionsById.clear(); attemptSeqs.clear(); committedAnswers.clear();
-    for (const event of rec.questions) questionsById.set(event.data.question_id, event.data);
-    for (const event of rec.questionAttempts) attemptSeqs.set(event.data.question_id, event.seq);
-    for (const event of rec.questionAnswers) committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
+    for (const event of rec.questionAttempts) {
+      noteAttempt(event);
+      if (BigInt(event.seq) > rec.unlinkSeq) claimableQuestions.delete(event.data.question_id);
+    }
+    for (const event of rec.questionAnswers) {
+      committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
+      claimableQuestions.delete(event.data.question_id);
+    }
     committedExchanges.clear(); exchangesById.clear();
     for (const event of rec.questionExchanges) {
       committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
@@ -358,23 +372,33 @@ export async function startCapture(
       };
     },
     onCommitted: (event) => {
-      // A resume or an unlinked chat leaves no current task or claimable questions (D1/D2).
-      if (event.type === 'slipstream.session.resumed.v1' || event.type === 'slipstream.agent.unlinked.v1') {
+      // A resume or an unlinked chat leaves no current task (D1). A resume leaves no
+      // claimable questions (D2); an unlink hands every unanswered question queued
+      // since the latest resume to whichever chat is linked next.
+      if (event.type === 'slipstream.session.resumed.v1') {
         currentTaskId = undefined;
-        unattemptedQuestions.clear();
+        latestResumeSeq = BigInt(event.seq);
+        claimableQuestions.clear();
+      }
+      if (event.type === 'slipstream.agent.unlinked.v1') {
+        currentTaskId = undefined;
+        for (const [id, queued] of questionsById) {
+          if (BigInt(queued.seq) > latestResumeSeq && !committedAnswers.has(id)) claimableQuestions.set(id, queued);
+        }
       }
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
       if (event.type === 'slipstream.question.queued.v1') {
-        unattemptedQuestions.set(event.data.question_id, event);
-        questionsById.set(event.data.question_id, event.data);
+        claimableQuestions.set(event.data.question_id, event);
+        questionsById.set(event.data.question_id, event);
       }
       if (event.type === 'slipstream.question.dispatch_attempted.v1') {
-        unattemptedQuestions.delete(event.data.question_id);
-        attemptSeqs.set(event.data.question_id, event.seq);
+        claimableQuestions.delete(event.data.question_id);
+        noteAttempt(event);
       }
       if (event.type === 'slipstream.question.answered.v1') {
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
+        claimableQuestions.delete(event.data.question_id);
       }
       if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, sourceContext(event.data.context));
       if (isCoreEvent(event)) producer?.noteCommitted(event);
@@ -1120,7 +1144,7 @@ export async function startCapture(
     if (settled) return { ...settled.result, duplicate: true };
     if (pending) return { ...await pending.promise, duplicate: true };
     if (req.reply_to_question_id !== undefined) {
-      if (!sameSourceContext(questionsById.get(req.reply_to_question_id)?.context, req.context)) {
+      if (!sameSourceContext(questionsById.get(req.reply_to_question_id)?.data.context, req.context)) {
         throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to a question in this capture about the same source');
       }
     }
@@ -1128,9 +1152,9 @@ export async function startCapture(
     // An expired-but-never-attempted entry can never become eligible again, so it
     // is dropped here rather than kept forever awaiting a claim that will not come.
     let eligible = 0;
-    for (const [id, q] of unattemptedQuestions) {
+    for (const [id, q] of claimableQuestions) {
       if (now() < q.data.expires_at_ms) eligible += 1;
-      else unattemptedQuestions.delete(id);
+      else claimableQuestions.delete(id);
     }
     const reserved = [...inflightQuestions.keys()].filter(id => !committedQuestions.has(id)).length;
     if (eligible + reserved >= QUESTION_LIMIT) throw new QuestionError('QUESTION_LIMIT', 'at most 16 unexpired questions may be queued');
@@ -1198,9 +1222,9 @@ export async function startCapture(
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {
     assertOwnership();
     questionReady();
-    const queued = [...unattemptedQuestions.values()].find(q => q.data.target.harness === target.harness
-      && q.data.target.harness_session_id === target.harness_session_id
-      && q.data.target.worktree === target.worktree
+    // The control handler admits only the linked chat, so a question queued for an
+    // earlier chat of this worktree is the current chat's to claim.
+    const queued = [...claimableQuestions.values()].find(q => q.data.target.worktree === target.worktree
       && now() < q.data.expires_at_ms
       && !reservedQuestions.has(q.data.question_id));
     if (!queued) return null;
@@ -1209,7 +1233,7 @@ export async function startCapture(
     try {
       const attempted_at_ms = now();
       await appendEvent({ type: 'slipstream.question.dispatch_attempted.v1', occurred_at_ms: attempted_at_ms,
-        data: { question_id: id, queued_seq: queued.seq, attempted_at_ms } });
+        data: { question_id: id, queued_seq: queued.seq, attempted_at_ms, target } });
       if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
       assertOwnership();
       return { ...queued.data, queued_seq: queued.seq };
@@ -1217,18 +1241,18 @@ export async function startCapture(
   };
 
   // Order: INVALID_ANSWER, then QUESTION_NOT_FOUND (which also hides questions
-  // dispatched to another harness session), then duplicate or ANSWER_CONFLICT.
+  // never dispatched to this harness session), then duplicate or ANSWER_CONFLICT.
   const answerQuestion = async (input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<AnswerAccepted> => {
     const { question_id: id, text } = input;
     assertAnswerText(text);
     assertOwnership();
     questionReady();
-    const owner = typeof id === 'string' ? questionsById.get(id)?.target : undefined;
-    const attemptSeq = typeof id === 'string' ? attemptSeqs.get(id) : undefined;
-    if (typeof id !== 'string' || !owner || attemptSeq === undefined || owner.harness !== target.harness
-      || owner.harness_session_id !== target.harness_session_id || owner.worktree !== target.worktree) {
+    const attempt = typeof id === 'string' ? attemptsById.get(id)?.findLast(a => a.target.harness === target.harness
+      && a.target.harness_session_id === target.harness_session_id && a.target.worktree === target.worktree) : undefined;
+    if (typeof id !== 'string' || attempt === undefined) {
       throw new QuestionError('QUESTION_NOT_FOUND', 'no question with that id was dispatched to this harness session');
     }
+    const attemptSeq = attempt.seq;
     const settled = committedAnswers.get(id);
     const pending = inflightAnswers.get(id);
     const existing = settled ?? pending;

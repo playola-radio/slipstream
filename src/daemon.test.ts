@@ -2069,6 +2069,32 @@ describe('daemon capture table', () => {
     });
   });
 
+  it('oldChatCannotAnswerWhileUnlinked: a waiting question moves to the next linked chat', async () => {
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      await linkChat(call, store, a!, 'c1');
+      await connectAgent(call, claimOf(store, 'c1', a!));
+      const asked = rec(await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT }));
+      const offered = (c: ResponseEnvelope) => (rec(c).question as unknown as { question_id: string } | null)?.question_id;
+      assert.equal(offered(await call(claimOf(store, 'c1', a!))), asked.question_id);
+      assert.equal(rec(await call({ verb: 'unlink', session_id: id })).ok, true);
+      const early = await call({ verb: 'answer_question', ...chatOf('c1', a!), question_id: asked.question_id, text: 'old' });
+      assert.equal(early.ok === false && early.code, 'SESSION_NOT_SELECTED');
+      await linkChat(call, store, a!, 'c2');
+      await connectAgent(call, claimOf(store, 'c2', a!));
+      assert.equal(offered(await call(claimOf(store, 'c2', a!))), asked.question_id);
+      const answer = await call({ verb: 'answer_question', ...chatOf('c2', a!), question_id: asked.question_id, text: 'new' });
+      assert.equal(answer.ok, true, JSON.stringify(answer));
+      const log = await readLog(store, id);
+      const attempts = log.filter((e) => e.type === 'slipstream.question.dispatch_attempted.v1'
+        && e.data.question_id === asked.question_id);
+      assert.deepEqual(attempts.map((e) => (e.data.target as { harness_session_id: string }).harness_session_id), ['c1', 'c2']);
+      const answered = log.filter((e) => e.type === 'slipstream.question.answered.v1' && e.data.question_id === asked.question_id);
+      assert.deepEqual(answered.map((e) => [e.data.attempt_seq, e.data.text]), [[attempts[1]!.seq, 'new']]);
+    });
+  });
+
   it('does not acknowledge a task to a chat unlinked while it was being recorded', async () => {
     let release!: () => void;
     let held!: () => void;

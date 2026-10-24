@@ -21,7 +21,17 @@
         "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
         "question_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
         "queued_seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "attempted_at_ms": { "type": "integer", "minimum": 0 }
+        "attempted_at_ms": { "type": "integer", "minimum": 0 },
+        "target": {
+          "$comment": "The chat this attempt was handed to. Absent on attempts written before it was recorded; those went to the queued target.",
+          "type": "object",
+          "required": ["harness", "harness_session_id", "worktree"],
+          "properties": {
+            "harness": { "enum": ["claude-code", "codex"] },
+            "harness_session_id": { "type": "string", "minLength": 1 },
+            "worktree": { "type": "string", "minLength": 1 }
+          }
+        }
       }
     }
   }

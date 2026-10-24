@@ -57,7 +57,8 @@ const queued = (questionId: string): EventInput => ({
 const attempted = (questionId: string, queuedSeq: string): EventInput => ({
   type: 'slipstream.question.dispatch_attempted.v1',
   occurred_at_ms: 5,
-  data: { question_id: questionId, queued_seq: queuedSeq, attempted_at_ms: 5 },
+  data: { question_id: questionId, queued_seq: queuedSeq, attempted_at_ms: 5,
+    target: { harness: 'codex', harness_session_id: 'root', worktree: '/work' } },
 });
 const answered = (questionId: string, attemptSeq: string, text = 'Because.'): EventInput => ({
   type: 'slipstream.question.answered.v1',
@@ -422,7 +423,7 @@ describe('recovery across a resume', () => {
       const rec = await recoverSession(path, SESSION, cas);
       assert.equal(rec.currentTaskId, undefined);
       assert.deepEqual([...rec.taskDeclarations.keys()], ['r1']);
-      assert.equal(rec.taskResetSeq, 3n);
+      assert.deepEqual([rec.resumeSeq, rec.unlinkSeq], [3n, 0n]);
     });
   });
 
@@ -442,15 +443,40 @@ describe('recovery across a resume', () => {
         data: { binding_generation: '1', reason: 'unlinked' } } as unknown as EventInput;
       const rec = await recoverSession(await seedLog(dir, [started, task('t1', 'r1'), unlinked]), SESSION, cas);
       assert.equal(rec.currentTaskId, undefined);
-      assert.equal(rec.taskResetSeq, 3n);
+      assert.deepEqual([rec.resumeSeq, rec.unlinkSeq], [0n, 3n]);
     });
   });
 
-  it('reports taskResetSeq 0 for a log that was never resumed', async () => {
+  it('reports resume and unlink seqs of 0 for a log with neither', async () => {
     await withTempDir(async (dir) => {
       const cas = await createCas(join(dir, 'blobs'));
       const rec = await recoverSession(await seedLog(dir, [started]), SESSION, cas);
-      assert.equal(rec.taskResetSeq, 0n);
+      assert.deepEqual([rec.resumeSeq, rec.unlinkSeq], [0n, 0n]);
+    });
+  });
+});
+
+describe('recovery of a question offered again after an unlink', () => {
+  const unlinked = { type: 'slipstream.agent.unlinked.v1', occurred_at_ms: 7,
+    data: { binding_generation: '1', reason: 'unlinked' } } as unknown as EventInput;
+
+  it('accepts a second attempt after an unlink and an answer naming the earlier attempt', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, queued(QUESTION), attempted(QUESTION, '2'), unlinked,
+        attempted(QUESTION, '2'), answered(QUESTION, '3')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual(rec.questionAttempts.map(e => e.seq), ['3', '5']);
+      assert.deepEqual(rec.questionAnswers.map(e => e.data.attempt_seq), ['3']);
+    });
+  });
+
+  it('rejects a second attempt with no unlink since the first as corrupt', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, queued(QUESTION), attempted(QUESTION, '2'), resumed,
+        attempted(QUESTION, '2')]);
+      await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError);
     });
   });
 });

@@ -1,4 +1,4 @@
-import { it } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, realpath } from 'node:fs/promises';
@@ -209,11 +209,180 @@ it('finishes an in-flight answer before stop closes the log', async () => {
   });
 });
 
-it('an unlink leaves no question claimable', async () => {
-  await fixture(async ({ session, target, ask }) => {
-    await ask();
-    await session.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: 1000,
-      data: { binding_generation: '1', reason: 'unlinked' } });
-    assert.equal(await session.claimQuestion(target), null);
+describe('an unlink hands unanswered questions to the next linked chat', () => {
+  const unlink = (s: Session) => s.recordAgent({ type: 'slipstream.agent.unlinked.v1', occurred_at_ms: 1000,
+    data: { binding_generation: '1', reason: 'unlinked' } });
+  const next = (target: Target): Target => ({ ...target, harness_session_id: 'next' });
+  const attempts = async (s: Session) => (await readRecords(s.logPath))
+    .filter(e => e.type === 'slipstream.question.dispatch_attempted.v1');
+
+  it('unlinkKeepsUndispatchedQuestionForNextChat', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const id = await ask();
+      await unlink(session);
+      assert.equal((await session.claimQuestion(next(target)))?.question_id, id);
+    });
+  });
+
+  it('unlinkReoffersDispatchedUnansweredQuestion', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const id = await ask();
+      await session.claimQuestion(target);
+      await unlink(session);
+      assert.equal((await session.claimQuestion(next(target)))?.question_id, id);
+      assert.equal(await session.claimQuestion(next(target)), null);
+    });
+  });
+
+  it('answeredQuestionIsNotReoffered', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const id = await ask();
+      await session.claimQuestion(target);
+      await session.answerQuestion({ question_id: id, text: 'done' }, target);
+      await unlink(session);
+      assert.equal(await session.claimQuestion(next(target)), null);
+    });
+  });
+
+  it('expiredQuestionIsNotReoffered', async () => {
+    await fixture(async ({ session, target, ask, setTime }) => {
+      await ask();
+      setTime(5000);
+      const later = await ask();
+      await unlink(session);
+      setTime(1000 + QUESTION_TTL_MS);
+      const claimed = await session.claimQuestion(next(target));
+      assert.deepEqual([claimed?.question_id, claimed?.expires_at_ms], [later, 5000 + QUESTION_TTL_MS]);
+      assert.equal(await session.claimQuestion(next(target)), null);
+    });
+  });
+
+  it('questionQueuedForOldChatAfterUnlinkIsClaimableByNewChat', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      await unlink(session);
+      const id = await ask();
+      assert.equal((await session.claimQuestion(next(target)))?.question_id, id);
+    });
+  });
+
+  it('newChatAnswerIsAccepted', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const id = await ask();
+      await session.claimQuestion(target);
+      await unlink(session);
+      await session.claimQuestion(next(target));
+      assert.equal((await session.answerQuestion({ question_id: id, text: 'from next' }, next(target))).duplicate, false);
+      const [, nextAttempt] = await attempts(session);
+      assert.deepEqual((await answers(session)).map(e => [e.data.attempt_seq, e.data.text]), [[nextAttempt!.seq, 'from next']]);
+    });
+  });
+
+  it('returningChatAnswerCounts', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const id = await ask();
+      await session.claimQuestion(target);
+      await unlink(session);
+      await session.claimQuestion(next(target));
+      await unlink(session);
+      await session.answerQuestion({ question_id: id, text: 'original copy' }, target);
+      const [firstAttempt] = await attempts(session);
+      assert.deepEqual((await answers(session)).map(e => e.data.attempt_seq), [firstAttempt!.seq]);
+      assert.equal(await session.claimQuestion(target), null, 'an answered question is not offered again');
+      await assert.rejects(session.answerQuestion({ question_id: id, text: 'other copy' }, next(target)), code('ANSWER_CONFLICT'));
+    });
+  });
+
+  it('dispatchAttemptRecordsTarget', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      await ask();
+      await session.claimQuestion(target);
+      await unlink(session);
+      await session.claimQuestion(next(target));
+      assert.deepEqual((await attempts(session)).map(e => e.data.target), [target, next(target)]);
+    });
+  });
+
+  it('resumeAfterUnlinkDropsMovedQuestion', async () => {
+    await withTempDir(async base => {
+      const root = join(base, 'work'); await mkdir(root);
+      const storeDir = join(base, 'store');
+      const deps = () => ({ platform: createFakePlatform(), readQuestionContext: async () => 'selected' });
+      const first = await startCapture({ root, storeDir, now: () => 1000 }, deps());
+      const target = { harness: 'codex' as const, harness_session_id: 'root', worktree: await realpath(root) };
+      try {
+        await first.askQuestion({ session_id: first.sessionId, request_id: randomUUID(), text: 'Why?', context: {
+          change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
+        } }, target);
+        await unlink(first);
+      } finally { await first.stop(); }
+      const resumed = await startCapture({ root, storeDir, now: () => 2000, resumeSessionId: first.sessionId }, deps());
+      try {
+        assert.equal(await resumed.claimQuestion(next(target)), null);
+      } finally { await resumed.stop(); }
+    });
+  });
+
+  it('recoveredSessionKeepsMovedQuestionClaimable', async () => {
+    let failNextAttempt = false;
+    await fixture(async ({ session, target, ask }) => {
+      await ask(); const moved = await ask();
+      await session.claimQuestion(target); await session.claimQuestion(target);
+      await unlink(session);
+      failNextAttempt = true;
+      // The new chat's attempt commits, then its reply is lost: storage recovery
+      // rebuilds what is claimable from the log alone.
+      await assert.rejects(session.claimQuestion(next(target)), StorageError);
+      const deadline = Date.now() + 5000;
+      while (session.health.snapshot().state !== 'healthy') {
+        assert.ok(Date.now() < deadline, 'recovery must finish');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal((await session.claimQuestion(next(target)))?.question_id, moved);
+      assert.equal(await session.claimQuestion(next(target)), null);
+    }, {
+      createLog: async opts => {
+        const log = await createLog(opts);
+        return { ...log, append: async input => {
+          const event = await log.append(input);
+          if (input.type === 'slipstream.question.dispatch_attempted.v1' && failNextAttempt) {
+            failNextAttempt = false; throw new StorageError('append', new Error('reply lost after fsync'));
+          }
+          return event;
+        } };
+      },
+    });
+  });
+
+  it('oldAttemptWithoutTargetStillAnswerable', async () => {
+    await withTempDir(async base => {
+      const root = join(base, 'work'); await mkdir(root);
+      const storeDir = join(base, 'store');
+      // An attempt written before attempts recorded their target.
+      const legacyLog: typeof createLog = async opts => {
+        const log = await createLog(opts);
+        return { ...log, append: async input => {
+          if (input.type !== 'slipstream.question.dispatch_attempted.v1') return log.append(input);
+          const { target: _, ...data } = input.data;
+          return log.append({ ...input, data } as typeof input);
+        } };
+      };
+      const first = await startCapture({ root, storeDir, now: () => 1000 },
+        { platform: createFakePlatform(), readQuestionContext: async () => 'selected', createLog: legacyLog });
+      const target = { harness: 'codex' as const, harness_session_id: 'root', worktree: await realpath(root) };
+      let id: string;
+      try {
+        id = (await first.askQuestion({ session_id: first.sessionId, request_id: randomUUID(), text: 'Why?', context: {
+          change_seq: '1', path: 'a.ts', snapshot_sha256: 'a'.repeat(64), line_start: 1, line_end: 1,
+        } }, target)).question_id;
+        await first.claimQuestion(target);
+      } finally { await first.stop(); }
+      const resumed = await startCapture({ root, storeDir, now: () => 2000, resumeSessionId: first.sessionId },
+        { platform: createFakePlatform(), readQuestionContext: async () => 'selected' });
+      try {
+        assert.equal((await attempts(resumed))[0]!.data.target, undefined);
+        await assert.rejects(resumed.answerQuestion({ question_id: id, text: 'x' }, next(target)), code('QUESTION_NOT_FOUND'));
+        assert.equal((await resumed.answerQuestion({ question_id: id, text: 'still mine' }, target)).duplicate, false);
+      } finally { await resumed.stop(); }
+    });
   });
 });

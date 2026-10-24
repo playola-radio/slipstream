@@ -39,9 +39,12 @@ export interface RecoveredSession {
   /** The `task_id` of the last task declaration after the latest `session.resumed`
    * or `agent.unlinked`; undefined if none. A resume or unlink clears the task. */
   currentTaskId: string | undefined;
-  /** Seq of the latest `session.resumed` or `agent.unlinked` record; 0n if none.
-   * Questions queued at or before it are history only and never claimable again. */
-  taskResetSeq: bigint;
+  /** Seq of the latest `session.resumed` record; 0n if none. Questions queued at
+   * or before it are history only and never claimable again. */
+  resumeSeq: bigint;
+  /** Seq of the latest `agent.unlinked` record; 0n if none. An unanswered question
+   * with no attempt after it is claimable by the next linked chat. */
+  unlinkSeq: bigint;
   /** Committed task declarations keyed by their idempotency `request_id`, so the
    * session rebuilds its dedup index: a replayed duplicate must not re-append. A
    * torn trailing declaration is discarded with the tail, so it never appears. */
@@ -135,7 +138,7 @@ export async function recoverSession(
   // Keep the ordered event arrays for callers, while replay validation uses
   // indexes so a long-lived session is replayed in one pass.
   const queuedSeqsByQuestion = new Map<string, Set<string>>();
-  const attemptSeqByQuestion = new Map<string, string>();
+  const attemptSeqsByQuestion = new Map<string, string[]>();
   const answeredQuestionIds = new Set<string>();
   const verifiedBlobs = new Map<string, number>(); // sha256 -> verified byte length
 
@@ -143,7 +146,8 @@ export async function recoverSession(
   let maxBytes: number | undefined;
   let baselineCompleted = false;
   let currentTaskId: string | undefined;
-  let taskResetSeq = 0n;
+  let resumeSeq = 0n;
+  let unlinkSeq = 0n;
   const bindingGenerations = new Set<string>();
   let seq = 0n;
 
@@ -289,18 +293,22 @@ export async function recoverSession(
         break;
       }
       case 'slipstream.question.dispatch_attempted.v1': {
+        // Only an unlink offers an attempted question again.
+        const attemptSeqs = attemptSeqsByQuestion.get(event.data.question_id) ?? [];
+        const lastAttempt = attemptSeqs.at(-1);
         if (event.subject !== `question/${event.data.question_id}`
           || !queuedSeqsByQuestion.get(event.data.question_id)?.has(event.data.queued_seq)
-          || attemptSeqByQuestion.has(event.data.question_id)) {
+          || (lastAttempt !== undefined && BigInt(lastAttempt) > unlinkSeq)) {
           throw new CorruptLogError(`${at}: dispatch attempt has no unique queued question`);
         }
         questionAttempts.push(event);
-        attemptSeqByQuestion.set(event.data.question_id, event.seq);
+        attemptSeqs.push(event.seq);
+        attemptSeqsByQuestion.set(event.data.question_id, attemptSeqs);
         break;
       }
       case 'slipstream.question.answered.v1': {
         if (event.subject !== `question/${event.data.question_id}`
-          || attemptSeqByQuestion.get(event.data.question_id) !== event.data.attempt_seq
+          || !attemptSeqsByQuestion.get(event.data.question_id)?.includes(event.data.attempt_seq)
           || answeredQuestionIds.has(event.data.question_id)) {
           throw new CorruptLogError(`${at}: answer has no unique attempted question`);
         }
@@ -329,9 +337,12 @@ export async function recoverSession(
         bindingGenerations.add(event.data.binding_generation);
         break;
       case 'slipstream.session.resumed.v1':
+        currentTaskId = undefined;
+        resumeSeq = BigInt(event.seq);
+        break;
       case 'slipstream.agent.unlinked.v1':
         currentTaskId = undefined;
-        taskResetSeq = BigInt(event.seq);
+        unlinkSeq = BigInt(event.seq);
         break;
     }
   }
@@ -371,7 +382,8 @@ export async function recoverSession(
     baselineUnknownDirs,
     storageGapSeqByEpisode,
     currentTaskId,
-    taskResetSeq,
+    resumeSeq,
+    unlinkSeq,
     taskDeclarations,
     attributionEvents,
     questions,
