@@ -1,9 +1,9 @@
 # Configuring the Slipstream MCP forwarder
 
 Slipstream reaches an agent through **user-level MCP configuration**, the same
-way any other MCP server would. Slipstream does not launch the agent — Conductor
-(or you) stays the launcher; the forwarder simply rides along in each session
-the harness starts.
+way any other MCP server would. The daemon does not launch the agent; the
+Slipstream app, Conductor, or you may. The forwarder simply rides along in each
+session the harness starts.
 
 ## What the forwarder is
 

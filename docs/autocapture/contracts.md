@@ -61,7 +61,7 @@ Appended as the last record of an activation that stopped cleanly.
 | `reason` | Written when |
 |---|---|
 | `detached` | An explicit `detach <target>` stopped the capture. |
-| `archived` | The Conductor archive path withdrew capture intent and stopped the capture. |
+| `archived` | An archive path (`slipstream workspace archive`, or Conductor's archive script) withdrew capture intent and stopped the capture. |
 | `maintenance` | GC quiescence stopped the capture (D9). Intent is kept; a later `session.resumed` plus `capture.gap{restart}` follows on the same session. |
 | `root-missing` | The watched root was deleted **or replaced** (device or inode of the canonical root changed). A recreated directory at the same path never inherits the capture. |
 | `watcher-failed` | The watcher subscription closed or could not be kept (rule below). |

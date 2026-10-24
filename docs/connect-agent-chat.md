@@ -2,6 +2,11 @@
 
 The full reference for one-command `slipstream attach`. The README has the short version.
 
+This page covers chats that run outside the Slipstream app (a terminal or Conductor
+chat), where the chat runs `slipstream attach` itself. The Slipstream app is being
+designed to link its own chat for you instead, naming it explicitly, in the client
+repo at `design/features/linked-chat/`; that path is not shipped yet.
+
 From inside the Claude Code or Codex chat you want to connect, run (or ask the
 agent to run) one command in the workspace:
 
