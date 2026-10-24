@@ -85,9 +85,6 @@ Product code changed in P6d; each change was a test seen failing first.
   was renamed into place but whose directory sync then failed reads `recording`
   offline while the daemon still shows the outage, until the daemon restarts;
   that errs toward showing less coverage, and is left as is.
-- **A changed Codex version reads `identity-changed`, not
-  `runtime-unsupported`.** Codex transcript verification does not tell the two
-  apart. Both readers agree; the reason is just less specific than for Claude.
 - **The daemon is a moment ahead of the files.** When a capture fails or starts
   baselining, `/v1/captures` and `status` show it a few milliseconds before the
   intent record, heartbeat or `session.started` that let an offline reader see

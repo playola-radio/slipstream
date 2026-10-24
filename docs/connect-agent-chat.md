@@ -54,12 +54,13 @@ approve it.
 
 Limitations:
 
-- Verified runtimes only: Claude Code 2.1.283 started with `claude -p` and
-  2.1.280 in Conductor; Codex 0.154.0 and 0.155.1 launched through its SDK
-  (`exec` or `vscode` source). Other versions, and interactive `claude` or
-  `codex exec` chats, are refused rather than guessed at. The Claude Code and
-  Codex versions Conductor ships today are outside this set, so Conductor chats
-  are refused for now. See the
+- Claude Code chats of any version attach if their transcript matches the
+  chat and the workspace; the link stays `setup_pending` until the chat answers
+  the setup check. Codex is limited to verified runtimes: 0.154.0 and 0.155.1
+  launched through its SDK (`exec` or `vscode` source). Other Codex versions,
+  and `codex exec` chats, are refused rather than guessed at. The Codex version
+  Conductor ships today is outside this set, so Conductor's Codex chats are
+  refused for now. See the
   [acceptance record](ask-agent/attach-acceptance-2026-10-07.md).
 - Codex SDK chats, including Conductor's, never show Codex's hook review. Run
   `codex` once in the workspace and trust the Slipstream hook there; attach

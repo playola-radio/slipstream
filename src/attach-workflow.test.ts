@@ -341,15 +341,26 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
-  it('refuses an unverified runtime honestly, with nothing installed or recorded', async () => {
+  it('links a Claude chat of any version and launch mode that passes the transcript checks', async () => {
     const f = await fixture();
     try {
-      await claudeTranscript(f, '9.9.9');
+      await claudeTranscript(f, '9.9.9', 'some-future-mode');
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
+      assert.equal(code, 0, f.err.join('\n'));
+      assert.equal(attachRequests(f).length, 1);
+      assert.match(f.out.join('\n'), /agent_connection: setup_pending/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('refuses an unverified Codex runtime honestly, with nothing installed or recorded', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f, '9.9.9');
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, codexEnv, { live: true }));
       assert.equal(code, 1);
       assert.match(f.err.join('\n'), /not a runtime Slipstream has verified/);
       assert.equal(attachRequests(f).length, 0);
-      await assert.rejects(stat(join(f.worktree, '.claude')));
+      await assert.rejects(stat(join(f.worktree, '.codex')));
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
@@ -505,13 +516,13 @@ describe('slipstream attach (one command)', () => {
       assert.match(f.err.join('\n'), /STORAGE_UNAVAILABLE: disk full/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
-  it('names launch mode, not only the directory, when the transcript does not match', async () => {
+  it('names the checked details, not only the directory, when the transcript does not match', async () => {
     const f = await fixture();
     try {
-      await claudeTranscript(f, '2.1.283', 'cli');
+      await claudeTranscript(f, '2.1.283', '');
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, { live: true }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /launched in a way Slipstream has not verified \(such as an interactive `claude`/);
+      assert.match(f.err.join('\n'), /contradicts the session, folder or launch details Slipstream checks/);
       assert.equal(attachRequests(f).length, 0);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });

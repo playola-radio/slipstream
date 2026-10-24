@@ -353,7 +353,7 @@ describe('cli attach (one command)', () => {
       await mkdir(work);
       await mkdir(join(config, 'projects', 'p'), { recursive: true });
       await writeFile(join(config, 'projects', 'p', `${sessionId}.jsonl`), `${JSON.stringify({ type: 'user',
-        sessionId, cwd: work, version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false })}\n`);
+        sessionId, cwd: work, version: '2.1.293', entrypoint: 'sdk-ts', userType: 'external', isSidechain: false })}\n`);
       const fakeClaude = join(dir, 'claude-bin');
       // Stands in for `claude mcp add --scope local`: record the call and the local server entry.
       await writeFile(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\n`

@@ -83,33 +83,35 @@ it('verifies the measured Conductor attachment as the first complete identity re
   });
 });
 
-it('accepts the observed Claude 2.1.284 Conductor root without widening its identity rules', async () => {
+it('accepts a Claude version and launch mode that were never listed, such as the app-launched 2.1.293/sdk-ts', async () => {
   await withFixture(async ({ root, path }) => {
-    const current = { ...identity(root, '2.1.284', 'sdk-ts'), type: 'attachment' };
-    const check = async (records: unknown[], expected: Awaited<ReturnType<typeof verifyClaudeRootTranscript>>) => {
-      await writeFile(path, records.map(line).join(''));
-      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), expected);
-    };
-    await check([preamble(), current, { ...current, type: 'user' }], { ok: true });
-    await check([{ ...current, entrypoint: 'sdk-cli' }], { ok: false, reason: 'mismatch' });
-    await check([{ ...current, isSidechain: true }], { ok: false, reason: 'mismatch' });
-    await check([current, { ...current, version: '2.1.280' }], { ok: false, reason: 'mismatch' });
-    await check([{ ...current, version: '2.1.285' }], { ok: false, reason: 'unsupported-version' });
+    await writeFile(path, line(preamble()) + line({ ...identity(root, '2.1.293', 'sdk-ts'), type: 'attachment' }));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
   });
 });
 
-it('accepts the observed Claude 2.1.300 Conductor root without widening its identity rules', async () => {
+it('accepts an unknown future entrypoint', async () => {
   await withFixture(async ({ root, path }) => {
-    const current = { ...identity(root, '2.1.300', 'sdk-ts'), type: 'attachment' };
-    const check = async (records: unknown[], expected: Awaited<ReturnType<typeof verifyClaudeRootTranscript>>) => {
-      await writeFile(path, records.map(line).join(''));
-      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), expected);
-    };
-    await check([preamble(), current, { ...current, type: 'user' }], { ok: true });
-    await check([{ ...current, entrypoint: 'sdk-cli' }], { ok: false, reason: 'mismatch' });
-    await check([{ ...current, isSidechain: true }], { ok: false, reason: 'mismatch' });
-    await check([current, { ...current, version: '2.1.284' }], { ok: false, reason: 'mismatch' });
-    await check([{ ...current, version: '2.1.301' }], { ok: false, reason: 'unsupported-version' });
+    await writeFile(path, line(preamble()) + line(identity(root, '2.1.283', 'some-future-mode')));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: true });
+  });
+});
+
+it('rejects an empty or non-string version or entrypoint on the first identity record', async () => {
+  await withFixture(async ({ root, path }) => {
+    for (const fields of [{ version: '' }, { entrypoint: '' }, { version: 2.1 }, { entrypoint: 1 }, { entrypoint: undefined }]) {
+      await writeFile(path, line(preamble()) + line({ ...identity(root), ...fields }));
+      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' }, JSON.stringify(fields));
+    }
+  });
+});
+
+it('rejects a version or entrypoint that changes between records', async () => {
+  await withFixture(async ({ root, path }) => {
+    for (const fields of [{ version: '2.1.284' }, { entrypoint: 'sdk-ts' }]) {
+      await writeFile(path, line(preamble()) + line(identity(root)) + line({ ...identity(root), ...fields }));
+      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' }, JSON.stringify(fields));
+    }
   });
 });
 
@@ -142,10 +144,8 @@ it('fails closed on unavailable, incomplete, malformed, and contradictory bounde
     await check(line(preamble()) + line(identity(root)) + '{"sessionId":"other"}\n', 'mismatch');
     await check(line(preamble()) + line(identity(root)) + 'x'.repeat(256 * 1024 + 1), 'gap');
     await check(Array.from({ length: 62 }, () => line(preamble())).join('') + line(identity(root)) + '{"sessionId":"other"', 'not-yet');
-    await check(line(preamble()) + line({ ...identity(root), version: '2.1.999' }), 'unsupported-version');
     await check(line(preamble()) + line({ ...identity(root), cwd: dir }), 'mismatch');
     await check(line(preamble()) + line({ ...identity(root), isSidechain: true }), 'mismatch');
-    await check(line(preamble()) + line({ ...identity(root), entrypoint: 'sdk-ts' }), 'mismatch');
     await check(line(preamble()) + line({ ...identity(root), version: undefined }), 'mismatch');
     await check(line(preamble()) + 'x'.repeat(256 * 1024 + 1) + '\n' + line(identity(root)), 'gap');
     await check(Array.from({ length: 65 }, () => line(preamble())).join('') + line(identity(root)), 'gap');

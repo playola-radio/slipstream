@@ -713,7 +713,7 @@ describe('auto-capture acceptance: end to end through real processes', () => {
       const config = join(dir, 'claude');
       await mkdir(join(config, 'projects', 'p'), { recursive: true });
       await writeFile(join(config, 'projects', 'p', `${claudeChat}.jsonl`), JSON.stringify({ type: 'user', sessionId: claudeChat,
-        cwd: wsA, version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+        cwd: wsA, version: '2.1.293', entrypoint: 'sdk-ts', userType: 'external', isSidechain: false }) + '\n');
       const fakeClaude = join(dir, 'claude-bin');
       await writeFile(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\nconst args = process.argv.slice(2);\n`
         + `const sep = args.indexOf('--'); fs.writeFileSync(${JSON.stringify(join(config, '.claude.json'))}, JSON.stringify({ projects: `

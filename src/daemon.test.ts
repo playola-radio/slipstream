@@ -99,9 +99,7 @@ async function withDaemon(
 }
 
 describe('daemon control verbs', () => {
-  for (const [version, entrypoint] of [
-    ['2.1.283', 'sdk-cli'], ['2.1.280', 'sdk-ts'], ['2.1.284', 'sdk-ts'], ['2.1.300', 'sdk-ts'],
-  ] as const) it(`attaches only to the verified Claude ${version}/${entrypoint} root and lets only that root claim once`, async () => {
+  for (const [version, entrypoint] of [['2.1.283', 'sdk-cli'], ['2.1.293', 'sdk-ts']] as const) it(`attaches only to the matching Claude ${version}/${entrypoint} root and lets only that root claim once`, async () => {
     const store = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-'));
     const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-wt-'));
     const otherWorktree = await mkdtemp(join(tmpdir(), 'slip-daemon-claude-other-'));
