@@ -319,7 +319,9 @@ export async function startCapture(
     const id = event.data.question_id;
     // An attempt written before attempts recorded their chat went to the queued target.
     const target = event.data.target ?? questionsById.get(id)!.data.target;
-    attemptsById.set(id, [...attemptsById.get(id) ?? [], { target, seq: event.seq }]);
+    const attempts = attemptsById.get(id) ?? [];
+    attempts.push({ target, seq: event.seq });
+    attemptsById.set(id, attempts);
   };
 
   const seedTaskState = (rec: RecoveredSession): void => {
