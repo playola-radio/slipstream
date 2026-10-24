@@ -37,8 +37,9 @@ ID, transcript path, Node path, or checkout path.
   seconds, attach says the outcome is unknown and exits with code 3; running it
   again never starts a second capture.
 - Attach refuses, recording nothing, when it cannot tell which chat it is in,
-  when the chat's transcript cannot be found, or when the harness version is not
-  one Slipstream has verified. It never falls back to recording without an agent.
+  when the chat's transcript cannot be found or does not match this workspace,
+  or when a Codex chat's version is not one Slipstream has verified. It never
+  falls back to recording without an agent.
 
 Files it writes, merging with what is already there and never duplicating its
 own entry: Claude Code gets a `PostToolUse` hook in `.claude/settings.local.json`
