@@ -72,7 +72,7 @@ describe('runWorkspaceCreate', () => {
     assert.deepEqual(f.calls, [
       `git ${REV_PARSE} @/src/repo`,
       `git remote get-url origin @${ROOT}`,
-      `git fetch origin @${ROOT}`,
+      `git fetch --prune origin @${ROOT}`,
       `git show-ref --verify --quiet refs/remotes/origin/develop @${ROOT}`,
       `git show-ref --verify --quiet refs/heads/slipstream/workspace-1 @${ROOT}`,
       `git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`,
@@ -86,10 +86,29 @@ describe('runWorkspaceCreate', () => {
   it('falls back to origin/HEAD when there is no origin/develop', async () => {
     const f = fake({ git: createGit({
       'show-ref --verify --quiet refs/remotes/origin/develop': NO_BRANCH,
+      'remote set-head origin --auto': { code: 0, output: '' },
       'symbolic-ref --short refs/remotes/origin/HEAD': { code: 0, output: 'origin/main\n' },
     }) });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
     assert.ok(f.calls.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/main @${ROOT}`), f.calls.join('\n'));
+  });
+
+  it('prunes stale remote branches before selecting origin/develop', async () => {
+    const f = fake({ git: createGit({
+      'fetch --prune origin': { code: 0, output: '' },
+    }) });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
+    assert.ok(f.calls.includes(`git fetch --prune origin @${ROOT}`), f.calls.join('\n'));
+  });
+
+  it('creates nothing when refreshing the remote default branch fails', async () => {
+    const f = fake({ git: createGit({
+      'show-ref --verify --quiet refs/remotes/origin/develop': NO_BRANCH,
+      'remote set-head origin --auto': { code: 1, output: 'error: cannot determine remote HEAD\n' },
+      'symbolic-ref --short refs/remotes/origin/HEAD': { code: 0, output: 'origin/main\n' },
+    }) });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.ok(!f.calls.some((c) => c.startsWith('git worktree add')));
   });
 
   it('creates nothing when the repo has no origin', async () => {
@@ -187,7 +206,9 @@ const ARCHIVE_ENV = { CONDUCTOR_ROOT_PATH: ROOT, CONDUCTOR_WORKSPACE_PATH: WS };
 function archiveGit(extra: Record<string, Reply> = {}): Record<string, Reply> {
   return {
     [REV_PARSE]: { code: 0, output: `${WS}\n${ROOT}/.git/worktrees/workspace-1\n${ROOT}/.git\n` },
-    'status --porcelain': { code: 0, output: '' },
+    'status --porcelain --untracked-files=all --ignore-submodules=none': { code: 0, output: '' },
+    'symbolic-ref --quiet --short HEAD': { code: 0, output: 'slipstream/workspace-1\n' },
+    'worktree list --porcelain': { code: 0, output: `worktree ${ROOT}\nHEAD abc\nbranch refs/heads/develop\n\nworktree ${WS}\nHEAD def\nbranch refs/heads/slipstream/workspace-1\n\n` },
     ...extra,
   };
 }
@@ -198,7 +219,9 @@ describe('runWorkspaceArchive', () => {
     assert.equal(await runWorkspaceArchive(WS, f.deps), 0);
     assert.deepEqual(f.calls, [
       `git ${REV_PARSE} @${WS}`,
-      `git status --porcelain @${WS}`,
+      `git status --porcelain --untracked-files=all --ignore-submodules=none @${WS}`,
+      `git symbolic-ref --quiet --short HEAD @${WS}`,
+      `git worktree list --porcelain @${WS}`,
       `withdraw ${WS}`,
       `scripts ${WS}`,
       `run make clean @${WS} ${JSON.stringify(ARCHIVE_ENV)}`,
@@ -234,11 +257,28 @@ describe('runWorkspaceArchive', () => {
   });
 
   it('refuses uncommitted or untracked changes before touching anything', async () => {
-    const f = fake({ git: archiveGit({ 'status --porcelain': { code: 0, output: '?? new.txt\n' } }) });
+    const f = fake({ git: archiveGit({ 'status --porcelain --untracked-files=all --ignore-submodules=none': { code: 0, output: '?? new.txt\n' } }) });
     assert.equal(await runWorkspaceArchive(WS, f.deps), 1);
     assert.match(f.err.join('\n'), /uncommitted or untracked changes/);
     assert.match(f.err.join('\n'), /new\.txt/);
     assert.ok(!f.calls.some((c) => c.startsWith('withdraw') || c.startsWith('run ')));
+  });
+
+  it('refuses a detached workspace before withdrawing recording', async () => {
+    const f = fake({ git: archiveGit({ 'symbolic-ref --quiet --short HEAD': { code: 1, output: '' } }) });
+    assert.equal(await runWorkspaceArchive(WS, f.deps), 1);
+    assert.match(f.err.join('\n'), /detached HEAD/);
+    assert.ok(!f.calls.some((c) => c.startsWith('withdraw') || c.startsWith('run ') || c.includes('worktree remove')));
+  });
+
+  it('uses the main checkout when Git stores its directory separately', async () => {
+    const separateRoot = '/src/separate-repo';
+    const f = fake({ git: archiveGit({
+      'worktree list --porcelain': { code: 0, output: `worktree ${separateRoot}\nHEAD abc\nbranch refs/heads/develop\n\nworktree ${WS}\nHEAD def\nbranch refs/heads/slipstream/workspace-1\n\n` },
+    }) });
+    assert.equal(await runWorkspaceArchive(WS, f.deps), 0);
+    assert.ok(f.calls.includes(`run make clean @${WS} ${JSON.stringify({ CONDUCTOR_ROOT_PATH: separateRoot, CONDUCTOR_WORKSPACE_PATH: WS })}`), f.calls.join('\n'));
+    assert.ok(f.calls.includes(`git worktree remove ${WS} @${separateRoot}`), f.calls.join('\n'));
   });
 
   it('a failing archive script keeps the worktree', async () => {
