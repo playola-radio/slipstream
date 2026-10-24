@@ -146,11 +146,13 @@ most one capture; attach explains and changes nothing otherwise.
 
 Current limits:
 
-- **Only versions Slipstream has verified are accepted.** For Claude Code that
-  is 2.1.283 started with `claude -p`, and 2.1.280 in Conductor. For Codex it is
-  0.154.0 and 0.155.1, launched through its SDK. Anything else is refused and
-  nothing is recorded. The versions Conductor ships today aren't on the list
-  yet, so Conductor chats are refused for now.
+- **Any Claude Code version can attach; Codex only in versions Slipstream has
+  verified.** A Claude Code chat attaches if its transcript matches the chat and
+  the workspace, and shows as setup pending until it answers the setup check.
+  For Codex the verified versions are 0.154.0 and 0.155.1, launched through its
+  SDK; anything else is refused and nothing is recorded. The Codex version
+  Conductor ships today isn't on the list yet, so Conductor's Codex chats are
+  refused for now.
 - At most 16 workspaces record at once. Past that, a workspace is shown as NOT
   recording (`capture-limit-reached`) and starts on its own, oldest first, when
   another is detached.

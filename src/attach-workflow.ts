@@ -286,12 +286,11 @@ async function isFile(path: string): Promise<boolean> {
 }
 
 async function verifyTranscript(chat: Chat, transcript: string, worktree: string): Promise<void> {
-  const unverified = (what: string) => new Refusal(`this ${what} is not a runtime Slipstream has verified, or its `
-    + `transcript does not match ${worktree}. Questions could not be delivered reliably, so nothing was installed `
-    + 'or recorded.');
   if (chat.harness === 'codex') {
     if (!await verifyCodexRootTranscript(transcript, chat.id, worktree)) {
-      throw unverified('Codex chat\'s version or launch mode (such as `codex exec`)');
+      throw new Refusal('this Codex chat\'s version or launch mode (such as `codex exec`) is not a runtime Slipstream has '
+        + `verified, or its transcript does not match ${worktree}. Questions could not be delivered reliably, so nothing `
+        + 'was installed or recorded.');
     }
     return;
   }
@@ -305,10 +304,9 @@ async function verifyTranscript(chat: Chat, transcript: string, worktree: string
     throw new Refusal('this chat\'s opening transcript is too large to verify; attach early in a new chat. '
       + 'Nothing was recorded.');
   }
-  if (result.reason === 'unsupported-version') throw unverified('Claude Code version');
   throw new Refusal(`this chat's transcript does not match ${worktree}: the chat may have been started in another `
-    + 'directory, or launched in a way Slipstream has not verified (such as an interactive `claude` session in a '
-    + 'terminal). Questions could not be delivered reliably, so nothing was installed or recorded.');
+    + 'directory, or its transcript is missing or contradicts the session, folder or launch details Slipstream checks. '
+    + 'Questions could not be delivered reliably, so nothing was installed or recorded.');
 }
 
 async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {

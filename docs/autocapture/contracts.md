@@ -302,7 +302,8 @@ recovery has scheduled another attempt.
 
 Public binding state: `setup_pending` (optional reason `config-missing`),
 `connected`, `unavailable` (reason: `transcript-missing`,
-`transcript-unreadable`, `identity-changed`, `runtime-unsupported`), `unlinked`.
+`transcript-unreadable`, `identity-changed`; `runtime-unsupported` only from an
+older daemon, until the link's next revalidation replaces it), `unlinked`.
 
 ### How each state is computed
 

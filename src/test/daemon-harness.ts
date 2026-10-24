@@ -87,7 +87,7 @@ export function createRootsPlatform() {
 export async function linkChat(call: Call, store: string, worktree: string, chat: string): Promise<ResponseEnvelope> {
   const transcript = join(store, `${chat}.jsonl`);
   await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: chat, cwd: worktree,
-    version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
+    version: '2.1.293', entrypoint: 'sdk-ts', userType: 'external', isSidechain: false }) + '\n');
   return call({ verb: 'attach', worktree, harness: 'claude-code', harness_session_id: chat, root_transcript: transcript });
 }
 

@@ -94,11 +94,11 @@ const STORE_LOCK_POLL_MS = 50;
 const RETRY_BACKOFF = { baseMs: 2_000, maxMs: 5 * 60_000 };
 const SETUP_REOFFER_MS = 30_000;
 
-type UnavailableReason = 'transcript-missing' | 'transcript-unreadable' | 'identity-changed' | 'runtime-unsupported';
+type UnavailableReason = 'transcript-missing' | 'transcript-unreadable' | 'identity-changed';
 
 const UNAVAILABLE_BY_CLAUDE_REASON = {
   'unavailable': 'transcript-unreadable', 'not-yet': 'transcript-unreadable', 'gap': 'transcript-unreadable',
-  'mismatch': 'identity-changed', 'unsupported-version': 'runtime-unsupported',
+  'mismatch': 'identity-changed',
 } as const satisfies Record<string, UnavailableReason>;
 
 class RootIdentityError extends Error {

@@ -3,14 +3,8 @@ import { open, realpath } from 'node:fs/promises';
 import { isWithinRoot } from './transcript/discovery.ts';
 import { HEAD_LINE_CAP, HEAD_SCAN_BYTES, HEAD_SCAN_LINES } from './transcript/fs-io.ts';
 
-export type ClaudeRootResult = { ok: true } | { ok: false; reason: 'unavailable' | 'not-yet' | 'gap' | 'mismatch' | 'unsupported-version' };
+export type ClaudeRootResult = { ok: true } | { ok: false; reason: 'unavailable' | 'not-yet' | 'gap' | 'mismatch' };
 
-const RUNTIMES = new Map([
-  ['2.1.280', 'sdk-ts'], // Conductor's observed Claude Code launch
-  ['2.1.284', 'sdk-ts'], // Conductor's observed Claude Code launch
-  ['2.1.300', 'sdk-ts'], // Conductor's observed Claude Code launch
-  ['2.1.283', 'sdk-cli'], // Terminal's observed Claude Code launch
-]);
 const FATAL_UTF8 = new TextDecoder('utf8', { fatal: true });
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -60,13 +54,10 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
       if (version === undefined) {
         if (parsed.sessionId !== sessionId || typeof parsed.cwd !== 'string' || parsed.cwd.length === 0
           || typeof parsed.version !== 'string' || parsed.version.length === 0
-          || typeof parsed.entrypoint !== 'string' || parsed.userType !== 'external'
+          || typeof parsed.entrypoint !== 'string' || parsed.entrypoint.length === 0 || parsed.userType !== 'external'
           || parsed.isSidechain !== false || (parsed.type !== 'user' && parsed.type !== 'attachment')) {
           return { ok: false, reason: 'mismatch' };
         }
-        const allowedEntrypoint = RUNTIMES.get(parsed.version);
-        if (allowedEntrypoint === undefined) return { ok: false, reason: 'unsupported-version' };
-        if (parsed.entrypoint !== allowedEntrypoint) return { ok: false, reason: 'mismatch' };
         try { if (await realpath(parsed.cwd) !== worktree) return { ok: false, reason: 'mismatch' }; }
         catch { return { ok: false, reason: 'mismatch' }; }
         version = parsed.version;
