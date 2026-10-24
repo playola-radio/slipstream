@@ -109,7 +109,7 @@ Use the existing single append/durability boundary; never append straight to eve
 
 Name reserved for the later public event: `slipstream.question.dispatch_attempted.v1`. It is written before a claim reply; it proves an attempt, not receipt or model emission. D2 supplies its schema when its claim contract is finalized. No speculative dispatcher or unused dispatch schema in D1.
 
-D2 offers at most one oldest eligible question per hook call, records an attempt before replying, and never automatically offers that question again after commit. Concurrent claims must have one winner. Failure after attempt commit is explicitly unconfirmed. Persisted attempt records rebuild the eligibility index during in-process recovery. Hook failures are silent exit 0, with a 300 ms connect / 1000 ms total budget and bounded additional context.
+D2 offers at most one oldest eligible question per hook call, records an attempt before replying, and never automatically offers that question again after commit, unless the chat is unlinked (see "Questions follow the link" below). Concurrent claims must have one winner. Failure after attempt commit is explicitly unconfirmed. Persisted attempt records rebuild the eligibility index during in-process recovery. Hook failures are silent exit 0, with a 300 ms connect / 1000 ms total budget and bounded additional context.
 
 The reported Conductor routing proof established this Codex discriminator: root
 PostToolUse omits both `agent_id` and `agent_type`; a child includes both and
@@ -156,9 +156,11 @@ output is proof of model receipt.
 Before returning a question, the daemon appends
 `slipstream.question.dispatch_attempted.v1` through the session's serialized,
 durable writer. Its `subject` is `question/<question_id>` and its data is
-`{session_id, question_id, queued_seq, attempted_at_ms}`. It records an attempt
-before response. A committed attempt is never automatically offered again;
-socket/output loss after commit is unconfirmed. In-process recovery rebuilds
+`{session_id, question_id, queued_seq, attempted_at_ms, target}`, where `target`
+is the `{harness, harness_session_id, worktree}` of the chat it was handed to.
+Attempts written before `target` existed omit it; they went to the queued target.
+It records an attempt before response. A committed attempt is not offered again
+until the chat is unlinked; socket/output loss after commit is unconfirmed. In-process recovery rebuilds
 attempted IDs from the valid durable prefix. A precommit failure releases the
 reservation. Expiry is derived from the queued deadline; no timer or expiry
 event is added.
@@ -324,10 +326,10 @@ Checks, in order:
    retargeted.
 3. Text is a string with a non-whitespace character, no unpaired surrogate, and
    at most 16384 UTF-8 bytes, else `INVALID_ANSWER`. It is stored verbatim.
-4. The question exists in this capture, has a committed `dispatch_attempted.v1`,
-   and its target equals the caller, else `QUESTION_NOT_FOUND`. Unknown, other
+4. The question exists in this capture and has a committed `dispatch_attempted.v1`
+   whose target equals the caller, else `QUESTION_NOT_FOUND`. Unknown, other
    capture, other harness session and queued-but-undispatched are
-   indistinguishable.
+   indistinguishable. The answer's `attempt_seq` is the caller's latest attempt.
 5. One immutable answer per question: the same text replays the original result
    with `duplicate:true`; different text is `ANSWER_CONFLICT`.
 
@@ -371,11 +373,26 @@ interface QuestionAnsweredData {
 ```
 
 Recovery treats a subject that does not match `question_id`, an `attempt_seq`
-that does not name that question's attempt, or a second answer for a question as
-a corrupt log. Answers are not filesystem changes or attribution evidence. The
+that does not name one of that question's attempts, a second attempt with no
+unlink since the previous one, or a second answer for a question as a corrupt log. Answers are not filesystem changes or attribution evidence. The
 reader and SSE carry them in seq order, and in-process recovery rebuilds the
 answer index from the durable prefix, so a resend after recovery replays. A
 detach or daemon restart ends the capture; an answer sent while no capture is selected gets `SESSION_NOT_SELECTED`. If the same chat re-attaches the same workspace, the capture resumes and an answer to a question already delivered to that chat is still recorded.
+
+### Questions follow the link
+
+An unlink (`agent.unlinked.v1`) hands every question queued since the latest
+`session.resumed` that has no committed answer to whichever chat is linked next,
+whether or not it was already dispatched. Claim matches the worktree, not the
+queued chat, because only the linked chat is admitted to claim. Each hand-off
+appends another `dispatch_attempted.v1` naming the new chat, and the question
+keeps its original `expires_at_ms`. Any chat a question was handed to may answer
+it while that chat is linked, so a chat relinked later can still answer its
+original copy; the first answer wins and a different later answer is
+`ANSWER_CONFLICT`. An unlinked chat's answer gets `SESSION_NOT_SELECTED`.
+In-process recovery rebuilds the same set: queued after the latest resume, no
+answer, and no attempt after the latest unlink. A resume still drops every
+question queued before it.
 
 ### Follow-up questions
 

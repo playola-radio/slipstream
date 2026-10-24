@@ -37,7 +37,9 @@ export interface QuestionDispatchAttemptedEvent {
   seq: string;
   time: string;
   subject: string;
-  data: { session_id: string; question_id: string; queued_seq: string; attempted_at_ms: number };
+  /** `target` is absent on attempts written before attempts recorded the chat they
+   * were handed to; such an attempt went to the queued target. */
+  data: { session_id: string; question_id: string; queued_seq: string; attempted_at_ms: number; target?: QuestionQueuedData['target'] };
 }
 export interface QuestionAnsweredData {
   session_id: string;
@@ -169,7 +171,7 @@ export type PublicEvent = AnyEvent | QuestionQueuedEvent | QuestionDispatchAttem
   | CaptureScopeEvent
   | AgentConnectionEvent | CaptureReadyEvent | CaptureStoppedEvent | AgentBindingEvent | AgentUnlinkedEvent;
 export type QuestionQueuedInput = { type: 'slipstream.question.queued.v1'; occurred_at_ms: number; data: Omit<QuestionQueuedData, 'session_id'> };
-export type QuestionDispatchAttemptedInput = { type: 'slipstream.question.dispatch_attempted.v1'; occurred_at_ms: number; data: { question_id: string; queued_seq: string; attempted_at_ms: number } };
+export type QuestionDispatchAttemptedInput = { type: 'slipstream.question.dispatch_attempted.v1'; occurred_at_ms: number; data: { question_id: string; queued_seq: string; attempted_at_ms: number; target: QuestionQueuedData['target'] } };
 export type QuestionAnsweredInput = { type: 'slipstream.question.answered.v1'; occurred_at_ms: number; data: Omit<QuestionAnsweredData, 'session_id'> };
 export type QuestionExchangeRecordedInput = { type: 'slipstream.question.exchange_recorded.v1'; occurred_at_ms: number; data: Omit<QuestionExchangeRecordedData, 'session_id'> };
 export type PublicEventInput = EventInput | QuestionQueuedInput | QuestionDispatchAttemptedInput | QuestionAnsweredInput
