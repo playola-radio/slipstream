@@ -264,6 +264,7 @@ describe('an unlink hands unanswered questions to the next linked chat', () => {
       const claimed = await session.claimQuestion(next(target));
       assert.deepEqual([claimed?.question_id, claimed?.expires_at_ms], [later, 5000 + QUESTION_TTL_MS]);
       assert.equal(await session.claimQuestion(next(target)), null);
+      assert.equal(await session.claimQuestion(next(target)), null, 'expired questions stay out of later hook checks');
     });
   });
 

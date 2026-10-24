@@ -310,6 +310,13 @@ export async function startCapture(
   const committedTasks = new Map<string, { title: string; result: BeginTaskResult }>();
   const inflightTasks = new Map<string, { title: string; promise: Promise<BeginTaskResult> }>();
 
+  const pruneExpiredClaimableQuestions = (): void => {
+    const currentTime = now();
+    for (const [id, queued] of claimableQuestions) {
+      if (currentTime >= queued.data.expires_at_ms) claimableQuestions.delete(id);
+    }
+  };
+
   // The attribution producer, constructed once the append path exists below. Its
   // `noteCommitted` is fed from the log's single in-order commit hook, so every
   // durably-committed change/evidence/policy reaches it exactly once, in order.
@@ -341,6 +348,7 @@ export async function startCapture(
       committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
       claimableQuestions.delete(event.data.question_id);
     }
+    pruneExpiredClaimableQuestions();
     committedExchanges.clear(); exchangesById.clear();
     for (const event of rec.questionExchanges) {
       committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
@@ -389,6 +397,7 @@ export async function startCapture(
         for (const [id, queued] of questionsById) {
           if (BigInt(queued.seq) > latestResumeSeq && !committedAnswers.has(id)) claimableQuestions.set(id, queued);
         }
+        pruneExpiredClaimableQuestions();
       }
       if (event.type === 'slipstream.task.started.v1') currentTaskId = event.data.task_id;
       // Route every durable commit to attribution in the same total order.
@@ -1226,6 +1235,7 @@ export async function startCapture(
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {
     assertOwnership();
     questionReady();
+    pruneExpiredClaimableQuestions();
     // The control handler admits only the linked chat, so a question queued for an
     // earlier chat of this worktree is the current chat's to claim.
     const queued = [...claimableQuestions.values()].find(q => q.data.target.worktree === target.worktree
