@@ -234,6 +234,16 @@ describe('an unlink hands unanswered questions to the next linked chat', () => {
     });
   });
 
+  it('offers moved questions oldest first', async () => {
+    await fixture(async ({ session, target, ask }) => {
+      const first = await ask(); const second = await ask();
+      await session.claimQuestion(target);
+      await unlink(session);
+      assert.deepEqual([(await session.claimQuestion(next(target)))?.question_id,
+        (await session.claimQuestion(next(target)))?.question_id], [first, second]);
+    });
+  });
+
   it('answeredQuestionIsNotReoffered', async () => {
     await fixture(async ({ session, target, ask }) => {
       const id = await ask();

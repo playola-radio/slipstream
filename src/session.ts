@@ -382,6 +382,8 @@ export async function startCapture(
       }
       if (event.type === 'slipstream.agent.unlinked.v1') {
         currentTaskId = undefined;
+        // Rebuilt in queue order so claims stay oldest first.
+        claimableQuestions.clear();
         for (const [id, queued] of questionsById) {
           if (BigInt(queued.seq) > latestResumeSeq && !committedAnswers.has(id)) claimableQuestions.set(id, queued);
         }
