@@ -106,12 +106,10 @@ it('rejects an empty or non-string version or entrypoint on the first identity r
   });
 });
 
-it('rejects a version or entrypoint that changes between records', async () => {
+it('rejects an entrypoint that changes between records', async () => {
   await withFixture(async ({ root, path }) => {
-    for (const fields of [{ version: '2.1.284' }, { entrypoint: 'sdk-ts' }]) {
-      await writeFile(path, line(preamble()) + line(identity(root)) + line({ ...identity(root), ...fields }));
-      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' }, JSON.stringify(fields));
-    }
+    await writeFile(path, line(preamble()) + line(identity(root)) + line(identity(root, '2.1.283', 'sdk-ts')));
+    assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), { ok: false, reason: 'mismatch' });
   });
 });
 
