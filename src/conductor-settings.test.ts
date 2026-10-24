@@ -40,6 +40,21 @@ describe('reading Conductor scripts', () => {
     });
   }
 
+  it('reads a file whose other top-level keys are quoted, as Conductor writes them', () => {
+    const text = '"$schema" = "https://conductor.build/schemas/settings.schema.json"\n\'other\' = 1\n[scripts]\nsetup = "npm ci"\n';
+    assert.deepEqual(readTomlScripts(text, P), { setup: 'npm ci' });
+  });
+
+  for (const [name, text] of [
+    ['a double-quoted top-level scripts key', '"scripts".setup = "npm ci"\n'],
+    ['a single-quoted top-level scripts key', "'scripts' = { setup = 'npm ci' }\n"],
+    ['a top-level key whose escapes Slipstream does not read', '"scr\\U00000069pts".setup = "npm ci"\n'],
+  ] as const) {
+    it(`refuses ${name} rather than guess`, () => {
+      assert.throws(() => readTomlScripts(text, P), SettingsError);
+    });
+  }
+
   it('still reads a file whose other tables merely resemble scripts', () => {
     const text = '[scripts.extra]\nsetup = "not ours"\n[scripts]\nsetup = "npm ci"\n';
     assert.deepEqual(readTomlScripts(text, P), { setup: 'npm ci' });
