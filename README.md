@@ -120,6 +120,10 @@ chat, run this in the workspace (or ask the agent to run it):
 slipstream attach
 ```
 
+This is the path for a chat that runs outside the Slipstream app, such as a
+terminal or Conductor chat. The Slipstream app is being designed to link its own
+chat for you instead, naming it explicitly, with no command to run.
+
 It works out which chat it is in, starts the daemon if needed, and starts
 recording. It also installs a hook and a tool in that workspace's agent config,
 which let you [ask the agent about a change](#experimental-ask-the-agent-about-a-change).
@@ -162,7 +166,11 @@ Current limits:
   answers a fresh setup check. A workspace whose folder was deleted or replaced
   in the meantime is not resumed; it shows as stopped (`root-missing`).
 
-### Capture every Conductor workspace
+### Capture every Conductor workspace (optional host)
+
+Conductor is an optional host. The Slipstream app can create and record
+workspaces itself (see [Workspaces without Conductor](#workspaces-without-conductor));
+this section is for capturing workspaces that Conductor creates.
 
 ```sh
 slipstream conductor install   # once, and again after upgrading Node or Slipstream
@@ -197,6 +205,8 @@ made 14 tool calls before it ended. Slipstream runs first in setup, but whether
 recording is ready before the agent's first edit was not measured. If the agent
 edits first, the first recorded state is whatever was there when recording
 started, and those earlier edits are not shown as changes. This is a known gap, accepted as is: Slipstream does not add a hook, a second capture source, or a wait to close it.
+`slipstream workspace create` (below) does not have this gap: it waits for setup to
+finish, and no agent exists in the workspace yet.
 
 Conductor removes an archived workspace's folder. Archive scripts were seen to
 run while the folder was still there (they could still use files in it), but
@@ -257,6 +267,10 @@ worktree stays and you can run `archive` again.
 Both scripts run in the workspace with `CONDUCTOR_ROOT_PATH` (the repo's main
 checkout) and `CONDUCTOR_WORKSPACE_PATH` (the workspace) set, so scripts written
 for Conductor work unchanged.
+
+Open question: setup and archive scripts are read only from Conductor's files
+(`.conductor/settings.toml`, `conductor.json`). Whether Slipstream gets its own
+native config for them is not decided.
 
 ## Group changes by task
 
@@ -373,9 +387,10 @@ codes are in [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
 - **Analysis never slows capture.** Transcript matching and code analysis run
   separately and only add to the log. If a step fails, the view has less
   detail, but no events are lost.
-- **Slipstream never launches your agent.** It joins through the agent's own
-  MCP and hook configuration. Each chat starts its own small `slipstream-mcp`
-  process, which only relays to the single daemon that owns the store.
+- **The daemon never launches your agent.** The Slipstream app can run the chat
+  itself; an outside chat joins through its own MCP and hook configuration. Each
+  chat starts its own small `slipstream-mcp` process, which only relays to the
+  single daemon that owns the store.
 
 The full decision record is in [NOTES-architecture.md](NOTES-architecture.md).
 
@@ -386,7 +401,7 @@ The full decision record is in [NOTES-architecture.md](NOTES-architecture.md).
 | `watch [dir] [--store dir]` | Capture a folder into its own store, with no daemon or HTTP |
 | `serve [dir] [--store dir]` | Same as `watch`, plus an HTTP reader |
 | `start [--store dir] [--config file] [...]` | Run the shared daemon |
-| `attach [dir]` | Run inside an agent chat: connect it and start recording |
+| `attach [dir]` | Run inside an outside agent chat (terminal, Conductor): connect it and start recording |
 | `attach [dir] --harness h --harness-session-id id` | Record a worktree for a chat you name yourself |
 | `status` / `detach` | Show or stop the active recording |
 | `conductor install` / `conductor enroll` | Keep the daemon running and capture every Conductor workspace |

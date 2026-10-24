@@ -6,9 +6,33 @@ Status: approved to build (Brian, after Codex adversarial review)
 ## What the MVP is
 
 A **live feed of code changes as an agent makes them**, watched alongside the
-agent in a browser. Conductor stays the launcher. Slipstream rides in via user-level
-MCP + skill config. (Amended 2026-10-18: Conductor still creates workspaces, but
-the Slipstream client may run the chat agent — see "C1: Chat console" below.)
+agent in a browser. The daemon never launches agents. Outside hosts (Conductor, a
+terminal) are launched by their own tools and Slipstream rides in via user-level
+MCP + skill config. (Amended 2026-10-18: the Slipstream client may run the chat
+agent; see "C1: Chat console" below. Amended 2026-10-24: the Slipstream app is the
+primary path and Conductor is an optional host; see the note below.)
+
+> **Direction (Brian, 2026-10-24): Slipstream is a standalone tool, not a Conductor
+> add-on.**
+> - Primary path: the app creates and archives workspaces (`slipstream workspace
+>   create|archive`; `create` starts recording the new workspace itself), runs the
+>   agent chat, and (planned, being designed in the client repo at
+>   `design/features/linked-chat/`) links one in-app chat tab as the workspace's
+>   linked chat so Ask questions reach it. The app links the chat on the chat's
+>   behalf, naming it explicitly with the `attach` form that takes a harness,
+>   session id and root transcript.
+> - Outside hosts stay supported as an option: a Conductor or terminal chat links
+>   with `slipstream attach` from inside the chat, and `slipstream conductor
+>   install|enroll|setup|archive` still work.
+> - Unchanged: the daemon never launches agents; capture is watcher-primary; a chat
+>   the app runs is never a capture source; one linked chat per capture; links bind
+>   the root transcript explicitly; no privileged back channel.
+> - Superseded: asking at a line from a forked copy of the tab's conversation (C1).
+>   Ask goes to the linked chat. `record_question_exchange` stays shipped; the
+>   client no longer plans to use it.
+> - Open: a native Slipstream setup/archive config (today read only from Conductor's
+>   files), and whether the transcript verifier's pinned version list is widened to
+>   accept app-run chats (needs live proof, settled in the linked-chat design).
 
 ## What the MVP promises — and does not
 
@@ -110,6 +134,9 @@ rewrite — and Stage 1's required p50/p99 measurements will name the function.
 
 **Amendment (Brian, 2026-10-05).** Q4 is lifted so every new Conductor
 workspace can be captured automatically.
+*Amended 2026-10-24 (Brian): every workspace is captured, whoever created it.
+`slipstream workspace create` records directly; the Conductor scripts are an
+optional trigger.*
 
 **Amendment (Brian, 2026-10-17).** Q4 is lifted further:
 
@@ -121,7 +148,10 @@ workspace can be captured automatically.
   Never two chats on one capture; replacing a chat on a workspace needs an
   explicit unlink. A chat is linked by `slipstream attach`, which binds it in
   place onto the live capture (same `session_id`, no new baseline, no fabricated
-  gap; earlier changes are never credited to the chat).
+  gap; earlier changes are never credited to the chat). *Amended 2026-10-24
+  (Brian): the app can also link its own in-app chat on the chat's behalf, naming
+  it explicitly; `slipstream attach` from inside the chat remains for outside
+  hosts. Planned, being designed in the client repo.*
 - D1 is revised: strict launch blocking is not required. Setup that cannot make
   capture ready exits non-zero with a readable reason, the workspace shows as
   NOT recording with that reason in public projections, and recovery retries
@@ -143,8 +173,8 @@ explicit selection, detach-before-switch and no competing auto-start carry
 explicit dated amendment notes below; identity verification and watcher-primary
 capture are unchanged. The text below predates the amendments.
 
-Capturing several worktrees at once and auto-connecting new Conductor workspaces
-are current MVP scope under amended Q4. The legacy single-active Stage 3 wording
+Capturing several worktrees at once and auto-connecting new workspaces (Conductor
+or `slipstream workspace create`) are current MVP scope under amended Q4. The legacy single-active Stage 3 wording
 below is superseded where it conflicts with this amendment; the log, blob store,
 reader, boundary registry and `CaptureSession` are already multi-session.
 
@@ -184,7 +214,8 @@ requirement to tests, the observed Conductor launch order is in the README, and
 refuse a daemon's store; a storage outage while recording is recorded in the
 intent so offline readers see it; parity tests for every failure state and
 Codex links after a restart; the Conductor setup-before-agent gap documented as
-accepted) is in review on `briankeane/autocapture-p6d-queued-parity`. P6a
+accepted; the gap does not apply to `slipstream workspace create`, which finishes
+setup before any agent exists) is in review on `briankeane/autocapture-p6d-queued-parity`. P6a
 (native app) is separate.
 The real-use day (the D8 verdict) has not been run; the feature is not complete.
 
@@ -341,7 +372,9 @@ acknowledging (health `ELOCKLOST`). A strict single-writer guarantee against
 takeover is detected asynchronously, so an append already awaiting its fsync
 cannot be un-written, and any pure-Node stale-break must briefly vacate the lock
 path. That residual is closed operationally: Conductor launches one daemon per
-worktree, so concurrent acquirers on one session do not occur. On-disk tests for
+worktree, so concurrent acquirers on one session do not occur. *(Superseded
+2026-10-24: the LaunchAgent and `workspace create` now also ensure the one
+shared daemon is running; that stage's wording is kept as history.)* On-disk tests for
 all three required failure paths pass. PR 2b delivered the `/v1` reader API
 (finite NDJSON and SSE follow with one-cursor replay-then-follow, HTTP error
 codes, and loopback bearer auth with host/origin checks), the two-reader
@@ -355,6 +388,10 @@ durable-sync gap remains tracked as separate work.
 ---
 
 ## Stage 3: Prove riding alongside Conductor, with tasks
+
+> Note 2026-10-24 (Brian): the stage goal below was written when Conductor was the
+> launcher. Conductor is now an optional host and the Slipstream app is the primary
+> path; the daemon still never launches agents. See the direction note at the top.
 
 **Goal**: Slipstream attaches to exactly one Conductor-launched session among several
 and receives declared task boundaries from the agent — without owning launch.
@@ -396,6 +433,8 @@ MCP tool `slipstream_begin_task`.
   *Amended 2026-10-17 (Brian): a user LaunchAgent and the Conductor setup script
   may start the one daemon that owns the store; ensure-running stays idempotent,
   so there is still no competing second daemon. Forwarders still fail fast.*
+  *Amended 2026-10-24 (Brian): `slipstream workspace create` may also start it,
+  under the same idempotent rule.*
 - CLI documented for start, attach, status, detach, session deletion, GC.
 
 **Tests**
@@ -866,7 +905,8 @@ pivot forces are marked ⚠ **pending Brian's ratification** — not enacted her
   render as gaps; `unknown` ≠ human; a stale view must disclose it is behind.
 - Feed uses lightweight rendered diffs; the expensive focused renderer is
   instantiated for the focused pane only, never per card.
-- **Acceptance run (Q14's bar):** live Conductor sessions for both harnesses; task
+- **Acceptance run (Q14's bar):** live agent sessions for both harnesses (app-run,
+  plus Conductor as an optional host; amended 2026-10-24); task
   grouping visible; daemon killed and readers reconnected mid-session; measured
   capture latency reported (instrumented, not inferred from event timestamps);
   known coverage gaps documented; then the bundled native UI is **stopped
@@ -889,6 +929,9 @@ remain). Stage T / Stage 5 must not silently discharge those.
 
 **Explicitly not in this MVP**: answer display and reply transport, review or approval
 workflow, automatic installer, launcher replacement, historical content import.
+*Superseded 2026-10-24 (Brian) for the launcher: the Slipstream app now creates
+workspaces and runs the chat agent (see the direction note at the top); the daemon
+still never launches agents.*
 The additive ask/send re-scope approved by Brian on 2026-09-25 starts with D1
 durable question submission below; queue acceptance does not promise delivery.
 
@@ -1042,6 +1085,10 @@ observed identities are Terminal `2.1.283`/`sdk-cli` and Conductor
 `2.1.280`/`sdk-ts`, `2.1.284`/`sdk-ts` or `2.1.300`/`sdk-ts`; ambiguous or unsupported identity fails closed. No new
 capture source, Swift UI, launcher, hook installer or automatic hook trust is
 added. Contract: [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
+*Note 2026-10-24 (Brian): "no launcher" here means the daemon launches nothing, which
+still holds; the app now runs a chat agent. Whether this pinned version list is widened
+to accept app-run chats is open and needs live proof (see the direction note at the
+top). The list itself is unchanged.*
 
 Compatibility follow-up (2026-10-03): the Conductor `2.1.284`/`sdk-ts` root
 identity was observed and its real transcript passed read-only verification.
@@ -1166,6 +1213,12 @@ starts recording, and proves question delivery and answer return with one live
 round trip. Repeating it reports the existing capture. Design settled through
 a Codex consult; contract in [docs/ask-agent/contract.md](docs/ask-agent/contract.md).
 
+*Note 2026-10-24 (Brian): this is the path for outside hosts (a Conductor or terminal
+chat). The Slipstream app will instead link its own in-app chat on the chat's behalf,
+naming it explicitly with `attach <dir> --harness … --harness-session-id …
+--root-transcript …`, so the agent does not run `slipstream attach` itself. Planned,
+being designed in the client repo at `design/features/linked-chat/`.*
+
 - **The chat names itself.** The agent's own environment
   (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) selects the chat; the root
   transcript is found automatically and verified as before. No agent identity,
@@ -1215,6 +1268,9 @@ capture is connected; drafts stay with their capture.
 both Conductor paths blocked because every runtime Conductor ships is outside
 the verified set (version policy, PR #48). See
 `docs/ask-agent/attach-acceptance-2026-10-07.md`.
+*Note 2026-10-24 (Brian): Conductor is an optional host, so this status stands as
+recorded. The app-run host has no row yet; it is covered by the linked-chat stage
+(C1.4) once designed.*
 
 ## W1: One stream per workspace (2026-10-14)
 
@@ -1235,6 +1291,9 @@ Codex); the daemon still never launches agents. Ask-at-a-line answers come from 
 branch-off copy of the tab's conversation, which hands change requests to the
 main chat; threads are saved in the log through a new daemon verb.
 Design: `docs/chat-console/DESIGN.md`. Client work lives in the client repo.
+*Superseded 2026-10-24 (Brian): Ask goes to the workspace's linked chat (C1.4), not
+a branch-off copy. `record_question_exchange` stays shipped; the client no longer
+plans to use it.*
 
 ### Stage C1.1: Amend the launch rule
 **Success Criteria**: `CLAUDE.md` (and `AGENTS.md`, a symlink to it) and this
@@ -1255,3 +1314,16 @@ heuristic / single-candidate after the fork.
 ### Stage C1.3: `record_question_exchange` verb and event
 **Success Criteria**: per `docs/chat-console/DESIGN.md` Change 2, with its tests.
 **Status**: Complete — 721b079..b1b80e9 (typecheck, npm test 1679/1679, test:tools 598/598, qa:check --all passed; conversation ids appear only in questions.ts validation and tests)
+
+### Stage C1.4: Linked chat for app-run chats
+**Goal:** the Slipstream app links one in-app chat tab as the workspace's linked
+chat, naming it explicitly through `attach`, so Ask questions reach that tab through
+the existing flow (`ask` queues, the `PostToolUse` hook delivers at the agent's next
+tool call, the agent answers with `slipstream_answer_question`). One linked chat per
+capture still holds; switching chats means unlink then link. The daemon never
+launches the agent, and the app's chat is never a capture source. Criteria are not
+written yet: the design is in progress in the client repo at
+`design/features/linked-chat/`. Open there: whether the transcript verifier's pinned
+(Claude version, entrypoint) list is widened to accept app-run chats, which needs
+live proof.
+**Status**: Not Started

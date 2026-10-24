@@ -14,6 +14,10 @@ at once, one per capture, so Brian can flip between workspaces in the native app
 and Ask Agent in each. Capture stops when the workspace is archived, and survives
 daemon restarts and maintenance without anyone thinking about it.
 
+> Note 2026-10-24 (Brian): every workspace is captured, whoever created it.
+> `slipstream workspace create` records the new workspace directly, a second trigger
+> beside the Conductor setup script, which is now an optional host.
+
 Capture reports observed filesystem states with explicit gaps, never a claim of
 complete edit history. A linked chat is a question-delivery relationship, never
 file authorship.

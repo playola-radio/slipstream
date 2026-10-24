@@ -9,6 +9,8 @@ Architect: Codex (gpt-6-astra) consult + local empirical checks.
 - Feature 3 must reach the **original implementing LLM**, live — not a replay.
 - Floor: Claude Code + Codex CLI, both launched by Conductor.
 
+> Superseded 2026-10-24 (Brian): Slipstream is now a standalone tool. The app creates workspaces and runs the agent chat; Conductor and terminal chats remain supported as optional hosts. The daemon still never launches agents.
+
 ## Decision
 
 **Headless local service + browser client.** TS/Node service, SQLite, React +
@@ -38,6 +40,8 @@ the agent pulls from Slipstream. Verified locally:
   `~/.codex/skills/` exists and is populated. Same mechanism available.
 
 Conductor stays the launcher. Slipstream rides in via user-level config.
+
+> Superseded 2026-10-24 (Brian): this describes outside hosts, which stay supported as an option. The app is the primary path and runs its own chat; "Slipstream-owns-launch is ruled out" above no longer limits the app, though the daemon still launches nothing.
 
 ## How feature 3 actually works
 
@@ -157,6 +161,7 @@ rather than re-deriving them.
 
 1. Is requiring a user-level install step (register Slipstream's MCP + skill + hooks
    once) acceptable? It's the price of not owning launch.
+   > Superseded 2026-10-24 (Brian): needed only for outside hosts; the app links its own chat (planned, being designed in the client repo).
 2. Should an agent's answer be allowed to **edit code**, or answer-only in v1?
 3. Adopt the canvas's "story" vocabulary over "task"?
 

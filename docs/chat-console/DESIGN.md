@@ -25,6 +25,14 @@ agents. Conductor stays the launcher.") and `IMPLEMENTATION_PLAN.md`
 Also record that the attach / hook / `slipstream_answer_question` path is kept
 for Conductor-run chats; client-run chats don't use it.
 
+> Amended 2026-10-24 (Brian): the app is now the primary path and Conductor is an
+> optional host. The attach / hook / `slipstream_answer_question` path is kept for
+> outside chats (Conductor, terminal), and is also planned for the app's own chat:
+> the app links one in-app chat as the workspace's linked chat, naming it explicitly,
+> so Ask questions reach it through that same path. This is being designed in the
+> client repo at `design/features/linked-chat/`. The daemon still never launches
+> agents, and a client-run chat is still never a capture source.
+
 ## Change 2 — record client-answered question threads
 
 ### Problem
@@ -35,6 +43,11 @@ Inline question threads are public log events today
 forking the tab's conversation (`claude --resume <id> --fork-session`) — no
 hook delivery, binding, or setup handshake. Those threads must still land in
 the log ("no capability reachable only through the bundled UI").
+
+> Superseded 2026-10-24 (Brian): the client no longer plans to answer ask-at-a-line
+> from a forked copy of the tab's conversation; Ask goes to the linked chat through
+> the existing flow. `record_question_exchange` stays shipped and documented below,
+> but the client does not plan to use it.
 
 ### Control verb: `record_question_exchange`
 
