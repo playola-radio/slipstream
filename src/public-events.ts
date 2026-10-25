@@ -1,6 +1,6 @@
 /** Additive public events outside the byte-frozen display-fold.v1 dependencies. */
 import { EVENT_TYPES, buildEnvelope, sourceFor, SPEC_VERSION, DATA_CONTENT_TYPE, type AnyEvent, type EventInput, type HarnessName } from './event.ts';
-import type { ExchangeConversation, QuestionContext } from './questions.ts';
+import type { ExchangeConversation, QuestionContext, QuestionRelay } from './questions.ts';
 
 export const PUBLIC_EVENT_TYPES = [...EVENT_TYPES, 'slipstream.question.queued.v1', 'slipstream.question.dispatch_attempted.v1',
   'slipstream.question.answered.v1', 'slipstream.question.exchange_recorded.v1', 'slipstream.capture.scope.v1', 'slipstream.agent.connection.v1',
@@ -71,6 +71,7 @@ export interface QuestionExchangeRecordedData {
   recorded_at_ms: number;
   reply_to_question_id?: string;
   conversation: ExchangeConversation & { reported_by: 'client' };
+  relay?: QuestionRelay;
 }
 export interface QuestionExchangeRecordedEvent {
   specversion: typeof SPEC_VERSION;

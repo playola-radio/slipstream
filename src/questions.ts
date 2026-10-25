@@ -179,9 +179,15 @@ export interface ExchangeConversation {
   parent_session_id: string;
   fork_session_id: string;
 }
+/** A change request the recorded answer accepted. The chat id is client-reported, like the conversation ids. */
+export interface QuestionRelay {
+  relay_id: string;
+  chat_session_id: string;
+}
 export interface QuestionExchangeRequest extends QuestionRequest {
   answer_text: string;
   conversation: ExchangeConversation;
+  relay?: QuestionRelay;
 }
 
 function conversationId(value: unknown, name: string): string {
@@ -210,17 +216,26 @@ export function normalizeExchange(value: unknown): QuestionExchangeRequest {
   if (parent === fork) throw new QuestionError('PROTOCOL', 'conversation parent and fork ids must differ');
   return { ...ask, answer_text: req.answer_text, conversation: {
     harness: c.harness as HarnessName, parent_session_id: parent, fork_session_id: fork,
-  } };
+  }, ...(req.relay !== undefined ? { relay: normalizeRelay(req.relay) } : {}) };
+}
+
+function normalizeRelay(value: unknown): QuestionRelay {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new QuestionError('PROTOCOL', 'relay must be an object');
+  const r = value as Record<string, unknown>;
+  if (typeof r.relay_id !== 'string' || !UUID.test(r.relay_id)) throw new QuestionError('PROTOCOL', 'relay.relay_id must be a canonical lowercase UUID');
+  return { relay_id: r.relay_id, chat_session_id: conversationId(r.chat_session_id, 'relay.chat_session_id') };
 }
 
 /**
- * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer and the
- * reported conversation. A digest, not the JSON itself, so the capture does not retain every answer
- * (up to ~1 MiB each) for its lifetime.
+ * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer, the
+ * reported conversation and the relay when present (an exchange without one keeps its original digest).
+ * A digest, not the JSON itself, so the capture does not retain every answer (up to ~1 MiB each) for
+ * its lifetime.
  */
 export function exchangeBody(req: QuestionExchangeRequest): string {
   const c = req.conversation;
-  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+  const relay = req.relay ? [req.relay.relay_id, req.relay.chat_session_id] : [];
+  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id, ...relay]);
   return createHash('sha256').update(json).digest('hex');
 }
 

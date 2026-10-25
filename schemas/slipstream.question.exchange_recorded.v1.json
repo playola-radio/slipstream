@@ -46,6 +46,15 @@
             "fork_session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
             "reported_by": { "const": "client" }
           }
+        },
+        "relay": {
+          "$comment": "The change request this answer accepted; it counts as that relay's first send. chat_session_id is client-reported and unverified.",
+          "type": "object",
+          "required": ["relay_id", "chat_session_id"],
+          "properties": {
+            "relay_id": { "$ref": "#/$defs/uuid" },
+            "chat_session_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
         }
       }
     }

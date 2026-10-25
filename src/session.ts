@@ -286,6 +286,10 @@ export async function startCapture(
   const committedExchanges = new Map<string, { body: string; result: QuestionExchangeAccepted }>();
   const inflightExchanges = new Map<string, { body: string; promise: Promise<QuestionExchangeAccepted> }>();
   const exchangesById = new Map<string, QuestionContext>();
+  // relay_id -> question_id for every committed send. A relay_id is reserved while
+  // its append is in flight, so a concurrent reuse is refused before either lands.
+  const relayQuestions = new Map<string, string>();
+  const reservedRelays = new Set<string>();
   const sourceContext = (context: QuestionContext): QuestionContext => ({
     change_seq: context.change_seq,
     path: context.path,
@@ -354,6 +358,8 @@ export async function startCapture(
       committedExchanges.set(event.data.request_id, { body: exchangeBody(event.data), result: exchangeResult(event) });
       exchangesById.set(event.data.question_id, sourceContext(event.data.context));
     }
+    relayQuestions.clear();
+    for (const [relayId, questionId] of rec.relayQuestions) relayQuestions.set(relayId, questionId);
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -413,7 +419,10 @@ export async function startCapture(
         committedAnswers.set(event.data.question_id, { text: event.data.text, result: answerResult(event) });
         claimableQuestions.delete(event.data.question_id);
       }
-      if (event.type === 'slipstream.question.exchange_recorded.v1') exchangesById.set(event.data.question_id, sourceContext(event.data.context));
+      if (event.type === 'slipstream.question.exchange_recorded.v1') {
+        exchangesById.set(event.data.question_id, sourceContext(event.data.context));
+        if (event.data.relay) relayQuestions.set(event.data.relay.relay_id, event.data.question_id);
+      }
       if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
   };
@@ -1193,6 +1202,10 @@ export async function startCapture(
     finally { inflightQuestions.delete(req.request_id); }
   };
 
+  // A committed send is registered by onCommitted (or rebuilt by recovery), so a
+  // reservation can be dropped once its append settles either way.
+  const isKnownRelay = (relayId: string): boolean => relayQuestions.has(relayId) || reservedRelays.has(relayId);
+
   const recordQuestionExchange = async (input: unknown, assertOwnership: () => void = () => {}): Promise<QuestionExchangeAccepted> => {
     const req = normalizeExchange(input);
     if (req.session_id !== sessionId) throw new QuestionError('SESSION_NOT_SELECTED', 'exchange addresses a different capture');
@@ -1209,6 +1222,8 @@ export async function startCapture(
       && !sameSourceContext(exchangesById.get(req.reply_to_question_id), req.context)) {
       throw new QuestionError('INVALID_CONTEXT', 'a follow-up must reply to an exchange in this capture about the same source');
     }
+    const relayId = req.relay?.relay_id;
+    if (relayId !== undefined && isKnownRelay(relayId)) throw new QuestionError('INVALID_RELAY_UPDATE', 'relay_id was already sent in this capture');
     // Defer starting I/O until the in-flight reservation is installed synchronously.
     const promise = Promise.resolve().then(async (): Promise<QuestionExchangeAccepted> => {
       const selected_text = await deps.readQuestionContext({ storeDir, logPath, sessionId,
@@ -1220,7 +1235,8 @@ export async function startCapture(
         data: { question_id: randomUUID(), request_id: req.request_id, text: req.text,
           context: { ...req.context, selected_text }, answer_text: req.answer_text, recorded_at_ms,
           conversation: { ...req.conversation, reported_by: 'client' },
-          ...(req.reply_to_question_id !== undefined ? { reply_to_question_id: req.reply_to_question_id } : {}) } });
+          ...(req.reply_to_question_id !== undefined ? { reply_to_question_id: req.reply_to_question_id } : {}),
+          ...(req.relay !== undefined ? { relay: req.relay } : {}) } });
       if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
       assertOwnership();
       const result = exchangeResult(event);
@@ -1228,8 +1244,12 @@ export async function startCapture(
       return result;
     });
     inflightExchanges.set(req.request_id, { body, promise });
+    if (relayId !== undefined) reservedRelays.add(relayId);
     try { return await promise; }
-    finally { inflightExchanges.delete(req.request_id); }
+    finally {
+      inflightExchanges.delete(req.request_id);
+      if (relayId !== undefined) reservedRelays.delete(relayId);
+    }
   };
 
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {

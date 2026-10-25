@@ -41,6 +41,7 @@ async function seedLog(dir: string, inputs: EventInput[]): Promise<string> {
 
 const QUESTION = '11111111-1111-4111-8111-111111111111';
 const OTHER_QUESTION = '22222222-2222-4222-8222-222222222222';
+const RELAY = '33333333-3333-4333-8333-333333333333';
 const queued = (questionId: string): EventInput => ({
   type: 'slipstream.question.queued.v1',
   occurred_at_ms: 4,
@@ -65,7 +66,7 @@ const answered = (questionId: string, attemptSeq: string, text = 'Because.'): Ev
   occurred_at_ms: 6,
   data: { question_id: questionId, attempt_seq: attemptSeq, text, answered_at_ms: 6 },
 });
-const exchange = (questionId: string, answerText = 'Because.'): EventInput => ({
+const exchange = (questionId: string, answerText = 'Because.', relay?: { relay_id: string; chat_session_id: string }): EventInput => ({
   type: 'slipstream.question.exchange_recorded.v1',
   occurred_at_ms: 7,
   data: {
@@ -76,6 +77,7 @@ const exchange = (questionId: string, answerText = 'Because.'): EventInput => ({
     answer_text: answerText,
     recorded_at_ms: 7,
     conversation: { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1', reported_by: 'client' },
+    ...(relay ? { relay } : {}),
   },
 });
 
@@ -163,6 +165,16 @@ describe('recovery', () => {
       const rec = await recoverSession(path, SESSION, cas);
       assert.deepEqual(rec.questionExchanges.map(e => [e.seq, e.data.question_id, e.data.answer_text]),
         [['2', QUESTION, 'first'], ['3', OTHER_QUESTION, 'second']]);
+    });
+  });
+
+  it('relayRegistryRebuiltFromLog: maps each exchange relay_id to its question', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        exchange(OTHER_QUESTION, 'second')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual([...rec.relayQuestions], [[RELAY, QUESTION]]);
     });
   });
 

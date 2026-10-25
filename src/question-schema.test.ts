@@ -207,6 +207,27 @@ describe('slipstream.question.exchange_recorded.v1 schema', () => {
     });
   }
 
+  const RELAY = { relay_id: 'c9d8e7f6-a5b4-4c3d-8e2f-1a0b9c8d7e6f', chat_session_id: '5896f28c-f4a9-46c2-b481-7ca57e8714a8' };
+  it('eventWithRelayValidatesAgainstSchema: an exchange carrying relay validates', async () => {
+    const event = buildExchange({ relay: RELAY });
+    assert.ok(event.type === TYPE);
+    assert.deepEqual(event.data.relay, RELAY);
+    assert.deepEqual(validate(await loadSchema(TYPE), event), []);
+  });
+
+  for (const [name, relay] of [
+    ['an uppercase relay_id', { ...RELAY, relay_id: RELAY.relay_id.toUpperCase() }],
+    ['a missing chat_session_id', { relay_id: RELAY.relay_id }],
+    ['an empty chat_session_id', { ...RELAY, chat_session_id: '' }],
+    ['a 257-character chat_session_id', { ...RELAY, chat_session_id: 'x'.repeat(257) }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    it(`rejects an exchange relay with ${name}`, async () => {
+      const event = structuredClone(buildExchange()) as Record<string, any>;
+      event.data.relay = relay;
+      assert.ok(validate(await loadSchema(TYPE), event).length > 0);
+    });
+  }
+
   it('foldDisplay ignores exchange_recorded', () => {
     assert.deepEqual(foldDisplay([buildExchange()]), { contract: 'display-fold.v1', result: 'ok',
       state: { attributions: [], coverage: [], evidence: [], gaps: [] } });

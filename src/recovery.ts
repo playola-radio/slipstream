@@ -57,6 +57,8 @@ export interface RecoveredSession {
   questionAttempts: QuestionDispatchAttemptedEvent[];
   questionAnswers: QuestionAnsweredEvent[];
   questionExchanges: QuestionExchangeRecordedEvent[];
+  /** Every relay_id the log has seen sent, mapped to its question. */
+  relayQuestions: Map<string, string>;
   /** Generations with a durable `agent.binding` record, so a resume can append
    * one a crash interrupted (contracts.md §6). */
   bindingGenerations: Set<string>;
@@ -135,6 +137,7 @@ export async function recoverSession(
   const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const questionAnswers: QuestionAnsweredEvent[] = [];
   const questionExchanges: QuestionExchangeRecordedEvent[] = [];
+  const relayQuestions = new Map<string, string>();
   // Keep the ordered event arrays for callers, while replay validation uses
   // indexes so a long-lived session is replayed in one pass.
   const queuedSeqsByQuestion = new Map<string, Set<string>>();
@@ -319,6 +322,7 @@ export async function recoverSession(
       case 'slipstream.question.exchange_recorded.v1': {
         if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
         questionExchanges.push(event);
+        if (event.data.relay) relayQuestions.set(event.data.relay.relay_id, event.data.question_id);
         break;
       }
       case 'slipstream.task.started.v1': {
@@ -390,6 +394,7 @@ export async function recoverSession(
     questionAttempts,
     questionAnswers,
     questionExchanges,
+    relayQuestions,
     bindingGenerations,
   };
 }
