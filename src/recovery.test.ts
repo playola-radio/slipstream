@@ -199,6 +199,27 @@ describe('recovery', () => {
     });
   });
 
+  it('recovery rejects relay histories the daemon refuses live', async () => {
+    const AGAIN = '44444444-4444-4444-8444-444444444444';
+    const STEP = '55555555-5555-4555-8555-555555555555';
+    const withRelay = exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' });
+    const cases: Array<[string, EventInput[]]> = [
+      ['a step before any send', [exchange(QUESTION), relayUpdate(QUESTION, RELAY, STEP, { kind: 'picked_up' })]],
+      ['a step for another question\'s relay', [withRelay, exchange(OTHER_QUESTION),
+        relayUpdate(OTHER_QUESTION, RELAY, STEP, { kind: 'picked_up' })]],
+      ['a send reusing a relay_id', [withRelay, relayUpdate(QUESTION, RELAY, STEP, { kind: 'sent', chat_session_id: 'chat-1' })]],
+      ['an exchange reusing a relay_id', [withRelay, exchange(OTHER_QUESTION, 'second', { relay_id: RELAY, chat_session_id: 'chat-1' })]],
+      ['a send from a question with no exchange', [relayUpdate(QUESTION, AGAIN, STEP, { kind: 'sent', chat_session_id: 'chat-1' })]],
+    ];
+    for (const [name, events] of cases) {
+      await withTempDir(async (dir) => {
+        const cas = await createCas(join(dir, 'blobs'));
+        const path = await seedLog(dir, [started, ...events]);
+        await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError, name);
+      });
+    }
+  });
+
   it('recovery rejects a relay update whose subject does not match its question_id', async () => {
     await withTempDir(async (dir) => {
       const cas = await createCas(join(dir, 'blobs'));

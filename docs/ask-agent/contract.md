@@ -498,7 +498,11 @@ interface RecordQuestionRelayUpdateRequest {
 - `question_id` must name a recorded exchange in this capture, else
   `INVALID_RELAY_UPDATE`. A question queued by `ask` does not count.
 - Steps are recorded in whatever order they arrive; the daemon does not check
-  order. A reader folds a relay's steps by status precedence. The daemon keeps only
+  order, so a reader folds a relay's steps without depending on it: the relay is
+  picked up if any `picked_up` exists (the earliest counts); it is not delivered
+  only if a `not_delivered` exists and no `picked_up` does; its report is any
+  `done` report, else the latest `reported` by `seq`. Status, first match wins:
+  done, not delivered, reported not done yet, picked up, sent. The daemon keeps only
   which question each `relay_id` was sent from, rebuilt from the log on restart,
   and refuses as `INVALID_RELAY_UPDATE`: a `relay_id` sent from another question; a
   `picked_up`, `not_delivered` or `reported` for a `relay_id` never sent in this

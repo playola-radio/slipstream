@@ -92,13 +92,6 @@ it('sendAgainRegistersNewRelay: a sent update registers a new relay_id for later
   });
 });
 
-it('a later picked_up is accepted after an exchange with relay', async () => {
-  await fixture(async ({ s, exchange, update }) => {
-    const { question_id, relay_id } = await exchange();
-    assert.equal((await s.recordQuestionRelayUpdate(update(question_id, relay_id, { kind: 'picked_up' }))).duplicate, false);
-  });
-});
-
 it('updatesInAnyOrderAreAppended: steps are recorded in arrival order with no order check', async () => {
   await fixture(async ({ s, exchange, update }) => {
     const { question_id, relay_id } = await exchange();
@@ -155,7 +148,7 @@ it('reusedRelayIDOnSentRefused: a sent reusing a recorded or in-flight relay_id 
   const gate = new Promise<void>(r => { release = r; });
   const reachedAppend = new Promise<void>(r => { entered = r; });
   try {
-    await fixture(async ({ s, exchange, update }) => {
+    await fixture(async ({ s, context, exchange, update }) => {
       const { question_id, relay_id } = await exchange();
       const sent = { kind: 'sent', chat_session_id: CHAT };
       await assert.rejects(s.recordQuestionRelayUpdate(update(question_id, relay_id, sent)), { code: 'INVALID_RELAY_UPDATE' });
@@ -163,7 +156,7 @@ it('reusedRelayIDOnSentRefused: a sent reusing a recorded or in-flight relay_id 
       const first = s.recordQuestionRelayUpdate(update(question_id, again, sent));
       await reachedAppend;
       await assert.rejects(s.recordQuestionRelayUpdate(update(question_id, again, sent)), { code: 'INVALID_RELAY_UPDATE' });
-      await assert.rejects(s.recordQuestionExchange({ session_id: s.sessionId, request_id: randomUUID(), text: 'Q', context: (await relayContext(s))!,
+      await assert.rejects(s.recordQuestionExchange({ session_id: s.sessionId, request_id: randomUUID(), text: 'Q', context,
         answer_text: 'On it.', conversation: { harness: 'claude-code', parent_session_id: CHAT, fork_session_id: 'fork-1' },
         relay: { relay_id: again, chat_session_id: CHAT } }), { code: 'INVALID_RELAY_UPDATE' });
       release();
@@ -179,13 +172,6 @@ it('reusedRelayIDOnSentRefused: a sent reusing a recorded or in-flight relay_id 
     } });
   } finally { release(); }
 });
-
-async function relayContext(s: Session): Promise<QuestionContext | undefined> {
-  const exchange = (await readRecords(s.logPath)).find(e => e.type === 'slipstream.question.exchange_recorded.v1');
-  if (exchange?.type !== 'slipstream.question.exchange_recorded.v1') return undefined;
-  const { selected_text: _selected, ...context } = exchange.data.context;
-  return context;
-}
 
 it('a sent whose append failed cleanly leaves its relay_id free', async () => {
   let fail = true;

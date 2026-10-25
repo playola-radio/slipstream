@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://slipstream.dev/schemas/slipstream.question.relay_updated.v1.json",
   "title": "slipstream.question.relay_updated.v1",
-  "$comment": "One later step of a change request sent from a recorded exchange, as the client reported it. Steps are recorded in arrival order with no order checks; a reader folds a relay's steps by status precedence. chat_session_id and report text are client-reported and unverified; never a binding and never authorship. Self-contained; unknown fields permitted for forward compatibility.",
+  "$comment": "One later step of a change request sent from a recorded exchange, as the client reported it. Steps are recorded in arrival order with no order checks; a reader folds a relay's steps by the precedence in docs/ask-agent/contract.md. chat_session_id and report text are client-reported and unverified; never a binding and never authorship. Self-contained; unknown fields permitted for forward compatibility.",
   "type": "object",
   "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "subject", "data"],
   "properties": {
