@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, readdir, utimes, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -11,6 +12,7 @@ import { createLog } from './log.ts';
 import { readQuestionContext } from './questions.ts';
 import { StorageError } from './storage.ts';
 import { createCas } from './cas.ts';
+import { loadSchema, validate } from './schema.ts';
 import { claudePostToolUse } from './question-hook.ts';
 import { createFakePlatform } from './test/fake-platform.ts';
 import type { Platform, Subscription, WatchOptions } from './platform.ts';
@@ -2587,6 +2589,94 @@ describe('daemon record_question_exchange', () => {
         } };
       } });
     } finally { release(); }
+  });
+
+  describe('record_question_relay_update', () => {
+    const RELAY_TYPE = 'slipstream.question.relay_updated.v1';
+    const RELAY = { relay_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', chat_session_id: '5896f28c-f4a9-46c2-b481-7ca57e8714a8' };
+    const UPDATE_REQUEST = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    const REPORT_REQUEST = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    const relayUpdate = (id: string, questionId: string, requestId: string, update: Record<string, unknown>): CallRequest =>
+      ({ verb: 'record_question_relay_update', session_id: id, request_id: requestId, question_id: questionId, relay_id: RELAY.relay_id, update });
+
+    it('watchOnlyCaptureAccepts: records each step with the documented reply and nothing else', async () => {
+      await withSeededCapture(async ({ store, call, id, exchange }) => {
+        const recorded = await call(exchange({ relay: RELAY }));
+        assert.equal(recorded.ok, true, JSON.stringify(recorded));
+        const questionId = rec(recorded).question_id!;
+        const before = (await readLog(store, id)).map((e) => e.seq);
+        const picked = await call(relayUpdate(id, questionId, UPDATE_REQUEST, { kind: 'picked_up' }));
+        const done = await call(relayUpdate(id, questionId, REPORT_REQUEST, { kind: 'reported', outcome: 'done', text: 'Done.' }));
+        const after = await readLog(store, id);
+        const added = after.filter((e) => !before.includes(e.seq) && e.type !== 'slipstream.change.attribution.v1');
+        assert.deepEqual(added.map((e) => e.type), [RELAY_TYPE, RELAY_TYPE]);
+        assert.deepEqual(picked, { v: 1, ok: true, session_id: id, request_id: UPDATE_REQUEST, question_id: questionId,
+          relay_id: RELAY.relay_id, seq: added[0]!.seq, duplicate: false });
+        assert.deepEqual(done, { v: 1, ok: true, session_id: id, request_id: REPORT_REQUEST, question_id: questionId,
+          relay_id: RELAY.relay_id, seq: added[1]!.seq, duplicate: false });
+        assert.equal((added[1] as unknown as { subject: string }).subject, `question/${questionId}`);
+        const schema = await loadSchema(RELAY_TYPE);
+        for (const event of added) assert.deepEqual(validate(schema, event), []);
+        const unknown = await call({ ...relayUpdate(id, questionId, randomUUID(), { kind: 'picked_up' }), relay_id: randomUUID() });
+        assert.equal(unknown.ok === false && unknown.code, 'INVALID_RELAY_UPDATE');
+      });
+    });
+
+    it('bodilessRequestIsProtocol: the capability probe is PROTOCOL whatever the capture state', async () => {
+      await withSeededCapture(async ({ store, call, id }) => {
+        const before = (await readLog(store, id)).length;
+        for (const sessionId of [id, ASK_ID]) {
+          const res = await call({ verb: 'record_question_relay_update', session_id: sessionId });
+          assert.equal(res.ok === false && res.code, 'PROTOCOL', JSON.stringify(res));
+        }
+        assert.equal((await readLog(store, id)).length, before);
+      });
+    });
+
+    it('is CAPTURE_NOT_READY before the capture records and SESSION_NOT_SELECTED for an unknown session', async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      try {
+        await withCaptures(async ({ call, roots }) => {
+          const [root] = await roots(1);
+          const attached = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
+          assert.equal(attached.ok, true);
+          const id = rec(attached).session_id!;
+          const early = await call(relayUpdate(id, ASK_REQUEST, UPDATE_REQUEST, { kind: 'picked_up' }));
+          assert.equal(early.ok === false && early.code, 'CAPTURE_NOT_READY');
+          const unknown = await call(relayUpdate(ASK_ID, ASK_REQUEST, UPDATE_REQUEST, { kind: 'picked_up' }));
+          assert.equal(unknown.ok === false && unknown.code, 'SESSION_NOT_SELECTED');
+          release();
+        }, { enumerate: () => gate });
+      } finally { release(); }
+    });
+
+    it('idempotencySurvivesRestart: a retried update after a daemon restart is a duplicate; a changed body conflicts', async () => {
+      const fake = createRootsPlatform();
+      await withResumeDaemon(async ({ store, worktree, call, restart }) => {
+        const root = await realpath(worktree);
+        const id = await attachWatchOnly(call, worktree);
+        await writeFile(join(root, 'a.ts'), 'one\ntwo\n');
+        fake.observe(root, 'a.ts');
+        const changed = (await waitForLog(store, id, (log) => log.some((e) => e.type === 'slipstream.file.changed.v1')))
+          .find((e) => e.type === 'slipstream.file.changed.v1')!;
+        const recorded = await call({ verb: 'record_question_exchange', session_id: id, request_id: EXCHANGE_REQUEST, text: 'Why?',
+          context: { change_seq: changed.seq, path: 'a.ts', snapshot_sha256: (changed.data.after as { sha256: string }).sha256, line_start: 1, line_end: 1 },
+          answer_text: 'On it.', conversation: CONVERSATION, relay: RELAY });
+        assert.equal(recorded.ok, true, JSON.stringify(recorded));
+        const req = relayUpdate(id, rec(recorded).question_id!, UPDATE_REQUEST, { kind: 'picked_up' });
+        const first = await call(req);
+        assert.equal(first.ok, true, JSON.stringify(first));
+        await restart();
+        assert.equal(await attachWatchOnly(call, worktree), id);
+        assert.deepEqual(await call(req), { ...first, duplicate: true });
+        const conflict = await call({ ...req, update: { kind: 'not_delivered' } });
+        assert.equal(conflict.ok === false && conflict.code, 'REQUEST_CONFLICT');
+        const resend = await call({ ...req, request_id: randomUUID(), update: { kind: 'sent', chat_session_id: RELAY.chat_session_id } });
+        assert.equal(resend.ok === false && resend.code, 'INVALID_RELAY_UPDATE', 'the relay registry is rebuilt from the log');
+        assert.equal((await readLog(store, id)).filter((e) => e.type === RELAY_TYPE).length, 1);
+      }, { captureDependencies: { platform: fake.platform, enumerate: async () => {}, readQuestionContext: async () => 'selected' } });
+    });
   });
 
   it('leaves ask on a watch-only capture as AGENT_NOT_CONNECTED', async () => {

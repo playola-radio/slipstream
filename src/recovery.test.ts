@@ -81,6 +81,12 @@ const exchange = (questionId: string, answerText = 'Because.', relay?: { relay_i
   },
 });
 
+const relayUpdate = (questionId: string, relayId: string, requestId: string, update: Record<string, unknown>): EventInput => ({
+  type: 'slipstream.question.relay_updated.v1',
+  occurred_at_ms: 8,
+  data: { question_id: questionId, relay_id: relayId, request_id: requestId, update, recorded_at_ms: 8 },
+} as EventInput);
+
 describe('recovery', () => {
   it('recovers through the last complete record and discards a torn trailing suffix', async () => {
     await withTempDir(async (dir) => {
@@ -175,6 +181,35 @@ describe('recovery', () => {
         exchange(OTHER_QUESTION, 'second')]);
       const rec = await recoverSession(path, SESSION, cas);
       assert.deepEqual([...rec.relayQuestions], [[RELAY, QUESTION]]);
+    });
+  });
+
+  it('relayRegistryRebuiltFromLog: a Send again registers its relay_id; steps in any order are kept for idempotency', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const AGAIN = '44444444-4444-4444-8444-444444444444';
+      const STEP = '55555555-5555-4555-8555-555555555555';
+      const SEND = '66666666-6666-4666-8666-666666666666';
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        relayUpdate(QUESTION, RELAY, STEP, { kind: 'reported', outcome: 'done', text: 'Done.' }),
+        relayUpdate(QUESTION, AGAIN, SEND, { kind: 'sent', chat_session_id: 'chat-1' })]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual([...rec.relayQuestions], [[RELAY, QUESTION], [AGAIN, QUESTION]]);
+      assert.deepEqual(rec.questionRelayUpdates.map(e => [e.seq, e.data.request_id]), [['3', STEP], ['4', SEND]]);
+    });
+  });
+
+  it('recovery rejects a relay update whose subject does not match its question_id', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        relayUpdate(QUESTION, RELAY, OTHER_QUESTION, { kind: 'picked_up' })]);
+      const lines = (await readFile(path, 'utf8')).trimEnd().split('\n');
+      const last = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
+      last.subject = `question/${OTHER_QUESTION}`;
+      lines[lines.length - 1] = JSON.stringify(last);
+      await writeFile(path, lines.join('\n') + '\n');
+      await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError);
     });
   });
 

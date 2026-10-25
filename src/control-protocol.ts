@@ -2,7 +2,7 @@
  * The Slipstream daemon control protocol: newline-delimited JSON over an
  * owner-only `node:net` unix socket. This is a PRIVATE CONTROL channel — its
  * verbs (attach / detach / unlink / status / begin_task / ask / record_question_exchange /
- * claim_question / answer_question / delete_session / gc) WRITE
+ * record_question_relay_update / claim_question / answer_question / delete_session / gc) WRITE
  * public events or maintain the store and never read or serve the feed. Readers
  * keep serving the public HTTP/disk view; there is no privileged back channel
  * for reading.

@@ -21,8 +21,8 @@ import {
 } from './attribution-producer.ts';
 import type { IngestOutcome, NormalizedEvidence } from './evidence-ingest.ts';
 import { EVENT_TYPES, type AnyEvent, type EnrichmentPolicy, type EventInput, type HarnessName } from './event.ts';
-import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent, QuestionExchangeRecordedInput, QuestionExchangeRecordedEvent } from './public-events.ts';
-import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted, normalizeExchange, exchangeBody, exchangeResult, sameSourceContext, type QuestionExchangeAccepted, type QuestionContext } from './questions.ts';
+import type { AgentBindingEvent, AgentBindingInput, AgentConnectionEvent, AgentConnectionInput, AgentUnlinkedEvent, AgentUnlinkedInput, CaptureMode, CaptureStopReason, CaptureScopeInput, PublicEvent, PublicEventInput, QuestionQueuedData, QuestionQueuedInput, QuestionQueuedEvent, QuestionDispatchAttemptedInput, QuestionDispatchAttemptedEvent, QuestionAnsweredInput, QuestionAnsweredEvent, QuestionExchangeRecordedInput, QuestionExchangeRecordedEvent, QuestionRelayUpdatedInput, QuestionRelayUpdatedEvent } from './public-events.ts';
+import { normalizeAsk, questionBody, questionResult, readQuestionContext, QuestionError, QUESTION_TTL_MS, QUESTION_LIMIT, type QuestionAccepted, assertAnswerText, answerResult, type AnswerAccepted, normalizeExchange, exchangeBody, exchangeResult, sameSourceContext, type QuestionExchangeAccepted, type QuestionContext, normalizeRelayUpdate, relayUpdateBody, relayUpdateResult, type QuestionRelayUpdateAccepted } from './questions.ts';
 import type { TranscriptScheduler } from './transcript/scheduler.ts';
 
 export interface CaptureOptions {
@@ -140,6 +140,8 @@ export interface CaptureSession {
   askQuestion(input: unknown, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<QuestionAccepted>;
   /** Record a question and the answer the client's own forked chat produced; appends exactly one event. */
   recordQuestionExchange(input: unknown, assertOwnership?: () => void): Promise<QuestionExchangeAccepted>;
+  /** Record one later step of a change request sent from a recorded exchange; appends exactly one event. */
+  recordQuestionRelayUpdate(input: unknown, assertOwnership?: () => void): Promise<QuestionRelayUpdateAccepted>;
   claimQuestion(target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<(QuestionQueuedData & { queued_seq: string }) | null>;
   answerQuestion(input: { question_id: unknown; text: unknown }, target: QuestionQueuedData['target'], assertOwnership?: () => void): Promise<AnswerAccepted>;
   /** Durably record a chat binding, its handshake state, or its revocation; never attribution. */
@@ -290,6 +292,8 @@ export async function startCapture(
   // its append is in flight, so a concurrent reuse is refused before either lands.
   const relayQuestions = new Map<string, string>();
   const reservedRelays = new Set<string>();
+  const committedRelayUpdates = new Map<string, { body: string; result: QuestionRelayUpdateAccepted }>();
+  const inflightRelayUpdates = new Map<string, { body: string; promise: Promise<QuestionRelayUpdateAccepted> }>();
   const sourceContext = (context: QuestionContext): QuestionContext => ({
     change_seq: context.change_seq,
     path: context.path,
@@ -360,6 +364,10 @@ export async function startCapture(
     }
     relayQuestions.clear();
     for (const [relayId, questionId] of rec.relayQuestions) relayQuestions.set(relayId, questionId);
+    committedRelayUpdates.clear();
+    for (const event of rec.questionRelayUpdates) {
+      committedRelayUpdates.set(event.data.request_id, { body: relayUpdateBody(event.data), result: relayUpdateResult(event) });
+    }
     currentTaskId = rec.currentTaskId;
     committedTasks.clear();
     for (const [requestId, decl] of rec.taskDeclarations) {
@@ -422,6 +430,9 @@ export async function startCapture(
       if (event.type === 'slipstream.question.exchange_recorded.v1') {
         exchangesById.set(event.data.question_id, sourceContext(event.data.context));
         if (event.data.relay) relayQuestions.set(event.data.relay.relay_id, event.data.question_id);
+      }
+      if (event.type === 'slipstream.question.relay_updated.v1' && event.data.update.kind === 'sent') {
+        relayQuestions.set(event.data.relay_id, event.data.question_id);
       }
       if (isCoreEvent(event)) producer?.noteCommitted(event);
     },
@@ -543,6 +554,7 @@ export async function startCapture(
   function appendEvent(input: QuestionDispatchAttemptedInput): Promise<QuestionDispatchAttemptedEvent>;
   function appendEvent(input: QuestionAnsweredInput): Promise<QuestionAnsweredEvent>;
   function appendEvent(input: QuestionExchangeRecordedInput): Promise<QuestionExchangeRecordedEvent>;
+  function appendEvent(input: QuestionRelayUpdatedInput): Promise<QuestionRelayUpdatedEvent>;
   function appendEvent<I extends AgentInput>(input: I): Promise<AgentEventFor<I>>;
   function appendEvent(input: PublicEventInput): Promise<PublicEvent>;
   async function appendEvent(input: PublicEventInput): Promise<PublicEvent> {
@@ -1252,6 +1264,47 @@ export async function startCapture(
     }
   };
 
+  const recordQuestionRelayUpdate = async (input: unknown, assertOwnership: () => void = () => {}): Promise<QuestionRelayUpdateAccepted> => {
+    const req = normalizeRelayUpdate(input);
+    if (req.session_id !== sessionId) throw new QuestionError('SESSION_NOT_SELECTED', 'relay update addresses a different capture');
+    assertOwnership();
+    questionReady();
+    const body = relayUpdateBody(req);
+    const settled = committedRelayUpdates.get(req.request_id);
+    const pending = inflightRelayUpdates.get(req.request_id);
+    const existing = settled ?? pending;
+    if (existing && existing.body !== body) throw new QuestionError('REQUEST_CONFLICT', 'request_id was used for a different relay update');
+    if (settled) return { ...settled.result, duplicate: true };
+    if (pending) return { ...await pending.promise, duplicate: true };
+    if (!exchangesById.has(req.question_id)) throw new QuestionError('INVALID_RELAY_UPDATE', 'question_id names no recorded exchange in this capture');
+    const isSend = req.update.kind === 'sent';
+    if (isSend && isKnownRelay(req.relay_id)) throw new QuestionError('INVALID_RELAY_UPDATE', 'relay_id was already sent in this capture');
+    if (!isSend) {
+      const owner = relayQuestions.get(req.relay_id);
+      if (owner === undefined) throw new QuestionError('INVALID_RELAY_UPDATE', 'relay_id was never sent in this capture');
+      if (owner !== req.question_id) throw new QuestionError('INVALID_RELAY_UPDATE', 'relay_id belongs to another question');
+    }
+    const promise = Promise.resolve().then(async (): Promise<QuestionRelayUpdateAccepted> => {
+      assertOwnership();
+      questionReady();
+      const recorded_at_ms = now();
+      const event = await appendEvent({ type: 'slipstream.question.relay_updated.v1', occurred_at_ms: recorded_at_ms,
+        data: { question_id: req.question_id, relay_id: req.relay_id, request_id: req.request_id, update: req.update, recorded_at_ms } });
+      if (surrendered) throw new StorageError('lock', Object.assign(new Error('session ownership lost'), { code: 'ELOCKLOST' }));
+      assertOwnership();
+      const result = relayUpdateResult(event);
+      committedRelayUpdates.set(req.request_id, { body, result });
+      return result;
+    });
+    inflightRelayUpdates.set(req.request_id, { body, promise });
+    if (isSend) reservedRelays.add(req.relay_id);
+    try { return await promise; }
+    finally {
+      inflightRelayUpdates.delete(req.request_id);
+      if (isSend) reservedRelays.delete(req.relay_id);
+    }
+  };
+
   const claimQuestion = async (target: QuestionQueuedData['target'], assertOwnership: () => void = () => {}): Promise<(QuestionQueuedData & { queued_seq: string }) | null> => {
     assertOwnership();
     questionReady();
@@ -1344,7 +1397,7 @@ export async function startCapture(
     // Fence the attribution generation and flush its in-flight appends before the
     // log closes: a stale evaluation must never append after the log is gone.
     await producer?.stop().catch(record);
-    await Promise.allSettled([...inflightQuestions.values(), ...inflightExchanges.values(), ...inflightAnswers.values()].map(q => q.promise));
+    await Promise.allSettled([...inflightQuestions.values(), ...inflightExchanges.values(), ...inflightRelayUpdates.values(), ...inflightAnswers.values()].map(q => q.promise));
     // Never manufactured: after a lost lock or during a storage outage the stop
     // stays unrecorded and stop() rejects, so no caller can report it stopped.
     if (opts && firstError === undefined && (surrendered || health.snapshot().state !== 'healthy')) {
@@ -1380,6 +1433,7 @@ export async function startCapture(
     beginTask,
     askQuestion,
     recordQuestionExchange,
+    recordQuestionRelayUpdate,
     claimQuestion,
     answerQuestion,
     recordAgent,

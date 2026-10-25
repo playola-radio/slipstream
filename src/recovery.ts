@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
 import { fsyncDir } from './storage.ts';
 import { sourceFor, type AnyEvent } from './event.ts';
-import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent, type QuestionExchangeRecordedEvent } from './public-events.ts';
+import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent, type QuestionExchangeRecordedEvent, type QuestionRelayUpdatedEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
@@ -57,6 +57,7 @@ export interface RecoveredSession {
   questionAttempts: QuestionDispatchAttemptedEvent[];
   questionAnswers: QuestionAnsweredEvent[];
   questionExchanges: QuestionExchangeRecordedEvent[];
+  questionRelayUpdates: QuestionRelayUpdatedEvent[];
   /** Every relay_id the log has seen sent, mapped to its question. */
   relayQuestions: Map<string, string>;
   /** Generations with a durable `agent.binding` record, so a resume can append
@@ -137,6 +138,7 @@ export async function recoverSession(
   const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const questionAnswers: QuestionAnsweredEvent[] = [];
   const questionExchanges: QuestionExchangeRecordedEvent[] = [];
+  const questionRelayUpdates: QuestionRelayUpdatedEvent[] = [];
   const relayQuestions = new Map<string, string>();
   // Keep the ordered event arrays for callers, while replay validation uses
   // indexes so a long-lived session is replayed in one pass.
@@ -325,6 +327,12 @@ export async function recoverSession(
         if (event.data.relay) relayQuestions.set(event.data.relay.relay_id, event.data.question_id);
         break;
       }
+      case 'slipstream.question.relay_updated.v1': {
+        if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
+        questionRelayUpdates.push(event);
+        if (event.data.update.kind === 'sent') relayQuestions.set(event.data.relay_id, event.data.question_id);
+        break;
+      }
       case 'slipstream.task.started.v1': {
         // Replayed in order: the last committed declaration is the current task,
         // and its request_id indexes the committed result so a replayed duplicate
@@ -394,6 +402,7 @@ export async function recoverSession(
     questionAttempts,
     questionAnswers,
     questionExchanges,
+    questionRelayUpdates,
     relayQuestions,
     bindingGenerations,
   };
