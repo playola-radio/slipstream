@@ -11,7 +11,8 @@ import { StorageError } from './storage.ts';
 import { readQuestionContext, type QuestionRequest } from './questions.ts';
 
 type Session = Awaited<ReturnType<typeof startCapture>>;
-type ExchangeInput = QuestionRequest & { answer_text: string; conversation: { harness: 'claude-code'; parent_session_id: string; fork_session_id: string } };
+type Relay = { relay_id: string; chat_session_id: string };
+type ExchangeInput = QuestionRequest & { answer_text: string; conversation: { harness: 'claude-code'; parent_session_id: string; fork_session_id: string }; relay?: Relay };
 
 const target = { harness: 'codex' as const, harness_session_id: 'main', worktree: '/tmp/example' };
 const exchangeEvents = async (s: Session) => (await readRecords(s.logPath)).filter(e => e.type === 'slipstream.question.exchange_recorded.v1');
@@ -278,4 +279,84 @@ it('stop() while an exchange is in flight fails it with CAPTURE_NOT_READY and no
     assert.equal(records.filter(e => e.type === 'slipstream.question.exchange_recorded.v1').length, 0);
     assert.equal(records.at(-1)!.type, 'slipstream.capture.stopped.v1');
   }, { readQuestionContext: gated.readQuestionContext });
+});
+
+const relay = (extra: Partial<Relay> = {}): Relay => ({ relay_id: randomUUID(), chat_session_id: '5896f28c-f4a9-46c2-b481-7ca57e8714a8', ...extra });
+
+it('relayCopiedIntoEvent: an exchange carries its relay into the event, and one without relay has none', async () => {
+  await fixture(async (s, input) => {
+    const sent = relay();
+    await s.recordQuestionExchange({ ...input, relay: sent });
+    await s.recordQuestionExchange({ ...input, request_id: randomUUID() });
+    const [withRelay, without] = await exchangeEvents(s);
+    assert.ok(withRelay?.type === 'slipstream.question.exchange_recorded.v1' && without?.type === 'slipstream.question.exchange_recorded.v1');
+    assert.deepEqual(withRelay.data.relay, sent);
+    assert.equal(Object.hasOwn(without.data, 'relay'), false);
+  });
+});
+
+it('reusedRelayIDRefused: a relay_id already recorded or in flight is INVALID_RELAY_UPDATE', async () => {
+  const gated = gatedReader();
+  await fixture(async (s, input) => {
+    const sent = relay();
+    const first = s.recordQuestionExchange({ ...input, relay: sent });
+    await gated.started;
+    await assert.rejects(s.recordQuestionExchange({ ...input, request_id: randomUUID(), relay: sent }), { code: 'INVALID_RELAY_UPDATE' });
+    gated.release();
+    await first;
+    await assert.rejects(s.recordQuestionExchange({ ...input, request_id: randomUUID(), relay: relay({ relay_id: sent.relay_id }) }),
+      { code: 'INVALID_RELAY_UPDATE' });
+    assert.equal((await exchangeEvents(s)).length, 1);
+  }, { readQuestionContext: gated.readQuestionContext });
+});
+
+it('reusedRelayIDRefused: a relay_id whose append failed cleanly is free again', async () => {
+  let fail = true;
+  await fixture(async (s, input) => {
+    const sent = relay();
+    await assert.rejects(s.recordQuestionExchange({ ...input, relay: sent }), StorageError);
+    const deadline = Date.now() + 5000;
+    while (s.health.snapshot().state !== 'healthy') {
+      assert.ok(Date.now() < deadline);
+      await new Promise(r => setTimeout(r, 10));
+    }
+    assert.equal((await s.recordQuestionExchange({ ...input, request_id: randomUUID(), relay: sent })).duplicate, false);
+    assert.equal((await exchangeEvents(s)).length, 1);
+  }, { createLog: async opts => {
+    const log = await createLog(opts);
+    return { ...log, append: async input => {
+      if (input.type === 'slipstream.question.exchange_recorded.v1' && fail) { fail = false; throw new StorageError('append', new Error('nothing written')); }
+      return log.append(input);
+    } };
+  } });
+});
+
+it('retryWithChangedRelayIsRequestConflict: a retry that adds, drops or changes relay is REQUEST_CONFLICT', async () => {
+  await fixture(async (s, input) => {
+    await s.recordQuestionExchange(input);
+    await assert.rejects(s.recordQuestionExchange({ ...input, relay: relay() }), { code: 'REQUEST_CONFLICT' });
+    const withRelay = { ...input, request_id: randomUUID(), relay: relay() };
+    const first = await s.recordQuestionExchange(withRelay);
+    const { relay: _dropped, ...dropped } = withRelay;
+    await assert.rejects(s.recordQuestionExchange(dropped), { code: 'REQUEST_CONFLICT' });
+    await assert.rejects(s.recordQuestionExchange({ ...withRelay, relay: relay() }), { code: 'REQUEST_CONFLICT' });
+    await assert.rejects(s.recordQuestionExchange({ ...withRelay, relay: { ...withRelay.relay, chat_session_id: 'other-chat' } }), { code: 'REQUEST_CONFLICT' });
+    assert.deepEqual(await s.recordQuestionExchange(withRelay), { ...first, duplicate: true });
+    assert.equal((await exchangeEvents(s)).length, 2);
+  });
+});
+
+it('malformedRelayIsProtocol: a malformed relay is PROTOCOL and appends nothing', async () => {
+  await fixture(async (s, input) => {
+    const before = (await readRecords(s.logPath)).length;
+    for (const bad of [
+      relay({ relay_id: randomUUID().toUpperCase() }), relay({ relay_id: 'not-a-uuid' }), { chat_session_id: 'chat' },
+      relay({ chat_session_id: '' }), relay({ chat_session_id: 'x'.repeat(257) }), relay({ chat_session_id: 'a\u0007b' }),
+      'c9d8e7f6-a5b4-4c3d-8e2f-1a0b9c8d7e6f', [], null,
+    ]) {
+      await assert.rejects(s.recordQuestionExchange({ ...input, request_id: randomUUID(), relay: bad as Relay }), { code: 'PROTOCOL' }, JSON.stringify(bad));
+    }
+    assert.equal((await s.recordQuestionExchange({ ...input, relay: relay({ chat_session_id: 'x'.repeat(256) }) })).duplicate, false);
+    assert.equal((await readRecords(s.logPath)).length, before + 1);
+  });
 });

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { openLogCursor } from './log-reader.ts';
 import { blobPath } from './store-reader.ts';
 import { sourceFor, type HarnessName } from './event.ts';
-import type { QuestionAnsweredEvent, QuestionExchangeRecordedEvent, QuestionQueuedEvent } from './public-events.ts';
+import type { QuestionAnsweredEvent, QuestionExchangeRecordedEvent, QuestionQueuedEvent, QuestionRelayUpdatedEvent } from './public-events.ts';
 export const QUESTION_TTL_MS = 1_800_000;
 export const QUESTION_LIMIT = 16;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
@@ -179,9 +179,15 @@ export interface ExchangeConversation {
   parent_session_id: string;
   fork_session_id: string;
 }
+/** A change request the recorded answer accepted. The chat id is client-reported, like the conversation ids. */
+export interface QuestionRelay {
+  relay_id: string;
+  chat_session_id: string;
+}
 export interface QuestionExchangeRequest extends QuestionRequest {
   answer_text: string;
   conversation: ExchangeConversation;
+  relay?: QuestionRelay;
 }
 
 function conversationId(value: unknown, name: string): string {
@@ -210,17 +216,26 @@ export function normalizeExchange(value: unknown): QuestionExchangeRequest {
   if (parent === fork) throw new QuestionError('PROTOCOL', 'conversation parent and fork ids must differ');
   return { ...ask, answer_text: req.answer_text, conversation: {
     harness: c.harness as HarnessName, parent_session_id: parent, fork_session_id: fork,
-  } };
+  }, ...(req.relay !== undefined ? { relay: normalizeRelay(req.relay) } : {}) };
+}
+
+function normalizeRelay(value: unknown): QuestionRelay {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new QuestionError('PROTOCOL', 'relay must be an object');
+  const r = value as Record<string, unknown>;
+  if (typeof r.relay_id !== 'string' || !UUID.test(r.relay_id)) throw new QuestionError('PROTOCOL', 'relay.relay_id must be a canonical lowercase UUID');
+  return { relay_id: r.relay_id, chat_session_id: conversationId(r.chat_session_id, 'relay.chat_session_id') };
 }
 
 /**
- * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer and the
- * reported conversation. A digest, not the JSON itself, so the capture does not retain every answer
- * (up to ~1 MiB each) for its lifetime.
+ * Idempotency fingerprint: the sha256 hex digest of the JSON of the ask body plus the answer, the
+ * reported conversation and the relay when present (an exchange without one keeps its original digest).
+ * A digest, not the JSON itself, so the capture does not retain every answer (up to ~1 MiB each) for
+ * its lifetime.
  */
 export function exchangeBody(req: QuestionExchangeRequest): string {
   const c = req.conversation;
-  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id]);
+  const relay = req.relay ? [req.relay.relay_id, req.relay.chat_session_id] : [];
+  const json = JSON.stringify([questionBody(req), req.answer_text, c.harness, c.parent_session_id, c.fork_session_id, ...relay]);
   return createHash('sha256').update(json).digest('hex');
 }
 
@@ -235,6 +250,68 @@ export function exchangeResult(event: QuestionExchangeRecordedEvent): QuestionEx
   const d = event.data;
   return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
     seq: event.seq, duplicate: false });
+}
+
+/** One later step of a change request. Steps carry no order; the client folds them. */
+export type RelayUpdate =
+  | { kind: 'sent'; chat_session_id: string }
+  | { kind: 'picked_up' }
+  | { kind: 'not_delivered' }
+  | { kind: 'reported'; outcome: 'done' | 'not_done_yet'; text: string };
+export interface QuestionRelayUpdateRequest {
+  session_id: string;
+  request_id: string;
+  question_id: string;
+  relay_id: string;
+  update: RelayUpdate;
+}
+
+function normalizeUpdate(value: unknown): RelayUpdate {
+  const u = record(value);
+  switch (u.kind) {
+    case 'sent': return { kind: 'sent', chat_session_id: conversationId(u.chat_session_id, 'update.chat_session_id') };
+    case 'picked_up': return { kind: 'picked_up' };
+    case 'not_delivered': return { kind: 'not_delivered' };
+    case 'reported':
+      if (u.outcome !== 'done' && u.outcome !== 'not_done_yet') throw new QuestionError('PROTOCOL', 'update.outcome must be done or not_done_yet');
+      // Stored verbatim, like answer text.
+      if (typeof u.text !== 'string' || !/\S/u.test(u.text) || /[\uD800-\uDFFF]/u.test(u.text)) {
+        throw new QuestionError('PROTOCOL', 'update.text must contain a non-whitespace character and no unpaired surrogates');
+      }
+      return { kind: 'reported', outcome: u.outcome, text: u.text };
+    default: throw new QuestionError('PROTOCOL', 'update.kind must be sent, picked_up, not_delivered or reported');
+  }
+}
+
+/** Copy only contract fields, as normalizeAsk does. */
+export function normalizeRelayUpdate(value: unknown): QuestionRelayUpdateRequest {
+  const req = record(value);
+  for (const name of ['session_id', 'request_id', 'question_id', 'relay_id'] as const) {
+    if (typeof req[name] !== 'string' || !UUID.test(req[name])) throw new QuestionError('PROTOCOL', `${name} must be a canonical lowercase UUID`);
+  }
+  return { session_id: req.session_id as string, request_id: req.request_id as string, question_id: req.question_id as string,
+    relay_id: req.relay_id as string, update: normalizeUpdate(req.update) };
+}
+
+/** Idempotency fingerprint: a digest, as for exchanges, because a report's text is unbounded. */
+export function relayUpdateBody(req: Pick<QuestionRelayUpdateRequest, 'question_id' | 'relay_id' | 'update'>): string {
+  const u = req.update;
+  const fields = u.kind === 'sent' ? [u.chat_session_id] : u.kind === 'reported' ? [u.outcome, u.text] : [];
+  return createHash('sha256').update(JSON.stringify([req.question_id, req.relay_id, u.kind, ...fields])).digest('hex');
+}
+
+export interface QuestionRelayUpdateAccepted {
+  session_id: string;
+  request_id: string;
+  question_id: string;
+  relay_id: string;
+  seq: string;
+  duplicate: boolean;
+}
+export function relayUpdateResult(event: QuestionRelayUpdatedEvent): QuestionRelayUpdateAccepted {
+  const d = event.data;
+  return Object.freeze({ session_id: d.session_id, request_id: d.request_id, question_id: d.question_id,
+    relay_id: d.relay_id, seq: event.seq, duplicate: false });
 }
 
 /** A follow-up must restate its parent's exact source context. */

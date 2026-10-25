@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slipstream.dev/schemas/slipstream.question.relay_updated.v1.json",
+  "title": "slipstream.question.relay_updated.v1",
+  "$comment": "One later step of a change request sent from a recorded exchange, as the client reported it. Steps are recorded in arrival order with no order checks; a reader folds a relay's steps by the precedence in docs/ask-agent/contract.md. chat_session_id and report text are client-reported and unverified; never a binding and never authorship. Self-contained; unknown fields permitted for forward compatibility.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "datacontenttype", "seq", "time", "subject", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "source": { "type": "string", "pattern": "^urn:slipstream:session:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "type": { "const": "slipstream.question.relay_updated.v1" },
+    "datacontenttype": { "const": "application/json" },
+    "seq": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "time": { "type": "string", "format": "date-time" },
+    "subject": { "type": "string", "pattern": "^question/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "data": {
+      "type": "object",
+      "required": ["session_id", "question_id", "relay_id", "request_id", "update", "recorded_at_ms"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/uuid" },
+        "question_id": { "$ref": "#/$defs/uuid" },
+        "relay_id": { "$ref": "#/$defs/uuid" },
+        "request_id": { "$ref": "#/$defs/uuid" },
+        "update": {
+          "oneOf": [
+            {
+              "$comment": "Send again: a new relay_id for the same question. A first send rides on the exchange's relay.",
+              "type": "object",
+              "required": ["kind", "chat_session_id"],
+              "properties": {
+                "kind": { "const": "sent" },
+                "chat_session_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "picked_up" } }
+            },
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "not_delivered" } }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "outcome", "text"],
+              "properties": {
+                "kind": { "const": "reported" },
+                "outcome": { "enum": ["done", "not_done_yet"] },
+                "text": { "type": "string", "minLength": 1, "pattern": "\\S" }
+              }
+            }
+          ]
+        },
+        "recorded_at_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+  }
+}

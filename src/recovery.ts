@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import type { Cas } from './cas.ts';
 import { fsyncDir } from './storage.ts';
 import { sourceFor, type AnyEvent } from './event.ts';
-import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent, type QuestionExchangeRecordedEvent } from './public-events.ts';
+import { PUBLIC_EVENT_TYPES, type PublicEvent, type QuestionQueuedEvent, type QuestionDispatchAttemptedEvent, type QuestionAnsweredEvent, type QuestionExchangeRecordedEvent, type QuestionRelayUpdatedEvent } from './public-events.ts';
 import { loadAllSchemas, validate, type JsonSchema } from './schema.ts';
 import { snapshotsEqual, type Snapshot } from './snapshot.ts';
 
@@ -57,6 +57,9 @@ export interface RecoveredSession {
   questionAttempts: QuestionDispatchAttemptedEvent[];
   questionAnswers: QuestionAnsweredEvent[];
   questionExchanges: QuestionExchangeRecordedEvent[];
+  questionRelayUpdates: QuestionRelayUpdatedEvent[];
+  /** Every relay_id the log has seen sent, mapped to its question. */
+  relayQuestions: Map<string, string>;
   /** Generations with a durable `agent.binding` record, so a resume can append
    * one a crash interrupted (contracts.md §6). */
   bindingGenerations: Set<string>;
@@ -135,6 +138,9 @@ export async function recoverSession(
   const questionAttempts: QuestionDispatchAttemptedEvent[] = [];
   const questionAnswers: QuestionAnsweredEvent[] = [];
   const questionExchanges: QuestionExchangeRecordedEvent[] = [];
+  const questionRelayUpdates: QuestionRelayUpdatedEvent[] = [];
+  const relayQuestions = new Map<string, string>();
+  const exchangeQuestionIds = new Set<string>();
   // Keep the ordered event arrays for callers, while replay validation uses
   // indexes so a long-lived session is replayed in one pass.
   const queuedSeqsByQuestion = new Map<string, Set<string>>();
@@ -318,7 +324,22 @@ export async function recoverSession(
       }
       case 'slipstream.question.exchange_recorded.v1': {
         if (event.subject !== `question/${event.data.question_id}`) throw new CorruptLogError(`${at}: question subject disagrees with id`);
+        if (event.data.relay && relayQuestions.has(event.data.relay.relay_id)) throw new CorruptLogError(`${at}: relay_id was already sent`);
         questionExchanges.push(event);
+        exchangeQuestionIds.add(event.data.question_id);
+        if (event.data.relay) relayQuestions.set(event.data.relay.relay_id, event.data.question_id);
+        break;
+      }
+      case 'slipstream.question.relay_updated.v1': {
+        // The live checks in recordQuestionRelayUpdate, replayed.
+        const owner = relayQuestions.get(event.data.relay_id);
+        if (event.subject !== `question/${event.data.question_id}`
+          || !exchangeQuestionIds.has(event.data.question_id)
+          || (event.data.update.kind === 'sent' ? owner !== undefined : owner !== event.data.question_id)) {
+          throw new CorruptLogError(`${at}: relay update has no matching sent relay`);
+        }
+        questionRelayUpdates.push(event);
+        if (event.data.update.kind === 'sent') relayQuestions.set(event.data.relay_id, event.data.question_id);
         break;
       }
       case 'slipstream.task.started.v1': {
@@ -390,6 +411,8 @@ export async function recoverSession(
     questionAttempts,
     questionAnswers,
     questionExchanges,
+    questionRelayUpdates,
+    relayQuestions,
     bindingGenerations,
   };
 }

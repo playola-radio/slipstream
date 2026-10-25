@@ -464,6 +464,67 @@ interface RecordQuestionExchangeRequest {
   event records `reported_by: "client"`. They are never used for binding or
   attribution, and never mean authorship.
 
+## Change requests from recorded exchanges
+
+When a recorded answer accepts a change request, the client sends the request to
+a chat and records how it went. The first send rides on the exchange itself; each
+later step is one `record_question_relay_update`.
+
+```typescript
+// On record_question_exchange: the answer accepted a change request.
+relay?: { relay_id: string; chat_session_id: string };
+
+interface RecordQuestionRelayUpdateRequest {
+  v: 1;
+  verb: 'record_question_relay_update';
+  session_id: string;   // capture session
+  request_id: string;   // caller-generated canonical lowercase UUID
+  question_id: string;  // a recorded exchange in this capture
+  relay_id: string;     // canonical lowercase UUID
+  update:
+    | { kind: 'sent'; chat_session_id: string }  // Send again, with a new relay_id
+    | { kind: 'picked_up' }
+    | { kind: 'not_delivered' }
+    | { kind: 'reported'; outcome: 'done' | 'not_done_yet'; text: string };
+}
+// ok: { v: 1, ok: true, session_id, request_id, question_id, relay_id, seq, duplicate }
+```
+
+- An exchange's `relay` is copied into its `exchange_recorded` event and counts as
+  that relay's `sent`: the answer and its first send are one append. `relay` is
+  part of the exchange body, so a retry that adds, drops or changes it is
+  `REQUEST_CONFLICT`. An exchange whose `relay_id` was already sent in the capture
+  is `INVALID_RELAY_UPDATE`. A malformed `relay` is `PROTOCOL`.
+- `question_id` must name a recorded exchange in this capture, else
+  `INVALID_RELAY_UPDATE`. A question queued by `ask` does not count.
+- Steps are recorded in whatever order they arrive; the daemon does not check
+  order, so a reader folds a relay's steps without depending on it: the relay is
+  picked up if any `picked_up` exists (the earliest counts); it is not delivered
+  only if a `not_delivered` exists and no `picked_up` does; its report is any
+  `done` report, else the latest `reported` by `seq`. Status, first match wins:
+  done, not delivered, reported not done yet, picked up, sent. The daemon keeps only
+  which question each `relay_id` was sent from, rebuilt from the log on restart,
+  and refuses as `INVALID_RELAY_UPDATE`: a `relay_id` sent from another question; a
+  `picked_up`, `not_delivered` or `reported` for a `relay_id` never sent in this
+  capture; and a `sent` (or an exchange `relay`) reusing a `relay_id` already sent
+  or being sent.
+- `chat_session_id` follows the `conversation` id rules (1–256 characters, no
+  control characters). It is client-reported and never used for binding or
+  attribution. `text` must contain a non-whitespace character and is stored
+  verbatim. Malformed ids or fields are `PROTOCOL`.
+- Errors are `SESSION_NOT_SELECTED`, `CAPTURE_NOT_READY`, `STORAGE_UNAVAILABLE`,
+  `INVALID_RELAY_UPDATE`, `REQUEST_CONFLICT` and `PROTOCOL`. A watch-only capture
+  works.
+- It appends exactly one `slipstream.question.relay_updated.v1` event, with
+  `subject` `question/<question_id>`, and replies after it is durable. It adds no
+  dispatch, binding, connection, attribution, or file-change event, and does not
+  count against the queue limit.
+- Idempotency and unknown outcomes are as for `record_question_exchange`. Request
+  ids are scoped to this verb.
+- Capability check: a request with only `v`, `verb` and `session_id` is `PROTOCOL`
+  from a daemon that has this verb, whatever the capture's state, and
+  `unknown verb: record_question_relay_update` from one that does not.
+
 ## Agent readiness
 
 A verified root binding is not proof that the chat can receive a question and

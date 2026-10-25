@@ -207,8 +207,80 @@ describe('slipstream.question.exchange_recorded.v1 schema', () => {
     });
   }
 
+  const RELAY = { relay_id: 'c9d8e7f6-a5b4-4c3d-8e2f-1a0b9c8d7e6f', chat_session_id: '5896f28c-f4a9-46c2-b481-7ca57e8714a8' };
+  it('eventWithRelayValidatesAgainstSchema: an exchange carrying relay validates', async () => {
+    const event = buildExchange({ relay: RELAY });
+    assert.ok(event.type === TYPE);
+    assert.deepEqual(event.data.relay, RELAY);
+    assert.deepEqual(validate(await loadSchema(TYPE), event), []);
+  });
+
+  for (const [name, relay] of [
+    ['an uppercase relay_id', { ...RELAY, relay_id: RELAY.relay_id.toUpperCase() }],
+    ['a missing chat_session_id', { relay_id: RELAY.relay_id }],
+    ['an empty chat_session_id', { ...RELAY, chat_session_id: '' }],
+    ['a 257-character chat_session_id', { ...RELAY, chat_session_id: 'x'.repeat(257) }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    it(`rejects an exchange relay with ${name}`, async () => {
+      const event = structuredClone(buildExchange()) as Record<string, any>;
+      event.data.relay = relay;
+      assert.ok(validate(await loadSchema(TYPE), event).length > 0);
+    });
+  }
+
   it('foldDisplay ignores exchange_recorded', () => {
     assert.deepEqual(foldDisplay([buildExchange()]), { contract: 'display-fold.v1', result: 'ok',
+      state: { attributions: [], coverage: [], evidence: [], gaps: [] } });
+  });
+});
+
+describe('slipstream.question.relay_updated.v1 schema', () => {
+  const TYPE = 'slipstream.question.relay_updated.v1';
+  const RELAY_ID = 'c9d8e7f6-a5b4-4c3d-8e2f-1a0b9c8d7e6f';
+  const UPDATES = [
+    { kind: 'sent', chat_session_id: '5896f28c-f4a9-46c2-b481-7ca57e8714a8' },
+    { kind: 'picked_up' },
+    { kind: 'not_delivered' },
+    { kind: 'reported', outcome: 'done', text: 'Done. greet now returns "Hello, friend".' },
+    { kind: 'reported', outcome: 'not_done_yet', text: 'Not yet.' },
+  ] as const;
+  const buildUpdate = (update: (typeof UPDATES)[number] = UPDATES[1]) => buildPublicEnvelope({
+    type: TYPE,
+    occurred_at_ms: 1789657200123,
+    data: { question_id: QUESTION, relay_id: RELAY_ID, request_id: REQUEST, update, recorded_at_ms: 1789657200123 },
+  }, 8n, SESSION);
+
+  for (const update of UPDATES) {
+    it(`relayUpdatedValidatesAgainstSchema: ${update.kind}${'outcome' in update ? ` ${update.outcome}` : ''}`, async () => {
+      const event = buildUpdate(update);
+      assert.equal(event.subject, `question/${QUESTION}`);
+      assert.equal(event.data.session_id, SESSION);
+      assert.deepEqual(validate(await loadSchema(TYPE), event), []);
+    });
+  }
+
+  const withUpdate = (update: Record<string, unknown>) => (event: Record<string, any>) => { event.data.update = update; };
+  for (const [name, mutate] of [
+    ['an unknown kind', withUpdate({ kind: 'started' })],
+    ['a sent with no chat_session_id', withUpdate({ kind: 'sent' })],
+    ['a sent with an empty chat_session_id', withUpdate({ kind: 'sent', chat_session_id: '' })],
+    ['a sent with a 257-character chat_session_id', withUpdate({ kind: 'sent', chat_session_id: 'x'.repeat(257) })],
+    ['a report with an unknown outcome', withUpdate({ kind: 'reported', outcome: 'maybe', text: 'x' })],
+    ['a report with no text', withUpdate({ kind: 'reported', outcome: 'done' })],
+    ['a report with whitespace-only text', withUpdate({ kind: 'reported', outcome: 'done', text: ' \n' })],
+    ['an uppercase relay_id', (event: Record<string, any>) => { event.data.relay_id = RELAY_ID.toUpperCase(); }],
+    ['a missing request_id', (event: Record<string, any>) => { delete event.data.request_id; }],
+    ['a bad subject', (event: Record<string, any>) => { event.subject = 'question/ABC'; }],
+  ] as Array<[string, (event: Record<string, any>) => void]>) {
+    it(`rejects a relay update with ${name}`, async () => {
+      const event = structuredClone(buildUpdate()) as Record<string, any>;
+      mutate(event);
+      assert.ok(validate(await loadSchema(TYPE), event).length > 0);
+    });
+  }
+
+  it('foldDisplay ignores relay_updated', () => {
+    assert.deepEqual(foldDisplay([buildUpdate()]), { contract: 'display-fold.v1', result: 'ok',
       state: { attributions: [], coverage: [], evidence: [], gaps: [] } });
   });
 });

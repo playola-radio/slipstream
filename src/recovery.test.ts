@@ -41,6 +41,7 @@ async function seedLog(dir: string, inputs: EventInput[]): Promise<string> {
 
 const QUESTION = '11111111-1111-4111-8111-111111111111';
 const OTHER_QUESTION = '22222222-2222-4222-8222-222222222222';
+const RELAY = '33333333-3333-4333-8333-333333333333';
 const queued = (questionId: string): EventInput => ({
   type: 'slipstream.question.queued.v1',
   occurred_at_ms: 4,
@@ -65,7 +66,7 @@ const answered = (questionId: string, attemptSeq: string, text = 'Because.'): Ev
   occurred_at_ms: 6,
   data: { question_id: questionId, attempt_seq: attemptSeq, text, answered_at_ms: 6 },
 });
-const exchange = (questionId: string, answerText = 'Because.'): EventInput => ({
+const exchange = (questionId: string, answerText = 'Because.', relay?: { relay_id: string; chat_session_id: string }): EventInput => ({
   type: 'slipstream.question.exchange_recorded.v1',
   occurred_at_ms: 7,
   data: {
@@ -76,8 +77,15 @@ const exchange = (questionId: string, answerText = 'Because.'): EventInput => ({
     answer_text: answerText,
     recorded_at_ms: 7,
     conversation: { harness: 'claude-code', parent_session_id: 'parent-1', fork_session_id: 'fork-1', reported_by: 'client' },
+    ...(relay ? { relay } : {}),
   },
 });
+
+const relayUpdate = (questionId: string, relayId: string, requestId: string, update: Record<string, unknown>): EventInput => ({
+  type: 'slipstream.question.relay_updated.v1',
+  occurred_at_ms: 8,
+  data: { question_id: questionId, relay_id: relayId, request_id: requestId, update, recorded_at_ms: 8 },
+} as EventInput);
 
 describe('recovery', () => {
   it('recovers through the last complete record and discards a torn trailing suffix', async () => {
@@ -163,6 +171,66 @@ describe('recovery', () => {
       const rec = await recoverSession(path, SESSION, cas);
       assert.deepEqual(rec.questionExchanges.map(e => [e.seq, e.data.question_id, e.data.answer_text]),
         [['2', QUESTION, 'first'], ['3', OTHER_QUESTION, 'second']]);
+    });
+  });
+
+  it('relayRegistryRebuiltFromLog: maps each exchange relay_id to its question', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        exchange(OTHER_QUESTION, 'second')]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual([...rec.relayQuestions], [[RELAY, QUESTION]]);
+    });
+  });
+
+  it('relayRegistryRebuiltFromLog: a Send again registers its relay_id; steps in any order are kept for idempotency', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const AGAIN = '44444444-4444-4444-8444-444444444444';
+      const STEP = '55555555-5555-4555-8555-555555555555';
+      const SEND = '66666666-6666-4666-8666-666666666666';
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        relayUpdate(QUESTION, RELAY, STEP, { kind: 'reported', outcome: 'done', text: 'Done.' }),
+        relayUpdate(QUESTION, AGAIN, SEND, { kind: 'sent', chat_session_id: 'chat-1' })]);
+      const rec = await recoverSession(path, SESSION, cas);
+      assert.deepEqual([...rec.relayQuestions], [[RELAY, QUESTION], [AGAIN, QUESTION]]);
+      assert.deepEqual(rec.questionRelayUpdates.map(e => [e.seq, e.data.request_id]), [['3', STEP], ['4', SEND]]);
+    });
+  });
+
+  it('recovery rejects relay histories the daemon refuses live', async () => {
+    const AGAIN = '44444444-4444-4444-8444-444444444444';
+    const STEP = '55555555-5555-4555-8555-555555555555';
+    const withRelay = exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' });
+    const cases: Array<[string, EventInput[]]> = [
+      ['a step before any send', [exchange(QUESTION), relayUpdate(QUESTION, RELAY, STEP, { kind: 'picked_up' })]],
+      ['a step for another question\'s relay', [withRelay, exchange(OTHER_QUESTION),
+        relayUpdate(OTHER_QUESTION, RELAY, STEP, { kind: 'picked_up' })]],
+      ['a send reusing a relay_id', [withRelay, relayUpdate(QUESTION, RELAY, STEP, { kind: 'sent', chat_session_id: 'chat-1' })]],
+      ['an exchange reusing a relay_id', [withRelay, exchange(OTHER_QUESTION, 'second', { relay_id: RELAY, chat_session_id: 'chat-1' })]],
+      ['a send from a question with no exchange', [relayUpdate(QUESTION, AGAIN, STEP, { kind: 'sent', chat_session_id: 'chat-1' })]],
+    ];
+    for (const [name, events] of cases) {
+      await withTempDir(async (dir) => {
+        const cas = await createCas(join(dir, 'blobs'));
+        const path = await seedLog(dir, [started, ...events]);
+        await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError, name);
+      });
+    }
+  });
+
+  it('recovery rejects a relay update whose subject does not match its question_id', async () => {
+    await withTempDir(async (dir) => {
+      const cas = await createCas(join(dir, 'blobs'));
+      const path = await seedLog(dir, [started, exchange(QUESTION, 'first', { relay_id: RELAY, chat_session_id: 'chat-1' }),
+        relayUpdate(QUESTION, RELAY, OTHER_QUESTION, { kind: 'picked_up' })]);
+      const lines = (await readFile(path, 'utf8')).trimEnd().split('\n');
+      const last = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
+      last.subject = `question/${OTHER_QUESTION}`;
+      lines[lines.length - 1] = JSON.stringify(last);
+      await writeFile(path, lines.join('\n') + '\n');
+      await assert.rejects(recoverSession(path, SESSION, cas), CorruptLogError);
     });
   });
 

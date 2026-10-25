@@ -5,7 +5,7 @@ import { join, sep } from 'node:path';
 import { startCapture, InvalidTitleError, RootChangedError, type CaptureSession } from './session.ts';
 import type { HealthFailure } from './health.ts';
 import { createTranscriptScheduler, type TranscriptScheduler } from './transcript/scheduler.ts';
-import { QuestionError, assertAnswerText } from './questions.ts';
+import { QuestionError, assertAnswerText, normalizeRelayUpdate } from './questions.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
@@ -1709,6 +1709,19 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     return track(c, c.session!.recordQuestionExchange(req, ownsCapture(c)), (r) => ({ ...r }));
   }
 
+  /** Record one later step of a change request sent from a recorded exchange.
+   * The body is checked first so the bodiless capability probe is PROTOCOL
+   * whatever state the capture is in. */
+  async function recordRelayUpdate(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'daemon storage ownership is unavailable');
+    try { normalizeRelayUpdate(req); } catch (err) { return errFields((err as QuestionError).code, (err as Error).message); }
+    const c = captures.get(req.session_id as string);
+    if (!c || !isLive(c)) return errFields('SESSION_NOT_SELECTED', 'no capture with that session id is running');
+    if (c.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    if (c.lifecycle !== 'recording' || !isRunning(c)) return errFields('CAPTURE_NOT_READY', 'the capture is not recording yet');
+    return track(c, c.session!.recordQuestionRelayUpdate(req, ownsCapture(c)), (r) => ({ ...r }));
+  }
+
   /** The question hook asks for this chat's next question (or its setup check).
    * Only a linked root chat may claim: subagents and other chats are refused. */
   async function claimQuestion(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
@@ -2052,6 +2065,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'begin_task': outcome = await beginTask(req); break;
       case 'ask': outcome = await ask(req); break;
       case 'record_question_exchange': outcome = await recordExchange(req); break;
+      case 'record_question_relay_update': outcome = await recordRelayUpdate(req); break;
       case 'claim_question': outcome = await claimQuestion(req); break;
       case 'answer_question': outcome = await answerQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
