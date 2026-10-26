@@ -256,9 +256,10 @@ fetches `origin` and starts from `origin/develop`, or from origin's default
 branch when there is no `develop`. A repo with no `origin` is refused. Then it
 starts the daemon if needed, starts recording the workspace, and runs the repo's
 committed setup script (`.conductor/settings.toml` or `conductor.json`, the same
-files Conductor reads). It waits for setup to finish. Its last line is
-`workspace_path: <folder>`, printed whenever the folder was made, even if
-recording or setup then failed; a failed setup leaves the workspace in place.
+files Conductor reads). It waits for setup to finish. Whenever the folder was
+made, even if recording or setup then failed, it prints `workspace_path: <folder>`
+twice: once before setup runs, and again as its last line. A failed setup leaves
+the workspace in place.
 
 `archive` only works on a folder directly under `~/slipstream/workspaces/<repo>/`.
 It refuses a workspace with uncommitted or untracked changes (ignored files are

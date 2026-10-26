@@ -67,6 +67,8 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
     deps.err(`slipstream: couldn't record ${path}: ${errorMessage(err)}`);
     return 1;
   });
+  deps.out('');
+  deps.out(`workspace_path: ${path}`);
   const setUp = await runRepoScript('setup', root, path, deps);
   // Ends any unterminated line the setup script left, so the path stays on a line of its own.
   deps.out('');
