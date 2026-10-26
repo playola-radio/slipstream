@@ -44,7 +44,7 @@ function fake(opts: {
     runScript: async (script, cwd, env) => { calls.push(`run ${script} @${cwd} ${JSON.stringify(env)}`); return opts.script ?? 0; },
     exists: async (path) => (opts.existing ?? []).includes(path),
     realpath: async (path) => path,
-    out: (line) => out.push(line),
+    out: (line) => { out.push(line); calls.push(`out ${line}`); },
     err: (line) => err.push(line),
   };
   return { deps, calls, out, err };
@@ -69,7 +69,7 @@ describe('runWorkspaceCreate', () => {
   it('creates workspace-1 from origin/develop, records it, then runs setup', async () => {
     const f = fake({ git: createGit() });
     assert.equal(await runWorkspaceCreate('/src/repo', f.deps), 0);
-    assert.deepEqual(f.calls, [
+    assert.deepEqual(f.calls.filter((c) => !c.startsWith('out ')), [
       `git ${REV_PARSE} @/src/repo`,
       `git remote get-url origin @${ROOT}`,
       `git fetch --prune origin @${ROOT}`,
@@ -81,6 +81,21 @@ describe('runWorkspaceCreate', () => {
       `run make setup @${WS} ${JSON.stringify(SETUP_ENV)}`,
     ]);
     assert.deepEqual(f.out.slice(-2), ['', `workspace_path: ${WS}`]);
+  });
+
+  it('prints the path after recording and before the setup script', async () => {
+    const f = fake({ git: createGit() });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
+    const order = f.calls.filter((c) => c.startsWith('out ') || c.startsWith('record ') || c.startsWith('run '));
+    assert.deepEqual(order.slice(-6).map((c) => c.split(' @')[0]), [
+      `record ${WS}`, 'out ', `out workspace_path: ${WS}`, 'run make setup', 'out ', `out workspace_path: ${WS}`,
+    ]);
+  });
+
+  it('prints both path lines when recording fails', async () => {
+    const f = fake({ git: createGit(), record: 1 });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.equal(f.out.filter((l) => l === `workspace_path: ${WS}`).length, 2);
   });
 
   it('falls back to origin/HEAD when there is no origin/develop', async () => {
@@ -217,7 +232,7 @@ describe('runWorkspaceArchive', () => {
   it('archives a clean workspace: stop recording, archive script, remove, keep branch', async () => {
     const f = fake({ git: archiveGit() });
     assert.equal(await runWorkspaceArchive(WS, f.deps), 0);
-    assert.deepEqual(f.calls, [
+    assert.deepEqual(f.calls.filter((c) => !c.startsWith('out ')), [
       `git ${REV_PARSE} @${WS}`,
       `git status --porcelain --untracked-files=all --ignore-submodules=none @${WS}`,
       `git symbolic-ref --quiet --short HEAD @${WS}`,
