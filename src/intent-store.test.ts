@@ -59,7 +59,7 @@ describe('durable intent record', () => {
     admitCapture(record, capture(2));
     Object.assign(record.captures[1]!, {
       intent: 'waiting',
-      last_failure: { reason: 'capture-limit-reached', message: 'full', at_ms: 1, next_attempt_at_ms: null },
+      last_failure: { reason: 'watcher-failed', message: 'watch closed', at_ms: 1, next_attempt_at_ms: null },
     });
     await saveIntent(dir, record);
     const before = await readFile(intentPath(dir), 'utf8');

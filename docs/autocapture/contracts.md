@@ -190,8 +190,8 @@ daemon always carries it. `--store` selects the daemon, never the chat.
 
 | CLI | Wire request | Result |
 |---|---|---|
-| `slipstream attach --watch-only <root> [--wait]` | `{verb:"attach", mode:"watch-only", worktree}` | Admission ack before any baseline work: `{session_id, state, created}`. The `session_id` is allocated and persisted at admission. Same root while queued/baselining joins the same capture (no duplicate). Ancestor/descendant roots refused (`ROOT_OVERLAP`). With 16 running capture intents already (spec D10), the intent is written as `waiting` under a fresh `session_id` and the reply is `CAPTURE_LIMIT_REACHED`; nothing is captured until a slot frees. |
-| `slipstream attach` (from a chat) | `{verb:"attach", harness, harness_session_id, worktree, root_transcript}` | If the workspace's capture is `recording`: binds in place (same `session_id`, no new baseline, no resume event, no gap). If it is `queued`/`baselining`: returns the admission state immediately without binding; the CLI polls `status <session_id>` and resubmits the same attach once `recording`, which is idempotent. If no capture exists: admits a watch-only capture first, then the same path. If the workspace is `waiting` for a slot, or admission finds the limit full: `CAPTURE_LIMIT_REACHED`, no binding intent written. |
+| `slipstream attach --watch-only <root> [--wait]` | `{verb:"attach", mode:"watch-only", worktree}` | Admission ack before any baseline work: `{session_id, state, created}`. The `session_id` is allocated and persisted at admission. Same root while queued/baselining joins the same capture (no duplicate). Ancestor/descendant roots refused (`ROOT_OVERLAP`). With 32 capture slots already held (8), the reply is `CAPTURE_LIMIT_REACHED` and nothing is written: no intent, no `session_id`, and a paused capture of the root stays paused. A root already queued, baselining or recording still joins its capture when full. A paused root (intent `withdrawn`, same path and directory) is resumed: same `session_id`, `session.resumed`, `capture.gap`, `created: true`. |
+| `slipstream attach` (from a chat) | `{verb:"attach", harness, harness_session_id, worktree, root_transcript}` | If the workspace's capture is `recording`: binds in place (same `session_id`, no new baseline, no resume event, no gap). If it is `queued`/`baselining`: returns the admission state immediately without binding; the CLI polls `status <session_id>` and resubmits the same attach once `recording`, which is idempotent. If no capture exists, or the root was deleted and recreated: admits a watch-only capture first, then the same path. If the root's capture is paused (intent `withdrawn`, same path and directory): `CAPTURE_PAUSED`, nothing written, admitted or linked; only a watch-only attach resumes it. If admission finds the limit full: `CAPTURE_LIMIT_REACHED`, nothing written. |
 | `slipstream status [<target>]` | `{verb:"status"}` or `{verb:"status", target}` | No target: list every capture with lifecycle and binding state. With target: that one capture. |
 | `slipstream detach <target>` | `{verb:"detach", target}` | Withdraws capture and binding intent durably, then stops the capture (`agent.unlinked{detached}` if bound, then `capture.stopped{detached}`). |
 | `slipstream unlink --session <id>` | `{verb:"unlink", session_id}` | Revokes binding intent; invalidates outstanding setup checks; clears task selection and claim eligibility; capture keeps running. |
@@ -237,16 +237,22 @@ New codes join `ControlErrorCode`:
   > `BINDING_LIMIT_REACHED: 10/10 chats linked. This workspace is still recording without a linked chat. Unlink another chat to connect this one.`
 
   The capture is unaffected and keeps recording.
-- `CAPTURE_LIMIT_REACHED`: 16 capture intents already hold slots (spec D10).
-  Exact text from the spec:
+- `CAPTURE_LIMIT_REACHED`: 32 capture intents already hold slots (8). Exact text:
 
-  > `CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
+  > `CAPTURE_LIMIT_REACHED: 32/32 capture slots in use. This workspace is NOT recording. Pause one first.`
 
-  The waiting intent is durable; the CLI exits non-zero (setup scripts report it
-  per D1). A slot is any capture intent that is `running`, whatever its lifecycle
-  state, including `not_recording` with a retry pending.
+  Nothing is written and nothing waits; the CLI exits non-zero (setup scripts
+  report it per D1). A slot is any capture intent that is `running`, whatever its
+  lifecycle state, including `not_recording` with a retry pending.
+- `CAPTURE_PAUSED`: a chat attach found the root's capture paused (intent
+  `withdrawn`). Exact text:
+
+  > `CAPTURE_PAUSED: This workspace is paused. Record it in Slipstream first, then attach again.`
+
+  Nothing is written, admitted or linked. The check runs in the same turn as
+  admission, so a pause racing an auto-link cannot restart recording.
 - `ROOT_OVERLAP`: the requested root is an ancestor or descendant (by path
-  components) of a waiting, queued, baselining, or recording capture's root, or
+  components) of a queued, baselining, or recording capture's root, or
   of a running `not_recording` capture with a scheduled retry. Sibling git
   worktrees sharing repository metadata are not overlaps.
 - `TARGET_NOT_FOUND`: a targeted verb names no known capture.
@@ -260,7 +266,7 @@ keeps its meaning for delete/GC against a live target.
 Maintenance (D9, P4):
 
 - `delete_session` runs while other captures record. It returns `SESSION_ACTIVE`
-  when the target's intent is `running` or `waiting`, or the target is still
+  when the target's intent is `running`, or the target is still
   starting or stopping. An attach whose lookup found the session before it was
   deleted gets `CAPTURE_NOT_READY` and never writes into it; a retry starts a new
   session.
@@ -295,9 +301,7 @@ Public capture state:
 `daemon-unavailable`, `root-overlap`, `root-missing`, `baseline-failed`,
 `storage-unavailable`, `watcher-failed`, `resume-failed`, `resource-limit`,
 `stop-unconfirmed` (intent withdrawn, an activation may have begun, and no
-durable `capture.stopped`),
-`capture-limit-reached` (intent `waiting` for one of the 16 slots). Retry is
-separate from the reason: a row may also carry `retry: {next_attempt_at_ms}` when
+durable `capture.stopped`). Retry is separate from the reason: a row may also carry `retry: {next_attempt_at_ms}` when
 recovery has scheduled another attempt.
 
 Public binding state: `setup_pending` (optional reason `config-missing`),
@@ -320,13 +324,11 @@ session ownership heartbeats (7), in this precedence:
    - Otherwise: `not_recording{stop-unconfirmed}`. This covers any capture that
      activated but has no durable `capture.stopped`, and the offline CLI, which
      cannot tell whether an activation began. Never `recording`.
-3. Intent `waiting`: `not_recording{capture-limit-reached}`. Waiting intents never
-   have an activation.
-4. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
+3. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
    with that event's reason. `maintenance` additionally carries the running
    intent, so it resumes later; `watcher-failed` does too when recovery is
    scheduled. Neither stop is hidden by a fresh heartbeat or `last_failure`.
-5. Intent `running` with a recorded `last_failure`: `not_recording` with that
+4. Intent `running` with a recorded `last_failure`: `not_recording` with that
    reason, whether or not its heartbeat is fresh. A storage failure therefore
    never reads as `recording`; when the store cannot accept another event, the
    reader uses the durable intent record's `last_failure`. That includes an
@@ -334,22 +336,22 @@ session ownership heartbeats (7), in this precedence:
    when the session recovers. If the intent record cannot be written either, an
    offline reader cannot see the outage until the recovered session's
    `capture.gap{storage}` discloses it.
-6. Intent `running`, session owner live: `recording` if the current activation
+5. Intent `running`, session owner live: `recording` if the current activation
    has `capture.ready`, `baselining` if it has none, `queued` if no activation
    has begun.
-7. Intent `running`, session owner not live, store owner live: `queued`. The
+6. Intent `running`, session owner not live, store owner live: `queued`. The
    capture is waiting for the daemon to start it, or to resume it after a
-   restart. A live daemon records `last_failure` (rule 5) whenever a capture
+   restart. A live daemon records `last_failure` (rule 4) whenever a capture
    loses its owner any other way, so a running capture with neither owner nor
    failure is one the daemon has yet to start (Brian, 2026-10-18 for a capture
    that never began; 2026-10-19 for one waiting to resume).
-8. Intent `running`, neither owner live: `not_recording{daemon-unavailable}`.
+7. Intent `running`, neither owner live: `not_recording{daemon-unavailable}`.
 
 Binding state is a fold of binding intent plus binding events; revoked intent
 wins over a missing `agent.unlinked` event. `unavailable` comes only from intent.
 `setup_pending` and `connected` come from the latest `agent.connection` at the
 current generation in the current activation; a `connected` from an earlier
-activation reads as `setup_pending`. A capture read `queued` under rule 7 has no
+activation reads as `setup_pending`. A capture read `queued` under rule 6 has no
 current activation yet.
 
 ### Crash points
@@ -378,7 +380,7 @@ last heartbeat".
 - **Store owner**, `<store>/owner.lock`: held by the daemon for as long as it
   runs. It answers one question only: for a running capture with no live session
   owner and no recorded failure, is a daemon there to start or resume it? Live:
-  `queued`. Not live: `not_recording{daemon-unavailable}` (6, rules 7 and 8). It
+  `queued`. Not live: `not_recording{daemon-unavailable}` (6, rules 6 and 7). It
   never makes a capture `baselining` or `recording`.
 
 The store lock records only a process id and a nonce, so a reader cannot tell
@@ -390,7 +392,7 @@ the daemon from any other holder. The other holders (P6d audit, 2026-10-19):
 - The offline `detach`/`unlink` writers (8) and the LaunchAgent install check
   hold it for milliseconds, and only while no daemon runs. A reader in that
   window, or within 12 s of one of them dying while holding it, can read a
-  waiting capture as `queued` with no daemon. That is the same bound as a session
+  running capture as `queued` with no daemon. That is the same bound as a session
   owner that dies: live as of the last heartbeat.
 
 ## 8. Durable intent record (P3 persists it)
@@ -408,7 +410,7 @@ any acknowledgement it backs.
     "session_id": "<uuid>",                    // allocated at admission, never null; stable across history, never the path
     "root": "/canonical/root",
     "root_identity": { "dev": "16777230", "ino": "123456" } | null,  // decimal strings; null if the root could not be read at admission
-    "intent": "running" | "waiting" | "withdrawn",   // waiting = beyond the 16-capture limit
+    "intent": "running" | "withdrawn",              // withdrawn = paused (detached) or archived
     "withdrawn_reason": "detached" | "archived" | null,
     "capture_mode": "watch-only",
     "last_failure": null | { "reason": "…", "message": "…", "at_ms": 0, "next_attempt_at_ms": 0 | null }
@@ -432,11 +434,14 @@ Rules:
   in memory under the same mutex as the file write. At most 10. Restored bindings
   keep their slot; nothing is evicted for inactivity.
 - Capture slots = capture entries with `intent: "running"` plus in-flight
-  admissions, under the same mutex. At most 16 (spec D10). `waiting` entries keep
-  their array order, which is admission order: when a `running` entry is withdrawn,
-  the first `waiting` entry becomes `running` in the same write and is queued.
-  Archiving or detaching a `waiting` entry withdraws it without a slot change.
-  Restart and maintenance never change which entries are `running`.
+  admissions, under the same mutex. At most 32 (`MAX_CAPTURES`). A full attach
+  writes nothing; withdrawing a `running` entry frees its slot and starts nothing
+  else. Restart and maintenance never change which entries are `running`.
+- An older daemon wrote `intent: "waiting"` for captures beyond its limit. The
+  loader reads each such entry as `intent: "withdrawn"`, `withdrawn_reason:
+  "detached"`, `last_failure: null` (paused) before validating; nothing is written
+  at startup, and the next ordinary intent write saves the new form. The record
+  stays `version: 1`.
 - `(harness, harness_session_id)` is unique among linked bindings (4).
 - Connection state is **not** persisted. Recovery restores every linked binding
   as `setup_pending`; only a fresh round trip makes it `connected`.

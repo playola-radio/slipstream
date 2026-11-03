@@ -322,7 +322,7 @@ export interface EnrollDeps {
 }
 
 /** Ask for a watch-only capture of every workspace, in order. A workspace that
- * already has one keeps it, and its place if it is waiting. */
+ * already has one keeps it. */
 export async function runConductorEnroll(inventory: Inventory, deps: EnrollDeps): Promise<number> {
   try {
     await deps.ensureDaemon();
@@ -335,14 +335,10 @@ export async function runConductorEnroll(inventory: Inventory, deps: EnrollDeps)
     : 'in Conductor\'s inventory order (it records no activity time)'}.`);
   let recording = 0;
   let starting = 0;
-  let waiting = 0;
   let failed = 0;
   for (const dir of inventory.workspaces) {
     const res = await deps.control({ verb: 'attach', mode: 'watch-only', worktree: dir });
-    if (!res.ok && res.code === 'CAPTURE_LIMIT_REACHED') {
-      waiting++;
-      deps.out(`${dir}: waiting for a capture slot (NOT recording)`);
-    } else if (!res.ok) {
+    if (!res.ok) {
       failed++;
       deps.err(`slipstream: ${dir}: NOT recording (${res.code}: ${res.message})`);
     } else if (res.state === 'recording') {
@@ -356,10 +352,6 @@ export async function runConductorEnroll(inventory: Inventory, deps: EnrollDeps)
       deps.err(`slipstream: ${dir}: NOT recording (${String(res.reason ?? res.state)}${res.message ? `: ${String(res.message)}` : ''})`);
     }
   }
-  deps.out(`${recording} recording, ${starting} starting, ${waiting} waiting, ${failed} not recording.`);
-  if (waiting > 0) {
-    deps.out('Waiting workspaces start automatically, in this order, as capture slots free up. '
-      + 'Archive workspaces you no longer use in Conductor to free slots.');
-  }
+  deps.out(`${recording} recording, ${starting} starting, ${failed} not recording.`);
   return failed > 0 ? 1 : 0;
 }
