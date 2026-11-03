@@ -222,6 +222,31 @@ describe('a chat attach never resumes a paused workspace', () => {
     });
   });
 
+  it('chat attach of a root paused before it ever started is refused and changes nothing', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const platform: Platform = {
+      watch: async () => {
+        if (first) { first = false; await held; }
+        return { close: async () => {} };
+      },
+    };
+    await withStore(async ({ store, call, roots }) => {
+      const [a, b] = await roots(2);
+      await call({ verb: 'attach', mode: 'watch-only', worktree: a });
+      const queued = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: b }));
+      assert.equal((await call({ verb: 'detach', target: queued.session_id })).ok, true);
+      const before = await readFile(intentPath(store), 'utf8');
+      try {
+        assert.equal(refusal(await linkChat(call, store, b!, 'chat-1')), PAUSED);
+        assert.equal(await readFile(intentPath(store), 'utf8'), before);
+      } finally {
+        release();
+      }
+    }, platform);
+  });
+
   it('a chat attach racing a pause leaves the workspace paused and unlinked', async () => {
     await withStore(async ({ store, call, roots }) => {
       const [ws] = await roots(1);

@@ -682,7 +682,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   function sameRoot(c: Capture, identity: RootIdentity | null | undefined): boolean {
-    const known = findCapture(intent, c.id)?.root_identity;
+    return sameDirectory(findCapture(intent, c.id)?.root_identity, identity);
+  }
+
+  function sameDirectory(known: RootIdentity | null | undefined, identity: RootIdentity | null | undefined): boolean {
     return !known || !identity || (known.dev === identity.dev && known.ino === identity.ino);
   }
 
@@ -908,8 +911,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return errFields('CAPTURE_NOT_READY', `session ${id} was deleted while this attach looked it up; retry attach`);
     }
     // Checked in the same turn as the intent entry below, so a pause or a
-    // concurrent admission cannot slip between them.
-    if (!opts.resumePaused && match && findCapture(intent, match.id)?.intent === 'withdrawn') {
+    // concurrent admission cannot slip between them. By root, not by log: a
+    // capture paused before it ever started has no log to find.
+    const paused = intent.captures.some((e) => e.root === root && e.intent === 'withdrawn' && sameDirectory(e.root_identity, rootIdentity));
+    if (!opts.resumePaused && paused) {
       return errFields('CAPTURE_PAUSED', CAPTURE_PAUSED_MESSAGE);
     }
     if (runningCount(intent) >= MAX_CAPTURES) return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);

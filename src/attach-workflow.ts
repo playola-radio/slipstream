@@ -209,7 +209,7 @@ function requireCaptureTable(status: Record<string, unknown>, store: string): vo
     + 'Nothing was installed or recorded.');
 }
 
-interface StatusRow { root?: unknown; state?: unknown; reason?: unknown;
+interface StatusRow { root?: unknown; state?: unknown;
   binding?: { harness?: unknown; harness_session_id?: unknown; state?: unknown } | null }
 
 /** Whether the daemon will refuse to link this chat: it is linked elsewhere, this

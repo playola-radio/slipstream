@@ -50,9 +50,10 @@ export async function foldCaptures(store: string, asOfMs: number): Promise<Recor
     const live = isLive(await heartbeatOf(join(store, 'sessions', c.session_id, 'owner.lock')));
     let state: string; let reason: string | null = null;
     let current = activation;
-    if (c.intent === 'withdrawn') {
+    // §8: an entry an older daemon left in any other intent reads as paused.
+    if (c.intent !== 'running') {
       if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
-      else if (log === null) [state, reason] = ['stopped', c.withdrawn_reason];
+      else if (log === null) [state, reason] = ['stopped', c.withdrawn_reason ?? 'detached'];
       else [state, reason] = ['not_recording', 'stop-unconfirmed'];
     } else if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
     else if (c.last_failure) [state, reason] = ['not_recording', c.last_failure.reason];

@@ -242,6 +242,27 @@ describe('auto-capture acceptance: a capture waiting for the baseline slot', () 
     });
   });
 
+  it('reads captures an older daemon left waiting as paused to both readers', async () => {
+    await withStore(async ({ store, roots, start, stop }) => {
+      const first = await start();
+      const [a, b] = await roots(2);
+      const resumable = await attachRecording(first.call, a!);
+      await stop();
+      const path = join(store, 'control', 'intent.json');
+      const intent = JSON.parse(await readFile(path, 'utf8')) as { captures: Row[] };
+      const never = randomUUID();
+      intent.captures.push({ ...intent.captures[0], session_id: never, root: b, root_identity: null });
+      for (const c of intent.captures) Object.assign(c, { intent: 'waiting', withdrawn_reason: null });
+      await writeFile(path, JSON.stringify(intent));
+
+      const { daemon } = await start();
+      const { projection, fold } = await bothReaders(store, daemon.readerUrl, daemon.readerToken);
+      assert.deepEqual(fold, projection);
+      assert.deepEqual(stateOf(rowOf(projection, never)), ['stopped', 'detached', null]);
+      assert.notEqual(rowOf(projection, resumable).state, 'recording');
+    });
+  });
+
   it('reads a restarted capture still waiting to resume as queued to both readers', async () => {
     await withStore(async ({ store, roots, start, stop }) => {
       const first = await start();
