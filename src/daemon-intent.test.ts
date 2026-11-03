@@ -1,13 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DaemonAlreadyRunningError, startDaemon, type Daemon } from './daemon.ts';
 import { acquireSessionLock } from './lock.ts';
-import { loadIntent } from './intent-store.ts';
+import { intentPath, loadIntent } from './intent-store.ts';
 import type { Platform } from './platform.ts';
-import { controlCall, createRootsPlatform, linkChat, rec, waitForRow, type Call } from './test/daemon-harness.ts';
+import type { ResponseEnvelope } from './control-protocol.ts';
+import {
+  captureRow, controlCall, createRootsPlatform, linkChat, rec, waitForRow, type Call,
+} from './test/daemon-harness.ts';
 
 async function withStore(fn: (ctx: { store: string; call: Call; roots: (n: number) => Promise<string[]> }) => Promise<void>,
   platform: Platform = createRootsPlatform().platform): Promise<void> {
@@ -47,16 +50,6 @@ describe('daemon capture intent is durable before each acknowledgement', () => {
       assert.equal(entry?.root, ws);
       assert.equal(entry?.intent, 'running');
       assert.match(entry?.root_identity?.ino ?? '', /^[0-9]+$/);
-    });
-  });
-
-  it('records waiting captures in admission order', async () => {
-    await withStore(async ({ store, call, roots }) => {
-      const ws = await roots(18);
-      for (const w of ws) await call({ verb: 'attach', mode: 'watch-only', worktree: w });
-      const recorded = (await loadIntent(store)).captures;
-      assert.deepEqual(recorded.map((c) => c.root), ws);
-      assert.deepEqual(recorded.map((c) => c.intent), [...Array(16).fill('running'), 'waiting', 'waiting']);
     });
   });
 
@@ -134,6 +127,79 @@ describe('daemon capture intent is durable before each acknowledgement', () => {
       const session_id = rec(linked).session_id;
       const both = await Promise.all([call({ verb: 'unlink', session_id }), call({ verb: 'unlink', session_id })]);
       assert.deepEqual(both.map((r) => r.ok), [false, false], JSON.stringify(both));
+    });
+  });
+});
+
+const FULL = 'CAPTURE_LIMIT_REACHED: 32/32 capture slots in use. This workspace is NOT recording. Pause one first.';
+
+function refusal(res: ResponseEnvelope): string {
+  return res.ok === false ? `${res.code}: ${res.message}` : `ok ${JSON.stringify(res)}`;
+}
+
+async function record(call: Call, root: string): Promise<string> {
+  const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const id = rec(res).session_id!;
+  await waitForRow(call, id, (row) => row.state === 'recording');
+  return id;
+}
+
+async function pause(call: Call, root: string): Promise<string> {
+  const id = await record(call, root);
+  assert.equal((await call({ verb: 'detach', target: root })).ok, true);
+  return id;
+}
+
+describe('daemon capture slots', () => {
+  it('refuses a new root when 32 slots are held and writes nothing', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [paused, ...ws] = await roots(34);
+      await pause(call, paused!);
+      for (const root of ws.slice(0, 32)) await record(call, root);
+      const before = await readFile(intentPath(store), 'utf8');
+
+      assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: ws[32]! })), FULL);
+      assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: paused! })), FULL);
+
+      assert.equal(await readFile(intentPath(store), 'utf8'), before);
+      assert.equal((await captureRow(call, paused!)).state, 'stopped');
+    });
+  });
+
+  it('two concurrent new roots at 31 slots admit exactly one', async () => {
+    await withStore(async ({ call, roots }) => {
+      const ws = await roots(33);
+      for (const root of ws.slice(0, 31)) await record(call, root);
+      const raced = await Promise.all(ws.slice(31).map((root) => call({ verb: 'attach', mode: 'watch-only', worktree: root })));
+      assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
+      assert.equal(refusal(raced.find((r) => !r.ok)!), FULL);
+    });
+  });
+
+  it('joining a recording root succeeds while full', async () => {
+    await withStore(async ({ call, roots }) => {
+      const ws = await roots(32);
+      const ids: string[] = [];
+      for (const root of ws) ids.push(await record(call, root));
+      const joined = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: ws[0]! }));
+      assert.deepEqual([joined.ok, joined.session_id, joined.created], [true, ids[0], false]);
+    });
+  });
+
+  it('detach frees a slot and starts nothing else', async () => {
+    await withStore(async ({ call, roots }) => {
+      const [paused, ...ws] = await roots(34);
+      await pause(call, paused!);
+      for (const root of ws.slice(0, 32)) await record(call, root);
+      const states = async () => (rec(await call({ verb: 'status' })) as unknown as { captures: Array<{ root: string; state: string }> })
+        .captures.filter((c) => c.root !== ws[0]).map((c) => [c.root, c.state]);
+      const before = await states();
+
+      assert.equal((await call({ verb: 'detach', target: ws[0]! })).ok, true);
+
+      assert.deepEqual(await states(), before);
+      await record(call, ws[32]!);
     });
   });
 });

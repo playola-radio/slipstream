@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { probeSocket, startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
+import { MAX_CAPTURES } from './capture-intent.ts';
 import type { Platform } from './platform.ts';
 import { bothReaders, foldCaptures, comparable } from './test/captures-fold.ts';
 import {
@@ -117,16 +118,11 @@ describe('auto-capture acceptance: two independent readers', () => {
         assert.deepEqual(fold, projection, what);
         return projection;
       };
-      const ws = await roots(18);
+      const ws = await roots(MAX_CAPTURES + 1);
       const ids: string[] = [];
-      for (const root of ws.slice(0, 16)) ids.push(await attachRecording(call, root));
-      const waiting: string[] = [];
-      for (const root of [ws[16]!, ws[17]!]) {
-        const res = await call({ verb: 'attach', mode: 'watch-only', worktree: root });
-        assert.equal(res.ok === false && res.code, 'CAPTURE_LIMIT_REACHED');
-        waiting.push((rec(await call({ verb: 'status', target: root })).capture as unknown as Row).session_id as string);
-      }
-      const [seventeenth, eighteenth] = waiting;
+      for (const root of ws.slice(0, MAX_CAPTURES)) ids.push(await attachRecording(call, root));
+      const full = await call({ verb: 'attach', mode: 'watch-only', worktree: ws[MAX_CAPTURES]! });
+      assert.equal(full.ok === false && full.code, 'CAPTURE_LIMIT_REACHED');
       await linkRecording(call, store, ws[0]!, 'chat-pending');
       await linkRecording(call, store, ws[1]!, 'chat-connected');
       await connect(call, store, 'chat-connected', ws[1]!);
@@ -134,7 +130,7 @@ describe('auto-capture acceptance: two independent readers', () => {
       assert.equal((await call({ verb: 'unlink', session_id: ids[2]! })).ok, true);
 
       let table = await agree('a full table with linked, connected, and unlinked chats');
-      assert.deepEqual(stateOf(rowOf(table, seventeenth!)), ['not_recording', 'capture-limit-reached', null]);
+      assert.equal((table.captures as Row[]).length, MAX_CAPTURES);
       assert.deepEqual(stateOf(rowOf(table, ids[0]!)), ['recording', null, 'setup_pending']);
       assert.deepEqual(stateOf(rowOf(table, ids[1]!)), ['recording', null, 'connected']);
       assert.deepEqual(stateOf(rowOf(table, ids[2]!)), ['recording', null, 'unlinked']);
@@ -146,12 +142,10 @@ describe('auto-capture acceptance: two independent readers', () => {
       }
 
       assert.equal((await call({ verb: 'detach', target: ids[3]! })).ok, true);
-      await waitForRow(call, seventeenth!, recording, 'the seventeenth recording once a slot freed');
-      assert.equal((await call({ verb: 'detach', target: eighteenth! })).ok, true);
-      table = await agree('a freed slot, a promoted workspace, and a withdrawn waiting one');
+      const latecomer = await attachRecording(call, ws[MAX_CAPTURES]!);
+      table = await agree('a freed slot taken by a new workspace');
       assert.deepEqual(stateOf(rowOf(table, ids[3]!)), ['stopped', 'detached', null]);
-      assert.deepEqual(stateOf(rowOf(table, seventeenth!)), ['recording', null, null]);
-      assert.deepEqual(stateOf(rowOf(table, eighteenth!)), ['stopped', 'detached', null]);
+      assert.deepEqual(stateOf(rowOf(table, latecomer)), ['recording', null, null]);
 
       const owner = join(store, 'sessions', ids[4]!, 'owner.lock');
       table = (await readStale(store, daemon, [owner])).projection;
@@ -168,7 +162,7 @@ describe('auto-capture acceptance: two independent readers', () => {
 
       await rm(join(store, 'chat-pending.jsonl'));
       const restarted = await start();
-      for (const id of [...ids.filter((id) => id !== ids[3]), seventeenth!]) await waitForRow(restarted.call, id, recording);
+      for (const id of [...ids.filter((id) => id !== ids[3]), latecomer]) await waitForRow(restarted.call, id, recording);
       await waitForRow(restarted.call, ids[0]!, (row) => (row.binding as Row).state === 'unavailable');
       await untilIntent(store, (intent) => intent.bindings.some((b) => b.session_id === ids[0] && b.unavailable !== null));
       const { projection, fold } = await bothReaders(store, restarted.daemon.readerUrl, restarted.daemon.readerToken);

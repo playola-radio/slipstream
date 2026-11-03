@@ -1812,8 +1812,6 @@ async function withCaptures(
   }
 }
 
-const CAPTURE_LIMIT_TEXT = 'CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. '
-  + 'It starts automatically when another workspace is archived or detached.';
 const BINDING_LIMIT_TEXT = 'BINDING_LIMIT_REACHED: 10/10 chats linked. This workspace is still recording without '
   + 'a linked chat. Unlink another chat to connect this one.';
 
@@ -2000,49 +1998,6 @@ describe('daemon capture table', () => {
       assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
       assert.equal(refusal(raced.find((r) => !r.ok)!), BINDING_LIMIT_TEXT);
       assert.deepEqual(rec(await call({ verb: 'status' })).binding_slots, { used: 10, limit: 10 } as unknown as string);
-    });
-  });
-
-  it('holds a seventeenth workspace waiting and starts the oldest waiting one when a slot frees', async () => {
-    await withCaptures(async ({ store, call, roots }) => {
-      const ws = await roots(18);
-      const ids: string[] = [];
-      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
-      const over = await call({ verb: 'attach', mode: 'watch-only', worktree: ws[16]! });
-      assert.equal(refusal(over), CAPTURE_LIMIT_TEXT);
-      const waiting = await captureRow(call, ws[16]!);
-      assert.deepEqual([waiting.state, waiting.reason], ['not_recording', 'capture-limit-reached']);
-      assert.equal(refusal(await linkChat(call, store, ws[16]!, 'c1')), CAPTURE_LIMIT_TEXT);
-      assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: ws[17]! })), CAPTURE_LIMIT_TEXT);
-      await call({ verb: 'detach', target: ids[0]! });
-      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
-      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
-      await call({ verb: 'detach', target: ids[1]! });
-      await waitForRow(call, ws[17]!, (row) => row.state === 'recording');
-    });
-  });
-
-  it('keeps a waiting workspace\'s place in line when it is attached again', async () => {
-    await withCaptures(async ({ call, roots }) => {
-      const ws = await roots(18);
-      const ids: string[] = [];
-      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
-      for (const root of [ws[16]!, ws[17]!, ws[16]!]) {
-        assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: root })), CAPTURE_LIMIT_TEXT);
-      }
-      await call({ verb: 'detach', target: ids[0]! });
-      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
-      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
-    });
-  });
-
-  it('gives the sixteenth capture slot to exactly one of two racing workspaces', async () => {
-    await withCaptures(async ({ call, roots }) => {
-      const ws = await roots(17);
-      for (const root of ws.slice(0, 15)) await attachWatchOnly(call, root);
-      const raced = await Promise.all(ws.slice(15).map((root) => call({ verb: 'attach', mode: 'watch-only', worktree: root })));
-      assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
-      assert.equal(refusal(raced.find((r) => !r.ok)!), CAPTURE_LIMIT_TEXT);
     });
   });
 

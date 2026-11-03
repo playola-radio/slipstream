@@ -48,9 +48,19 @@ export async function loadIntent(storeDir: string): Promise<IntentRecord> {
   } catch {
     throw new IntentCorruptError(path, 'not JSON');
   }
+  readLegacyWaitingAsPaused(parsed);
   const problem = intentProblem(parsed);
   if (problem) throw new IntentCorruptError(path, problem);
   return parsed as IntentRecord;
+}
+
+/** An older daemon queued captures as `waiting`; they load as paused. Nothing is
+ * written here; the next ordinary save persists the new form. */
+function readLegacyWaitingAsPaused(parsed: unknown): void {
+  if (!isObject(parsed) || !Array.isArray(parsed.captures)) return;
+  for (const c of parsed.captures) {
+    if (isObject(c) && c.intent === 'waiting') Object.assign(c, { intent: 'withdrawn', withdrawn_reason: 'detached', last_failure: null });
+  }
 }
 
 export async function saveIntent(storeDir: string, record: IntentRecord): Promise<void> {
@@ -139,7 +149,7 @@ function captureProblem(c: unknown, i: number): string | null {
   if (e.root_identity !== null && !(isObject(e.root_identity) && isDecimal(e.root_identity.dev) && isDecimal(e.root_identity.ino))) {
     return `captures[${i}].root_identity is malformed`;
   }
-  if (!['running', 'waiting', 'withdrawn'].includes(e.intent as string)) return `captures[${i}].intent is unknown`;
+  if (!['running', 'withdrawn'].includes(e.intent as string)) return `captures[${i}].intent is unknown`;
   if (![null, 'detached', 'archived'].includes(e.withdrawn_reason as string | null)) return `captures[${i}].withdrawn_reason is unknown`;
   if (e.capture_mode !== 'watch-only') return `captures[${i}].capture_mode is unknown`;
   const f = e.last_failure;

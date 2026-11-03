@@ -54,8 +54,7 @@ export async function foldCaptures(store: string, asOfMs: number): Promise<Recor
       if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
       else if (log === null) [state, reason] = ['stopped', c.withdrawn_reason];
       else [state, reason] = ['not_recording', 'stop-unconfirmed'];
-    } else if (c.intent === 'waiting') [state, reason] = ['not_recording', 'capture-limit-reached'];
-    else if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
+    } else if (stop) [state, reason] = ['stopped', String(stop.data.reason)];
     else if (c.last_failure) [state, reason] = ['not_recording', c.last_failure.reason];
     else if (!live && daemonLive) {
       // Waiting to start or resume: the logged activation is a previous one (§6).
