@@ -32,7 +32,7 @@ Files: `A` = `src/autocapture-acceptance.test.ts`,
 | Later readiness baselines current bytes without presenting earlier edits as captured history | A `stays visible while failed, and the retry baselines current bytes without presenting earlier edits as history` (a file edited and a file created while failing appear only as `file.baselined` with the current bytes' hash; zero `file.changed`) | Covered |
 | Public-reader parity | A `agree on capture and binding states as the table fills, a slot frees, a heartbeat goes stale, and a transcript goes missing` (`/v1/captures` equals an independent fold of `control/intent.json`, the session logs and the heartbeats, for `recording`, `stopped`/`detached`, `queued` and `daemon-unavailable` as heartbeats go stale, and chats `setup_pending`, `connected`, `unlinked` and `unavailable`; the `status` verb shows the same states); A `reads as baselining to both readers until its baseline finishes`; A `reads as queued to both readers while the daemon holds the store`; A `reads as daemon-unavailable to both readers once the store heartbeat goes stale, and with the daemon gone`; A `reads a restarted capture still waiting to resume as queued to both readers`; A `read root-missing, watcher-failed and storage-unavailable the same to both readers` (including recovery back to `recording`); A `keeps showing a recovered outage to both readers while the intent record cannot be written`; A `reads a chat connected before the restart as setup pending to both readers while its capture waits to resume`; A `reads a connected chat as setup pending to both readers once its session heartbeat goes stale under a live daemon`; the two Codex tests above; D `lets independent readers follow each capture and lists every capture` | Covered |
 | Native parity | none | P6a (native client), not this PR |
-| Real-use overhead check at 16 captures with linked chats (the D8 verdict) | none; [real-use-check.md](real-use-check.md) is the runbook | Real-use day, not run |
+| Real-use overhead check at 32 captures with linked chats (the D8 verdict) | none; [real-use-check.md](real-use-check.md) is the runbook and records a compressed agent-run at 32 (2026-11-03): every measured part passes | Working day, not run |
 | The 33rd workspace is refused (`CAPTURE_LIMIT_REACHED`) and nothing is written; a paused workspace stays paused | I `refuses a new root when 32 slots are held and writes nothing`; I `two concurrent new roots at 31 slots admit exactly one`; I `joining a recording root succeeds while full`; A `agree on capture and binding states …` | Covered |
 | A freed slot starts nothing else | I `detach frees a slot and starts nothing else` | Covered |
 | A chat attach never resumes a paused workspace (`CAPTURE_PAUSED`); a watch-only attach does | I `chat attach of a paused root is refused and changes nothing`; I `chat attach of a root paused before it ever started is refused and changes nothing`; I `a chat attach racing a pause leaves the workspace paused and unlinked`; I `watch-only attach of a paused root resumes it` | Covered |
@@ -45,7 +45,7 @@ Files: `A` = `src/autocapture-acceptance.test.ts`,
 ## Uncovered
 
 - **Native-app flip and native parity**: P6a.
-- **The real-use day (D8 verdict)**: not run; see [real-use-check.md](real-use-check.md).
+- **The real-use day (D8 verdict)**: not run; a compressed agent-run at 32 is recorded in [real-use-check.md](real-use-check.md).
 
 ## Known gap: Conductor starts the agent before setup finishes
 

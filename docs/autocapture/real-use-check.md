@@ -9,7 +9,7 @@ for a day and then reads the numbers against the pass bar.
 Quoted verbatim from the
 [design spec](../superpowers/specs/2026-10-05-workspace-auto-capture-design.md):
 
-> **Real-use check (P6, the D8 verdict).** Sixteen workspaces recording, with
+> **Real-use check (P6, the D8 verdict).** Thirty-two workspaces (the D10 limit) recording, with
 > linked chats, for a working day of normal use: the daemon's idle CPU stays at or
 > under 1% of one core on average, its memory stays at or under 512 MiB with no
 > sustained growth, and no change is lost (no unexplained gap, zero watcher
@@ -22,7 +22,7 @@ Quoted verbatim from the
    that build.
 2. Run `slipstream conductor install` (its `Slipstream:` line shows the version
    the daemon now runs), then `slipstream conductor enroll`.
-3. Make sure 16 intended Conductor workspace rows are `state: recording` in
+3. Make sure 32 intended Conductor workspace rows are `state: recording` in
    `slipstream status`; retained or archived capture history does not count.
    Any intended `not_recording` row has a reason on it; fix that before starting.
 4. Link a chat in as many of them as you will use; at most 10 can be linked.
@@ -85,7 +85,7 @@ Each part of the bar, and the numbers that answer it:
 
 | Part of the bar | Read | Pass when |
 |---|---|---|
-| Sixteen workspaces recording, with linked chats | `slipstream status` at the start and the end of the day | 16 rows `state: recording`, with the chats you linked `connected` |
+| Thirty-two workspaces recording, with linked chats | `slipstream status` at the start and the end of the day | 32 rows `state: recording`, with the chats you linked `connected` |
 | A working day of normal use | `hours`, `max_gap_s`; your own account of the day | You judge it a normal working day, and `max_gap_s` shows no long unsampled stretch |
 | Idle CPU at or under 1% of one core on average | `cpu_pct_idle` | ≤ 1 |
 | Memory at or under 512 MiB | `rss_max_mib` | ≤ 512 |
@@ -98,6 +98,41 @@ lost changes, but each should match something you did.
 
 A miss on any part is written up with the numbers above and stops the work. The
 verdict is recorded with the P6 closeout, not in this file.
+
+## Recorded runs
+
+**2026-11-03, 32 captures (recording controls, PR 1).** Agent-run on a disposable
+store (`npm run qa:daemon`), not a person's working day, so the "working day"
+part of the bar is not established by this run. 31 clones of this repo plus the
+QA sandbox were recording (32/32), with 10 chats linked and `connected`. A 33rd
+attach was refused with `CAPTURE_LIMIT_REACHED: 32/32 capture slots in use. This
+workspace is NOT recording. Pause one first.` A script edited, created and
+deleted files in 12 of the workspaces and appended to the chat transcripts for
+4 minutes, then idled for 3, sampling every 15 s.
+
+The Mac went to sleep on battery from 21:31 to 21:42 UTC during the first
+window, so a second window was run under `caffeinate` against the same daemon
+(no restart). That one ended early, after 15 minutes, when the system file table
+filled (`ENFILE`). Two macOS Virtualization VMs held about 230,000 files; the
+daemon held 55. Recording was not affected.
+
+| | First window | Second window |
+|---|---|---|
+| `hours` | 0.619 (about 0.4 awake) | 0.25 |
+| `samples` / `max_gap_s` | 95 / 684.8 (the sleep) | 60 / 30.0 |
+| `cpu_pct_idle` (`idle_intervals`) | 0.281 (32) | 0.291 (22) |
+| `cpu_pct_all` | 1.498 (includes baselining 32 workspaces) | 0.413 |
+| `rss_max_mib` | 159.1 (during baselining) | 74.4 |
+| `rss_first_quarter_mib` → `rss_last_quarter_mib` | 132.1 → 69.5 | 72.2 → 69.0 |
+| `daemon_restarts` | 0 | 0 |
+| `gaps` / `stops` | none / none | none / none |
+
+The daemon log had no "is not recording", "stopped:" or watcher lines. At the
+end, all 32 rows were `state: recording` with 10/10 chats linked, and no session
+log held a `capture.gap` or `capture.stopped` event. Every measured part of the
+bar passes: idle CPU 0.29% of one core or less (bar ≤ 1), at most 159 MiB of
+memory (bar ≤ 512) settling at about 69 MiB with no growth, no gaps, and no
+watcher failures. A person's working day at 32 has not been run.
 
 ## Two checks of Conductor's order
 

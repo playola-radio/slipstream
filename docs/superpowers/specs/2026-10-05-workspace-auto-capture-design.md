@@ -37,7 +37,7 @@ one in force.
 | D5 | Agent binding | ~~Watch-only now; verified binding is a separate later step.~~ **Changed.** | Capture is watch-only until a chat runs `slipstream attach`, which binds that chat **in place** onto the live capture: same `session_id`, no new baseline, no resume event, no fabricated gap. Earlier changes are never credited to the chat. |
 | D6 | Order | Measure first, then the minimal slice, then recovery and maintenance. | **Revised (Brian, 2026-10-17).** P1 measured once and answered the question that could stop the feature: the watcher holds 16 captures cheaply. No further benchmark runs gate any PR. Known costs are fixed as code changes with counting tests; overhead is judged once, at P6, in real use. See "Overhead". |
 | D7 | Install | ~~Global install from a dedicated clone plus launcher.~~ **Superseded.** | Install is the published npm package `@playola-radio/slipstream`. Setup scripts and the LaunchAgent use the absolute Node 24 path and the real `dist/cli.js` path, recorded at install time. No nvm sourcing. |
-| D8 | Overhead gates | Proposed, not ratified. | **Amended (Brian, 2026-10-17).** The bar is idle CPU, memory and no lost changes, judged in real use at 16 captures (see "Overhead"); a miss there is report-and-stop. The wakeup, baseline-seconds and latency-regression gates are dropped: wakeups cannot be measured without sudo, and stopwatch numbers on a loaded laptop kept producing failures that told us nothing new. |
+| D8 | Overhead gates | Proposed, not ratified. | **Amended (Brian, 2026-10-17).** The bar is idle CPU, memory and no lost changes, judged in real use at 16 captures (32 since the D10 amendment of 2026-11-03; see "Overhead"); a miss there is report-and-stop. The wakeup, baseline-seconds and latency-regression gates are dropped: wakeups cannot be measured without sudo, and stopwatch numbers on a loaded laptop kept producing failures that told us nothing new. |
 | D9 | GC | New. | **Ratified.** `slipstream gc` may quiesce all captures (a disclosed maintenance gap via stop events plus the existing resume gap), then automatically resume them and re-handshake bindings. Fully concurrent GC is deferred. |
 | D10 | Capture cap | New. | **Ratified 2026-10-17; amended 2026-11-03 by recording controls** (client repo `design/features/recording-controls/`). At most **32** workspaces record at once. Beyond that an attach is refused with `CAPTURE_LIMIT_REACHED` and nothing is written; nothing queues or starts automatically. No eviction. The limit is one constant; raising it later is that change plus the P6 real-use check at the new number. |
 | R | Restart recovery | Later unit. | **In the MVP.** Durable capture and binding intent, a user LaunchAgent, reuse of PR #64's resume. Bindings are restored as `setup_pending` and upgraded to `connected` only by a fresh live round trip. |
@@ -450,7 +450,7 @@ known costs. They count operations, so they give the same answer on any machine:
 - With several linked chats, one discovery cycle enumerates each transcript
   directory once, not once per chat (P5).
 
-**Real-use check (P6, the D8 verdict).** Sixteen workspaces recording, with
+**Real-use check (P6, the D8 verdict).** Thirty-two workspaces (the D10 limit) recording, with
 linked chats, for a working day of normal use: the daemon's idle CPU stays at or
 under 1% of one core on average, its memory stays at or under 512 MiB with no
 sustained growth, and no change is lost (no unexplained gap, zero watcher

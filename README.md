@@ -157,9 +157,12 @@ Current limits:
   SDK; anything else is refused and nothing is recorded. The Codex version
   Conductor ships today isn't on the list yet, so Conductor's Codex chats are
   refused for now.
-- At most 16 workspaces record at once. Past that, a workspace is shown as NOT
-  recording (`capture-limit-reached`) and starts on its own, oldest first, when
-  another is detached.
+- At most 32 workspaces record at once. Past that, an attach is refused
+  (`CAPTURE_LIMIT_REACHED`) and nothing is recorded or queued; pause another
+  workspace, then attach again. Freeing a slot starts nothing on its own.
+- A paused workspace stays paused: a chat attach is refused (`CAPTURE_PAUSED`)
+  until the workspace is recorded again in Slipstream (or with
+  `slipstream attach --watch-only`).
 - At most 10 chats are linked at once. Past that, the workspace keeps recording
   without a chat (`BINDING_LIMIT_REACHED`); unlink another chat to connect it.
 - Captures survive a daemon restart. Each one resumes under the same session
@@ -195,7 +198,7 @@ until you run `install` again.
 
 From then on, a new workspace starts recording before the repo's own setup runs.
 The repo's own setup always runs, even when recording can't start (for example,
-when all 16 capture slots are in use). In that case Slipstream prints the reason
+when all 32 capture slots are in use). In that case Slipstream prints the reason
 and the setup script still fails, so the workspace shows that it isn't recording.
 Archiving a workspace stops its capture first and keeps the history; the repo's
 own archive script runs even if that stop fails.
