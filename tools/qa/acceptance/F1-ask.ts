@@ -179,9 +179,11 @@ async function runLive(signal: AbortSignal, live: {
   reader: AcceptanceContext['reader'];
 }): Promise<{ assertions: Array<{ id: string; claim: string; evidence: unknown }> }> {
     // qa-daemon's normal `qa` harness is deliberately not a D1 target. Rebind
-    // this disposable capture through public control with a supported identity.
+    // this disposable capture through public control with a supported identity:
+    // pause it, record it again, then attach the chat (a chat never resumes it).
     const { store, worktree, reader } = live;
     await cli(['detach', worktree, '--store', store]);
+    await cli(['attach', '--watch-only', worktree, '--store', store]);
     const harnessSessionId = `f1-${randomUUID()}`;
     const transcript = join(store, `f1-root-${randomUUID()}.jsonl`);
     await writeFile(transcript, JSON.stringify({ type: 'session_meta', payload: {
