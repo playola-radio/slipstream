@@ -22,8 +22,8 @@
  * not resume it; the message names the session and whether to retry or
  * restore/delete it. Attach never falls back to a new session. The capture-table
  * codes (`BINDING_EXISTS`, `BINDING_LIMIT_REACHED`, `CAPTURE_LIMIT_REACHED`,
- * `ROOT_OVERLAP`, `TARGET_NOT_FOUND`, `STALE_BINDING`) are defined in
- * docs/autocapture/contracts.md §5. */
+ * `CAPTURE_PAUSED`, `ROOT_OVERLAP`, `TARGET_NOT_FOUND`, `STALE_BINDING`) are
+ * defined in docs/autocapture/contracts.md §5. */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
   | 'SESSION_NOT_SELECTED'
@@ -46,6 +46,7 @@ export type ControlErrorCode =
   | 'BINDING_EXISTS'
   | 'BINDING_LIMIT_REACHED'
   | 'CAPTURE_LIMIT_REACHED'
+  | 'CAPTURE_PAUSED'
   | 'ROOT_OVERLAP'
   | 'TARGET_NOT_FOUND'
   | 'STALE_BINDING'

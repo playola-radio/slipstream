@@ -309,6 +309,7 @@ interface Capture {
 
 const CAPTURE_LIMIT_MESSAGE = `${MAX_CAPTURES}/${MAX_CAPTURES} capture slots in use. This workspace is NOT recording. `
   + 'Pause one first.';
+const CAPTURE_PAUSED_MESSAGE = 'This workspace is paused. Record it in Slipstream first, then attach again.';
 const BINDING_LIMIT_MESSAGE = `${MAX_BINDINGS}/${MAX_BINDINGS} chats linked. This workspace is still recording without `
   + 'a linked chat. Unlink another chat to connect this one.';
 const WATCH_ONLY_MESSAGE = 'this capture is watch-only: no agent chat is linked to it. Run `slipstream attach` from '
@@ -840,8 +841,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     } catch { return null; }
   }
 
-  /** Find or admit the capture of a canonical root. */
-  async function admit(root: string): Promise<Admitted | ErrorFields> {
+  /** Find or admit the capture of a canonical root. Only `resumePaused` restarts a
+   * withdrawn capture of this root. */
+  async function admit(root: string, opts: { resumePaused: boolean }): Promise<Admitted | ErrorFields> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     const refused = intentRefusal();
     if (refused) return refused;
@@ -861,7 +863,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (other) {
       return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
     }
-    const p = admitNew(root, identity);
+    const p = admitNew(root, identity, opts);
     admitting.set(root, p);
     try {
       return await p;
@@ -870,7 +872,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
-  async function admitNew(root: string, rootIdentity: RootIdentity | null): Promise<Admitted | ErrorFields> {
+  async function admitNew(root: string, rootIdentity: RootIdentity | null, opts: { resumePaused: boolean }): Promise<Admitted | ErrorFields> {
     const lookedUpAt = deletesDone;
     let lookup;
     try {
@@ -905,8 +907,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (match && (deleting === id || (deleteDoneAt.get(id) ?? 0) > lookedUpAt)) {
       return errFields('CAPTURE_NOT_READY', `session ${id} was deleted while this attach looked it up; retry attach`);
     }
-    // Checked in the same turn as the intent entry below, so two concurrent
-    // admissions cannot both take the last slot.
+    // Checked in the same turn as the intent entry below, so a pause or a
+    // concurrent admission cannot slip between them.
+    if (!opts.resumePaused && match && findCapture(intent, match.id)?.intent === 'withdrawn') {
+      return errFields('CAPTURE_PAUSED', CAPTURE_PAUSED_MESSAGE);
+    }
     if (runningCount(intent) >= MAX_CAPTURES) return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);
     if (match) {
       // Pin the boundary at the durable high-water BEFORE the log can grow, and
@@ -1246,7 +1251,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (!nonEmptyString(req.worktree)) return errFields('PROTOCOL', 'attach --watch-only requires a worktree');
     let root: string;
     try { root = await realpath(req.worktree); } catch (err) { return errFields('CAPTURE_NOT_READY', (err as Error).message); }
-    const admitted = await admit(root);
+    const admitted = await admit(root, { resumePaused: true });
     return isErrorFields(admitted) ? admitted : admissionReply(admitted);
   }
 
@@ -1300,7 +1305,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
       throw err;
     }
-    const admitted = await admit(root);
+    const admitted = await admit(root, { resumePaused: false });
     if (isErrorFields(admitted)) return admitted;
     const c = admitted.capture;
     if (c.lifecycle !== 'recording' || !isRunning(c)) return admissionReply(admitted);

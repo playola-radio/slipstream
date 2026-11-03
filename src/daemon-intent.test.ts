@@ -9,7 +9,7 @@ import { intentPath, loadIntent } from './intent-store.ts';
 import type { Platform } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import {
-  captureRow, controlCall, createRootsPlatform, linkChat, rec, waitForRow, type Call,
+  captureRow, controlCall, createRootsPlatform, linkChat, readLog, rec, waitForRow, type Call,
 } from './test/daemon-harness.ts';
 
 async function withStore(fn: (ctx: { store: string; call: Call; roots: (n: number) => Promise<string[]> }) => Promise<void>,
@@ -132,6 +132,7 @@ describe('daemon capture intent is durable before each acknowledgement', () => {
 });
 
 const FULL = 'CAPTURE_LIMIT_REACHED: 32/32 capture slots in use. This workspace is NOT recording. Pause one first.';
+const PAUSED = 'CAPTURE_PAUSED: This workspace is paused. Record it in Slipstream first, then attach again.';
 
 function refusal(res: ResponseEnvelope): string {
   return res.ok === false ? `${res.code}: ${res.message}` : `ok ${JSON.stringify(res)}`;
@@ -200,6 +201,77 @@ describe('daemon capture slots', () => {
 
       assert.deepEqual(await states(), before);
       await record(call, ws[32]!);
+    });
+  });
+});
+
+describe('a chat attach never resumes a paused workspace', () => {
+  it('chat attach of a paused root is refused and changes nothing', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      const linked = await linkChat(call, store, ws!, 'chat-1');
+      assert.equal(linked.ok, true, JSON.stringify(linked));
+      const id = rec(linked).session_id!;
+      assert.equal((await call({ verb: 'detach', target: ws! })).ok, true);
+      const before = await readFile(intentPath(store), 'utf8');
+
+      assert.equal(refusal(await linkChat(call, store, ws!, 'chat-1')), PAUSED);
+
+      assert.equal(await readFile(intentPath(store), 'utf8'), before);
+      assert.equal((await readLog(store, id)).filter((r) => r.type === 'slipstream.session.resumed.v1').length, 0);
+    });
+  });
+
+  it('a chat attach racing a pause leaves the workspace paused and unlinked', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      const id = await record(call, ws!);
+
+      await Promise.all([call({ verb: 'detach', target: ws! }), linkChat(call, store, ws!, 'chat-1')]);
+
+      const after = await loadIntent(store);
+      assert.deepEqual(after.captures.map((c) => [c.session_id, c.intent]), [[id, 'withdrawn']]);
+      assert.ok(after.bindings.every((b) => b.intent === 'revoked'));
+    });
+  });
+
+  it('chat attach of a recreated root admits a new session', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      const id = await pause(call, ws!);
+      await rm(ws!, { recursive: true });
+      await mkdir(ws!);
+
+      const linked = await linkChat(call, store, ws!, 'chat-1');
+
+      assert.equal(linked.ok, true, JSON.stringify(linked));
+      assert.notEqual(rec(linked).session_id, id);
+    });
+  });
+
+  it('paused is reported before full', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [paused, ...ws] = await roots(33);
+      await pause(call, paused!);
+      for (const root of ws) await record(call, root);
+      assert.equal(refusal(await linkChat(call, store, paused!, 'chat-1')), PAUSED);
+    });
+  });
+
+  it('watch-only attach of a paused root resumes it', async () => {
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      assert.equal((await linkChat(call, store, ws!, 'chat-1')).ok, true);
+      const id = (await captureRow(call, ws!)).session_id as string;
+      assert.equal((await call({ verb: 'detach', target: ws! })).ok, true);
+
+      const resumed = rec(await call({ verb: 'attach', mode: 'watch-only', worktree: ws! }));
+
+      assert.equal(resumed.session_id, id);
+      const row = await waitForRow(call, id, (r) => r.state === 'recording');
+      assert.equal((row.binding as { state: string }).state, 'unlinked');
+      const log = await readLog(store, id);
+      assert.ok(log.some((r) => r.type === 'slipstream.capture.gap.v1'), 'the paused time is a gap');
     });
   });
 });
