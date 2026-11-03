@@ -913,8 +913,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     // Checked in the same turn as the intent entry below, so a pause or a
     // concurrent admission cannot slip between them. By root, not by log: a
     // capture paused before it ever started has no log to find.
-    const paused = intent.captures.some((e) => e.root === root && e.intent === 'withdrawn' && sameDirectory(e.root_identity, rootIdentity));
-    if (!opts.resumePaused && paused) {
+    const latest = intent.captures.findLast((e) => e.root === root);
+    if (!opts.resumePaused && latest?.intent === 'withdrawn' && sameDirectory(latest.root_identity, rootIdentity)) {
       return errFields('CAPTURE_PAUSED', CAPTURE_PAUSED_MESSAGE);
     }
     if (runningCount(intent) >= MAX_CAPTURES) return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);
