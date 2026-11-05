@@ -3,20 +3,21 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DaemonAlreadyRunningError, startDaemon, type Daemon } from './daemon.ts';
+import { DaemonAlreadyRunningError, startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { acquireSessionLock } from './lock.ts';
 import { intentPath, loadIntent } from './intent-store.ts';
 import type { Platform } from './platform.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import { findWorkspaceSession } from './store-reader.ts';
 import {
   captureRow, controlCall, createRootsPlatform, linkChat, readLog, rec, waitForRow, type Call,
 } from './test/daemon-harness.ts';
 
 async function withStore(fn: (ctx: { store: string; call: Call; roots: (n: number) => Promise<string[]> }) => Promise<void>,
-  platform: Platform = createRootsPlatform().platform): Promise<void> {
+  platform: Platform = createRootsPlatform().platform, daemonOptions: Partial<DaemonOptions> = {}): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-intent-daemon-'));
   const base = await realpath(await mkdtemp(join(tmpdir(), 'slip-intent-roots-')));
-  const daemon: Daemon = await startDaemon({ storeDir: store, captureDependencies: {
+  const daemon: Daemon = await startDaemon({ ...daemonOptions, storeDir: store, captureDependencies: {
     platform, enumerate: async () => {}, readQuestionContext: async () => 'selected',
   } });
   let made = 0;
@@ -206,6 +207,39 @@ describe('daemon capture slots', () => {
 });
 
 describe('a chat attach never resumes a paused workspace', () => {
+  it('lets a Record request retry after sharing a chat attach refusal', async () => {
+    let hold = false;
+    let entered!: () => void;
+    let release!: () => void;
+    const entering = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const workspaceLookup: typeof findWorkspaceSession = async (store, root) => {
+      const result = await findWorkspaceSession(store, root);
+      if (hold) {
+        hold = false;
+        entered();
+        await gate;
+      }
+      return result;
+    };
+    await withStore(async ({ store, call, roots }) => {
+      const [ws] = await roots(1);
+      const id = await pause(call, ws!);
+      hold = true;
+      const chat = linkChat(call, store, ws!, 'chat-1');
+      await entering;
+      const recording = call({ verb: 'attach', mode: 'watch-only', worktree: ws! });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      release();
+
+      assert.equal(refusal(await chat), PAUSED);
+      const resumed = await recording;
+      assert.equal(resumed.ok, true, JSON.stringify(resumed));
+      assert.equal(rec(resumed).session_id, id);
+      await waitForRow(call, id, (row) => row.state === 'recording');
+    }, createRootsPlatform().platform, { workspaceLookup });
+  });
+
   it('chat attach of a paused root is refused and changes nothing', async () => {
     await withStore(async ({ store, call, roots }) => {
       const [ws] = await roots(1);

@@ -857,6 +857,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const pending = admitting.get(root);
     if (pending) {
       const joined = await pending;
+      if (isErrorFields(joined) && joined.code === 'CAPTURE_PAUSED' && opts.resumePaused) {
+        if (admitting.get(root) === pending) admitting.delete(root);
+        return admit(root, opts);
+      }
       return isErrorFields(joined) ? joined : { capture: joined.capture, created: false };
     }
     // A withdrawn capture still watches its root until its stop completes.
@@ -871,7 +875,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     try {
       return await p;
     } finally {
-      admitting.delete(root);
+      if (admitting.get(root) === p) admitting.delete(root);
     }
   }
 

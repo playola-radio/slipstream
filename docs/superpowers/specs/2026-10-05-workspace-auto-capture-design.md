@@ -124,9 +124,10 @@ Replace the single `state`/`current` slot with:
 - `bindingsBySessionId` (unit 2). There is **no daemon-wide selected-binding
   slot**.
 - One store-wide ownership/shutdown state and one baseline queue.
-- One capture limit (D10): `MAX_CAPTURES = 16` running capture intents, counting
+- One capture limit (D10): `MAX_CAPTURES = 32` running capture intents, counting
   queued, baselining, recording and failed-retrying captures. Waiting intents are
-  kept in request order.
+  not kept: admission beyond the limit is refused and must be retried after
+  capacity is available.
 
 Lifecycle: `queued -> baselining -> ready -> stopping -> stopped`, with explicit
 failure states. A per-capture failure affects only that capture; loss of the
@@ -346,11 +347,11 @@ Capture before user login is not promised.
   verified inventory of non-archived workspaces, including sleeping ones, and
   enrolls them through the same queue. It does not infer "open" from a directory
   existing. It records current baselines (first observed state), not historical
-  backfill, and reports per-workspace failures. With more than 16 live workspaces,
+  backfill, and reports per-workspace failures. With more than 32 live workspaces,
   roots are admitted most recently active first (Conductor's own activity time if
   the inventory exposes one, otherwise inventory order, disclosed in the output);
-  the rest wait visibly under D10. The output says to archive unused workspaces to
-  free slots.
+  the rest are refused under D10. The output says to archive unused workspaces to
+  free slots and retry enrollment; freeing a slot starts nothing automatically.
 
 #### 7. Maintenance
 
