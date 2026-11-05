@@ -35,6 +35,7 @@ export const f3ClaudeDelivery: AcceptanceModule = {
       const { store, worktree, url, token } = handle.env;
       const reader = createReaderClient(url, token);
       await cli(['detach', worktree, '--store', store]);
+      await cli(['attach', '--watch-only', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `claude-root-${randomUUID()}.jsonl`);
       const otherTranscript = join(store, `other-root-${randomUUID()}.jsonl`);

@@ -144,9 +144,11 @@ a workspace without connecting a chat, run `slipstream attach --watch-only [dir]
 in a workspace that is already recording connects the chat to that same capture:
 no new baseline and no gap.
 
-After a detach, `attach` in the same workspace from any chat resumes the same
-session ID. Each capture has at most one linked chat, and a chat is linked to at
-most one capture; attach explains and changes nothing otherwise.
+After a detach, first resume recording with `slipstream attach --watch-only`,
+then run `slipstream attach` from the chat. A chat attach by itself returns
+`CAPTURE_PAUSED` and does not resume recording. Each capture has at most one
+linked chat, and a chat is linked to at most one capture; attach explains and
+changes nothing otherwise.
 
 Current limits:
 
@@ -157,9 +159,12 @@ Current limits:
   SDK; anything else is refused and nothing is recorded. The Codex version
   Conductor ships today isn't on the list yet, so Conductor's Codex chats are
   refused for now.
-- At most 16 workspaces record at once. Past that, a workspace is shown as NOT
-  recording (`capture-limit-reached`) and starts on its own, oldest first, when
-  another is detached.
+- At most 32 workspaces record at once. Past that, an attach is refused
+  (`CAPTURE_LIMIT_REACHED`) and nothing is recorded or queued; pause another
+  workspace, then attach again. Freeing a slot starts nothing on its own.
+- A paused workspace stays paused: a chat attach is refused (`CAPTURE_PAUSED`)
+  until the workspace is recorded again in Slipstream (or with
+  `slipstream attach --watch-only`).
 - At most 10 chats are linked at once. Past that, the workspace keeps recording
   without a chat (`BINDING_LIMIT_REACHED`); unlink another chat to connect it.
 - Captures survive a daemon restart. Each one resumes under the same session
@@ -195,7 +200,7 @@ until you run `install` again.
 
 From then on, a new workspace starts recording before the repo's own setup runs.
 The repo's own setup always runs, even when recording can't start (for example,
-when all 16 capture slots are in use). In that case Slipstream prints the reason
+when all 32 capture slots are in use). In that case Slipstream prints the reason
 and the setup script still fails, so the workspace shows that it isn't recording.
 Archiving a workspace stops its capture first and keeps the history; the repo's
 own archive script runs even if that stop fails.
@@ -218,9 +223,10 @@ has a direct check: an archived workspace's capture should end `stopped
 (archived)`, not `root-missing`.
 
 `enroll` reads Conductor's own list of workspaces that aren't archived, including
-sleeping ones. It captures them most recently active first. Past 16, the rest
-wait and start by themselves, in that order, as slots free up. Archive the
-workspaces you no longer use to free slots. `enroll` is safe to run again.
+sleeping ones. It captures them most recently active first. At 32 recording
+workspaces, additional enrollments are refused and freeing a slot starts nothing
+on its own. Archive a workspace you no longer use, then retry `enroll` or attach
+the workspace after capacity is available. `enroll` is safe to run again.
 
 **Recording any chat, without Ask Agent.** If your agent version isn't
 verified, you can still record its workspace by naming the chat yourself:

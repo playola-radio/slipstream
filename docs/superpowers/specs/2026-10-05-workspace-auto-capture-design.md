@@ -37,9 +37,9 @@ one in force.
 | D5 | Agent binding | ~~Watch-only now; verified binding is a separate later step.~~ **Changed.** | Capture is watch-only until a chat runs `slipstream attach`, which binds that chat **in place** onto the live capture: same `session_id`, no new baseline, no resume event, no fabricated gap. Earlier changes are never credited to the chat. |
 | D6 | Order | Measure first, then the minimal slice, then recovery and maintenance. | **Revised (Brian, 2026-10-17).** P1 measured once and answered the question that could stop the feature: the watcher holds 16 captures cheaply. No further benchmark runs gate any PR. Known costs are fixed as code changes with counting tests; overhead is judged once, at P6, in real use. See "Overhead". |
 | D7 | Install | ~~Global install from a dedicated clone plus launcher.~~ **Superseded.** | Install is the published npm package `@playola-radio/slipstream`. Setup scripts and the LaunchAgent use the absolute Node 24 path and the real `dist/cli.js` path, recorded at install time. No nvm sourcing. |
-| D8 | Overhead gates | Proposed, not ratified. | **Amended (Brian, 2026-10-17).** The bar is idle CPU, memory and no lost changes, judged in real use at 16 captures (see "Overhead"); a miss there is report-and-stop. The wakeup, baseline-seconds and latency-regression gates are dropped: wakeups cannot be measured without sudo, and stopwatch numbers on a loaded laptop kept producing failures that told us nothing new. |
+| D8 | Overhead gates | Proposed, not ratified. | **Amended (Brian, 2026-10-17).** The bar is idle CPU, memory and no lost changes, judged in real use at 16 captures (32 since the D10 amendment of 2026-11-03; see "Overhead"); a miss there is report-and-stop. The wakeup, baseline-seconds and latency-regression gates are dropped: wakeups cannot be measured without sudo, and stopwatch numbers on a loaded laptop kept producing failures that told us nothing new. |
 | D9 | GC | New. | **Ratified.** `slipstream gc` may quiesce all captures (a disclosed maintenance gap via stop events plus the existing resume gap), then automatically resume them and re-handshake bindings. Fully concurrent GC is deferred. |
-| D10 | Capture cap | New. | **Ratified 2026-10-17.** At most **16** workspaces record at once. Beyond that a workspace is visibly **NOT recording** (`capture-limit-reached`) and starts automatically, oldest request first, when a slot frees. No eviction. The limit is one constant; raising it later is that change plus the P6 real-use check at the new number. |
+| D10 | Capture cap | New. | **Ratified 2026-10-17; amended 2026-11-03 by recording controls** (client repo `design/features/recording-controls/`). At most **32** workspaces record at once. Beyond that an attach is refused with `CAPTURE_LIMIT_REACHED` and nothing is written; nothing queues or starts automatically. No eviction. The limit is one constant; raising it later is that change plus the P6 real-use check at the new number. |
 | R | Restart recovery | Later unit. | **In the MVP.** Durable capture and binding intent, a user LaunchAgent, reuse of PR #64's resume. Bindings are restored as `setup_pending` and upgraded to `connected` only by a fresh live round trip. |
 
 Stage 3 criteria amended by Q4 and D5 (one active capture daemon-wide, explicit
@@ -124,9 +124,10 @@ Replace the single `state`/`current` slot with:
 - `bindingsBySessionId` (unit 2). There is **no daemon-wide selected-binding
   slot**.
 - One store-wide ownership/shutdown state and one baseline queue.
-- One capture limit (D10): `MAX_CAPTURES = 16` running capture intents, counting
+- One capture limit (D10): `MAX_CAPTURES = 32` running capture intents, counting
   queued, baselining, recording and failed-retrying captures. Waiting intents are
-  kept in request order.
+  not kept: admission beyond the limit is refused and must be retried after
+  capacity is available.
 
 Lifecycle: `queued -> baselining -> ready -> stopping -> stopped`, with explicit
 failure states. A per-capture failure affects only that capture; loss of the
@@ -136,18 +137,16 @@ Targeting and admission:
 
 - Canonicalize the path first, then atomically reserve the root. Concurrent
   requests for the same root share one activation.
-- Ancestor and descendant roots are rejected by path components, including waiting, queued,
+- Ancestor and descendant roots are rejected by path components, including queued
   and failed-retrying roots. Sibling git worktrees that share repository metadata are allowed.
-- **Capture limit (D10).** A new root while 16 captures hold slots is not
-  admitted. Its intent is kept as waiting, public status is NOT recording with
-  reason `capture-limit-reached`, and the caller gets:
+- **Capture limit (D10, amended 2026-11-03).** A new root while 32 captures hold
+  slots is not admitted and nothing is written. The caller gets:
 
-  > `CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another workspace is archived or detached.`
+  > `CAPTURE_LIMIT_REACHED: 32/32 capture slots in use. This workspace is NOT recording. Pause one first.`
 
-  When a capture stops for archive or detach, the oldest waiting intent is
-  admitted automatically through the normal queue. Maintenance and restart keep
-  slots; they never reshuffle which workspaces record. A chat attach on a waiting
-  workspace gets the same refusal and stays unlinked. A capture is never evicted
+  A freed slot starts nothing. Maintenance and restart keep slots; they never
+  reshuffle which workspaces record. A chat attach that finds the limit full gets
+  the same refusal and stays unlinked. A capture is never evicted
   to make room.
 - `detach` and `status` take a target. A CLI convenience may resolve the current
   directory, but the wire request names its target. `status` with no target lists
@@ -327,8 +326,8 @@ Capture before user login is not promised.
 - **Setup script.** `slipstream conductor setup`: ensure the daemon, admit a
   watch-only capture for `$CONDUCTOR_WORKSPACE_PATH`, and wait for ready. Then the
   repo's own setup runs whatever Slipstream returned: Slipstream never stops a
-  workspace from being set up, including one waiting for a capture slot (Brian,
-  2026-10-18). If capture cannot become ready, Slipstream prints a readable reason
+  workspace from being set up, including one refused for want of a capture slot
+  (Brian, 2026-10-18). If capture cannot become ready, Slipstream prints a readable reason
   and the workspace shows NOT recording (D1 revised); the script still exits
   non-zero. Never a silent half-capture.
 - **Archive script.** `slipstream conductor archive` runs first, so it durably
@@ -348,11 +347,11 @@ Capture before user login is not promised.
   verified inventory of non-archived workspaces, including sleeping ones, and
   enrolls them through the same queue. It does not infer "open" from a directory
   existing. It records current baselines (first observed state), not historical
-  backfill, and reports per-workspace failures. With more than 16 live workspaces,
+  backfill, and reports per-workspace failures. With more than 32 live workspaces,
   roots are admitted most recently active first (Conductor's own activity time if
   the inventory exposes one, otherwise inventory order, disclosed in the output);
-  the rest wait visibly under D10. The output says to archive unused workspaces to
-  free slots.
+  the rest are refused under D10. The output says to archive unused workspaces to
+  free slots and retry enrollment; freeing a slot starts nothing automatically.
 
 #### 7. Maintenance
 
@@ -452,7 +451,7 @@ known costs. They count operations, so they give the same answer on any machine:
 - With several linked chats, one discovery cycle enumerates each transcript
   directory once, not once per chat (P5).
 
-**Real-use check (P6, the D8 verdict).** Sixteen workspaces recording, with
+**Real-use check (P6, the D8 verdict).** Thirty-two workspaces (the D10 limit) recording, with
 linked chats, for a working day of normal use: the daemon's idle CPU stays at or
 under 1% of one core on average, its memory stays at or under 512 MiB with no
 sustained growth, and no change is lost (no unexplained gap, zero watcher
@@ -493,10 +492,10 @@ Acceptance requirements (P6 unless a PR owns the test):
   recovery, and lost setup-check responses.
 - Failed setup stays visible; later readiness baselines current bytes without
   presenting earlier edits as captured history.
-- Public-reader and native parity, and the real-use overhead check at 16
-  captures with linked chats (the D8 verdict).
-- The 17th workspace is visibly NOT recording (`capture-limit-reached`) and starts
-  automatically when a slot frees.
+- Public-reader and native parity, and the real-use overhead check at 32
+  captures with linked chats (the D8 verdict; 16 before the 2026-11-03 amendment).
+- The 33rd workspace is refused and visibly NOT recording (D10 as amended
+  2026-11-03; it was the 17th, which then started automatically when a slot freed).
 - Trace CLI -> control -> session/log -> reader -> Ask Agent end to end; exercise
   both independent readers and the existing Conductor Claude attach workflow.
   Codex's unsupported version stays an explicit refusal.

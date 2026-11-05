@@ -28,7 +28,7 @@ import { createBoundaryRegistry } from './boundary-registry.ts';
 import { createCas, type Cas } from './cas.ts';
 import {
   MAX_BINDINGS, MAX_CAPTURES, admitCapture, emptyIntent, findCapture, findLinked, forgetSession, linkBinding, linkedCount,
-  revokeBinding, withdrawCapture, type NotRecordingReason,
+  revokeBinding, runningCount, withdrawCapture, type NotRecordingReason,
 } from './capture-intent.ts';
 import { loadIntent, saveIntent } from './intent-store.ts';
 import { liveBoundary } from './reader-runtime.ts';
@@ -276,13 +276,12 @@ const END_MESSAGES: Record<EndReason, string> = {
   'maintenance': 'stopped while gc reclaims storage; it resumes on its own afterwards',
 };
 
-/** A capture's runtime. Its intent (running / waiting / withdrawn, last failure)
+/** A capture's runtime. Its intent (running / withdrawn, last failure)
  * lives in the intent record; this holds what only the live daemon knows. */
 interface Capture {
   id: string;
   root: string;
-  /** `queued` covers both waiting for a slot and waiting for the baseline slot;
-   * the intent tells them apart. */
+  /** `queued` is waiting for the baseline slot. */
   lifecycle: 'queued' | 'baselining' | 'recording' | 'failed' | 'stopping' | 'stopped';
   /** The session has history on disk to resume. */
   resume: boolean;
@@ -309,7 +308,8 @@ interface Capture {
 }
 
 const CAPTURE_LIMIT_MESSAGE = `${MAX_CAPTURES}/${MAX_CAPTURES} capture slots in use. This workspace is NOT recording. `
-  + 'It starts automatically when another workspace is archived or detached.';
+  + 'Pause one first.';
+const CAPTURE_PAUSED_MESSAGE = 'This workspace is paused. Record it in Slipstream first, then attach again.';
 const BINDING_LIMIT_MESSAGE = `${MAX_BINDINGS}/${MAX_BINDINGS} chats linked. This workspace is still recording without `
   + 'a linked chat. Unlink another chat to connect this one.';
 const WATCH_ONLY_MESSAGE = 'this capture is watch-only: no agent chat is linked to it. Run `slipstream attach` from '
@@ -567,7 +567,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return c.lifecycle === 'stopped' ? { state: 'stopped', reason: entry?.withdrawn_reason ?? 'detached' }
         : { state: 'not_recording', reason: 'stop-unconfirmed', message: 'detach was requested, but the capture could not be confirmed stopped' };
     }
-    if (entry.intent === 'waiting') return { state: 'not_recording', reason: 'capture-limit-reached', message: CAPTURE_LIMIT_MESSAGE };
     if (c.ended && ['queued', 'failed', 'stopped'].includes(c.lifecycle)) return { state: 'stopped', reason: c.ended, message: END_MESSAGES[c.ended] };
     if (entry.last_failure) return { state: 'not_recording', reason: entry.last_failure.reason, message: entry.last_failure.message };
     const health = c.session?.health.snapshot().state;
@@ -683,7 +682,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   }
 
   function sameRoot(c: Capture, identity: RootIdentity | null | undefined): boolean {
-    const known = findCapture(intent, c.id)?.root_identity;
+    return sameDirectory(findCapture(intent, c.id)?.root_identity, identity);
+  }
+
+  function sameDirectory(known: RootIdentity | null | undefined, identity: RootIdentity | null | undefined): boolean {
     return !known || !identity || (known.dev === identity.dev && known.ino === identity.ino);
   }
 
@@ -776,7 +778,6 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       // An unreadable log is pinned at 0; its resume fails visibly below.
       if (c.resume) registry.freeze(id, last?.seq ?? 0n);
       else registry.reserve(id);
-      if (entry.intent !== 'running') continue;
       const stoppedFor = last?.type === 'slipstream.capture.stopped.v1' ? (last.data as { reason?: unknown } | null)?.reason : undefined;
       if (stoppedFor === 'root-missing' || stoppedFor === 'watcher-failed' || stoppedFor === 'maintenance') c.ended = stoppedFor;
       // Connection state is not persisted: a linked chat comes back pending and is
@@ -843,8 +844,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     } catch { return null; }
   }
 
-  /** Find or admit the capture of a canonical root. */
-  async function admit(root: string): Promise<Admitted | ErrorFields> {
+  /** Find or admit the capture of a canonical root. Only `resumePaused` restarts a
+   * withdrawn capture of this root. */
+  async function admit(root: string, opts: { resumePaused: boolean }): Promise<Admitted | ErrorFields> {
     if (torn || compromised) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
     const refused = intentRefusal();
     if (refused) return refused;
@@ -855,6 +857,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const pending = admitting.get(root);
     if (pending) {
       const joined = await pending;
+      if (isErrorFields(joined) && joined.code === 'CAPTURE_PAUSED' && opts.resumePaused) {
+        if (admitting.get(root) === pending) admitting.delete(root);
+        return admit(root, opts);
+      }
       return isErrorFields(joined) ? joined : { capture: joined.capture, created: false };
     }
     // A withdrawn capture still watches its root until its stop completes.
@@ -864,16 +870,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (other) {
       return errFields('ROOT_OVERLAP', `${root} overlaps the capture of ${other}: one contains the other. Nothing was changed`);
     }
-    const p = admitNew(root, identity);
+    const p = admitNew(root, identity, opts);
     admitting.set(root, p);
     try {
       return await p;
     } finally {
-      admitting.delete(root);
+      if (admitting.get(root) === p) admitting.delete(root);
     }
   }
 
-  async function admitNew(root: string, rootIdentity: RootIdentity | null): Promise<Admitted | ErrorFields> {
+  async function admitNew(root: string, rootIdentity: RootIdentity | null, opts: { resumePaused: boolean }): Promise<Admitted | ErrorFields> {
     const lookedUpAt = deletesDone;
     let lookup;
     try {
@@ -908,6 +914,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (match && (deleting === id || (deleteDoneAt.get(id) ?? 0) > lookedUpAt)) {
       return errFields('CAPTURE_NOT_READY', `session ${id} was deleted while this attach looked it up; retry attach`);
     }
+    // Checked in the same turn as the intent entry below, so a pause or a
+    // concurrent admission cannot slip between them. By root, not by log: a
+    // capture paused before it ever started has no log to find.
+    const latest = intent.captures.findLast((e) => e.root === root);
+    if (!opts.resumePaused && latest?.intent === 'withdrawn' && sameDirectory(latest.root_identity, rootIdentity)) {
+      return errFields('CAPTURE_PAUSED', CAPTURE_PAUSED_MESSAGE);
+    }
+    if (runningCount(intent) >= MAX_CAPTURES) return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);
     if (match) {
       // Pin the boundary at the durable high-water BEFORE the log can grow, and
       // hold it until activation: readers never see past it mid-resume.
@@ -927,7 +941,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const c: Capture = prior ?? { id, root, lifecycle: 'queued', resume: false, inflight: new Set(), attempts: 0 };
     Object.assign(c, { root, lifecycle: 'queued', resume: match !== undefined, closeError: undefined });
     captures.set(id, c);
-    if (entry.intent === 'running') enqueueStart(c);
+    enqueueStart(c);
     return { capture: c, created: true };
   }
 
@@ -1237,8 +1251,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   // ---- attach / detach / unlink -------------------------------------------
 
-  function admissionReply({ capture, created }: Admitted): Record<string, unknown> | ErrorFields {
-    if (findCapture(intent, capture.id)?.intent === 'waiting') return errFields('CAPTURE_LIMIT_REACHED', CAPTURE_LIMIT_MESSAGE);
+  function admissionReply({ capture, created }: Admitted): Record<string, unknown> {
     const { state, reason, message } = publicState(capture);
     return { session_id: capture.id, state, reason, ...(message ? { message } : {}), created };
   }
@@ -1247,7 +1260,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (!nonEmptyString(req.worktree)) return errFields('PROTOCOL', 'attach --watch-only requires a worktree');
     let root: string;
     try { root = await realpath(req.worktree); } catch (err) { return errFields('CAPTURE_NOT_READY', (err as Error).message); }
-    const admitted = await admit(root);
+    const admitted = await admit(root, { resumePaused: true });
     return isErrorFields(admitted) ? admitted : admissionReply(admitted);
   }
 
@@ -1301,7 +1314,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       if (err instanceof RootIdentityError) return errFields('IDENTITY_UNRESOLVED', err.message);
       throw err;
     }
-    const admitted = await admit(root);
+    const admitted = await admit(root, { resumePaused: false });
     if (isErrorFields(admitted)) return admitted;
     const c = admitted.capture;
     if (c.lifecycle !== 'recording' || !isRunning(c)) return admissionReply(admitted);
@@ -1456,22 +1469,16 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     if (pending.length > 0) {
       const refused = intentRefusal();
       if (refused) return refused;
-      const promotedFor = pending.map((t) => {
-        const promoted = withdrawCapture(intent, t.id, why);
+      for (const t of pending) {
+        withdrawCapture(intent, t.id, why);
         revokeBinding(intent, t.id);
-        return promoted;
-      });
+      }
       const durable = persistIntent();
-      for (const [i, t] of pending.entries()) {
+      for (const t of pending) {
         const prior = t.closing;
         // Set in this turn, so a concurrent detach waits for the same stop. A
         // withdrawal that is not durable stops nothing, and is never acknowledged.
-        setClosing(t, durable.then(() => {
-          const promoted = promotedFor[i];
-          const next = promoted && captures.get(promoted.session_id);
-          if (next) enqueueStart(next);
-          return closeCapture(t, prior, why);
-        }, (err: unknown) => { t.withdrawalError = err; }));
+        setClosing(t, durable.then(() => closeCapture(t, prior, why), (err: unknown) => { t.withdrawalError = err; }));
       }
     }
     const already = !pending.includes(c) && findCapture(intent, c.id)?.intent === 'withdrawn' && c.lifecycle === 'stopped';
@@ -1898,7 +1905,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   /** gc as one maintenance transaction (D9): close admission, stop every capture
    * with `capture.stopped{maintenance}`, sweep, then resume each one stopped here.
-   * Intent is untouched throughout, so waiting captures keep their places. */
+   * Intent is untouched throughout. */
   async function gc(): Promise<Record<string, unknown> | ErrorFields> {
     return runMaintenance(async () => {
       quiescing = true;

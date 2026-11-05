@@ -70,6 +70,7 @@ export const f4Answer: AcceptanceModule = {
       const { store, worktree } = handle.env;
       let reader = createReaderClient(handle.env.url, handle.env.token);
       await cli(['detach', worktree, '--store', store]);
+      await cli(['attach', '--watch-only', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `claude-root-${randomUUID()}.jsonl`);
       await writeFile(transcript, JSON.stringify({ type: 'attachment', sessionId: harnessSessionId, cwd: worktree,

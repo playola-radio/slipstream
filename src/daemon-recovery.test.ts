@@ -106,23 +106,25 @@ describe('daemon restart recovery', () => {
     });
   });
 
-  it('keeps waiting captures waiting across a restart and promotes them in admission order', async () => {
+  it('starts a legacy waiting capture paused and writes nothing at startup', async () => {
     await withRestartableStore(async ({ store, roots, start, stop }) => {
-      const ws = await roots(18);
+      const [a, b] = await roots(2);
       let { call } = await start();
-      for (const w of ws) await call({ verb: 'attach', mode: 'watch-only', worktree: w });
-      const ids = (await loadIntent(store)).captures.map((c) => c.session_id);
-      await waitForRow(call, ids[15]!, recording);
+      const running = await attachRecording(call, a!);
+      const legacy = await attachRecording(call, b!);
+      assert.equal((await call({ verb: 'detach', target: legacy })).ok, true);
       await stop();
+      const record = JSON.parse(await readFile(intentPath(store), 'utf8')) as { captures: Array<Record<string, unknown>> };
+      Object.assign(record.captures.find((c) => c.session_id === legacy)!, { intent: 'waiting', withdrawn_reason: null });
+      await writeFile(intentPath(store), JSON.stringify(record));
+      const before = await readFile(intentPath(store), 'utf8');
+
       ({ call } = await start());
-      for (const id of ids.slice(0, 16)) await waitForRow(call, id, recording);
-      for (const id of ids.slice(16)) {
-        const row = await captureRow(call, id);
-        assert.deepEqual([row.state, row.reason], ['not_recording', 'capture-limit-reached']);
-      }
-      assert.equal((await call({ verb: 'detach', target: ids[3] })).ok, true);
-      await waitForRow(call, ids[16]!, recording);
-      assert.equal((await captureRow(call, ids[17]!)).reason, 'capture-limit-reached');
+
+      await waitForRow(call, running, recording);
+      const row = await captureRow(call, legacy);
+      assert.deepEqual([row.state, row.reason], ['stopped', 'detached']);
+      assert.equal(await readFile(intentPath(store), 'utf8'), before);
     });
   });
 

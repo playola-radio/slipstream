@@ -141,17 +141,11 @@ describe('delete_session beside running captures', () => {
     });
   });
 
-  it('refuses to delete a waiting capture or one that is still stopping', async () => {
+  it('refuses to delete a capture that is still stopping', async () => {
     await withStore(async ({ call, roots, holdClose }) => {
-      const ws = await roots(17);
-      for (const w of ws.slice(0, 16)) await call({ verb: 'attach', mode: 'watch-only', worktree: w });
-      const waiting = await call({ verb: 'attach', mode: 'watch-only', worktree: ws[16] });
-      assert.equal(waiting.ok === false && waiting.code, 'CAPTURE_LIMIT_REACHED');
+      const ws = await roots(1);
+      await call({ verb: 'attach', mode: 'watch-only', worktree: ws[0] });
       const rows = rec(await call({ verb: 'status' })) as unknown as { captures: { session_id: string; root: string }[] };
-      const waitingId = rows.captures.find((r) => r.root === ws[16])!.session_id;
-      const del = await call({ verb: 'delete_session', session_id: waitingId });
-      assert.equal(del.ok === false && del.code, 'SESSION_ACTIVE');
-
       const stoppingId = rows.captures.find((r) => r.root === ws[0])!.session_id;
       await waitForRow(call, stoppingId, recording);
       const hold = holdClose(ws[0]!);
@@ -320,22 +314,6 @@ describe('gc as a maintenance transaction', () => {
       assert.deepEqual(maintenanceCycle(await readLog(store, id)), MAINTENANCE_CYCLE);
       await connect(call, store, 'chat-a', a!);
     }, { deps: { createLog: heldLog } });
-  });
-
-  it('leaves waiting captures waiting, in the same order', { timeout: 60_000 }, async () => {
-    await withStore(async ({ store, call, roots }) => {
-      const ws = await roots(18);
-      for (const w of ws) await call({ verb: 'attach', mode: 'watch-only', worktree: w });
-      const before = (await loadIntent(store)).captures.map((e) => [e.session_id, e.intent]);
-      for (const [id] of before.slice(0, 16)) await waitForRow(call, id!, recording);
-      assert.equal((await call({ verb: 'gc' })).ok, true);
-      assert.deepEqual((await loadIntent(store)).captures.map((e) => [e.session_id, e.intent]), before);
-      for (const [id] of before.slice(0, 16)) await waitForRow(call, id!, recording);
-      for (const [id] of before.slice(16)) {
-        const row = await captureRow(call, id!);
-        assert.deepEqual([row.state, row.reason], ['not_recording', 'capture-limit-reached']);
-      }
-    });
   });
 
   it('keeps a blob an in-flight change is about to reference', async () => {

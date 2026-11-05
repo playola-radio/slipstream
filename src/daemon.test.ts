@@ -197,6 +197,7 @@ describe('daemon control verbs', () => {
       const stale = call(claim);
       await Promise.race([entering, new Promise((_, reject) => setTimeout(() => reject(new Error('claim did not enter path resolution')), 1000))]);
       assert.equal((await call({ verb: 'detach', target: worktree })).ok, true);
+      await attachWatchOnly(call, worktree);
       const second = await call(attach);
       assert.equal(second.ok, true);
       await connectAgent(call, claim);
@@ -307,6 +308,7 @@ describe('daemon control verbs', () => {
       const stale = call(answer);
       await Promise.race([entering, new Promise((_, reject) => setTimeout(() => reject(new Error('answer did not enter path resolution')), 1000))]);
       assert.equal((await call({ verb: 'detach', target: worktree })).ok, true);
+      await attachWatchOnly(call, worktree);
       assert.equal((await call(attach)).ok, true);
       release();
       const result = await stale;
@@ -467,10 +469,11 @@ describe('daemon control verbs', () => {
     });
   });
 
-  it('resumes the same session id when the same chat re-attaches the same workspace', async () => {
+  it('links the same chat to the same session once the workspace records again', async () => {
     await withDaemon(async ({ worktree, store, call }) => {
       const idA = rec(await attachConnected(call, worktree, store)).session_id;
       assert.equal((await call({ verb: 'detach', target: worktree })).ok, true);
+      await attachWatchOnly(call, worktree);
       const b = await attachConnected(call, worktree, store);
       assert.equal(rec(b).session_id, idA);
       assert.equal(rec(b).already_active, undefined);
@@ -1475,10 +1478,11 @@ describe('daemon workspace resume', () => {
     });
   });
 
-  it('resumes for a different chat and runs a fresh setup check for it', { timeout: 30_000 }, async () => {
+  it('links a different chat after a resume and runs a fresh setup check for it', { timeout: 30_000 }, async () => {
     await withResumeDaemon(async ({ store, worktree, call }) => {
       const id = rec(await attachConnected(call, worktree, store)).session_id!;
       await call({ verb: 'detach', target: worktree });
+      await attachWatchOnly(call, worktree);
       const transcriptB = join(store, 'chat-b.jsonl');
       await writeFile(transcriptB, JSON.stringify({ type: 'user', sessionId: 'chat-b', cwd: await realpath(worktree),
         version: '2.1.283', entrypoint: 'sdk-cli', userType: 'external', isSidechain: false }) + '\n');
@@ -1625,6 +1629,7 @@ describe('daemon workspace resume fails closed at agent-connection setup', () =>
           ? Promise.reject(new Error('injected connection append failure')) : log.append(input) };
       };
       await restart({ captureDependencies: { platform: createFakePlatform(), createLog: failingLog } });
+      await attachWatchOnly(call, worktree);
       const res = await call({ verb: 'attach', worktree, ...IDENTITY, root_transcript: join(store, 'abc123.jsonl') });
       assert.equal(res.ok, false);
       assert.match(res.ok === false ? res.message : '', /injected connection append failure/);
@@ -1763,6 +1768,7 @@ describe('daemon workspace resume concurrency', () => {
       const stale = call({ verb: 'begin_task', title: 'Old', request_id: 'r-old', worktree, ...IDENTITY });
       await entering;
       await call({ verb: 'detach', target: worktree });
+      await attachWatchOnly(call, worktree);
       assert.equal(rec(await attachConnected(call, worktree, store)).session_id, id);
       release();
       const res = await stale;
@@ -1812,8 +1818,6 @@ async function withCaptures(
   }
 }
 
-const CAPTURE_LIMIT_TEXT = 'CAPTURE_LIMIT_REACHED: 16/16 capture slots in use. This workspace is NOT recording. '
-  + 'It starts automatically when another workspace is archived or detached.';
 const BINDING_LIMIT_TEXT = 'BINDING_LIMIT_REACHED: 10/10 chats linked. This workspace is still recording without '
   + 'a linked chat. Unlink another chat to connect this one.';
 
@@ -2000,49 +2004,6 @@ describe('daemon capture table', () => {
       assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
       assert.equal(refusal(raced.find((r) => !r.ok)!), BINDING_LIMIT_TEXT);
       assert.deepEqual(rec(await call({ verb: 'status' })).binding_slots, { used: 10, limit: 10 } as unknown as string);
-    });
-  });
-
-  it('holds a seventeenth workspace waiting and starts the oldest waiting one when a slot frees', async () => {
-    await withCaptures(async ({ store, call, roots }) => {
-      const ws = await roots(18);
-      const ids: string[] = [];
-      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
-      const over = await call({ verb: 'attach', mode: 'watch-only', worktree: ws[16]! });
-      assert.equal(refusal(over), CAPTURE_LIMIT_TEXT);
-      const waiting = await captureRow(call, ws[16]!);
-      assert.deepEqual([waiting.state, waiting.reason], ['not_recording', 'capture-limit-reached']);
-      assert.equal(refusal(await linkChat(call, store, ws[16]!, 'c1')), CAPTURE_LIMIT_TEXT);
-      assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: ws[17]! })), CAPTURE_LIMIT_TEXT);
-      await call({ verb: 'detach', target: ids[0]! });
-      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
-      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
-      await call({ verb: 'detach', target: ids[1]! });
-      await waitForRow(call, ws[17]!, (row) => row.state === 'recording');
-    });
-  });
-
-  it('keeps a waiting workspace\'s place in line when it is attached again', async () => {
-    await withCaptures(async ({ call, roots }) => {
-      const ws = await roots(18);
-      const ids: string[] = [];
-      for (const root of ws.slice(0, 16)) ids.push(await attachWatchOnly(call, root));
-      for (const root of [ws[16]!, ws[17]!, ws[16]!]) {
-        assert.equal(refusal(await call({ verb: 'attach', mode: 'watch-only', worktree: root })), CAPTURE_LIMIT_TEXT);
-      }
-      await call({ verb: 'detach', target: ids[0]! });
-      await waitForRow(call, ws[16]!, (row) => row.state === 'recording');
-      assert.equal((await captureRow(call, ws[17]!)).reason, 'capture-limit-reached');
-    });
-  });
-
-  it('gives the sixteenth capture slot to exactly one of two racing workspaces', async () => {
-    await withCaptures(async ({ call, roots }) => {
-      const ws = await roots(17);
-      for (const root of ws.slice(0, 15)) await attachWatchOnly(call, root);
-      const raced = await Promise.all(ws.slice(15).map((root) => call({ verb: 'attach', mode: 'watch-only', worktree: root })));
-      assert.deepEqual(raced.map((r) => r.ok).sort(), [false, true]);
-      assert.equal(refusal(raced.find((r) => !r.ok)!), CAPTURE_LIMIT_TEXT);
     });
   });
 

@@ -327,19 +327,20 @@ describe('slipstream conductor enroll', () => {
       },
     };
   }
-  const limit: ResponseEnvelope = { v: 1, ok: false, code: 'CAPTURE_LIMIT_REACHED', message: '16/16 capture slots in use.' };
+  const FULL = '32/32 capture slots in use. This workspace is NOT recording. Pause one first.';
+  const limit: ResponseEnvelope = { v: 1, ok: false, code: 'CAPTURE_LIMIT_REACHED', message: FULL };
 
-  it('asks in order, discloses the order, and tells the user to archive when workspaces wait', async () => {
+  it('asks in order, discloses the order, and reports a full daemon as a failure', async () => {
     const d = daemon({ '/w/c': limit, '/w/b': { v: 1, ok: true, session_id: 's', state: 'recording', created: false } });
     const out: string[] = [];
     const code = await runConductorEnroll({ workspaces: ['/w/a', '/w/b', '/w/c'], byActivity: true },
       { ensureDaemon: async () => {}, control: d.control, out: (l) => out.push(l), err: (l) => out.push(l) });
-    assert.equal(code, 0);
+    assert.equal(code, 1);
     assert.deepEqual(d.asked, ['/w/a', '/w/b', '/w/c']);
     assert.match(out[0]!, /most recently active first/);
-    assert.ok(out.includes('/w/c: waiting for a capture slot (NOT recording)'));
-    assert.ok(out.includes('1 recording, 1 starting, 1 waiting, 0 not recording.'));
-    assert.ok(out.some((l) => /Archive workspaces you no longer use/.test(l)));
+    assert.ok(out.includes(`slipstream: /w/c: NOT recording (CAPTURE_LIMIT_REACHED: ${FULL})`));
+    assert.ok(out.includes('1 recording, 1 starting, 1 not recording.'));
+    assert.ok(!out.some((l) => /waiting/.test(l)));
   });
 
   it('reports each failed workspace and exits 1', async () => {

@@ -10,13 +10,13 @@ import type { CaptureMode } from './public-events.ts';
  */
 
 /** Capture slots (spec D10). A slot is any `running` intent, whatever its state. */
-export const MAX_CAPTURES = 16;
+export const MAX_CAPTURES = 32;
 /** Linked chats store-wide. */
 export const MAX_BINDINGS = 10;
 
 export type NotRecordingReason =
   | 'daemon-unavailable' | 'root-overlap' | 'root-missing' | 'baseline-failed' | 'storage-unavailable'
-  | 'watcher-failed' | 'resume-failed' | 'resource-limit' | 'stop-unconfirmed' | 'capture-limit-reached';
+  | 'watcher-failed' | 'resume-failed' | 'resource-limit' | 'stop-unconfirmed';
 
 export interface CaptureFailure {
   reason: NotRecordingReason;
@@ -29,7 +29,7 @@ export interface CaptureIntent {
   session_id: string;
   root: string;
   root_identity: { dev: string; ino: string } | null;
-  intent: 'running' | 'waiting' | 'withdrawn';
+  intent: 'running' | 'withdrawn';
   withdrawn_reason: 'detached' | 'archived' | null;
   capture_mode: CaptureMode;
   last_failure: CaptureFailure | null;
@@ -69,9 +69,9 @@ export function findCapture(record: IntentRecord, sessionId: string): CaptureInt
   return record.captures.find((c) => c.session_id === sessionId);
 }
 
-/** Admit a capture: `running` while a slot is free, otherwise `waiting`. A prior
- * entry for the same session (a re-attach after detach) is replaced and moves to
- * the end, which is admission order for waiting entries. */
+/** Admit a capture as `running`. The caller checks `runningCount < MAX_CAPTURES`
+ * with no await before this call. A prior entry for the same session (a
+ * re-attach after detach) is replaced. */
 export function admitCapture(
   record: IntentRecord,
   entry: Pick<CaptureIntent, 'session_id' | 'root' | 'root_identity'>,
@@ -79,7 +79,7 @@ export function admitCapture(
   record.captures = record.captures.filter((c) => c.session_id !== entry.session_id);
   const admitted: CaptureIntent = {
     ...entry,
-    intent: runningCount(record) < MAX_CAPTURES ? 'running' : 'waiting',
+    intent: 'running',
     withdrawn_reason: null,
     capture_mode: 'watch-only',
     last_failure: null,
@@ -88,22 +88,11 @@ export function admitCapture(
   return admitted;
 }
 
-/** Withdraw a capture. Withdrawing a `running` entry promotes the first `waiting`
- * entry to `running` in the same mutation; that entry is returned. */
-export function withdrawCapture(
-  record: IntentRecord,
-  sessionId: string,
-  reason: 'detached' | 'archived',
-): CaptureIntent | undefined {
+export function withdrawCapture(record: IntentRecord, sessionId: string, reason: 'detached' | 'archived'): void {
   const entry = findCapture(record, sessionId);
-  if (!entry || entry.intent === 'withdrawn') return undefined;
-  const freedSlot = entry.intent === 'running';
+  if (!entry || entry.intent === 'withdrawn') return;
   entry.intent = 'withdrawn';
   entry.withdrawn_reason = reason;
-  if (!freedSlot) return undefined;
-  const next = record.captures.find((c) => c.intent === 'waiting');
-  if (next) next.intent = 'running';
-  return next;
 }
 
 export function findLinked(record: IntentRecord, harness: string, harnessSessionId: string): BindingIntent | undefined {

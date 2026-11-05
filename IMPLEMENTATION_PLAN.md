@@ -143,7 +143,10 @@ optional trigger.*
 - Every workspace is captured, watch-only by default. *Later the same day
   (Brian, D10):* at most 16 workspaces record at once; beyond that a workspace is
   visibly NOT recording (`capture-limit-reached`) and starts automatically,
-  oldest request first, when a slot frees. No eviction.
+  oldest request first, when a slot frees. No eviction. *Amended 2026-11-03
+  (recording controls):* at most 32; beyond that an attach is refused and
+  nothing is written or queued, and a chat attach never resumes a paused
+  workspace.
 - Up to 10 agent chats may be linked at once, **one linked chat per capture**.
   Never two chats on one capture; replacing a chat on a workspace needs an
   explicit unlink. A chat is linked by `slipstream attach`, which binds it in

@@ -255,9 +255,6 @@ describe('slipstream attach (one command)', () => {
     ['another chat is linked to this workspace', (f: Fixture) => ({ captures: [row(f, {
       binding: { harness: 'codex', harness_session_id: 'other', binding_generation: '1', state: 'connected' } })] }),
     { code: 'BINDING_EXISTS', message: 'codex chat other is already linked' }],
-    ['this workspace waits for a capture slot', (f: Fixture) => ({ captures: [row(f, { state: 'not_recording',
-      reason: 'capture-limit-reached' })] }),
-    { code: 'CAPTURE_LIMIT_REACHED', message: '16/16 capture slots in use.' }],
     ['every chat slot is used', () => ({ binding_slots: { used: 10, limit: 10 } }),
     { code: 'BINDING_LIMIT_REACHED', message: '10/10 chats linked.' }],
   ] as const) {
@@ -733,8 +730,7 @@ describe('slipstream attach --watch-only', () => {
   });
 
   it('exits non-zero with the exact capture-limit text when every slot is used', async () => {
-    const text = '16/16 capture slots in use. This workspace is NOT recording. It starts automatically when another '
-      + 'workspace is archived or detached.';
+    const text = '32/32 capture slots in use. This workspace is NOT recording. Pause one first.';
     const r = await run([{ ok: false, code: 'CAPTURE_LIMIT_REACHED', message: text }], true);
     assert.equal(r.code, 1);
     assert.equal(r.err, `slipstream: CAPTURE_LIMIT_REACHED: ${text}`);

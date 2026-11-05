@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, stat, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, stat, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { admitCapture, emptyIntent, linkBinding, MAX_CAPTURES } from './capture-intent.ts';
+import { admitCapture, emptyIntent, linkBinding } from './capture-intent.ts';
 import { IntentCorruptError, intentPath, loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
 import { acquireSessionLock, SessionOwnedError } from './lock.ts';
 
@@ -52,6 +52,27 @@ describe('durable intent record', () => {
     await assert.rejects(loadIntent(dir), /captures\[0\]\.intent is unknown/);
   });
 
+  it('loads a legacy waiting entry as paused', async () => {
+    const dir = await store();
+    const record = emptyIntent();
+    admitCapture(record, capture(1));
+    admitCapture(record, capture(2));
+    Object.assign(record.captures[1]!, {
+      intent: 'waiting',
+      last_failure: { reason: 'watcher-failed', message: 'watch closed', at_ms: 1, next_attempt_at_ms: null },
+    });
+    await saveIntent(dir, record);
+    const before = await readFile(intentPath(dir), 'utf8');
+
+    const loaded = await loadIntent(dir);
+
+    assert.deepEqual(loaded.captures, [
+      { ...capture(1), intent: 'running', withdrawn_reason: null, capture_mode: 'watch-only', last_failure: null },
+      { ...capture(2), intent: 'withdrawn', withdrawn_reason: 'detached', capture_mode: 'watch-only', last_failure: null },
+    ]);
+    assert.equal(await readFile(intentPath(dir), 'utf8'), before);
+  });
+
   it('refuses a group-readable record', async () => {
     const dir = await store();
     await saveIntent(dir, emptyIntent());
@@ -61,10 +82,10 @@ describe('durable intent record', () => {
 });
 
 describe('withdrawal while no daemon runs', () => {
-  it('withdraws every entry at a root, revokes its binding, and promotes the oldest waiting entry', async () => {
+  it('withdraws every entry at a root and revokes its binding', async () => {
     const dir = await store();
     const record = emptyIntent();
-    for (let i = 0; i < MAX_CAPTURES + 2; i++) admitCapture(record, capture(i));
+    for (let i = 0; i < 5; i++) admitCapture(record, capture(i));
     linkBinding(record, { session_id: 's3', harness: 'codex', harness_session_id: 'c3', canonical_worktree: '/w/3',
       verified_transcript_path: '/t/3.jsonl' });
     await saveIntent(dir, record);
@@ -75,8 +96,7 @@ describe('withdrawal while no daemon runs', () => {
     const after = await loadIntent(dir);
     assert.deepEqual(after.captures.find((c) => c.session_id === 's3'),
       { ...capture(3), intent: 'withdrawn', withdrawn_reason: 'archived', capture_mode: 'watch-only', last_failure: null });
-    assert.equal(after.captures.find((c) => c.session_id === 's16')?.intent, 'running');
-    assert.equal(after.captures.find((c) => c.session_id === 's17')?.intent, 'waiting');
+    assert.equal(after.captures.filter((c) => c.intent === 'running').length, 4);
     assert.equal(after.bindings[0]?.intent, 'revoked');
   });
 

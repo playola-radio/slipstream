@@ -34,6 +34,7 @@ export const f2Delivery: AcceptanceModule = {
       const { store, worktree, url, token } = handle.env;
       const reader = createReaderClient(url, token);
       await cli(['detach', worktree, '--store', store]);
+      await cli(['attach', '--watch-only', worktree, '--store', store]);
       const harnessSessionId = randomUUID();
       const transcript = join(store, `root-${randomUUID()}.jsonl`);
       const worktreeAlias = join(store, `alias-${randomUUID()}`);

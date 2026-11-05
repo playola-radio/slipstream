@@ -563,12 +563,12 @@ describe('cli formatStatus', () => {
     const lines = formatStatus({ reader_url: 'http://r', binding_slots: { used: 1, limit: 10 }, captures: [
       { session_id: 's1', root: '/a', state: 'recording', reason: null,
         binding: { harness: 'codex', harness_session_id: 'c1', binding_generation: '2', state: 'connected' } },
-      { session_id: 's2', root: '/b', state: 'not_recording', reason: 'capture-limit-reached', message: '16/16 ...',
+      { session_id: 's2', root: '/b', state: 'not_recording', reason: 'watcher-failed', message: 'watch closed',
         binding: null },
     ] });
     assert.deepEqual(lines, ['reader_url: http://r', 'linked_chats: 1/10', 'captures: 2',
       '', '/a', '  session_id: s1', '  state: recording', '  chat: codex c1 connected (generation 2)',
-      '', '/b', '  session_id: s2', '  state: not_recording (capture-limit-reached)', '  16/16 ...', '  chat: none']);
+      '', '/b', '  session_id: s2', '  state: not_recording (watcher-failed)', '  watch closed', '  chat: none']);
   });
 });
 

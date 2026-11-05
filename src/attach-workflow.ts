@@ -209,11 +209,11 @@ function requireCaptureTable(status: Record<string, unknown>, store: string): vo
     + 'Nothing was installed or recorded.');
 }
 
-interface StatusRow { root?: unknown; state?: unknown; reason?: unknown;
+interface StatusRow { root?: unknown; state?: unknown;
   binding?: { harness?: unknown; harness_session_id?: unknown; state?: unknown } | null }
 
 /** Whether the daemon will refuse to link this chat: it is linked elsewhere, this
- * workspace waits for a capture slot or has another chat, or every chat slot is used. */
+ * workspace has another chat, or every chat slot is used. */
 function refusalExpected(status: Record<string, unknown>, chat: Chat, worktree: string): boolean {
   const rows = (Array.isArray(status.captures) ? status.captures : []) as StatusRow[];
   const linked = (r: StatusRow) => r.binding != null && r.binding.state !== 'unlinked';
@@ -221,7 +221,7 @@ function refusalExpected(status: Record<string, unknown>, chat: Chat, worktree: 
     && r.binding!.harness_session_id === chat.id);
   if (mine) return mine.root !== worktree;
   const here = rows.find((r) => r.root === worktree && r.state !== 'stopped');
-  if (here && (here.reason === 'capture-limit-reached' || linked(here))) return true;
+  if (here && linked(here)) return true;
   const slots = status.binding_slots as { used?: unknown; limit?: unknown } | undefined;
   return typeof slots?.used === 'number' && typeof slots.limit === 'number' && slots.used >= slots.limit;
 }

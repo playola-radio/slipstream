@@ -929,7 +929,7 @@ async function main(): Promise<void> {
     return;
   }
   // Readers take a live store lock to mean a daemon will start this store's
-  // waiting captures (contracts.md §7), so never hold a daemon store's lock for
+  // queued captures (contracts.md §7), so never hold a daemon store's lock for
   // a capture. Checked under the lock: only a lock holder creates the record.
   const daemonStore = await lstat(intentPath(args.store)).then(() => true, async (err: NodeJS.ErrnoException) => {
     if (err.code === 'ENOENT') return false;

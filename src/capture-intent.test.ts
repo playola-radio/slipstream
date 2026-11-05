@@ -12,36 +12,18 @@ const chat = (n: number) => ({
 });
 
 describe('capture intent', () => {
-  it('admits sixteen running captures and the seventeenth as waiting', () => {
+  it('admits up to 32 running captures', () => {
     const record = emptyIntent();
-    for (let i = 0; i < MAX_CAPTURES; i++) assert.equal(admitCapture(record, capture(i)).intent, 'running');
-    assert.equal(admitCapture(record, capture(16)).intent, 'waiting');
-    assert.equal(runningCount(record), 16);
-  });
-
-  it('promotes the oldest waiting capture when a running one is withdrawn', () => {
-    const record = emptyIntent();
-    for (let i = 0; i < 18; i++) admitCapture(record, capture(i));
-    const promoted = withdrawCapture(record, 's3', 'detached');
-    assert.equal(promoted?.session_id, 's16');
-    assert.equal(promoted?.intent, 'running');
-    assert.equal(record.captures.find((c) => c.session_id === 's17')?.intent, 'waiting');
-    assert.equal(runningCount(record), 16);
-  });
-
-  it('withdrawing a waiting capture frees no slot', () => {
-    const record = emptyIntent();
-    for (let i = 0; i < 18; i++) admitCapture(record, capture(i));
-    assert.equal(withdrawCapture(record, 's17', 'detached'), undefined);
-    assert.equal(runningCount(record), 16);
-    assert.equal(record.captures.find((c) => c.session_id === 's16')?.intent, 'waiting');
+    for (let i = 0; i < 32; i++) assert.equal(admitCapture(record, capture(i)).intent, 'running');
+    assert.equal(runningCount(record), 32);
+    assert.equal(MAX_CAPTURES, 32);
   });
 
   it('withdraws once and keeps the entry for history', () => {
     const record = emptyIntent();
     admitCapture(record, capture(0));
     withdrawCapture(record, 's0', 'detached');
-    assert.equal(withdrawCapture(record, 's0', 'detached'), undefined);
+    withdrawCapture(record, 's0', 'archived');
     assert.deepEqual(record.captures.map((c) => [c.intent, c.withdrawn_reason]), [['withdrawn', 'detached']]);
   });
 
