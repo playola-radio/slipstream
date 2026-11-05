@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DaemonAlreadyRunningError, startDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
@@ -298,8 +298,10 @@ describe('a chat attach never resumes a paused workspace', () => {
     await withStore(async ({ store, call, roots }) => {
       const [ws] = await roots(1);
       const id = await pause(call, ws!);
+      // Made before the old one is removed, so Linux cannot hand back the same inode.
+      await mkdir(`${ws!}.new`);
       await rm(ws!, { recursive: true });
-      await mkdir(ws!);
+      await rename(`${ws!}.new`, ws!);
 
       const linked = await linkChat(call, store, ws!, 'chat-1');
 
