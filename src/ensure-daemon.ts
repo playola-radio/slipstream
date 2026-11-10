@@ -46,6 +46,8 @@ export async function ensureDaemon(store: string, deps: EnsureDaemonDeps): Promi
   }
   const { message, restart } = await deps.mismatch(check.daemon);
   if (!restart) throw new DaemonUnavailableError(`${message} Nothing was recorded.`);
+  // Another setup may have replaced the daemon while the remedy was computed.
+  if ((await deps.checkBuild()).kind === 'same') return;
   if (await comesUp(restart(), async () => (await deps.checkBuild()).kind === 'same', deps)) return;
   const see = deps.logPath ? `; see ${deps.logPath}` : '';
   throw new DaemonUnavailableError(`${message} Restarting it did not bring up this version${see}. Nothing was recorded.`);

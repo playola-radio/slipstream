@@ -176,4 +176,23 @@ describe('versionGate', () => {
     assert.equal(!res.ok && res.code, 'DAEMON_UNAVAILABLE');
     assert.deepEqual(sent, ['status']);
   });
+
+  it('checks again after an unavailable response before forwarding a retry', async () => {
+    const sent: string[] = [];
+    let attempts = 0;
+    const send = async (request: RequestEnvelope): Promise<ResponseEnvelope> => {
+      sent.push(request.verb);
+      if (request.verb === 'status') {
+        attempts++;
+        return attempts === 1
+          ? { v: 1, ok: false, code: 'DAEMON_UNAVAILABLE', message: 'starting' }
+          : { v: 1, ok: true, daemon_version: '0.3.0', daemon_build: null };
+      }
+      return { v: 1, ok: true, verb: request.verb };
+    };
+    const gated = versionGate(send, '/s', OWN);
+    assert.equal(!(await gated({ v: 1, verb: 'detach' })).ok, true);
+    assert.equal((await gated({ v: 1, verb: 'detach' })).ok, true);
+    assert.deepEqual(sent, ['status', 'status', 'detach']);
+  });
 });

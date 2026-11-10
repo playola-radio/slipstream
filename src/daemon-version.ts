@@ -154,14 +154,14 @@ async function runsThisCli(node: string, store: string, home: string): Promise<b
 /**
  * Wraps a control sender so requests reach only a daemon of this exact build.
  * The build is checked once, before the first request; on a mismatch nothing is
- * sent and every request answers `DAEMON_VERSION_MISMATCH` with what to run. When
- * no daemon answers, every request answers that `DAEMON_UNAVAILABLE` unsent, so a
- * daemon that starts in between is never used unchecked.
+ * sent and every request answers `DAEMON_VERSION_MISMATCH` with what to run. An
+ * unavailable check is not cached, so a later retry checks again. That retry
+ * still never sends its request until the daemon has answered with this build.
  */
 export function versionGate(send: Send, store: string, own: Build): Send {
   let refusal: Promise<ResponseEnvelope | null> | undefined;
   return async (request) => {
-    refusal ??= checkDaemonBuild(send, own).then(async (check) => {
+    const current = refusal ??= checkDaemonBuild(send, own).then(async (check) => {
       if (check.kind === 'same') return null;
       if (check.kind === 'absent') return check.response;
       const message = check.kind === 'unreadable'
@@ -169,6 +169,9 @@ export function versionGate(send: Send, store: string, own: Build): Send {
         : mismatchMessage(store, check.daemon, own, (await remedyFor(store, check.daemon, own)).text);
       return { v: 1, ok: false, code: 'DAEMON_VERSION_MISMATCH', message } as const;
     });
-    return (await refusal) ?? send(request);
+    const response = await current;
+    if (!response) return send(request);
+    if (response.code === 'DAEMON_UNAVAILABLE' && refusal === current) refusal = undefined;
+    return response;
   };
 }

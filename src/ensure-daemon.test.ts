@@ -63,6 +63,18 @@ describe('ensureDaemon', () => {
     assert.equal(restarted, 1);
   });
 
+  it('does not restart when another caller replaces the daemon while the remedy is computed', async () => {
+    let checks = 0;
+    let restarted = 0;
+    await ensureDaemon('/s', {
+      probe: async () => 'live', startDaemon: never,
+      checkBuild: async () => ++checks === 1 ? { kind: 'different', daemon: null } : { kind: 'same' },
+      mismatch: async (d) => ({ ...await refuse(d), restart: () => { restarted++; return never(); } }),
+    });
+    assert.equal(restarted, 0);
+    assert.equal(checks, 2);
+  });
+
   it('refuses when a restart in place does not bring up this build', async () => {
     let restarted = 0;
     await assert.rejects(ensureDaemon('/s', {
