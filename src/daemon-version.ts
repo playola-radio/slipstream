@@ -1,10 +1,12 @@
+import { execFile } from 'node:child_process';
 import { readFile, realpath } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OutcomeUnknownError } from './control-client.ts';
 import type { RequestEnvelope, ResponseEnvelope } from './control-protocol.ts';
 import { shellWord } from './shell-word.ts';
-import { LAUNCH_AGENT_LABEL, readManagedInstall } from './launch-agent.ts';
+import { daemonLogPath, LAUNCH_AGENT_LABEL, plistPath, readManagedInstall, renderPlist } from './launch-agent.ts';
 import { parseLock } from './lock.ts';
 
 /**
@@ -14,14 +16,31 @@ import { parseLock } from './lock.ts';
  *
  * `build` is a random id written next to the compiled modules at build time, so
  * two installs of the same version from different commits still differ. Running
- * from source has none.
+ * from source, it is the checkout's commit; null when Git cannot say.
  */
 export interface Build { version: string; build: string | null }
 
-export async function thisBuild(): Promise<Build> {
+const SOURCE_BUILD = 'git-';
+
+// Read once, as the process loads: an upgrade in place rewrites these files
+// under a long-running process that still runs the old code.
+const own = readBuild();
+
+export function thisBuild(): Promise<Build> {
+  return own;
+}
+
+async function readBuild(): Promise<Build> {
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
-  const build = await readFile(new URL('./build-id', import.meta.url), 'utf8').then((text) => text.trim() || null, () => null);
+  const build = await readFile(new URL('./build-id', import.meta.url), 'utf8')
+    .then((text) => text.trim() || null, () => sourceCommit());
   return { version: pkg.version, build };
+}
+
+function sourceCommit(): Promise<string | null> {
+  return new Promise((resolve) => execFile('git', ['rev-parse', 'HEAD'],
+    { cwd: dirname(fileURLToPath(import.meta.url)), timeout: 2000 },
+    (error, stdout) => resolve(error || !stdout.trim() ? null : `${SOURCE_BUILD}${stdout.trim()}`)));
 }
 
 /** The CLI module beside this one, as a managed install records it. */
@@ -48,7 +67,7 @@ export type Send = (request: RequestEnvelope) => Promise<ResponseEnvelope>;
 
 export type BuildCheck =
   | { kind: 'same' }
-  | { kind: 'absent' }
+  | { kind: 'absent'; response: ResponseEnvelope }
   /** `daemon` is null when the daemon does not report a build: one older than this check. */
   | { kind: 'different'; daemon: Build | null }
   | { kind: 'unreadable'; message: string };
@@ -68,7 +87,7 @@ export async function checkDaemonBuild(send: Send, own: Build): Promise<BuildChe
       const daemon = reportedBuild(res);
       return sameBuild(daemon, own) ? { kind: 'same' } : { kind: 'different', daemon };
     }
-    if (res.code === 'DAEMON_UNAVAILABLE') return { kind: 'absent' };
+    if (res.code === 'DAEMON_UNAVAILABLE') return { kind: 'absent', response: res };
     if (res.code !== 'CAPTURE_NOT_READY' || attempt >= NOT_READY_RETRIES) return { kind: 'unreadable', message: `${res.code}: ${res.message}` };
     await new Promise((r) => setTimeout(r, NOT_READY_WAIT_MS));
   }
@@ -78,7 +97,9 @@ export async function checkDaemonBuild(send: Send, own: Build): Promise<BuildChe
 export function describeBuild(build: Build | null, other: Build | null): string {
   if (build === null) return 'an older version (it does not report one)';
   if (build.version !== other?.version || build.build === other.build) return build.version;
-  return `${build.version} (${build.build === null ? 'run from source' : `build ${build.build.slice(0, 8)}`})`;
+  if (build.build === null) return `${build.version} (run from source)`;
+  if (build.build.startsWith(SOURCE_BUILD)) return `${build.version} (run from source at ${build.build.slice(SOURCE_BUILD.length, SOURCE_BUILD.length + 8)})`;
+  return `${build.version} (build ${build.build.slice(0, 8)})`;
 }
 
 export function mismatchMessage(store: string, daemon: Build | null, own: Build, remedy: string): string {
@@ -98,16 +119,16 @@ export interface Remedy {
 }
 
 /**
- * How to get a daemon of this build. A managed daemon whose LaunchAgent already
- * runs this CLI's path restarts on the new code; launchd sends SIGTERM, and a
- * daemon that keeps capture intent (every managed one) resumes its recordings
- * with a marked gap. A detached daemon is never stopped for the user: an older
- * one may keep no intent, so stopping it would end its recordings.
+ * How to get a daemon of this build. A managed daemon whose LaunchAgent plist is
+ * exactly what this install writes restarts on the new code; launchd sends
+ * SIGTERM, and a daemon that keeps capture intent (every managed one) resumes
+ * its recordings with a marked gap. A detached daemon is never stopped for the
+ * user: an older one may keep no intent, so stopping it would end its recordings.
  */
-export async function remedyFor(store: string, daemon: Build | null, own: Build): Promise<Remedy> {
+export async function remedyFor(store: string, daemon: Build | null, own: Build, home = homedir()): Promise<Remedy> {
   const managed = await readManagedInstall(store).catch(() => null);
   if (managed) {
-    if (process.getuid && managed.cli === await thisCliPath().catch(() => null)) {
+    if (process.getuid && await runsThisCli(managed.node, store, home)) {
       const uid = process.getuid();
       return { text: `Restart it with \`launchctl kickstart -k gui/${uid}/${LAUNCH_AGENT_LABEL}\`.`, restart: { uid } };
     }
@@ -120,20 +141,29 @@ export async function remedyFor(store: string, daemon: Build | null, own: Build)
   const recordings = daemon === null
     ? 'The new daemon resumes recordings started on 0.3.0 or later with a marked gap; record folders an older daemon was recording again.'
     : 'The new daemon resumes its recordings with a marked gap.';
-  return { text: `${stop}, then run this command again to start one on ${own.version}. ${recordings}` };
+  return { text: `${stop}; the next \`slipstream attach\` or \`slipstream workspace create\` starts one on ${own.version}. ${recordings}` };
+}
+
+/** Whether the store's LaunchAgent plist is the one this CLI would install. */
+async function runsThisCli(node: string, store: string, home: string): Promise<boolean> {
+  const cli = await thisCliPath().catch(() => null);
+  const plist = await readFile(plistPath(home), 'utf8').catch(() => null);
+  return cli !== null && plist === renderPlist({ node, cli, store, log: daemonLogPath(home), home });
 }
 
 /**
  * Wraps a control sender so requests reach only a daemon of this exact build.
  * The build is checked once, before the first request; on a mismatch nothing is
- * sent and every request answers `DAEMON_VERSION_MISMATCH` with what to run. No
- * daemon answering passes through, so callers still see `DAEMON_UNAVAILABLE`.
+ * sent and every request answers `DAEMON_VERSION_MISMATCH` with what to run. When
+ * no daemon answers, every request answers that `DAEMON_UNAVAILABLE` unsent, so a
+ * daemon that starts in between is never used unchecked.
  */
 export function versionGate(send: Send, store: string, own: Build): Send {
   let refusal: Promise<ResponseEnvelope | null> | undefined;
   return async (request) => {
     refusal ??= checkDaemonBuild(send, own).then(async (check) => {
-      if (check.kind === 'same' || check.kind === 'absent') return null;
+      if (check.kind === 'same') return null;
+      if (check.kind === 'absent') return check.response;
       const message = check.kind === 'unreadable'
         ? unreadableMessage(store, check.message)
         : mismatchMessage(store, check.daemon, own, (await remedyFor(store, check.daemon, own)).text);
