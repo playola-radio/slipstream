@@ -14,6 +14,7 @@ function fake(opts: {
   git?: Record<string, Reply>;
   existing?: string[];
   scripts?: Scripts;
+  prepare?: number;
   record?: number;
   withdraw?: number;
   script?: number;
@@ -30,6 +31,7 @@ function fake(opts: {
       calls.push(`git ${key} @${cwd}`);
       return opts.git?.[key] ?? { code: 0, output: '' };
     },
+    prepare: async () => { calls.push('prepare'); return opts.prepare ?? 0; },
     record: async (dir) => {
       calls.push(`record ${dir}`);
       if (opts.recordError) throw opts.recordError;
@@ -72,6 +74,7 @@ describe('runWorkspaceCreate', () => {
     assert.deepEqual(f.calls.filter((c) => !c.startsWith('out ')), [
       `git ${REV_PARSE} @/src/repo`,
       `git remote get-url origin @${ROOT}`,
+      'prepare',
       `git fetch --prune origin @${ROOT}`,
       `git show-ref --verify --quiet refs/remotes/origin/develop @${ROOT}`,
       `git show-ref --verify --quiet refs/heads/slipstream/workspace-1 @${ROOT}`,
@@ -90,6 +93,13 @@ describe('runWorkspaceCreate', () => {
     assert.deepEqual(order.slice(-6).map((c) => c.split(' @')[0]), [
       `record ${WS}`, 'out ', `out workspace_path: ${WS}`, 'run make setup', 'out ', `out workspace_path: ${WS}`,
     ]);
+  });
+
+  it('creates no worktree, and fetches nothing, when no daemon of this version can record it', async () => {
+    const f = fake({ git: createGit(), prepare: 1 });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.equal(f.calls.at(-1), 'prepare');
+    assert.ok(!f.calls.some((c) => c.startsWith('git fetch') || c.startsWith('git worktree')), f.calls.join('\n'));
   });
 
   it('prints both path lines when recording fails', async () => {

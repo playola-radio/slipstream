@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { parseArgs, retryGuidance, formatStatus } from './cli.ts';
+import { thisBuildDaemon } from './test/helpers.ts';
 
 const ASK_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const ASK_REQUEST = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -61,7 +62,7 @@ describe('cli ask', () => {
       reply_to_question_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
     }));
     let received: Record<string, unknown> | undefined;
-    const server = createServer((socket) => {
+    const server = createServer(thisBuildDaemon((socket) => {
       let text = '';
       socket.on('data', (chunk) => { text += chunk.toString('utf8'); });
       socket.on('end', () => undefined);
@@ -73,7 +74,7 @@ describe('cli ask', () => {
           queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
         }) + '\n');
       });
-    });
+    }));
     await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
     try {
       const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
@@ -146,14 +147,14 @@ describe('cli ask', () => {
     const envelope = { v: 1, verb: 'ask', session_id: ASK_SESSION, request_id: ASK_REQUEST, text: '', context };
     const textLength = MAX_MESSAGE_BYTES - Buffer.byteLength(JSON.stringify(envelope));
     let connections = 0;
-    const server = createServer((socket) => {
+    const server = createServer(thisBuildDaemon((socket) => {
       connections++;
       socket.once('data', () => socket.end(JSON.stringify({
         v: 1, ok: true, session_id: ASK_SESSION, request_id: ASK_REQUEST,
         question_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', seq: '7',
         queued_at_ms: 10, expires_at_ms: 1_800_010, duplicate: false,
       }) + '\n'));
-    });
+    }));
     await mkdir(store, { mode: 0o700 });
     await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
     try {
@@ -193,10 +194,10 @@ describe('cli ask', () => {
     try {
       for (const code of ['INVALID_CONTEXT', 'STORAGE_UNAVAILABLE']) {
         let received: unknown;
-        const server = createServer((socket) => socket.once('data', (chunk) => {
+        const server = createServer(thisBuildDaemon((socket) => socket.once('data', (chunk) => {
           received = JSON.parse(chunk.toString());
           socket.end(JSON.stringify({ v: 1, ok: false, code, message: 'fixture failure' }) + '\n');
-        }));
+        })));
         await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
         try {
           const result = await new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) => {
@@ -249,7 +250,7 @@ describe('cli ask', () => {
     ];
     try {
       for (const reply of invalid) {
-        const server = createServer((socket) => socket.once('data', () => socket.end(JSON.stringify(reply) + '\n')));
+        const server = createServer(thisBuildDaemon((socket) => socket.once('data', () => socket.end(JSON.stringify(reply) + '\n'))));
         await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
         try {
           const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
@@ -495,6 +496,85 @@ describe('cli attach --watch-only without a running daemon', () => {
   });
 });
 
+describe('cli against a daemon of another version', () => {
+  /** A detached daemon that answers status with `status` and refuses a
+   * watch-only attach the way 0.1.0 did. */
+  async function withOldDaemon(status: Record<string, unknown>,
+    run: (paths: { dir: string; work: string; store: string; verbs: string[] }) => Promise<void>): Promise<void> {
+    const { mkdtemp, mkdir, writeFile, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createServer } = await import('node:net');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-old-daemon-')));
+    const work = join(dir, 'work'); const store = join(dir, 'store');
+    await mkdir(work); await mkdir(store, { mode: 0o700 });
+    await writeFile(join(store, 'owner.lock'), JSON.stringify({ pid: 4242, nonce: 'n' }));
+    const verbs: string[] = [];
+    const server = createServer((socket) => socket.once('data', (chunk) => {
+      const { verb } = JSON.parse(chunk.toString()) as { verb: string };
+      verbs.push(verb);
+      socket.end(JSON.stringify(verb === 'status' ? { v: 1, ok: true, ...status }
+        : { v: 1, ok: false, code: 'IDENTITY_UNRESOLVED',
+          message: 'attach requires non-empty worktree, harness, and harness_session_id' }) + '\n');
+    }));
+    await new Promise<void>((resolve) => server.listen(join(store, 'control.sock'), resolve));
+    try { await run({ dir, work, store, verbs }); } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  async function cli(argv: string[], home: string): Promise<{ code: number; stderr: string }> {
+    const { execFile } = await import('node:child_process');
+    return new Promise((done) => execFile(process.execPath, ['src/cli.ts', ...argv],
+      { env: { PATH: process.env.PATH, HOME: home }, cwd: process.cwd(), timeout: 15_000 },
+      (error, _stdout, stderr) => done({ code: error ? Number(error.code) : 0, stderr })));
+  }
+
+  for (const [name, status] of [
+    ['reports no version (0.1.0)', {}],
+    ['reports an older version', { daemon_version: '0.0.9', daemon_build: null }],
+  ] as const) {
+    it(`refuses a watch-only attach to a daemon that ${name}, and says what to stop`, async () => {
+      await withOldDaemon(status, async ({ dir, work, store, verbs }) => {
+        const result = await cli(['attach', '--watch-only', work, '--store', store], dir);
+        assert.equal(result.code, 1, result.stderr);
+        assert.match(result.stderr, /The Slipstream daemon running for .* is (an older version|0\.0\.9)/);
+        assert.match(result.stderr, /Stop it with `kill 4242`/);
+        assert.doesNotMatch(result.stderr, /IDENTITY_UNRESOLVED/);
+        assert.deepEqual(verbs.filter((v) => v !== 'status'), []);
+      });
+    });
+  }
+
+  it('creates no worktree for a workspace when the daemon is another version', async () => {
+    const { execFile } = await import('node:child_process');
+    const { readdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const git = (cwd: string, ...args: string[]) => new Promise<void>((done, fail) =>
+      execFile('git', args, { cwd }, (error) => error ? fail(error) : done()));
+    await withOldDaemon({}, async ({ dir, work, store, verbs }) => {
+      await git(work, 'init', '-q', '-b', 'develop');
+      await git(work, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init');
+      await git(work, 'remote', 'add', 'origin', work);
+      const result = await cli(['workspace', 'create', work, '--store', store], dir);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /is an older version/);
+      assert.deepEqual(verbs.filter((v) => v !== 'status'), []);
+      assert.deepEqual((await readdir(dir)).sort(), ['store', 'work']);
+      assert.deepEqual(await readdir(join(work, '.git', 'worktrees')).catch(() => []), []);
+    });
+  });
+
+  it('uses a daemon of this version', async () => {
+    const { thisBuild, buildFields } = await import('./daemon-version.ts');
+    await withOldDaemon(buildFields(await thisBuild()), async ({ dir, work, store, verbs }) => {
+      await cli(['attach', '--watch-only', work, '--store', store], dir);
+      assert.ok(verbs.includes('attach'), verbs.join(','));
+    });
+  });
+});
+
 describe('cli parseArgs (daemon commands)', () => {
   it('parses start with a store override and no worktree', () => {
     assert.deepEqual(parseArgs(['start', '--store', '/s']), {
@@ -559,13 +639,22 @@ describe('cli parseArgs (daemon commands)', () => {
 });
 
 describe('cli formatStatus', () => {
+  const own = { version: '0.3.0', build: null };
+  it('shows this CLI\'s version and the daemon\'s, and flags a mismatch', () => {
+    assert.deepEqual(formatStatus({ reader_url: 'http://r', daemon_version: '0.3.0', daemon_build: null, captures: [] }, own, null)
+      .slice(0, 2), ['cli_version: 0.3.0', 'daemon_version: 0.3.0']);
+    const old = formatStatus({ reader_url: 'http://r', captures: [] }, own, 'The Slipstream daemon is older. Stop it.');
+    assert.deepEqual(old.slice(0, 3), ['cli_version: 0.3.0', 'daemon_version: an older version (it does not report one)',
+      'warning: The Slipstream daemon is older. Stop it.']);
+  });
+
   it('lists every capture with its state, any reason and message, and its chat', () => {
     const lines = formatStatus({ reader_url: 'http://r', binding_slots: { used: 1, limit: 10 }, captures: [
       { session_id: 's1', root: '/a', state: 'recording', reason: null,
         binding: { harness: 'codex', harness_session_id: 'c1', binding_generation: '2', state: 'connected' } },
       { session_id: 's2', root: '/b', state: 'not_recording', reason: 'watcher-failed', message: 'watch closed',
         binding: null },
-    ] });
+    ] }, own, null).slice(2);
     assert.deepEqual(lines, ['reader_url: http://r', 'linked_chats: 1/10', 'captures: 2',
       '', '/a', '  session_id: s1', '  state: recording', '  chat: codex c1 connected (generation 2)',
       '', '/b', '  session_id: s2', '  state: not_recording (watcher-failed)', '  watch closed', '  chat: none']);

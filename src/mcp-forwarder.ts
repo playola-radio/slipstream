@@ -15,12 +15,14 @@
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
+import { dirname } from 'node:path';
 import { isMainModule } from './entrypoint.ts';
 import { dispatch, parseMessage, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
 import { forwardAnswer } from './answer-forwarder.ts';
 import { sendControlRequest } from './control-client.ts';
+import { thisBuild, versionGate } from './daemon-version.ts';
 import { controlSocketPath, resolveStoreDir } from './daemon-location.ts';
 import type { RequestEnvelope } from './control-protocol.ts';
 
@@ -89,7 +91,9 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
     },
     callTool: (name, params) => {
       const identity = ctx.identityForCall(params);
-      const send = (request: RequestEnvelope) => sendControlRequest({ socketPath: opts.socketPath, request });
+      const raw = (request: RequestEnvelope) => sendControlRequest({ socketPath: opts.socketPath, request });
+      const send = async (request: RequestEnvelope) =>
+        versionGate(raw, dirname(opts.socketPath), await thisBuild())(request);
       return name === ANSWER_QUESTION_TOOL.name
         ? forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send })
         : forwardBeginTask({ identity, title: stringArg(params, 'title'), send });

@@ -9,7 +9,10 @@ import { type ScriptKind, type Scripts } from './conductor-settings.ts';
 export interface WorkspaceDeps {
   home: string;
   git: (args: string[], cwd: string) => Promise<{ code: number | null; output: string }>;
-  /** Watch-only attach with --wait, starting the daemon if needed. */
+  /** Makes sure a daemon of this build is running, starting one if needed; non-zero,
+   * with the reason reported, when there is none to record with. */
+  prepare: () => Promise<number>;
+  /** Watch-only attach with --wait. */
   record: (dir: string) => Promise<number>;
   /** Stop recording with reason `archived`; an unrecorded folder is not an error. */
   withdraw: (dir: string) => Promise<number>;
@@ -41,6 +44,8 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
     deps.err(`slipstream: ${root} has no "origin" remote to branch from.`);
     return 1;
   }
+  // Before anything changes, so a daemon that can't record leaves no unrecorded worktree.
+  if (await deps.prepare() !== 0) return 1;
   const fetch = await deps.git(['fetch', '--prune', 'origin'], root);
   if (fetch.code !== 0) {
     deps.err(`slipstream: git fetch origin failed:\n${fetch.output.trim()}`);

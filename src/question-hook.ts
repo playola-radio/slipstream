@@ -1,5 +1,6 @@
 import { controlSocketPath } from './daemon-location.ts';
 import { sendControlRequest } from './control-client.ts';
+import { thisBuild, versionGate } from './daemon-version.ts';
 import { UUID } from './questions.ts';
 
 const MAX_INPUT_BYTES = 1024 * 1024;
@@ -19,10 +20,10 @@ async function postToolUse(harness: 'codex' | 'claude-code', input: unknown, sto
     || Object.hasOwn(event, 'agent_id') || Object.hasOwn(event, 'agent_type')
     || Date.now() >= deadlineAtMs) return null;
   try {
-    const reply = await sendControlRequest({ socketPath: controlSocketPath(storeDir),
-      request: { v: 1, verb: 'claim_question', harness, harness_session_id: event.session_id,
-        worktree: event.cwd, transcript_path: event.transcript_path },
-      connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs });
+    const send = versionGate((request) => sendControlRequest({ socketPath: controlSocketPath(storeDir), request,
+      connectTimeoutMs: 300, responseTimeoutMs: 700, deadlineAtMs }), storeDir, await thisBuild());
+    const reply = await send({ v: 1, verb: 'claim_question', harness, harness_session_id: event.session_id,
+      worktree: event.cwd, transcript_path: event.transcript_path });
     if (!reply.ok) return null;
     if (reply.question === null) {
       const check = object(reply.setup_check);

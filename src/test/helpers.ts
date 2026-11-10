@@ -6,6 +6,7 @@
  * TESTING.md for the full policy on where we do and do not mock.
  */
 import { mkdtemp, readFile, rm, type FileHandle } from 'node:fs/promises';
+import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCas, type Cas } from '../cas.ts';
@@ -16,6 +17,7 @@ import { createEngine, type Engine } from '../engine.ts';
 import { startCapture, type CaptureSession } from '../session.ts';
 import { createFakePlatform } from './fake-platform.ts';
 import type { Snapshot } from '../snapshot.ts';
+import { buildFields, thisBuild } from '../daemon-version.ts';
 
 /** Every record on disk is a full CloudEvents envelope. */
 export type LoggedRecord = import('../public-events.ts').PublicEvent;
@@ -25,6 +27,20 @@ const TEST_SESSION_ID = '00000000-0000-4000-8000-000000000000';
 
 /** Build a content snapshot for a given hash (size is incidental to these tests). */
 export const content = (sha256: string): Snapshot => ({ kind: 'content', sha256, size: 1 });
+
+/** A fake daemon of this build: answers the client's version check, then hands
+ * every other connection to `handle`. */
+export function thisBuildDaemon(handle: (socket: Socket) => void): (socket: Socket) => void {
+  return (socket) => socket.once('data', (chunk) => {
+    const line = chunk.toString();
+    if (!line.endsWith('\n') || (JSON.parse(line) as { verb?: string }).verb !== 'status') {
+      socket.unshift(chunk);
+      handle(socket);
+      return;
+    }
+    void thisBuild().then((own) => socket.end(JSON.stringify({ v: 1, ok: true, ...buildFields(own) }) + '\n'));
+  });
+}
 
 /** Create a fresh temp directory that is removed when `fn` settles. */
 export async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {

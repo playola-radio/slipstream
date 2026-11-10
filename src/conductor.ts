@@ -15,7 +15,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promis
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ResponseEnvelope } from './control-protocol.ts';
-import { shellWord } from './attach-workflow.ts';
+import { shellWord } from './shell-word.ts';
 import {
   SCRIPT_KINDS, SettingsError, readLegacyScripts, readTomlScripts, removeTomlScripts, writeTomlScripts, type ScriptKind, type Scripts,
 } from './conductor-settings.ts';
