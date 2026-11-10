@@ -458,7 +458,8 @@ Bump `version` in `package.json` (and `package-lock.json`) in a `chore:` pull
 request to `develop`. Once it merges and Tests pass on that commit,
 [`publish.yml`](.github/workflows/publish.yml) publishes it to npm with
 provenance, tags the commit `v<version>`, and creates a GitHub release. A merge
-that doesn't change the version publishes nothing.
+that doesn't change the version publishes nothing. If another merge lands
+before Tests finish, the newer commit publishes instead.
 
 If the publish fails, fix the cause and run the Publish workflow by hand on
 `develop` (Actions → Publish → Run workflow); it refuses a commit Tests haven't
