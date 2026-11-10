@@ -15,9 +15,12 @@
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
-import { dirname } from 'node:path';
+import { once } from 'node:events';
+import { readFile, realpath } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { appRuntime } from './app-runtime.ts';
 import { isMainModule } from './entrypoint.ts';
-import { dispatch, parseMessage, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
+import { dispatch, parseMessage, type JsonRpcRequest, type JsonRpcResponse, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
 import { forwardAnswer } from './answer-forwarder.ts';
@@ -64,6 +67,28 @@ export interface ForwarderHandlerOpts {
   socketPath: string;
   /** The subprocess env, read once at initialize for the Claude identity triple. */
   env: Env;
+  /** Replaces this process; the app's shim after an update. Defaults to `process.execve`. */
+  execve?: (file: string, args: string[], env: Env) => void | Promise<void>;
+  /** The build the app's runtime `<root>/current` now holds, or null if unreadable. */
+  readCurrentBuild?: (root: string) => Promise<string | null>;
+}
+
+/** The env var a replaced forwarder hands its successor the call it was answering. */
+export const REPLAY_ENV = 'SLIPSTREAM_MCP_REPLAY';
+
+interface Replay { initialize: JsonRpcRequest | null; call: JsonRpcRequest }
+
+async function currentBuild(root: string): Promise<string | null> {
+  try {
+    return (await readFile(join(await realpath(join(root, 'current')), 'app', 'dist', 'build-id'), 'utf8')).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function execveAfterFlush(file: string, args: string[], env: Env): Promise<void> {
+  if (process.stdout.writableLength > 0) await once(process.stdout, 'drain');
+  process.execve!(file, args, env);
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -80,20 +105,45 @@ function stringArg(params: unknown, key: string): string {
 
 export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers {
   const ctx = createHarnessContext();
+  const execve = opts.execve ?? execveAfterFlush;
+  const readCurrentBuild = opts.readCurrentBuild ?? currentBuild;
+  let initialized: JsonRpcRequest | null = null;
+
+  /** After an app update the daemon runs the new build and this process is the
+   * stale side: hand the call to the new shim instead of answering a mismatch. */
+  const replaceIfStale = async (call: JsonRpcRequest) => {
+    const runtime = appRuntime(opts.env);
+    if (!runtime) return;
+    const current = await readCurrentBuild(runtime.root);
+    if (current === null || current === (await thisBuild()).build) return;
+    const replay: Replay = { initialize: initialized, call };
+    try {
+      await execve(runtime.mcp, [runtime.mcp, ...process.argv.slice(2)],
+        { ...opts.env, [REPLAY_ENV]: Buffer.from(JSON.stringify(replay)).toString('base64') });
+    } catch (err) {
+      process.stderr.write(`slipstream-forwarder: could not switch to ${runtime.mcp}: ${(err as Error).message}\n`);
+    }
+  };
 
   return {
     serverInfo: { name: 'slipstream-forwarder', version: '0.0.0' },
     protocolVersion: '2025-06-18',
     tools: [BEGIN_TASK_TOOL, ANSWER_QUESTION_TOOL],
     onInitialize: (params) => {
+      initialized = { jsonrpc: '2.0', method: 'initialize', params };
       const clientInfo = isObject(params) ? params.clientInfo : undefined;
       ctx.initialize(clientInfo, opts.env);
     },
-    callTool: (name, params) => {
+    callTool: (name, params, id) => {
       const identity = ctx.identityForCall(params);
       const raw = (request: RequestEnvelope) => sendControlRequest({ socketPath: opts.socketPath, request });
-      const send = async (request: RequestEnvelope) =>
-        versionGate(raw, dirname(opts.socketPath), await thisBuild())(request);
+      const send = async (request: RequestEnvelope) => {
+        const response = await versionGate(raw, dirname(opts.socketPath), await thisBuild())(request);
+        if (!response.ok && response.code === 'DAEMON_VERSION_MISMATCH') {
+          await replaceIfStale({ jsonrpc: '2.0', id, method: 'tools/call', params });
+        }
+        return response;
+      };
       return name === ANSWER_QUESTION_TOOL.name
         ? forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send })
         : forwardBeginTask({ identity, title: stringArg(params, 'title'), send });
@@ -147,6 +197,21 @@ export function createStdinFramer(maxBytes: number = MAX_STDIN_LINE_BYTES) {
   };
 }
 
+/** A replaced forwarder's successor answers the call its predecessor was holding,
+ * under the original id; the saved initialize only primes the identity. */
+async function answerReplay(text: string, handlers: McpHandlers, write: (res: JsonRpcResponse) => void): Promise<void> {
+  let saved: Replay;
+  try {
+    saved = JSON.parse(Buffer.from(text, 'base64').toString('utf8')) as Replay;
+  } catch (err) {
+    process.stderr.write(`slipstream-forwarder: ${REPLAY_ENV} is unreadable: ${(err as Error).message}\n`);
+    return;
+  }
+  if (saved.initialize) await dispatch(saved.initialize, handlers);
+  const res = await dispatch(saved.call, handlers);
+  if (res) write(res);
+}
+
 export async function runForwarder(): Promise<void> {
   let socketPath: string;
   try {
@@ -157,9 +222,13 @@ export async function runForwarder(): Promise<void> {
     return;
   }
 
+  const replay = process.env[REPLAY_ENV];
+  delete process.env[REPLAY_ENV];
   const handlers = createForwarderHandlers({ socketPath, env: process.env });
-  const writeError = (code: number, message: string) =>
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code, message } }) + '\n');
+  const write = (res: JsonRpcResponse) => process.stdout.write(JSON.stringify(res) + '\n');
+  const writeError = (code: number, message: string) => write({ jsonrpc: '2.0', id: null, error: { code, message } });
+
+  if (replay !== undefined) await answerReplay(replay, handlers, write);
 
   const framer = createStdinFramer();
   for await (const chunk of process.stdin) {
@@ -174,7 +243,7 @@ export async function runForwarder(): Promise<void> {
         continue;
       }
       const res = await dispatch(parsed.value, handlers);
-      if (res) process.stdout.write(JSON.stringify(res) + '\n');
+      if (res) write(res);
     }
   }
 }

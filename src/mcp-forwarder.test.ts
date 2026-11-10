@@ -1,12 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createForwarderHandlers, createStdinFramer, type StdinFrame } from './mcp-forwarder.ts';
 import { dispatch, type JsonRpcRequest, type JsonRpcResponse } from './mcp-protocol.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import { thisBuild } from './daemon-version.ts';
 import { thisBuildDaemon } from './test/helpers.ts';
 
 /** A fake daemon that speaks the control protocol over a unix socket: it records
@@ -236,5 +239,104 @@ test('a down daemon fails fast as DAEMON_UNAVAILABLE rather than hanging', async
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(worktree, { recursive: true, force: true });
+  }
+});
+
+/** A daemon too old to report its build, so every gated call is a mismatch. */
+async function olderDaemon(): Promise<{ socketPath: string; close: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-fwd-old-'));
+  const server = createServer((socket) => socket.once('data', () => socket.end(JSON.stringify({ v: 1, ok: true }) + '\n')));
+  const socketPath = join(dir, 'control.sock');
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  return { socketPath, close: async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  } };
+}
+
+function appForwarder(socketPath: string, currentBuild: string | null, env: Record<string, string> = { SLIPSTREAM_APP_RUNTIME: '/rt' }) {
+  const execs: { file: string; args: string[]; env: Record<string, string | undefined> }[] = [];
+  const handlers = createForwarderHandlers({
+    socketPath, env,
+    execve: (file, args, env) => { execs.push({ file, args, env }); },
+    readCurrentBuild: async (root) => (root === '/rt' ? currentBuild : null),
+  });
+  return { handlers, execs };
+}
+
+test('forwarderReplacesItselfOnNewerBuild', async () => {
+  const daemon = await olderDaemon();
+  try {
+    const { handlers, execs } = appForwarder(daemon.socketPath, 'a-newer-build');
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    await dispatch(callBeginTask({ title: 't' }, CODEX_META), handlers);
+
+    assert.equal(execs.length, 1);
+    const [exec] = execs;
+    assert.equal(exec!.file, '/rt/bin/slipstream-mcp');
+    assert.deepEqual(exec!.args, ['/rt/bin/slipstream-mcp', ...process.argv.slice(2)]);
+    assert.equal(exec!.env.SLIPSTREAM_APP_RUNTIME, '/rt');
+    const replay = JSON.parse(Buffer.from(exec!.env.SLIPSTREAM_MCP_REPLAY!, 'base64').toString('utf8'));
+    assert.deepEqual(replay, {
+      initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
+      call: callBeginTask({ title: 't' }, CODEX_META),
+    });
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('forwarderDoesNotReplaceOnSameBuild', async () => {
+  const daemon = await olderDaemon();
+  try {
+    const { handlers, execs } = appForwarder(daemon.socketPath, (await thisBuild()).build);
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    const res = resultOf(await dispatch(callBeginTask({ title: 't' }, CODEX_META), handlers));
+
+    assert.equal(execs.length, 0);
+    assert.equal(res.isError, true);
+    assert.match(res.text, /DAEMON_VERSION_MISMATCH/);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('outside the Slipstream app a mismatch never replaces the forwarder', async () => {
+  const daemon = await olderDaemon();
+  try {
+    const { handlers, execs } = appForwarder(daemon.socketPath, 'a-newer-build', {});
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    const res = resultOf(await dispatch(callBeginTask({ title: 't' }, CODEX_META), handlers));
+
+    assert.equal(execs.length, 0);
+    assert.match(res.text, /DAEMON_VERSION_MISMATCH/);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('replayAnswersPendingCallOnce', async () => {
+  const daemon = await fakeDaemon(OK);
+  try {
+    const replay = Buffer.from(JSON.stringify({
+      initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
+      call: { ...callBeginTask({ title: 'replayed' }, CODEX_META), id: 'call-41' },
+    })).toString('base64');
+    const forwarder = fileURLToPath(new URL('./mcp-forwarder.ts', import.meta.url));
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = execFile(process.execPath, [forwarder, '--store', dirname(daemon.socketPath)],
+        { env: { PATH: process.env.PATH, SLIPSTREAM_MCP_REPLAY: replay }, timeout: 10_000 },
+        (err, out) => (err ? reject(err) : resolve(out)));
+      child.stdin!.end();
+    });
+
+    const lines = stdout.trim().split('\n').map((l) => JSON.parse(l) as JsonRpcResponse);
+    assert.equal(lines.length, 1, stdout);
+    assert.equal(lines[0]!.id, 'call-41');
+    assert.equal(resultOf(lines[0]!).isError, false);
+    assert.equal(daemon.received[0]!.title, 'replayed');
+    assert.equal(daemon.received[0]!.harness, 'codex');
+  } finally {
+    await daemon.close();
   }
 });

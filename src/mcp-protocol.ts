@@ -49,7 +49,7 @@ export interface McpHandlers {
   protocolVersion: string;
   tools: ToolDef[];
   onInitialize(params: unknown): void;
-  callTool(name: string, params: unknown): Promise<ToolResult>;
+  callTool(name: string, params: unknown, id: string | number | null): Promise<ToolResult>;
 }
 
 export type ParseResult =
@@ -114,7 +114,7 @@ export async function dispatch(req: JsonRpcRequest, h: McpHandlers): Promise<Jso
         const name = req.params.name;
         const found = h.tools.some((t) => t.name === name);
         if (!found) return err(id, -32602, `unknown tool: ${name}`);
-        const out = await h.callTool(name, req.params);
+        const out = await h.callTool(name, req.params, id);
         const result: Record<string, unknown> = {
           content: [{ type: 'text', text: out.text }],
           isError: out.isError ?? false,
