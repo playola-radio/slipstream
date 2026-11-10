@@ -452,6 +452,19 @@ npm run test:tools
 [TESTING.md](TESTING.md) covers the test layout and the fake filesystem the fast
 tier uses.
 
+### Releasing
+
+Bump `version` in `package.json` (and `package-lock.json`) in a `chore:` pull
+request to `develop`. Once it merges and Tests pass on that commit,
+[`publish.yml`](.github/workflows/publish.yml) publishes it to npm with
+provenance, tags the commit `v<version>`, and creates a GitHub release. A merge
+that doesn't change the version publishes nothing.
+
+If the publish fails, fix the cause and run the Publish workflow by hand on
+`develop` (Actions → Publish → Run workflow); it refuses a commit Tests haven't
+passed on. If only the tag or release failed, use "Re-run failed jobs" on that
+run instead.
+
 ### Design documents
 
 | Document | Covers |
