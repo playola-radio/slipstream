@@ -19,6 +19,9 @@ function record(value: unknown): Record<string, unknown> | null {
  * complete bounded line is parsed; the first identity record fixes the root
  * cwd and identity, while later records must not conflict with the binding.
  * A later cwd may move inside the root (the chat ran `cd`) but not out of it.
+ * Once the identity record is verified, a later line too long or malformed to
+ * check (such as a large early tool result) ends the scan; it can never shrink,
+ * so failing on it would make the chat permanently unlinkable.
  */
 export async function verifyClaudeRootTranscript(path: string, sessionId: string, worktree: string): Promise<ClaudeRootResult> {
   let handle;
@@ -38,13 +41,14 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
     let version: string | undefined;
     let entrypoint: string | undefined;
     let rootCwd: string | undefined;
+    const unchecked = (): ClaudeRootResult => version === undefined ? { ok: false, reason: 'gap' } : { ok: true };
     for (let i = 0; i < total && lines < HEAD_SCAN_LINES; i += 1) {
       if (bytes[i] !== 0x0a) continue;
-      if (i - start > HEAD_LINE_CAP || i >= HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
+      if (i - start > HEAD_LINE_CAP || i >= HEAD_SCAN_BYTES) return unchecked();
       let parsed: Record<string, unknown> | null;
       try { parsed = record(JSON.parse(FATAL_UTF8.decode(bytes.subarray(start, i)))); }
-      catch { return { ok: false, reason: 'gap' }; }
-      if (!parsed) return { ok: false, reason: 'gap' };
+      catch { return unchecked(); }
+      if (!parsed) return unchecked();
       lines += 1;
       start = i + 1;
       if (Object.hasOwn(parsed, 'sessionId') && parsed.sessionId !== sessionId) return { ok: false, reason: 'mismatch' };
@@ -78,8 +82,8 @@ export async function verifyClaudeRootTranscript(path: string, sessionId: string
         }
       }
     }
-    if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return { ok: false, reason: 'gap' };
-    if (lines < HEAD_SCAN_LINES && total - start > HEAD_LINE_CAP) return { ok: false, reason: 'gap' };
+    if (lines < HEAD_SCAN_LINES && total > HEAD_SCAN_BYTES) return unchecked();
+    if (lines < HEAD_SCAN_LINES && total - start > HEAD_LINE_CAP) return unchecked();
     // A torn record inside the bounded head may still be written; attach is retryable.
     if (lines < HEAD_SCAN_LINES && start < total) return { ok: false, reason: 'not-yet' };
     if (version === undefined) return { ok: false, reason: lines === HEAD_SCAN_LINES ? 'gap' : 'not-yet' };

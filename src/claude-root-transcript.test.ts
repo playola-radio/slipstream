@@ -122,6 +122,25 @@ it('accepts a completed matching tail and leaves bytes after the bounded 64 reco
   });
 });
 
+it('stops at a later line the bounds cannot check once the identity record is verified', async () => {
+  await withFixture(async ({ root, path }) => {
+    const oversized = line({ ...identity(root), message: 'x'.repeat(256 * 1024) });
+    const check = async (body: string, expected: unknown) => {
+      await writeFile(path, body);
+      assert.deepEqual(await verifyClaudeRootTranscript(path, sessionId, root), expected);
+    };
+    await check(line(preamble()) + line(identity(root)) + oversized + line(preamble()), { ok: true });
+    await check(line(preamble()) + line(identity(root)) + '{bad}\n' + line(preamble()), { ok: true });
+    await check(line(preamble()) + line(identity(root)) + 'x'.repeat(256 * 1024 + 1), { ok: true });
+    await check(line(preamble()) + line(identity(root))
+      + Array.from({ length: 17 }, () => line({ ...preamble(), message: 'x'.repeat(250 * 1024) })).join(''), { ok: true });
+    await check(line(preamble()) + oversized + line(identity(root)), { ok: false, reason: 'gap' });
+    await check(line(preamble()) + line(identity(root)) + line(preamble('queue-operation', 'other')) + oversized,
+      { ok: false, reason: 'mismatch' });
+    await check(line(preamble()) + line(identity(root)) + '{"type":"user"', { ok: false, reason: 'not-yet' });
+  });
+});
+
 it('fails closed on unavailable, incomplete, malformed, and contradictory bounded evidence', async () => {
   await withFixture(async ({ dir, root, path }) => {
     const check = async (body: string | Buffer, reason: string) => {
@@ -140,7 +159,6 @@ it('fails closed on unavailable, incomplete, malformed, and contradictory bounde
     await check(line(preamble()) + line(identity(root)) + line({ ...identity(root), sessionId: 'other' }), 'mismatch');
     await check(line(preamble()) + line(identity(root)) + '{"sessionId":"other"', 'not-yet');
     await check(line(preamble()) + line(identity(root)) + '{"sessionId":"other"}\n', 'mismatch');
-    await check(line(preamble()) + line(identity(root)) + 'x'.repeat(256 * 1024 + 1), 'gap');
     await check(Array.from({ length: 62 }, () => line(preamble())).join('') + line(identity(root)) + '{"sessionId":"other"', 'not-yet');
     await check(line(preamble()) + line({ ...identity(root), cwd: dir }), 'mismatch');
     await check(line(preamble()) + line({ ...identity(root), isSidechain: true }), 'mismatch');
