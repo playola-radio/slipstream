@@ -16,7 +16,7 @@ test('package.json exposes both bin commands as compiled dist entrypoints', asyn
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { bin?: Record<string, string> };
 
   assert.deepEqual(manifest.bin, {
-    slipstream: './dist/cli.js',
-    'slipstream-mcp': './dist/mcp-forwarder.js',
+    slipstream: 'dist/cli.js',
+    'slipstream-mcp': 'dist/mcp-forwarder.js',
   });
 });
