@@ -91,6 +91,7 @@ type Args =
   | { command: 'watch'; dir: string; store: string }
   | { command: 'serve'; dir: string; store: string }
   | { command: 'view' }
+  | { command: 'version' }
   | { command: 'start'; store: string; configPath?: string; overrides: ConfigOverrides }
   | { command: 'status'; store: string; target?: string }
   | { command: 'detach'; store: string; target: string }
@@ -386,6 +387,7 @@ export function parseArgs(argv: string[]): Args | null {
     return store === null ? null : { command, action: argv[1] as WorkspaceAction, dir: resolve(dir), store };
   }
   if (command === 'view') return { command: 'view' };
+  if (command === '--version' && argv.length === 1) return { command: 'version' };
   return null;
 }
 
@@ -395,7 +397,8 @@ async function countRecords(logPath: string): Promise<number> {
 }
 
 function usage(): void {
-  console.error('Usage: slipstream watch  [dir] [--store <dir>]');
+  console.error('Usage: slipstream --version');
+  console.error('       slipstream watch  [dir] [--store <dir>]');
   console.error('       slipstream serve  [dir] [--store <dir>]');
   console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
@@ -864,6 +867,11 @@ async function main(): Promise<void> {
   if (!args) {
     usage();
     process.exitCode = 2;
+    return;
+  }
+
+  if (args.command === 'version') {
+    console.log(await packageVersion());
     return;
   }
 

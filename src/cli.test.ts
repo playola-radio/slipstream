@@ -278,6 +278,27 @@ describe('cli', () => {
       assert.deepEqual(parseArgs(['watch', '/w', '--store', '/s']),
         { command: 'watch', dir: '/w', store: '/s' });
     });
+
+    it('parses the Slipstream app\'s service install and adopt-app with a store', () => {
+      assert.deepEqual(parseArgs(['service', 'install', '--store', '/s']), { command: 'service-install', store: '/s' });
+      assert.deepEqual(parseArgs(['adopt-app', '--store', '/s']), { command: 'adopt-app', store: '/s' });
+      assert.equal(parseArgs(['service', 'install', 'extra']), null);
+    });
+
+    it('parses --version', () => {
+      assert.deepEqual(parseArgs(['--version']), { command: 'version' });
+      assert.equal(parseArgs(['--version', 'extra']), null);
+    });
+  });
+
+  it('prints the package version for --version', async () => {
+    const { execFile } = await import('node:child_process');
+    const { readFile } = await import('node:fs/promises');
+    const { version } = JSON.parse(await readFile('package.json', 'utf8')) as { version: string };
+    const stdout = await new Promise<string>((done, fail) => {
+      execFile(process.execPath, ['src/cli.ts', '--version'], (err, out) => err ? fail(err) : done(out));
+    });
+    assert.equal(stdout, `${version}\n`);
   });
 });
 
