@@ -49,6 +49,13 @@ npm install -g @playola-radio/slipstream
 This installs two commands: `slipstream`, and `slipstream-mcp` (the connector
 agents use, see [Group changes by task](#group-changes-by-task)).
 
+**Upgrading:** run the same command. An upgrade leaves the old background
+daemon running, and the new `slipstream` refuses to use a daemon of another
+version. If `slipstream conductor install` set the daemon up, the next command
+restarts it on the new version, and its recordings resume with a marked gap.
+Otherwise the command stops and prints which process to stop; stop it and run
+the command again. `slipstream status` shows both versions.
+
 **From a clone:** run `npm ci`, then `npm run slipstream -- <command>`. That
 runs the TypeScript sources directly, with no build step. To put a clone's
 commands on your PATH, run `npm run build && npm link`. Rebuild after pulling,
