@@ -429,12 +429,17 @@ async function planCodexTool(path: string, node: string, args: string[]): Promis
   const text = await readWorkspaceConfig(path);
   const existing = codexToolMatches(path, text, node, args, 'workspace');
   if (existing) return null;
-  const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
-    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
+  const block = codexServerBlock(node, args);
   if (text === null) return { path, text: block, original: null };
   const lines = text.split('\n');
   const sep = text === '' ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
   return { path, text: `${text}${sep}${block}`, original: text };
+}
+
+/** Slipstream's own Codex server table, as attach writes it. */
+export function codexServerBlock(command: string, args: string[]): string {
+  return `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(command)}\n`
+    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
 }
 
 async function readCodexTool(path: string, node: string, args: string[], scope: string): Promise<boolean> {
@@ -443,8 +448,7 @@ async function readCodexTool(path: string, node: string, args: string[], scope: 
 
 function codexToolMatches(path: string, text: string | null, node: string, args: string[], scope: string): boolean {
   if (text === null) return false;
-  const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
-    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
+  const block = codexServerBlock(node, args);
   const lines = text.split('\n');
   const header = lines.findIndex((l) => l.trim() === '[mcp_servers.slipstream]');
   if (header >= 0) {

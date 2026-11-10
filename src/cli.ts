@@ -31,6 +31,7 @@
  * The background daemon on its own, as the Slipstream app installs it:
  *
  *   slipstream service install [--store <dir>]
+ *   slipstream adopt-app [--store <dir>]   (move attach's hooks and answer tools onto the app's commands)
  *
  * Workspaces without Conductor: a git worktree under ~/slipstream/workspaces,
  * set up and recorded, and later archived.
@@ -75,6 +76,7 @@ import {
 import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
 import { agentEntries } from './app-runtime.ts';
+import { runAdoptApp } from './adopt-app.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
@@ -102,6 +104,7 @@ type Args =
   | { command: 'gc'; store: string }
   | { command: 'conductor'; action: ConductorAction; store: string }
   | { command: 'service-install'; store: string }
+  | { command: 'adopt-app'; store: string }
   | { command: 'workspace'; action: WorkspaceAction; dir: string; store: string };
 
 const CONDUCTOR_ACTIONS = ['install', 'setup', 'archive', 'enroll'] as const;
@@ -372,6 +375,10 @@ export function parseArgs(argv: string[]): Args | null {
     const store = parseStoreOnly(argv.slice(2));
     return store === null ? null : { command: 'service-install', store };
   }
+  if (command === 'adopt-app') {
+    const store = parseStoreOnly(argv.slice(1));
+    return store === null ? null : { command, store };
+  }
   if (command === 'workspace' && (WORKSPACE_ACTIONS as readonly string[]).includes(argv[1] ?? '')) {
     const dir = argv[2];
     if (dir === undefined || dir.startsWith('--')) return null;
@@ -404,6 +411,7 @@ function usage(): void {
   console.error('       slipstream conductor enroll  [--store <dir>]   (capture every existing Conductor workspace)');
   console.error('       slipstream conductor setup|archive [--store <dir>]   (run by Conductor\'s scripts)');
   console.error('       slipstream service install [--store <dir>]   (the background daemon\'s LaunchAgent, without Conductor)');
+  console.error('       slipstream adopt-app [--store <dir>]   (run by the Slipstream app: hooks and answer tools onto its commands)');
   console.error('       slipstream workspace create <repo-dir> [--store <dir>]   (new worktree under ~/slipstream/workspaces)');
   console.error('       slipstream workspace archive <workspace-dir> [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
@@ -819,6 +827,17 @@ async function runIdentity(store: string, request: Record<string, unknown> & { v
   }
 }
 
+/** Run a helper command such as `claude mcp` in a directory; a command that
+ * cannot start (not on PATH, say) has a null code and its error as output. */
+function runIn(command: string, commandArgs: string[], cwd: string): Promise<{ code: number | null; output: string }> {
+  return new Promise((done) => {
+    execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
+      const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
+      done({ code, output: `${stdout}${stderr}` || (err?.message ?? '') });
+    });
+  });
+}
+
 /** `slipstream attach` without identity flags connects the chat it runs in. */
 async function runThisChatAttach(dir: string, store: string): Promise<void> {
   const send = await daemonSend(store);
@@ -830,12 +849,7 @@ async function runThisChatAttach(dir: string, store: string): Promise<void> {
       err: (line) => console.error(line),
       ...await daemonStarter(store, cliPath),
       control: (request) => send({ v: 1, ...request }),
-      run: (command, commandArgs, cwd) => new Promise((done) => {
-        execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
-          const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
-          done({ code, output: `${stdout}${stderr}` });
-        });
-      }),
+      run: runIn,
     });
   } catch (err) {
     if (!(err instanceof OutcomeUnknownError)) throw err;
@@ -948,6 +962,12 @@ async function main(): Promise<void> {
 
   if (args.command === 'service-install') {
     process.exitCode = await runServiceInstall(args.store);
+    return;
+  }
+
+  if (args.command === 'adopt-app') {
+    process.exitCode = await runAdoptApp({ env: process.env, home: homedir(), store: args.store,
+      run: runIn, out: (line) => console.log(line), err: (line) => console.error(line) });
     return;
   }
 
