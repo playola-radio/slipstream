@@ -204,3 +204,29 @@ export function kickstartLaunchAgent(uid: number, run: Run, restart = false): { 
       .then((r) => r.code === 0 ? new Promise<never>(() => {}) : r.code),
   };
 }
+
+export interface ServiceDeps {
+  execPath: string;
+  nodeVersion: string;
+  cliPath: string;
+  home: string;
+  store: string;
+  uid: number;
+  packageVersion: string;
+  run: Run;
+}
+
+/** Install the LaunchAgent on these paths and start it if launchd has it
+ * stopped. The install record keeps whatever repos it already lists. */
+export async function installService(deps: ServiceDeps): Promise<LaunchAgentResult> {
+  const paths = await entryPaths(deps.execPath, deps.nodeVersion, deps.cliPath);
+  const prior = await readManagedInstall(deps.store);
+  const agent = await installLaunchAgent({ ...paths, home: deps.home, store: deps.store, uid: deps.uid }, deps.run);
+  await writeManagedInstall(deps.store,
+    { version: 1, package_version: deps.packageVersion, ...paths, log: agent.log, repos: prior?.repos ?? [] });
+  const started = await deps.run('launchctl', ['kickstart', `gui/${deps.uid}/${LAUNCH_AGENT_LABEL}`]);
+  if (started.code !== 0) {
+    throw new InstallError(`launchctl could not start the daemon (exit ${started.code}): ${started.output.trim()}`);
+  }
+  return agent;
+}

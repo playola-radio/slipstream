@@ -28,6 +28,10 @@
  *
  *   slipstream conductor install|setup|archive|enroll [--store <dir>]
  *
+ * The background daemon on its own, as the Slipstream app installs it:
+ *
+ *   slipstream service install [--store <dir>]
+ *
  * Workspaces without Conductor: a git worktree under ~/slipstream/workspaces,
  * set up and recorded, and later archived.
  *
@@ -59,7 +63,7 @@ import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
 import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
 import { DaemonUnavailableError, ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
-import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
+import { InstallError, installService, kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
 import {
   checkDaemonBuild, describeBuild, mismatchMessage, remedyFor, reportedBuild, sameBuild, thisBuild, versionGate,
   type Build, type Send,
@@ -97,6 +101,7 @@ type Args =
   | { command: 'delete'; store: string; sessionId: string }
   | { command: 'gc'; store: string }
   | { command: 'conductor'; action: ConductorAction; store: string }
+  | { command: 'service-install'; store: string }
   | { command: 'workspace'; action: WorkspaceAction; dir: string; store: string };
 
 const CONDUCTOR_ACTIONS = ['install', 'setup', 'archive', 'enroll'] as const;
@@ -363,6 +368,10 @@ export function parseArgs(argv: string[]): Args | null {
     const store = parseStoreOnly(argv.slice(2));
     return store === null ? null : { command, action: argv[1] as ConductorAction, store };
   }
+  if (command === 'service' && argv[1] === 'install') {
+    const store = parseStoreOnly(argv.slice(2));
+    return store === null ? null : { command: 'service-install', store };
+  }
   if (command === 'workspace' && (WORKSPACE_ACTIONS as readonly string[]).includes(argv[1] ?? '')) {
     const dir = argv[2];
     if (dir === undefined || dir.startsWith('--')) return null;
@@ -394,6 +403,7 @@ function usage(): void {
   console.error('       slipstream conductor install [--store <dir>]   (LaunchAgent + Conductor setup/archive scripts)');
   console.error('       slipstream conductor enroll  [--store <dir>]   (capture every existing Conductor workspace)');
   console.error('       slipstream conductor setup|archive [--store <dir>]   (run by Conductor\'s scripts)');
+  console.error('       slipstream service install [--store <dir>]   (the background daemon\'s LaunchAgent, without Conductor)');
   console.error('       slipstream workspace create <repo-dir> [--store <dir>]   (new worktree under ~/slipstream/workspaces)');
   console.error('       slipstream workspace archive <workspace-dir> [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
@@ -699,6 +709,28 @@ async function packageVersion(): Promise<string> {
   return (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 }
 
+async function runServiceInstall(store: string): Promise<number> {
+  if (!process.getuid) {
+    console.error('slipstream: `service install` needs macOS launchd.');
+    return 1;
+  }
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  const version = await packageVersion();
+  try {
+    const agent = await installService({ execPath: process.execPath, nodeVersion: process.versions.node, cliPath,
+      home: homedir(), store, uid: process.getuid(), packageVersion: version, run: runCommand });
+    console.log(`LaunchAgent: ${agent.plist}${agent.reloaded ? ' (loaded; the daemon was started on these paths)' : ' (unchanged)'}`);
+    console.log(`Daemon log: ${agent.log}`);
+    console.log(`Node: ${process.execPath}`);
+    console.log(`Slipstream: ${cliPath} (${version})`);
+    return 0;
+  } catch (err) {
+    if (!(err instanceof InstallError)) throw err;
+    console.error(`slipstream: ${err.message}`);
+    return 1;
+  }
+}
+
 async function runConductor(action: ConductorAction, store: string): Promise<number> {
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   const send = await daemonSend(store);
@@ -911,6 +943,11 @@ async function main(): Promise<void> {
 
   if (args.command === 'conductor') {
     process.exitCode = await runConductor(args.action, args.store);
+    return;
+  }
+
+  if (args.command === 'service-install') {
+    process.exitCode = await runServiceInstall(args.store);
     return;
   }
 
