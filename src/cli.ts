@@ -61,6 +61,10 @@ import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.t
 import { DaemonUnavailableError, ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
 import {
+  checkDaemonBuild, describeBuild, mismatchMessage, remedyFor, reportedBuild, sameBuild, thisBuild, versionGate,
+  type Build, type Send,
+} from './daemon-version.ts';
+import {
   InventoryError, readConductorInventory, runConductorArchive, runConductorEnroll, runConductorInstall, runConductorSetup,
   sharedScripts,
 } from './conductor.ts';
@@ -464,7 +468,7 @@ async function runAskControl(store: string, request: AskInput & {
   verb: 'ask'; session_id: string; request_id: string;
 }): Promise<void> {
   try {
-    const res = await sendControlRequest({ socketPath: controlSocketPath(store), request: { v: 1, ...request } });
+    const res = await (await daemonSend(store))({ v: 1, ...request });
     if (!isAskAcknowledgment(res, request.session_id, request.request_id)) {
       throw new OutcomeUnknownError('daemon reply was not a valid ask acknowledgment');
     }
@@ -543,11 +547,10 @@ export function retryGuidance(verb: string): string {
 }
 
 async function runControl(store: string, request: Record<string, unknown> & { verb: string },
-  printOk?: (res: Record<string, unknown>) => void): Promise<void> {
-  const socketPath = controlSocketPath(store);
+  printOk?: (res: Record<string, unknown>) => void | Promise<void>, send?: Send): Promise<void> {
   try {
-    const res = await sendControlRequest({ socketPath, request: { v: 1, ...request } });
-    if (res.ok && printOk) printOk(res);
+    const res = await (send ?? await daemonSend(store))({ v: 1, ...request });
+    if (res.ok && printOk) await printOk(res);
     else reportControl(res);
   } catch (err) {
     if (err instanceof OutcomeUnknownError) {
@@ -564,10 +567,10 @@ async function runControl(store: string, request: Record<string, unknown> & { ve
 
 /** Detach, unlink or archive: through the daemon, or recorded offline without one. */
 async function runWithdrawal(store: string, run: (deps: WithdrawDeps) => Promise<number>, verb: string): Promise<void> {
-  const socketPath = controlSocketPath(store);
+  const send = await daemonSend(store);
   try {
     process.exitCode = await run({ store, out: (line) => console.log(line), err: (line) => console.error(line),
-      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }) });
+      control: (request) => send({ v: 1, ...request }) });
   } catch (err) {
     if (!(err instanceof OutcomeUnknownError)) throw err;
     console.error(`slipstream: outcome unknown — ${err.message}`);
@@ -578,9 +581,13 @@ async function runWithdrawal(store: string, run: (deps: WithdrawDeps) => Promise
 
 type CaptureRow = Record<string, unknown> & { binding?: Record<string, unknown> | null };
 
-/** Human-readable `status`: the daemon, then one block per capture. */
-export function formatStatus(res: Record<string, unknown>): string[] {
-  const lines = [`reader_url: ${String(res.reader_url)}`];
+/** Human-readable `status`: both versions and any mismatch, the daemon, then one
+ * block per capture. */
+export function formatStatus(res: Record<string, unknown>, own: Build, mismatch: string | null): string[] {
+  const daemon = reportedBuild(res);
+  const lines = [`cli_version: ${describeBuild(own, daemon)}`, `daemon_version: ${describeBuild(daemon, own)}`];
+  if (mismatch) lines.push(`warning: ${mismatch}`);
+  lines.push(`reader_url: ${String(res.reader_url)}`);
   const slots = res.binding_slots as { used: number; limit: number } | undefined;
   if (slots) lines.push(`linked_chats: ${slots.used}/${slots.limit}`);
   const rows = res.capture ? [res.capture as CaptureRow] : (res.captures ?? []) as CaptureRow[];
@@ -600,12 +607,12 @@ export function formatStatus(res: Record<string, unknown>): string[] {
 
 /** `slipstream attach --watch-only` records a workspace without linking a chat. */
 async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<number> {
-  const socketPath = controlSocketPath(store);
+  const send = await daemonSend(store);
   try {
     return await runWatchOnlyAttach({ dir, wait }, {
       out: (line) => console.log(line),
       err: (line) => console.error(line),
-      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
+      control: (request) => send({ v: 1, ...request }),
     });
   } catch (err) {
     if (!(err instanceof OutcomeUnknownError)) throw err;
@@ -615,17 +622,29 @@ async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<
   }
 }
 
-/** Watch-only attach that first starts this store's daemon when none is running. */
-async function watchOnlyWithDaemon(dir: string, store: string, wait: boolean): Promise<number> {
+/** Starts this store's daemon when none is running, or replaces or refuses one
+ * of another build. False, with the reason printed, when there is none to use. */
+async function daemonReady(store: string): Promise<boolean> {
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   try {
     await ensureDaemon(store, await daemonStarter(store, cliPath));
+    return true;
   } catch (err) {
     if (!(err instanceof DaemonUnavailableError)) throw err;
     console.error(`slipstream: ${err.message}`);
-    return 1;
+    return false;
   }
-  return runWatchOnly(dir, store, wait);
+}
+
+/** Watch-only attach that first starts this store's daemon when none is running. */
+async function watchOnlyWithDaemon(dir: string, store: string, wait: boolean): Promise<number> {
+  return await daemonReady(store) ? runWatchOnly(dir, store, wait) : 1;
+}
+
+/** Sends control requests to the store's daemon only while it is this CLI's build. */
+async function daemonSend(store: string): Promise<Send> {
+  const socketPath = controlSocketPath(store);
+  return versionGate((request) => sendControlRequest({ socketPath, request }), store, await thisBuild());
 }
 
 const runCommand: Run = (command, commandArgs) => new Promise((done) => {
@@ -639,14 +658,30 @@ const runCommand: Run = (command, commandArgs) => new Promise((done) => {
  * manages it, so there is only ever the supervised one; otherwise detached. */
 async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaemonDeps> {
   const socketPath = controlSocketPath(store);
-  const probe = () => probeSocket(socketPath, PROBE_TIMEOUT_MS);
+  const own = await thisBuild();
+  const checks = {
+    probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
+    checkBuild: () => checkDaemonBuild((request) => sendControlRequest({ socketPath, request }), own),
+    mismatch: async (daemon: Build | null) => {
+      const remedy = await remedyFor(store, daemon, own);
+      const { uid } = remedy.restart ?? {};
+      return {
+        message: mismatchMessage(store, daemon, own, remedy.text),
+        restart: uid === undefined ? undefined : () => {
+          console.error(`slipstream: restarting the Slipstream daemon for ${store} on ${own.version} `
+            + `(it was ${describeBuild(daemon, own)}); its recordings resume with a marked gap.`);
+          return kickstartLaunchAgent(uid, runCommand, true);
+        },
+      };
+    },
+  };
   const managed = await readManagedInstall(store).catch(() => null);
   if (managed && process.getuid) {
     const uid = process.getuid();
-    return { probe, logPath: managed.log, startDaemon: () => kickstartLaunchAgent(uid, runCommand) };
+    return { ...checks, logPath: managed.log, startDaemon: () => kickstartLaunchAgent(uid, runCommand) };
   }
   return {
-    probe,
+    ...checks,
     startDaemon: () => {
       const child = spawn(process.execPath, [cliPath, 'start', '--store', store], { cwd: homedir(), detached: true, stdio: 'ignore' });
       const exited = new Promise<number | null>((done) => {
@@ -665,10 +700,10 @@ async function packageVersion(): Promise<string> {
 
 async function runConductor(action: ConductorAction, store: string): Promise<number> {
   const cliPath = await realpath(fileURLToPath(import.meta.url));
-  const socketPath = controlSocketPath(store);
+  const send = await daemonSend(store);
   const out = (line: string) => console.log(line);
   const err = (line: string) => console.error(line);
-  const control = (request: Record<string, unknown> & { verb: string }) => sendControlRequest({ socketPath, request: { v: 1, ...request } });
+  const control = (request: Record<string, unknown> & { verb: string }) => send({ v: 1, ...request });
   const ensure = async () => ensureDaemon(store, await daemonStarter(store, cliPath));
   if (action === 'install') {
     if (!process.getuid) {
@@ -714,7 +749,8 @@ async function runWorkspace(action: WorkspaceAction, dir: string, store: string)
         done({ code: err ? (typeof err.code === 'number' ? err.code : null) : 0, output: `${stdout}${stderr}` });
       });
     }),
-    record: (path) => watchOnlyWithDaemon(path, store, true),
+    prepare: async () => await daemonReady(store) ? 0 : 1,
+    record: (path) => runWatchOnly(path, store, true),
     withdraw: async (path) => {
       await runWithdrawal(store, (w) => runWithdraw({ target: path, reason: 'archived', missingOk: true }, w), 'detach');
       return Number(process.exitCode ?? 0);
@@ -734,12 +770,12 @@ async function runWorkspace(action: WorkspaceAction, dir: string, store: string)
 }
 
 async function runIdentity(store: string, request: Record<string, unknown> & { verb: 'attach'; worktree: string }): Promise<void> {
-  const socketPath = controlSocketPath(store);
+  const send = await daemonSend(store);
   try {
     process.exitCode = await runIdentityAttach(request, {
       out: (line) => console.log(line),
       err: (line) => console.error(line),
-      control: (req) => sendControlRequest({ socketPath, request: { v: 1, ...req } }),
+      control: (req) => send({ v: 1, ...req }),
       report: (res) => reportControl({ v: 1, ok: true, ...res }),
     });
   } catch (err) {
@@ -752,7 +788,7 @@ async function runIdentity(store: string, request: Record<string, unknown> & { v
 
 /** `slipstream attach` without identity flags connects the chat it runs in. */
 async function runThisChatAttach(dir: string, store: string): Promise<void> {
-  const socketPath = controlSocketPath(store);
+  const send = await daemonSend(store);
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   try {
     process.exitCode = await runAttachWorkflow({ dir, store }, {
@@ -760,7 +796,7 @@ async function runThisChatAttach(dir: string, store: string): Promise<void> {
       out: (line) => console.log(line),
       err: (line) => console.error(line),
       ...await daemonStarter(store, cliPath),
-      control: (request) => sendControlRequest({ socketPath, request: { v: 1, ...request } }),
+      control: (request) => send({ v: 1, ...request }),
       run: (command, commandArgs, cwd) => new Promise((done) => {
         execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
           const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
@@ -826,8 +862,16 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'status') {
+    // Status reports a daemon of another build rather than refusing it.
+    const own = await thisBuild();
+    const socketPath = controlSocketPath(args.store);
     await runControl(args.store, { verb: 'status', ...(args.target !== undefined ? { target: args.target } : {}) },
-      (res) => formatStatus(res).forEach((line) => console.log(line)));
+      async (res) => {
+        const daemon = reportedBuild(res);
+        const mismatch = sameBuild(daemon, own) ? null
+          : mismatchMessage(args.store, daemon, own, (await remedyFor(args.store, daemon, own)).text);
+        formatStatus(res, own, mismatch).forEach((line) => console.log(line));
+      }, (request) => sendControlRequest({ socketPath, request }));
     return;
   }
 

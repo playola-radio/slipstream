@@ -195,11 +195,12 @@ export async function installLaunchAgent(o: EntryPaths & { home: string; store: 
   return { plist, log, reloaded: true };
 }
 
-/** Ask launchd to start the managed daemon now. `exited` settles only when
- * launchd refuses, so a slow start is waited out rather than abandoned. */
-export function kickstartLaunchAgent(uid: number, run: Run): { exited: Promise<number | null> } {
+/** Ask launchd to start the managed daemon now, or with `restart` to stop the
+ * running one first (SIGTERM). `exited` settles only when launchd refuses, so a
+ * slow start is waited out rather than abandoned. */
+export function kickstartLaunchAgent(uid: number, run: Run, restart = false): { exited: Promise<number | null> } {
   return {
-    exited: run('launchctl', ['kickstart', `gui/${uid}/${LAUNCH_AGENT_LABEL}`])
+    exited: run('launchctl', ['kickstart', ...(restart ? ['-k'] : []), `gui/${uid}/${LAUNCH_AGENT_LABEL}`])
       .then((r) => r.code === 0 ? new Promise<never>(() => {}) : r.code),
   };
 }

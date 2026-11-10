@@ -6,6 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexPostToolUse, claudePostToolUse, readHookInput } from './question-hook.ts';
+import { thisBuildDaemon } from './test/helpers.ts';
 
 const callback = { hook_event_name: 'PostToolUse', session_id: 'root', cwd: '/tmp/work',
   transcript_path: '/tmp/root.jsonl', tool_name: 'Bash' };
@@ -17,7 +18,7 @@ it('sends only a proven root callback and returns hook-specific additionalContex
   const dir = await mkdtemp(join(tmpdir(), 'slip-hook-'));
   const requests: unknown[] = [];
   let responseQuestion = question;
-  const server = createServer(socket => {
+  const server = createServer(thisBuildDaemon(socket => {
     let raw = '';
     socket.on('data', chunk => {
       raw += chunk;
@@ -26,7 +27,7 @@ it('sends only a proven root callback and returns hook-specific additionalContex
         socket.end(JSON.stringify({ v: 1, ok: true, question: responseQuestion }) + '\n');
       }
     });
-  });
+  }));
   await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
   try {
     for (const bad of [{ ...callback, agent_id: null }, { ...callback, agent_type: '' },
@@ -66,7 +67,7 @@ it('routes only root Claude PostToolUse and preserves near-cap selected source b
   const dir = await mkdtemp(join(tmpdir(), 'slip-claude-hook-'));
   const requests: unknown[] = [];
   let responseQuestion: typeof question = question;
-  const server = createServer(socket => {
+  const server = createServer(thisBuildDaemon(socket => {
     let raw = '';
     socket.on('data', chunk => {
       raw += chunk;
@@ -75,7 +76,7 @@ it('routes only root Claude PostToolUse and preserves near-cap selected source b
         socket.end(JSON.stringify({ v: 1, ok: true, question: responseQuestion }) + '\n');
       }
     });
-  });
+  }));
   await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
   try {
     for (const bad of [{ ...callback, agent_id: null }, { ...callback, agent_type: null },
@@ -116,7 +117,7 @@ async function withClaimServer(run: (dir: string, reply: (q: unknown) => void, c
   const dir = await mkdtemp(join(tmpdir(), 'slip-hook-format-'));
   let responseQuestion: unknown = null;
   let count = 0;
-  const server = createServer(socket => {
+  const server = createServer(thisBuildDaemon(socket => {
     let raw = '';
     socket.on('data', chunk => {
       raw += chunk;
@@ -125,7 +126,7 @@ async function withClaimServer(run: (dir: string, reply: (q: unknown) => void, c
         socket.end(JSON.stringify({ v: 1, ok: true, question: responseQuestion }) + '\n');
       }
     });
-  });
+  }));
   await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
   try { await run(dir, q => { responseQuestion = q; }, () => count); }
   finally { await new Promise<void>(resolve => server.close(() => resolve())); await rm(dir, { recursive: true, force: true }); }
@@ -241,9 +242,9 @@ it('delivers a setup check as an instruction to return it through the answer too
   const dir = await mkdtemp(join(tmpdir(), 'slip-hook-check-'));
   const checkId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
   let reply: unknown = { v: 1, ok: true, question: null, setup_check: { check_id: checkId } };
-  const server = createServer(socket => {
+  const server = createServer(thisBuildDaemon(socket => {
     socket.on('data', () => socket.end(JSON.stringify(reply) + '\n'));
-  });
+  }));
   await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
   try {
     const output = await claudePostToolUse(callback, dir);
@@ -256,5 +257,19 @@ it('delivers a setup check as an instruction to return it through the answer too
     }
     reply = { v: 1, ok: true, question: null };
     assert.equal(await claudePostToolUse(callback, dir), null);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); await rm(dir, { recursive: true, force: true }); }
+});
+
+it('claims nothing from a daemon of another version', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-hook-old-'));
+  const verbs: string[] = [];
+  const server = createServer(socket => socket.once('data', chunk => {
+    verbs.push((JSON.parse(chunk.toString()) as { verb: string }).verb);
+    socket.end(JSON.stringify({ v: 1, ok: true, question }) + '\n');
+  }));
+  await new Promise<void>(resolve => server.listen(join(dir, 'control.sock'), resolve));
+  try {
+    assert.equal(await claudePostToolUse(callback, dir), null);
+    assert.deepEqual(verbs, ['status']);
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); await rm(dir, { recursive: true, force: true }); }
 });

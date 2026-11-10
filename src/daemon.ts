@@ -32,6 +32,7 @@ import {
 } from './capture-intent.ts';
 import { loadIntent, saveIntent } from './intent-store.ts';
 import { liveBoundary } from './reader-runtime.ts';
+import { buildFields, thisBuild } from './daemon-version.ts';
 import {
   createLineDecoder,
   encodeMessage,
@@ -333,6 +334,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   const workspaceLookup = opts.workspaceLookup ?? findWorkspaceSession;
   const transcripts = opts.transcriptScheduler ?? transcriptSchedulerFrom(opts.config);
   const socketPath = join(storeDir, 'control.sock');
+  const build = buildFields(await thisBuild());
 
   await mkdirpDurable(storeDir);
   await assertOwnerOnly(storeDir, 'dir');
@@ -642,7 +644,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
 
   async function statusFields(): Promise<Record<string, unknown>> {
     return {
-      reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'],
+      reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], ...build,
       binding_slots: { used: linkedCount(intent), limit: MAX_BINDINGS },
       captures: await statusRows(Date.now(), true),
     };
@@ -653,7 +655,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const c = await resolveTarget(req.target);
     if (isErrorFields(c)) return c;
     const capture = (await statusRows(Date.now(), true)).find((row) => row.session_id === c.id)!;
-    return { reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], capture };
+    return { reader_url: readerRef.url, attach_features: ['agent-connection-v1', 'capture-table-v1'], ...build, capture };
   }
 
   /** A target is a session id or a root path. The id is authoritative; a path

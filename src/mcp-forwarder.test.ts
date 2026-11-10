@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createForwarderHandlers, createStdinFramer, type StdinFrame } from './mcp-forwarder.ts';
 import { dispatch, type JsonRpcRequest, type JsonRpcResponse } from './mcp-protocol.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import { thisBuildDaemon } from './test/helpers.ts';
 
 /** A fake daemon that speaks the control protocol over a unix socket: it records
  * each envelope it receives and replies with a scripted response. */
@@ -16,7 +17,7 @@ async function fakeDaemon(
   const dir = await mkdtemp(join(tmpdir(), 'slip-fwd-'));
   const socketPath = join(dir, 'control.sock');
   const received: Array<Record<string, unknown>> = [];
-  const server: Server = createServer((socket) => {
+  const server: Server = createServer(thisBuildDaemon((socket) => {
     let buf = '';
     socket.on('data', (chunk) => {
       buf += chunk.toString('utf8');
@@ -29,7 +30,7 @@ async function fakeDaemon(
         socket.write(JSON.stringify(reply) + '\n');
       }
     });
-  });
+  }));
   await new Promise<void>((resolve) => server.listen(socketPath, resolve));
   return {
     socketPath,
@@ -104,6 +105,30 @@ test('Codex: per-call _meta identity flows through to the daemon', async () => {
     assert.equal(env.worktree, '/repos/edinburgh-v1');
   } finally {
     await daemon.close();
+  }
+});
+
+test('an older daemon gets no task, and the tool says which versions differ', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'slip-fwd-old-'));
+  const verbs: string[] = [];
+  const server = createServer((socket) => socket.once('data', (chunk) => {
+    verbs.push((JSON.parse(chunk.toString()) as { verb: string }).verb);
+    socket.end(JSON.stringify({ v: 1, ok: true }) + '\n');
+  }));
+  await new Promise<void>((resolve) => server.listen(join(dir, 'control.sock'), resolve));
+  try {
+    const handlers = createForwarderHandlers({ socketPath: join(dir, 'control.sock'), env: {} });
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    const res = resultOf(await dispatch(callBeginTask({ title: 't' }, { threadId: 'thread-9',
+      'x-codex-turn-metadata': { workspaces: { '/repos/w': { role: 'primary' } } } }), handlers));
+
+    assert.equal(res.isError, true);
+    assert.match(res.text, /DAEMON_VERSION_MISMATCH/);
+    assert.match(res.text, /is an older version/);
+    assert.deepEqual(verbs, ['status']);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

@@ -13,6 +13,7 @@ import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
+import { shellWord } from './shell-word.ts';
 import { DaemonUnavailableError, ensureDaemon as ensureStoreDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 
 type Harness = 'claude-code' | 'codex';
@@ -64,7 +65,6 @@ async function attachThisChat(opts: { dir: string; store: string }, deps: Attach
   await ensureDaemon(opts.store, deps);
   const status = await deps.control({ verb: 'status' });
   if (!status.ok) throw new Refusal(`${status.code}: ${status.message}`);
-  requireCaptureTable(status, opts.store);
 
   // A status snapshot can predict a refusal, but slots may free before attach.
   const deferredConfig = refusalExpected(status, chat, worktree);
@@ -200,15 +200,6 @@ function stillPending(worktree: string, id: string, deps: WaitDeps): number {
   return PENDING_EXIT;
 }
 
-function requireCaptureTable(status: Record<string, unknown>, store: string): void {
-  const features = status.attach_features;
-  if (Array.isArray(features) && features.includes('agent-connection-v1') && features.includes('capture-table-v1')) return;
-  throw new Refusal('the running daemon does not support multi-workspace capture and chat setup checks. Stop it '
-    + `(end the \`slipstream start --store ${shellWord(store)}\` process, or run \`slipstream conductor install\` to restart `
-    + `a managed daemon on this version), then run \`slipstream attach --store ${shellWord(store)}\` again. `
-    + 'Nothing was installed or recorded.');
-}
-
 interface StatusRow { root?: unknown; state?: unknown;
   binding?: { harness?: unknown; harness_session_id?: unknown; state?: unknown } | null }
 
@@ -316,10 +307,6 @@ async function ensureDaemon(store: string, deps: AttachDeps): Promise<void> {
     if (err instanceof DaemonUnavailableError) throw new Refusal(err.message);
     throw err;
   }
-}
-
-export function shellWord(value: string): string {
-  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 interface ConfigPlan { hookEdit: Edit | null; toolEdit: Edit | null; claudeTool: string[] | null }

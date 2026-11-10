@@ -36,7 +36,7 @@
     "test:os": "node --test --test-concurrency=1 'src/**/*.os.test.ts'",
     "test:tools": "node --test --test-concurrency=1 'tools/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node -e \"require('node:fs').writeFileSync('dist/build-id', require('node:crypto').randomUUID() + '\\n')\"",
     "prepack": "npm run build",
     "bench": "node src/bench.ts",
     "slipstream": "node src/cli.ts",

@@ -144,6 +144,13 @@ describe('the LaunchAgent', () => {
     assert.equal(settled, false);
     assert.equal(await kickstartLaunchAgent(501, async () => ({ code: 113, output: '' })).exited, 113);
   });
+
+  it('restarts the managed daemon in place with kickstart -k', async () => {
+    const calls: string[][] = [];
+    void kickstartLaunchAgent(501, async (command, args) => { calls.push([command, ...args]); return { code: 0, output: '' }; }, true);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(calls, [['launchctl', 'kickstart', '-k', 'gui/501/radio.playola.slipstream']]);
+  });
 });
 
 describe('the install record', () => {

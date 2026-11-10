@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach, type AttachDeps } from './attach-workflow.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
+import type { BuildCheck } from './daemon-version.ts';
 
 const CLAUDE_ID = '11111111-2222-4333-8444-555555555555';
 const CODEX_ID = '019a0000-0000-7000-8000-000000000001';
@@ -49,7 +50,7 @@ async function codexTranscript(f: Fixture, version = '0.155.1'): Promise<string>
   return path;
 }
 
-interface Daemon { live: boolean; legacy?: boolean; status?: Record<string, unknown>; attach?: Record<string, unknown> }
+interface Daemon { live: boolean; build?: BuildCheck; status?: Record<string, unknown>; attach?: Record<string, unknown> }
 
 function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDeps {
   return {
@@ -58,10 +59,12 @@ function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDe
     err: (line) => f.err.push(line),
     probe: async () => daemon.live ? 'live' : 'stale',
     startDaemon: () => { f.started += 1; daemon.live = true; return { exited: new Promise(() => {}) }; },
+    checkBuild: async () => daemon.build ?? { kind: 'same' },
+    mismatch: async () => ({ message: 'The Slipstream daemon running for the store is an older version (it does not report one).' }),
     control: async (req) => {
       f.requests.push(req);
       const fields = req.verb === 'status'
-        ? { attach_features: daemon.legacy ? undefined : FEATURES, captures: [], binding_slots: { used: 0, limit: 10 },
+        ? { attach_features: FEATURES, captures: [], binding_slots: { used: 0, limit: 10 },
           ...daemon.status }
         : daemon.attach ?? LINKED;
       return { v: 1, ok: true, ...fields } as ResponseEnvelope;
@@ -167,46 +170,18 @@ describe('slipstream attach (one command)', () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
-  it('refuses a live daemon without setup-check support before changing config or attaching', async () => {
+  it('refuses a live daemon of another version before changing config or attaching', async () => {
     const f = await fixture();
     try {
       await claudeTranscript(f);
       const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, {
-        live: true, legacy: true, status: { state: 'detached' },
+        live: true, build: { kind: 'different', daemon: null },
       }));
       assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /running daemon does not support multi-workspace capture and chat setup checks/);
-      assert.match(f.err.join('\n'), new RegExp(`end the .slipstream start --store ${f.store}. process`));
+      assert.match(f.err.join('\n'), /is an older version .*\. Nothing was recorded\.$/);
       assert.equal(attachRequests(f).length, 0);
       await assert.rejects(stat(join(f.worktree, '.claude')));
       assert.deepEqual(f.commands, []);
-    } finally { await rm(f.root, { recursive: true, force: true }); }
-  });
-
-  it('refuses a daemon that runs only one capture at a time before changing anything', async () => {
-    const f = await fixture();
-    try {
-      await claudeTranscript(f);
-      const d = deps(f, claudeEnv, { live: true, status: { attach_features: ['agent-connection-v1'] } });
-      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, d);
-      assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /running daemon does not support/);
-      assert.equal(attachRequests(f).length, 0);
-      await assert.rejects(stat(join(f.worktree, '.claude')));
-    } finally { await rm(f.root, { recursive: true, force: true }); }
-  });
-
-  it('quotes a spaced store path in the legacy-daemon recovery instructions', async () => {
-    const f = await fixture();
-    try {
-      f.store = join(f.root, 'store with spaces');
-      await claudeTranscript(f);
-      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store }, deps(f, claudeEnv, {
-        live: true, legacy: true, status: { state: 'detached' },
-      }));
-      assert.equal(code, 1);
-      assert.match(f.err.join('\n'), /slipstream start --store '.*store with spaces'/);
-      assert.match(f.err.join('\n'), /slipstream attach --store '.*store with spaces'/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
