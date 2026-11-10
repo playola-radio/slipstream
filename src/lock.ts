@@ -61,7 +61,7 @@ interface LockContent {
 }
 
 /** Parse a lock file. Tolerant of a foreign/legacy bare-integer pid. */
-function parseLock(text: string): LockContent {
+export function parseLock(text: string): LockContent {
   try {
     const obj = JSON.parse(text) as { pid?: unknown; nonce?: unknown };
     if (obj && typeof obj === 'object') {

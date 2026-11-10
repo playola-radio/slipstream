@@ -26,6 +26,8 @@
  * defined in docs/autocapture/contracts.md §5. */
 export type ControlErrorCode =
   | 'DAEMON_UNAVAILABLE'
+  // Client-side only: the CLI sent nothing because the daemon is another build.
+  | 'DAEMON_VERSION_MISMATCH'
   | 'SESSION_NOT_SELECTED'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_ACTIVE'

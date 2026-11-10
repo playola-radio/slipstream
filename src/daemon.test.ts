@@ -23,6 +23,7 @@ import {
 } from './test/daemon-harness.ts';
 import type { PublicEventInput } from './public-events.ts';
 import { defaultConfig, type ResolvedConfig } from './config.ts';
+import { thisBuild } from './daemon-version.ts';
 import { createTranscriptScheduler } from './transcript/scheduler.ts';
 import { claudeSlug, type DiscoveryIO } from './transcript/discovery.ts';
 import { nodeDiscoveryIO } from './transcript/fs-io.ts';
@@ -448,6 +449,19 @@ describe('daemon control verbs', () => {
       assert.deepEqual(rec(res).captures, []);
       assert.deepEqual(rec(res).binding_slots, { used: 0, limit: 10 });
       assert.equal(rec(res).reader_url, daemon.readerUrl);
+    });
+  });
+
+  it('reports which build it is, so a CLI can refuse a daemon of another version', async () => {
+    await withDaemon(async ({ worktree, call }) => {
+      const own = await thisBuild();
+      const res = rec(await call({ verb: 'status' }));
+      assert.equal(res.daemon_version, own.version);
+      assert.equal(res.daemon_build, own.build);
+      const id = await attachWatchOnly(call, worktree);
+      const one = rec(await call({ verb: 'status', target: id }));
+      assert.equal(one.daemon_version, own.version);
+      assert.equal(one.daemon_build, own.build);
     });
   });
 
