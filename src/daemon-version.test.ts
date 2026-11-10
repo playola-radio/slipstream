@@ -126,6 +126,16 @@ describe('remedyFor', () => {
     });
   });
 
+  it('leaves the switch to the Slipstream app, never restarting its daemon', async () => {
+    await withTempDir(async (dir) => {
+      const store = join(dir, 'store'); await mkdir(store);
+      await managedBy(store, dir, await realpath(fileURLToPath(new URL('./cli.ts', import.meta.url))));
+      const remedy = await remedyFor(store, null, OWN, dir, { SLIPSTREAM_APP_RUNTIME: join(dir, 'rt') });
+      assert.equal(remedy.restart, undefined);
+      assert.equal(remedy.text, 'The Slipstream app is switching this recorder to 0.3.0; open Slipstream if it doesn\'t finish.');
+    });
+  });
+
   it('does not restart a managed daemon whose plist runs another CLI, whatever the install record says', async () => {
     await withTempDir(async (dir) => {
       const store = join(dir, 'store'); await mkdir(store);

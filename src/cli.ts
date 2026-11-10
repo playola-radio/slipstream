@@ -70,6 +70,7 @@ import {
 } from './conductor.ts';
 import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
+import { agentEntries } from './app-runtime.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
@@ -792,7 +793,7 @@ async function runThisChatAttach(dir: string, store: string): Promise<void> {
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   try {
     process.exitCode = await runAttachWorkflow({ dir, store }, {
-      env: process.env, home: homedir(), nodePath: process.execPath, cliPath,
+      env: process.env, home: homedir(), ...agentEntries(process.env, process.execPath, cliPath),
       out: (line) => console.log(line),
       err: (line) => console.error(line),
       ...await daemonStarter(store, cliPath),

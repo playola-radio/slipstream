@@ -8,6 +8,7 @@ import type { RequestEnvelope, ResponseEnvelope } from './control-protocol.ts';
 import { shellWord } from './shell-word.ts';
 import { daemonLogPath, LAUNCH_AGENT_LABEL, plistPath, readManagedInstall, renderPlist } from './launch-agent.ts';
 import { parseLock } from './lock.ts';
+import { appRuntime } from './app-runtime.ts';
 
 /**
  * Which Slipstream a CLI or daemon is. A CLI only talks to a daemon of exactly
@@ -125,7 +126,11 @@ export interface Remedy {
  * its recordings with a marked gap. A detached daemon is never stopped for the
  * user: an older one may keep no intent, so stopping it would end its recordings.
  */
-export async function remedyFor(store: string, daemon: Build | null, own: Build, home = homedir()): Promise<Remedy> {
+export async function remedyFor(store: string, daemon: Build | null, own: Build, home = homedir(),
+  env = process.env): Promise<Remedy> {
+  if (appRuntime(env)) {
+    return { text: `The Slipstream app is switching this recorder to ${own.version}; open Slipstream if it doesn't finish.` };
+  }
   const managed = await readManagedInstall(store).catch(() => null);
   if (managed) {
     if (process.getuid && await runsThisCli(managed.node, store, home)) {
