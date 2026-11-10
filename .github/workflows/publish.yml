@@ -1,0 +1,147 @@
+name: Publish
+
+# Publishes package.json's version to npm once Tests pass on a push to develop.
+# A merge that doesn't change the version finds it already on npm and stops.
+on:
+  workflow_run:
+    workflows: [Tests]
+    types: [completed]
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # `event == 'push'` also rules out a pull request from a fork whose branch
+    # happens to be named develop.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'develop')
+    permissions:
+      contents: read
+      actions: read
+      # npm trusted publishing (OIDC) and provenance; there is no npm token.
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      published: ${{ steps.publish.outcome == 'success' }}
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          # No dependency cache: a publish should not restore files another
+          # workflow could have written.
+
+      - name: Confirm Tests passed on this commit (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
+            --branch develop --event push --commit "$SHA" \
+            --json conclusion --jq 'map(select(.conclusion == "success")) | length')
+          if [ "$passed" = "0" ]; then
+            echo "::error::Tests have not passed on a push of $SHA to develop; refusing to publish."
+            exit 1
+          fi
+
+      - name: Decide whether to publish
+        id: check
+        run: |
+          # npm provenance names GITHUB_SHA, which for workflow_run is develop's
+          # tip when Tests finished. If develop has moved on, that newer
+          # commit's own run publishes instead.
+          if [ "$SHA" != "$GITHUB_SHA" ]; then
+            echo "develop has moved on from $SHA to $GITHUB_SHA; leaving the publish to that commit's run."
+            exit 0
+          fi
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A missing version exits non-zero (E404). Any other lookup failure
+          # also falls through to publish, which npm refuses for a duplicate.
+          if [ "$(npm view "$name@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "$name@$version is already published; nothing to do."
+            exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Make sure npm supports trusted publishing
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          required=11.5.1
+          current=$(npm --version)
+          if [ "$(printf '%s\n' "$required" "$current" | sort -V | head -n1)" != "$required" ]; then
+            npm install -g npm@11
+          fi
+          npm --version
+
+      - name: Install dependencies
+        if: steps.check.outputs.publish == 'true'
+        run: npm ci
+
+      - name: Publish to npm
+        id: publish
+        if: steps.check.outputs.publish == 'true'
+        # `prepack` builds dist.
+        run: npm publish --provenance
+
+  release:
+    needs: publish
+    # A separate job so "Re-run failed jobs" can retry the tag and release
+    # without republishing.
+    if: needs.publish.outputs.published == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TAG: v${{ needs.publish.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out the published commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Tag the published commit
+        run: |
+          # The last line is the peeled commit for an annotated tag.
+          existing=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n1 | cut -f1)
+          if [ "$existing" = "$SHA" ]; then
+            echo "Tag $TAG already exists."
+          elif [ -n "$existing" ]; then
+            echo "::error::Tag $TAG points at $existing, not the published commit $SHA."
+            exit 1
+          else
+            git tag "$TAG" "$SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+
+      - name: Create the GitHub release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
