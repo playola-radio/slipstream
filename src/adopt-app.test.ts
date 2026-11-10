@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { runAdoptApp, type AdoptDeps } from './adopt-app.ts';
@@ -135,6 +135,44 @@ describe('adopt-app', () => {
       ]);
       const [backup] = await backups(config);
       assert.ok(f.lines.includes(`rewrote ${config} (backup ${join(f.home, backup!)})`), f.lines.join('\n'));
+    } finally { await f.cleanup(); }
+  });
+
+  it('puts the old Claude entry back when the new one cannot be added', async () => {
+    const f = await fixture();
+    try {
+      const config = join(f.home, '.claude.json');
+      const old = [OLD_FORWARDER, '--store', f.store];
+      await put(config, JSON.stringify({ mcpServers: { slipstream: { type: 'stdio', command: NODE, args: old } } }));
+      f.deps.run = async (command, args, cwd) => {
+        f.calls.push({ command, args, cwd });
+        return args[1] === 'add' && args.includes(`${f.rt}/bin/slipstream-mcp`) ? { code: 1, output: 'boom' } : { code: 0, output: '' };
+      };
+
+      assert.equal(await runAdoptApp(f.deps), 1);
+
+      assert.deepEqual(f.calls.at(-1), { command: 'claude', args: ['mcp', 'add', '--scope', 'user', 'slipstream', '--', NODE, ...old], cwd: f.home });
+      const [backup] = await backups(config);
+      assert.ok(f.lines.some((l) => l.startsWith(`failed ${config}: `) && l.includes('boom')
+        && l.includes('the previous entry was put back') && l.includes(`backup ${join(f.home, backup!)}`)), f.lines.join('\n'));
+    } finally { await f.cleanup(); }
+  });
+
+  it('leaves a symlinked worktree file alone', async () => {
+    const f = await fixture();
+    try {
+      const shared = join(f.dir, 'shared', 'settings.local.json');
+      const before = hooksFile(oldHook('claude-code', f.store));
+      await put(shared, before);
+      const link = join(f.roots[0]!, '.claude', 'settings.local.json');
+      await mkdir(dirname(link), { recursive: true });
+      await symlink(shared, link);
+
+      assert.equal(await runAdoptApp(f.deps), 1);
+
+      assert.equal(await readFile(shared, 'utf8'), before);
+      assert.deepEqual(await backups(shared), []);
+      assert.ok(f.lines.some((l) => l.startsWith(`failed ${link}: `) && l.includes('symbolic link')), f.lines.join('\n'));
     } finally { await f.cleanup(); }
   });
 

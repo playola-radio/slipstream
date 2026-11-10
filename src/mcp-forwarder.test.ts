@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
-import { mkdtemp, rm, realpath } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, realpath, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -254,12 +254,15 @@ async function olderDaemon(): Promise<{ socketPath: string; close: () => Promise
   } };
 }
 
+const UNREAD = '{"jsonrpc":"2.0","id":3,"method":"tools/list"}\n{"jsonrpc":"2.0",';
+
 function appForwarder(socketPath: string, currentBuild: string | null, env: Record<string, string> = { SLIPSTREAM_APP_RUNTIME: '/rt' }) {
   const execs: { file: string; args: string[]; env: Record<string, string | undefined> }[] = [];
   const handlers = createForwarderHandlers({
     socketPath, env,
     execve: (file, args, env) => { execs.push({ file, args, env }); },
     readCurrentBuild: async (root) => (root === '/rt' ? currentBuild : null),
+    unreadInput: () => Buffer.from(UNREAD),
   });
   return { handlers, execs };
 }
@@ -280,6 +283,7 @@ test('forwarderReplacesItselfOnNewerBuild', async () => {
     assert.deepEqual(replay, {
       initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
       call: callBeginTask({ title: 't' }, CODEX_META),
+      input: Buffer.from(UNREAD).toString('base64'),
     });
   } finally {
     await daemon.close();
@@ -321,6 +325,7 @@ test('replayAnswersPendingCallOnce', async () => {
     const replay = Buffer.from(JSON.stringify({
       initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
       call: { ...callBeginTask({ title: 'replayed' }, CODEX_META), id: 'call-41' },
+      input: '',
     })).toString('base64');
     const forwarder = fileURLToPath(new URL('./mcp-forwarder.ts', import.meta.url));
     const stdout = await new Promise<string>((resolve, reject) => {
@@ -336,6 +341,63 @@ test('replayAnswersPendingCallOnce', async () => {
     assert.equal(resultOf(lines[0]!).isError, false);
     assert.equal(daemon.received[0]!.title, 'replayed');
     assert.equal(daemon.received[0]!.harness, 'codex');
+  } finally {
+    await daemon.close();
+  }
+});
+
+function runForwarderProcess(store: string, env: Record<string, string | undefined>,
+  feed: (stdin: NodeJS.WritableStream) => void): Promise<string> {
+  const forwarder = fileURLToPath(new URL('./mcp-forwarder.ts', import.meta.url));
+  return new Promise<string>((resolve, reject) => {
+    const child = execFile(process.execPath, [forwarder, '--store', store],
+      { env: { PATH: process.env.PATH, ...env }, timeout: 10_000 }, (err, out) => (err ? reject(err) : resolve(out)));
+    feed(child.stdin!);
+  });
+}
+
+test('forwarderHandsPipelinedInputToItsSuccessor', async () => {
+  const daemon = await olderDaemon();
+  const rt = await mkdtemp(join(tmpdir(), 'slip-fwd-rt-'));
+  try {
+    await mkdir(join(rt, 'builds', 'b1', 'app', 'dist'), { recursive: true });
+    await writeFile(join(rt, 'builds', 'b1', 'app', 'dist', 'build-id'), 'a-newer-build\n');
+    await symlink(join(rt, 'builds', 'b1'), join(rt, 'current'));
+    await mkdir(join(rt, 'bin'));
+    const shim = join(rt, 'bin', 'slipstream-mcp');
+    await writeFile(shim, `#!/bin/sh\nprintf '%s' "$SLIPSTREAM_MCP_REPLAY" > '${rt}/replay'\n`
+      + `exec '${process.execPath}' -e 'process.stdin.pipe(require("fs").createWriteStream(process.argv[1]))' '${rt}/stdin'\n`);
+    await chmod(shim, 0o755);
+    const pipelined = `${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' })}\n{"jsonrpc":"2.0","id":4,`;
+
+    const stdout = await runForwarderProcess(dirname(daemon.socketPath), { SLIPSTREAM_APP_RUNTIME: rt }, (stdin) => {
+      stdin.end([initialize('codex-mcp-client'), callBeginTask({ title: 't' }, CODEX_META)]
+        .map((m) => JSON.stringify(m) + '\n').join('') + pipelined);
+    });
+
+    assert.deepEqual(stdout.trim().split('\n').map((l) => (JSON.parse(l) as JsonRpcResponse).id), [1]);
+    const replay = JSON.parse(Buffer.from(await readFile(join(rt, 'replay'), 'utf8'), 'base64').toString('utf8'));
+    assert.equal(replay.call.id, 2);
+    assert.equal(Buffer.from(replay.input, 'base64').toString('utf8') + await readFile(join(rt, 'stdin'), 'utf8'), pipelined);
+  } finally {
+    await daemon.close();
+    await rm(rt, { recursive: true, force: true });
+  }
+});
+
+test('replayHandlesHandedInputBeforeStdin', async () => {
+  const daemon = await fakeDaemon(OK);
+  try {
+    const replay = Buffer.from(JSON.stringify({
+      initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
+      call: { ...callBeginTask({ title: 'replayed' }, CODEX_META), id: 'call-41' },
+      input: Buffer.from('{"jsonrpc":"2.0","id":8,"method":"tools/list"}\n{"jsonrpc":"2.0","id":9,"meth').toString('base64'),
+    })).toString('base64');
+
+    const stdout = await runForwarderProcess(dirname(daemon.socketPath), { SLIPSTREAM_MCP_REPLAY: replay },
+      (stdin) => stdin.end('od":"tools/list"}\n'));
+
+    assert.deepEqual(stdout.trim().split('\n').map((l) => (JSON.parse(l) as JsonRpcResponse).id), ['call-41', 8, 9]);
   } finally {
     await daemon.close();
   }

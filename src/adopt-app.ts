@@ -6,8 +6,8 @@
  * each changed file is copied beside itself first.
  */
 import { randomUUID } from 'node:crypto';
-import { chmod, constants, copyFile, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod, constants, copyFile, lstat, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { appRuntime } from './app-runtime.ts';
 import { codexServerBlock, hookCommand } from './attach-workflow.ts';
@@ -48,7 +48,7 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
   catch (err) { fail(intentPath(store), (err as Error).message); }
 
   const seen = new Set<string>();
-  const adopt = async (path: string, rewrite: Rewrite) => {
+  const adopt = async (path: string, rewrite: Rewrite, inWorkspace: boolean) => {
     try {
       const real = await existing(path);
       if (real === null || seen.has(real)) return;
@@ -57,6 +57,13 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
       const next = rewrite(text);
       if (next === null) {
         deps.out(`unchanged ${path}`);
+        return;
+      }
+      // As in attach: a symlinked workspace file or directory may be shared
+      // with other workspaces, so it is reported rather than followed.
+      const link = inWorkspace ? await linkIn(path) : null;
+      if (link !== null) {
+        fail(path, `${link} is a symbolic link; adopt-app only edits this workspace's own config`);
         return;
       }
       const backup = await backUp(path);
@@ -71,11 +78,11 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
   const codexTool: Rewrite = (text) => rewriteCodexTool(text, store, runtime.mcp, mcpArgs);
 
   for (const root of roots) {
-    await adopt(join(root, '.claude', 'settings.local.json'), hooks);
-    await adopt(join(root, '.codex', 'hooks.json'), hooks);
-    await adopt(join(root, '.codex', 'config.toml'), codexTool);
+    await adopt(join(root, '.claude', 'settings.local.json'), hooks, true);
+    await adopt(join(root, '.codex', 'hooks.json'), hooks, true);
+    await adopt(join(root, '.codex', 'config.toml'), codexTool, true);
   }
-  await adopt(join(deps.env.CODEX_HOME ?? join(deps.home, '.codex'), 'config.toml'), codexTool);
+  await adopt(join(deps.env.CODEX_HOME ?? join(deps.home, '.codex'), 'config.toml'), codexTool, false);
   if (!await adoptClaudeTool(deps, roots, [runtime.mcp, ...mcpArgs])) failed = true;
   return failed ? 1 : 0;
 }
@@ -85,6 +92,11 @@ async function existing(path: string): Promise<string | null> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
+}
+
+async function linkIn(path: string): Promise<string | null> {
+  for (const p of [dirname(path), path]) if ((await lstat(p)).isSymbolicLink()) return p;
+  return null;
 }
 
 function isNpmForwarder(args: unknown, store: string): boolean {
@@ -140,7 +152,7 @@ function rewriteCodexTool(text: string, store: string, command: string, args: st
  * scopes are the ones attach checks: each recorded root's local scope, and the user's. */
 async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[]): Promise<boolean> {
   const path = join(deps.env.CLAUDE_CONFIG_DIR ?? deps.home, '.claude.json');
-  type Servers = { mcpServers?: Record<string, { args?: unknown } | null> };
+  type Servers = { mcpServers?: Record<string, { command?: unknown; args?: unknown } | null> };
   let config: Servers & { projects?: Record<string, Servers> };
   try {
     const text = await readFile(path, 'utf8').catch((err: NodeJS.ErrnoException) => {
@@ -153,11 +165,15 @@ async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[])
     deps.out(`failed ${path}: ${(err as Error).message}`);
     return false;
   }
+  const npmEntry = (servers: Servers | undefined) => {
+    const server = servers?.mcpServers?.slipstream;
+    return typeof server?.command === 'string' && isNpmForwarder(server.args, deps.store)
+      ? [server.command, ...server.args as string[]] : null;
+  };
   const scopes = [
-    ...roots.filter((root) => isNpmForwarder(config.projects?.[root]?.mcpServers?.slipstream?.args, deps.store))
-      .map((root) => ({ scope: 'local', cwd: root })),
-    ...isNpmForwarder(config.mcpServers?.slipstream?.args, deps.store) ? [{ scope: 'user', cwd: deps.home }] : [],
-  ];
+    ...roots.map((root) => ({ scope: 'local', cwd: root, old: npmEntry(config.projects?.[root]) })),
+    { scope: 'user', cwd: deps.home, old: npmEntry(config) },
+  ].filter((s): s is { scope: string; cwd: string; old: string[] } => s.old !== null);
   if (scopes.length === 0) {
     deps.out(`unchanged ${path}`);
     return true;
@@ -168,19 +184,29 @@ async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[])
     return false;
   }
   const claude = deps.env.CLAUDE_CODE_EXECPATH ?? 'claude';
+  const add = (scope: string, cwd: string, entry: string[]) =>
+    deps.run(claude, ['mcp', 'add', '--scope', scope, 'slipstream', '--', ...entry], cwd);
   let ok = true;
   let rewrote = false;
-  for (const { scope, cwd } of scopes) {
-    for (const args of [['mcp', 'remove', '--scope', scope, 'slipstream'],
-      ['mcp', 'add', '--scope', scope, 'slipstream', '--', ...shim]]) {
-      const { code, output } = await deps.run(claude, args, cwd);
-      if (code !== 0) {
-        deps.out(`failed ${path}: \`claude ${args.slice(0, 5).join(' ')}\` in ${cwd} exited ${String(code)}: ${output.trim()}`);
-        ok = false;
-        break;
-      }
-      if (args[1] === 'add') rewrote = true;
+  for (const { scope, cwd, old } of scopes) {
+    const failure = (verb: string, r: { code: number | null; output: string }) =>
+      `\`claude mcp ${verb} --scope ${scope} slipstream\` in ${cwd} exited ${String(r.code)}: ${r.output.trim()}`;
+    const removed = await deps.run(claude, ['mcp', 'remove', '--scope', scope, 'slipstream'], cwd);
+    if (removed.code !== 0) {
+      deps.out(`failed ${path}: ${failure('remove', removed)}`);
+      ok = false;
+      continue;
     }
+    const added = await add(scope, cwd, shim);
+    if (added.code === 0) {
+      rewrote = true;
+      continue;
+    }
+    const restored = await add(scope, cwd, old);
+    deps.out(`failed ${path}: ${failure('add', added)}; ${restored.code === 0
+      ? 'the previous entry was put back'
+      : `putting the previous entry back also failed (exit ${String(restored.code)})`} (backup ${backup})`);
+    ok = false;
   }
   if (rewrote) deps.out(`rewrote ${path} (backup ${backup})`);
   return ok;

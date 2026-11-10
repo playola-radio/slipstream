@@ -15,7 +15,6 @@
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
-import { once } from 'node:events';
 import { readFile, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { appRuntime } from './app-runtime.ts';
@@ -71,12 +70,14 @@ export interface ForwarderHandlerOpts {
   execve?: (file: string, args: string[], env: Env) => void | Promise<void>;
   /** The build the app's runtime `<root>/current` now holds, or null if unreadable. */
   readCurrentBuild?: (root: string) => Promise<string | null>;
+  /** Input read from stdin but not handled yet, which a successor must handle first. */
+  unreadInput?: () => Buffer;
 }
 
 /** The env var a replaced forwarder hands its successor the call it was answering. */
 export const REPLAY_ENV = 'SLIPSTREAM_MCP_REPLAY';
 
-interface Replay { initialize: JsonRpcRequest | null; call: JsonRpcRequest }
+interface Replay { initialize: JsonRpcRequest | null; call: JsonRpcRequest; input: string }
 
 async function currentBuild(root: string): Promise<string | null> {
   try {
@@ -87,7 +88,8 @@ async function currentBuild(root: string): Promise<string | null> {
 }
 
 async function execveAfterFlush(file: string, args: string[], env: Env): Promise<void> {
-  if (process.stdout.writableLength > 0) await once(process.stdout, 'drain');
+  // Its callback runs once everything written before it has been flushed.
+  await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
   process.execve!(file, args, env);
 }
 
@@ -107,6 +109,7 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
   const ctx = createHarnessContext();
   const execve = opts.execve ?? execveAfterFlush;
   const readCurrentBuild = opts.readCurrentBuild ?? currentBuild;
+  const unreadInput = opts.unreadInput ?? (() => Buffer.alloc(0));
   let initialized: JsonRpcRequest | null = null;
 
   /** After an app update the daemon runs the new build and this process is the
@@ -116,7 +119,7 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
     if (!runtime) return;
     const current = await readCurrentBuild(runtime.root);
     if (current === null || current === (await thisBuild()).build) return;
-    const replay: Replay = { initialize: initialized, call };
+    const replay: Replay = { initialize: initialized, call, input: unreadInput().toString('base64') };
     try {
       await execve(runtime.mcp, [runtime.mcp, ...process.argv.slice(2)],
         { ...opts.env, [REPLAY_ENV]: Buffer.from(JSON.stringify(replay)).toString('base64') });
@@ -194,22 +197,28 @@ export function createStdinFramer(maxBytes: number = MAX_STDIN_LINE_BYTES) {
       }
       return out;
     },
+    /** The partial line held for the next push. */
+    buffered(): Buffer {
+      return discarding ? Buffer.alloc(0) : buf;
+    },
   };
 }
 
 /** A replaced forwarder's successor answers the call its predecessor was holding,
- * under the original id; the saved initialize only primes the identity. */
-async function answerReplay(text: string, handlers: McpHandlers, write: (res: JsonRpcResponse) => void): Promise<void> {
+ * under the original id; the saved initialize only primes the identity. Returns
+ * the input the predecessor had read but not handled. */
+async function answerReplay(text: string, handlers: McpHandlers, write: (res: JsonRpcResponse) => void): Promise<Buffer> {
   let saved: Replay;
   try {
     saved = JSON.parse(Buffer.from(text, 'base64').toString('utf8')) as Replay;
   } catch (err) {
     process.stderr.write(`slipstream-forwarder: ${REPLAY_ENV} is unreadable: ${(err as Error).message}\n`);
-    return;
+    return Buffer.alloc(0);
   }
   if (saved.initialize) await dispatch(saved.initialize, handlers);
   const res = await dispatch(saved.call, handlers);
   if (res) write(res);
+  return Buffer.from(saved.input, 'base64');
 }
 
 export async function runForwarder(): Promise<void> {
@@ -222,30 +231,45 @@ export async function runForwarder(): Promise<void> {
     return;
   }
 
+  const framer = createStdinFramer();
+  const pending: StdinFrame[] = [];
+  // Left in place, so a failed switch carries on reading where it was.
+  const unreadInput = () => {
+    const streamed = process.stdin.read() as Buffer | null;
+    if (streamed !== null) process.stdin.unshift(streamed);
+    return Buffer.concat([
+      ...pending.flatMap((f) => ('line' in f ? [Buffer.from(f.line + '\n')] : [])),
+      framer.buffered(),
+      ...(streamed !== null ? [streamed] : []),
+    ]);
+  };
+
   const replay = process.env[REPLAY_ENV];
   delete process.env[REPLAY_ENV];
-  const handlers = createForwarderHandlers({ socketPath, env: process.env });
+  const handlers = createForwarderHandlers({ socketPath, env: process.env, unreadInput });
   const write = (res: JsonRpcResponse) => process.stdout.write(JSON.stringify(res) + '\n');
   const writeError = (code: number, message: string) => write({ jsonrpc: '2.0', id: null, error: { code, message } });
 
-  if (replay !== undefined) await answerReplay(replay, handlers, write);
-
-  const framer = createStdinFramer();
-  for await (const chunk of process.stdin) {
-    for (const frame of framer.push(chunk as Buffer)) {
-      if ('overflow' in frame) {
-        writeError(-32700, 'message exceeds byte cap');
-        continue;
-      }
-      const parsed = parseMessage(frame.line);
-      if (!parsed.ok) {
-        writeError(parsed.code, parsed.code === -32700 ? 'parse error' : 'invalid request');
-        continue;
-      }
-      const res = await dispatch(parsed.value, handlers);
-      if (res) write(res);
+  const handle = async (frame: StdinFrame) => {
+    if ('overflow' in frame) {
+      writeError(-32700, 'message exceeds byte cap');
+      return;
     }
-  }
+    const parsed = parseMessage(frame.line);
+    if (!parsed.ok) {
+      writeError(parsed.code, parsed.code === -32700 ? 'parse error' : 'invalid request');
+      return;
+    }
+    const res = await dispatch(parsed.value, handlers);
+    if (res) write(res);
+  };
+  const take = async (chunk: Buffer) => {
+    pending.push(...framer.push(chunk));
+    while (pending.length > 0) await handle(pending.shift()!);
+  };
+
+  if (replay !== undefined) await take(await answerReplay(replay, handlers, write));
+  for await (const chunk of process.stdin) await take(chunk as Buffer);
 }
 
 if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {
