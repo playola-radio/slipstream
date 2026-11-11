@@ -6,7 +6,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, realpath, symlink, writeFile } fro
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createForwarderHandlers, createStdinFramer, type StdinFrame } from './mcp-forwarder.ts';
+import { BEGIN_TASK_TOOL, createForwarderHandlers, createStdinFramer, type StdinFrame } from './mcp-forwarder.ts';
 import { dispatch, type JsonRpcRequest, type JsonRpcResponse } from './mcp-protocol.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { thisBuild } from './daemon-version.ts';
@@ -150,11 +150,34 @@ test('an unrecognized client fails closed as IDENTITY_UNRESOLVED without contact
   }
 });
 
-test('lists the task and answer tools', async () => {
+test('lists the task, answer and name tools', async () => {
   const handlers = createForwarderHandlers({ socketPath: '/nonexistent/control.sock', env: {} });
   const res = await dispatch({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, handlers);
   const tools = (res!.result as { tools: Array<{ name: string }> }).tools;
-  assert.deepEqual(tools.map(t => t.name), ['slipstream_begin_task', 'slipstream_answer_question']);
+  assert.deepEqual(tools.map(t => t.name), ['slipstream_begin_task', 'slipstream_answer_question', 'slipstream_name_workspace']);
+});
+
+test('begin_task tells the agent when to name the workspace', () => {
+  assert.ok(BEGIN_TASK_TOOL.description.endsWith(' Once you know what this workspace\'s work is about, also call '
+    + 'slipstream_name_workspace with a 2-5 word name \u2014 usually on your first task.'));
+});
+
+const callName = (args: Record<string, unknown>, meta: Record<string, unknown>): JsonRpcRequest => ({
+  jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'slipstream_name_workspace', arguments: args, _meta: meta },
+});
+
+test('the name tool forwards its raw arguments and the caller identity', async () => {
+  const daemon = await fakeDaemon({ v: 1, ok: true, changed: true });
+  try {
+    const handlers = createForwarderHandlers({ socketPath: daemon.socketPath, env: {} });
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    const res = resultOf(await dispatch(callName({ name: 7, replace_existing: 'yes' }, CODEX_META), handlers));
+    assert.deepEqual(res, { text: 'Agent name saved.', isError: false, structured: { changed: true } });
+    assert.deepEqual(daemon.received, [{ v: 1, verb: 'name_workspace', name: 7, replace_existing: 'yes',
+      harness: 'codex', harness_session_id: 'thread-9', worktree: '/repos/edinburgh-v1' }]);
+  } finally {
+    await daemon.close();
+  }
 });
 
 const callAnswer = (args: Record<string, unknown>, meta: Record<string, unknown>): JsonRpcRequest => ({
@@ -290,6 +313,22 @@ test('forwarderReplacesItselfOnNewerBuild', async () => {
       input: Buffer.from(UNREAD).toString('base64'),
     });
     assert.match(replay.requestId, /^[0-9a-f-]{36}$/);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('a name call on a newer build takes the same replace path', async () => {
+  const daemon = await olderDaemon();
+  try {
+    const { handlers, execs } = appForwarder(daemon.socketPath, 'a-newer-build');
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    await dispatch(callName({ name: 'Workspace rename menu' }, CODEX_META), handlers);
+
+    assert.equal(execs.length, 1);
+    const replay = JSON.parse(Buffer.from(execs[0]!.env.SLIPSTREAM_MCP_REPLAY!, 'base64').toString('utf8'));
+    assert.deepEqual(replay.call, callName({ name: 'Workspace rename menu' }, CODEX_META));
+    assert.equal('requestId' in replay, false);
   } finally {
     await daemon.close();
   }

@@ -9,13 +9,16 @@ session the harness starts.
 
 `src/mcp-forwarder.ts` is a thin, per-session stdio MCP server. When a harness
 starts a session it spawns one forwarder subprocess and speaks JSON-RPC to it
-over stdin/stdout. The forwarder exposes two tools and forwards each call to the
+over stdin/stdout. The forwarder exposes three tools and forwards each call to the
 shared Slipstream daemon over the daemon's local control socket:
 
 - `slipstream_begin_task(title)` declares a task (see `SKILL.md`).
 - `slipstream_answer_question(question_id, text)` returns the agent's answer to
   a question the user asked from Slipstream. The delivered question tells the
   agent to call it; see `docs/ask-agent/contract.md` ("Answer return").
+- `slipstream_name_workspace(name, replace_existing?)` gives the workspace a short
+  name the person watching sees in Slipstream (see `SKILL.md` and
+  `docs/ask-agent/contract.md`, "Workspace names").
 
 It never captures files, never attaches or detaches (the `slipstream` CLI owns
 that), and never reads the feed.
