@@ -19,6 +19,9 @@ on:
 concurrency:
   group: publish-npm
   cancel-in-progress: false
+  # Without a queue, a newer pending run cancels an older one, even when the
+  # newer one is a stale run that will do nothing.
+  queue: max
 
 jobs:
   publish:
@@ -91,9 +94,18 @@ jobs:
           version=$(node -p "require('./package.json').version")
           previous=$(git show HEAD^:package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          # A missing version exits non-zero (E404). Any other lookup failure
-          # also falls through to publish, which npm refuses for a duplicate.
-          if [ "$(npm view "$name@$version" version 2>/dev/null)" != "$version" ]; then
+          # npm answers E404 for a version it doesn't have. Any other lookup
+          # failure stops here rather than guessing which way to go.
+          if npm view "$name@$version" version >/dev/null 2>"$RUNNER_TEMP/npm-view.log"; then
+            published=true
+          elif grep -q E404 "$RUNNER_TEMP/npm-view.log"; then
+            published=false
+          else
+            cat "$RUNNER_TEMP/npm-view.log"
+            echo "::error::Could not look up $name@$version on npm."
+            exit 1
+          fi
+          if [ "$published" = false ]; then
             # A dispatched run publishes only a release commit. A merge that lands
             # just as the bump job dispatches Tests is left to its push run, which
             # would otherwise find it published and bump it again.
@@ -103,6 +115,13 @@ jobs:
             fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
           elif [ "$TESTS_EVENT" = push ] && [ "$version" = "$previous" ]; then
+            # A merge can be published with the version it inherited from a
+            # release commit; the release job tags it, and a re-run stops here.
+            tagged=$(git ls-remote origin "refs/tags/v$version" "refs/tags/v$version^{}" | tail -n1 | cut -f1)
+            if [ "$tagged" = "$SHA" ]; then
+              echo "$name@$version was released from $SHA; nothing to do."
+              exit 0
+            fi
             echo "$name@$version is already published; bumping the patch version."
             echo "bump=true" >> "$GITHUB_OUTPUT"
           else
