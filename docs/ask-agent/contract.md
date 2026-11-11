@@ -688,7 +688,8 @@ Checks, in order:
 
 1. `session_id` is a lowercase UUIDv4, else `PROTOCOL`.
 2. `name` is present and a string or `null`, else `PROTOCOL`.
-3. A string `name` is valid, else `INVALID_NAME`.
+3. A string `name` is valid, else `INVALID_NAME`; a value that is neither a
+   string nor `null` was rejected as `PROTOCOL` in step 2.
 4. Queue on the metadata lock.
 5. The session directory exists with no tombstone, else `SESSION_NOT_FOUND`
    (the message says the session was deleted when tombstoned).
@@ -700,7 +701,9 @@ Any capture state is fine: the recording session, a stopped capture, or an
 archived session. It is not routed through `delete_session` / `gc`
 maintenance. A write can land even when the reply is lost; a client treats any
 failure after sending as "may have saved", re-reads `GET /v1/sessions`, and does
-not resend on its own.
+not resend on its own. If the connection closes while the write is queued, that
+first re-read can precede the eventual write and cannot establish the final
+value.
 
 ### MCP tool `slipstream_name_workspace`
 

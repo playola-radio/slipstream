@@ -192,7 +192,10 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     if (pathname === '/v1/sessions') {
       const sessions = await listSessions(opts.storeDir);
-      const namings = await Promise.all(sessions.map((s) => s.removed ? UNNAMED : sessionNaming(s.id)));
+      const namings: Naming[] = [];
+      for (const session of sessions) {
+        namings.push(session.removed ? UNNAMED : await sessionNaming(session.id));
+      }
       // A registry-known session's authoritative durable high-water is its
       // boundary, not the disk-derived value (a written-but-not-yet-committed
       // record would otherwise advertise H+1 while /events still uses H; a
