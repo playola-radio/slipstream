@@ -146,6 +146,17 @@ describe('http-reader core', () => {
     } finally { warn.mock.restore(); await s.close(); await rm(d, { recursive: true, force: true }); }
   });
 
+  it('an unreadable name.json shows no name and the list still loads', async () => {
+    const d = await namedStore({ [UUID]: {}, [OTHER]: { name: '{"version":1,"agent_name":"Kept","user_name":null}' } });
+    await mkdir(join(d, 'sessions', UUID, 'name.json'));
+    const s = await startReaderServer({ storeDir: d });
+    const warn = mock.method(console, 'error', () => {});
+    try {
+      assert.deepEqual(await namingOf(s), { [UUID]: UNNAMED, [OTHER]: { agent_name: 'Kept', user_name: null } });
+      assert.equal(warn.mock.calls.filter((c) => String(c.arguments[0]).includes(UUID)).length, 1);
+    } finally { warn.mock.restore(); await s.close(); await rm(d, { recursive: true, force: true }); }
+  });
+
   it('rejects a missing bearer with 401', async () => {
     const res = await fetch(`${srv.url}/v1/sessions`, { headers: { host: `127.0.0.1:${srv.port}` } });
     assert.equal(res.status, 401);

@@ -594,7 +594,9 @@ writes no event.
 - A malformed file (bad JSON, `version` other than `1`, a missing key, or a value
   that is neither a string nor `null`) reads as both names `null` and logs one
   daemon warning naming the session; the rest of the list is unaffected. The next
-  write replaces it and logs that it did.
+  write replaces it and logs that it did. A file that cannot be read at all also
+  lists as both names `null` with one warning, but a write to it fails with
+  `STORAGE_UNAVAILABLE` rather than replacing a name it could not read.
 - Writes are crash-safe: a unique temp file (`wx`, mode 0600) in the existing
   session directory, full write, fsync, atomic rename over `name.json`, fsync of
   the directory. A write never creates the directory.

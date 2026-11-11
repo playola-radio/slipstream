@@ -8,8 +8,9 @@ import { namePath } from './store-reader.ts';
  * `sessions/<id>/name.json`: the agent's and the user's display names for one
  * session. A sidebar file, never a log record. Names are display-only, so a
  * malformed file reads as unnamed (with a reason the caller logs) rather than
- * failing; the next write replaces it. Names are not re-validated on read: the
- * daemon is the only writer.
+ * failing; the next write replaces it. An unreadable file is a StorageError, so
+ * a writer never replaces a name it could not read. Names are not re-validated
+ * on read: the daemon is the only writer.
  */
 export interface Naming { agent_name: string | null; user_name: string | null }
 
@@ -34,7 +35,7 @@ export async function readNaming(storeDir: string, id: string): Promise<{ naming
     raw = await readFile(namePath(storeDir, id), 'utf8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { naming: { ...UNNAMED } };
-    throw err;
+    throw new StorageError('read-name', err);
   }
   const naming = parseNaming(raw);
   return typeof naming === 'string' ? { naming: { ...UNNAMED }, malformed: naming } : { naming };

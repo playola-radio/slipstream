@@ -155,16 +155,21 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     throw err;
   }
 
-  // Names are display-only: a malformed name.json reads as unnamed and logs once
+  // Names are display-only: a malformed or unreadable name.json reads as unnamed and logs once
   // per session for this reader's lifetime, so one bad file never fails the list.
   const warnedMalformedNames = new Set<string>();
   async function sessionNaming(id: string): Promise<Naming> {
-    const { naming, malformed } = await readNaming(opts.storeDir, id);
-    if (malformed !== undefined && !warnedMalformedNames.has(id)) {
-      warnedMalformedNames.add(id);
-      console.error(`slipstream reader: name.json for ${id} is malformed (${malformed}); showing no name`);
+    let read: { naming: Naming; malformed?: string };
+    try {
+      read = await readNaming(opts.storeDir, id);
+    } catch (err) {
+      read = { naming: UNNAMED, malformed: `unreadable: ${(err as Error).message}` };
     }
-    return naming;
+    if (read.malformed !== undefined && !warnedMalformedNames.has(id)) {
+      warnedMalformedNames.add(id);
+      console.error(`slipstream reader: name.json for ${id} is malformed (${read.malformed}); showing no name`);
+    }
+    return read.naming;
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

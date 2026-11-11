@@ -2761,6 +2761,15 @@ describe('daemon workspace names', () => {
     });
   });
 
+  it('rename_session on an unreadable name.json is STORAGE_UNAVAILABLE', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await mkdir(namePath(store, NAMED));
+      const res = await call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' });
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+    });
+  });
+
   it('concurrent renames serialize', async () => {
     await withDaemon(async ({ store, call }) => {
       await seedSession(store, NAMED, HEX_LIVE);

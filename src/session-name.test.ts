@@ -79,3 +79,10 @@ test('file mode is 0600', async () => {
     assert.equal((await stat(namePath(store, ID))).mode & 0o777, 0o600);
   });
 });
+
+test('an unreadable file throws StorageError', async () => {
+  await withTempDir(async (store) => {
+    await mkdir(namePath(store, ID), { recursive: true });
+    await assert.rejects(readNaming(store, ID), StorageError);
+  });
+});
