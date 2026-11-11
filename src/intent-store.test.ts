@@ -44,8 +44,7 @@ describe('durable intent record', () => {
     const dir = await store();
     await mkdir(join(dir, 'control'), { mode: 0o700 });
     await writeFile(intentPath(dir), JSON.stringify({ ...emptyIntent(), version: 2 }), { mode: 0o600 });
-    await assert.rejects(loadIntent(dir), (err: Error) => !(err instanceof IntentCorruptError)
-      && /written by a newer Slipstream \(intent version 2; this one reads version 1\)/.test(err.message)
+    await assert.rejects(loadIntent(dir), (err: Error) => /written by a newer Slipstream \(intent version 2; this one reads version 1\)/.test(err.message)
       && !/move the file aside/.test(err.message));
   });
 

@@ -45,9 +45,9 @@ export function appRuntimeRoot(home: string): string {
  */
 export async function appRecorderRefusal(o: { env: NodeJS.ProcessEnv; home: string; cliPath: string; store: string }):
   Promise<string | null> {
-  if (appRuntime(o.env) || resolve(o.store) !== defaultDaemonStore(o.home)) return null;
+  if (appRuntime(o.env) || !await isDefaultStore(o.store, o.home)) return null;
   const root = appRuntimeRoot(o.home);
-  const realRoot = await realpath(root).catch(() => null);
+  const realRoot = await realpath(root).catch(absent);
   if (!realRoot) return null;
   const inside = relative(realRoot, await realpath(o.cliPath).catch(() => resolve(o.cliPath)));
   if (inside && !inside.startsWith('..') && !isAbsolute(inside)) return null;
@@ -57,9 +57,23 @@ export async function appRecorderRefusal(o: { env: NodeJS.ProcessEnv; home: stri
     + `If Slipstream.app was removed, delete ${root} to let this copy run the recorder again.`;
 }
 
+/** The same folder as the default store, also when reached through another path. */
+async function isDefaultStore(store: string, home: string): Promise<boolean> {
+  const own = defaultDaemonStore(home);
+  if (resolve(store) === own) return true;
+  const [a, b] = await Promise.all([stat(store).catch(absent), stat(own).catch(absent)]);
+  return !!a && !!b && a.dev === b.dev && a.ino === b.ino;
+}
+
+/** Only a missing path means there is nothing there; any other error is reported. */
+function absent(err: NodeJS.ErrnoException): null {
+  if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+  throw err;
+}
+
 /** A runtime the app finished copying; staging folders are hidden until renamed. */
 async function hasPreparedRuntime(root: string): Promise<boolean> {
-  for (const name of await readdir(root).catch(() => [])) {
+  for (const name of await readdir(root)) {
     if (name.startsWith('.')) continue;
     const files = ['app/package.json', 'app/dist/cli.js', 'bin/node'].map((f) => stat(join(root, name, f)).then((s) => s.isFile(), () => false));
     if ((await Promise.all(files)).every(Boolean)) return true;
