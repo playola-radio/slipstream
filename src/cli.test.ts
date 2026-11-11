@@ -944,11 +944,11 @@ describe('cli when Slipstream.app owns the recorder', () => {
   });
 
   for (const command of [['service', 'install'], ['conductor', 'install']]) {
-    it(`\`${command.join(' ')}\` from npm refuses without touching launchd`, async () => {
+    it(`\`${command.join(' ')}\` from npm refuses without touching launchd, whichever store it names`, async () => {
       const { access } = await import('node:fs/promises');
       const { join } = await import('node:path');
-      await withAppHome(async ({ home, store, cli, launchctl }) => {
-        const result = await cli([...command, '--store', store]);
+      await withAppHome(async ({ home, cli, launchctl }) => {
+        const result = await cli([...command, '--store', join(home, 'other-store')]);
         assert.equal(result.code, 1, result.stderr);
         assert.match(result.stderr, /Slipstream\.app manages the recorder for .*will not replace its LaunchAgent/);
         assert.equal(await launchctl(), '');
@@ -956,6 +956,18 @@ describe('cli when Slipstream.app owns the recorder', () => {
       });
     });
   }
+
+  it('`watch` from npm will not record into the app\'s store', async () => {
+    const { access, mkdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await withAppHome(async ({ home, store, cli }) => {
+      await mkdir(join(home, 'work'));
+      const result = await cli(['watch', join(home, 'work'), '--store', store]);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /Slipstream\.app manages the recorder for .*will not record into that store\./);
+      await assert.rejects(access(store), { code: 'ENOENT' });
+    });
+  });
 
   it('`attach --watch-only` from npm names the app instead of starting a recorder', async () => {
     const { access, mkdir } = await import('node:fs/promises');

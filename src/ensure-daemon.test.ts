@@ -21,6 +21,16 @@ describe('ensureDaemon', () => {
     assert.deepEqual(touched, []);
   });
 
+  it('touches nothing when it cannot tell whether Slipstream.app owns the recorder', async () => {
+    let probed = false;
+    await assert.rejects(ensureDaemon('/s', {
+      appRefusal: async () => { throw new Error('couldn\'t tell: EACCES'); },
+      probe: async () => { probed = true; return 'live'; },
+      startDaemon: never, checkBuild: same, mismatch: refuse,
+    }), (err: Error) => err instanceof DaemonUnavailableError && err.message === 'couldn\'t tell: EACCES');
+    assert.equal(probed, false);
+  });
+
   it('keeps a live daemon of this build without starting another', async () => {
     let started = 0;
     await ensureDaemon('/s', { probe: async () => 'live', startDaemon: () => { started++; return never(); }, checkBuild: same, mismatch: refuse });

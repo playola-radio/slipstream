@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appOwnedRefusal, appRecorderRoot, appRuntimeRoot } from './app-recorder-owner.ts';
@@ -11,11 +11,11 @@ async function withHome(run: (home: string) => Promise<void>): Promise<void> {
 }
 
 /** A runtime as the app's prepare() leaves it: a version folder, no `current`. */
-async function prepareRuntime(home: string, name = '0.3.1-abcdef12'): Promise<string> {
-  const dist = join(appRuntimeRoot(home), name, 'app', 'dist');
+async function prepareRuntime(home: string): Promise<string> {
+  const dist = join(appRuntimeRoot(home), '0.3.1-abcdef12', 'app', 'dist');
   await mkdir(dist, { recursive: true });
   await writeFile(join(dist, 'cli.js'), '');
-  return join(appRuntimeRoot(home), name);
+  return join(appRuntimeRoot(home), '0.3.1-abcdef12');
 }
 
 const npmCli = '/usr/local/lib/node_modules/@playola-radio/slipstream/dist/cli.js';
@@ -68,13 +68,36 @@ describe('appRecorderRoot', () => {
     });
   });
 
+  it('knows the app\'s store under another name for the same folder', async () => {
+    await withHome(async (home) => {
+      await prepareRuntime(home);
+      await symlink(home, join(home, 'alias'));
+      assert.equal(await appRecorderRoot({ home, store: join(home, 'alias', '.slipstream'), env: {}, cliPath: npmCli }),
+        appRuntimeRoot(home));
+      await mkdir(join(home, 'data'));
+      await symlink(join(home, 'data'), join(home, '.slipstream'));
+      assert.equal(await appRecorderRoot({ home, store: join(home, 'data'), env: {}, cliPath: npmCli }), appRuntimeRoot(home));
+    });
+  });
+
+  for (const [what, unreadable] of [['runtime folder', ''], ['prepared runtime', '0.3.1-abcdef12']] as const) {
+    it(`refuses to guess when the app's ${what} cannot be read`, async () => {
+      await withHome(async (home) => {
+        await prepareRuntime(home);
+        const dir = join(appRuntimeRoot(home), unreadable);
+        await chmod(dir, 0o000);
+        try {
+          await assert.rejects(appRecorderRoot({ home, store: join(home, '.slipstream'), env: {}, cliPath: npmCli }),
+            { message: /^couldn't tell whether Slipstream\.app manages the recorder for .*: EACCES/ });
+        } finally { await chmod(dir, 0o700); }
+      });
+    });
+  }
+
   it('does not take a folder that only shares the runtime folder\'s name prefix for the app', async () => {
     await withHome(async (home) => {
       await prepareRuntime(home);
-      const beside = `${appRuntimeRoot(home)}-old`;
-      await mkdir(join(beside, 'app', 'dist'), { recursive: true });
-      await writeFile(join(beside, 'app', 'dist', 'cli.js'), '');
-      const cliPath = join(beside, 'app', 'dist', 'cli.js');
+      const cliPath = join(`${appRuntimeRoot(home)}-old`, 'app', 'dist', 'cli.js');
       assert.equal(await appRecorderRoot({ home, store: join(home, '.slipstream'), env: {}, cliPath }),
         appRuntimeRoot(home));
     });

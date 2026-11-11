@@ -31,7 +31,7 @@ export class DaemonUnavailableError extends Error {}
 const DAEMON_START_MS = 10_000;
 
 export async function ensureDaemon(store: string, deps: EnsureDaemonDeps): Promise<void> {
-  const refusal = await deps.appRefusal?.();
+  const refusal = await deps.appRefusal?.().catch((err: Error) => { throw new DaemonUnavailableError(err.message); });
   if (refusal) throw new DaemonUnavailableError(`${refusal} Nothing was recorded.`);
   const verdict = await deps.probe();
   if (verdict === 'ambiguous') {

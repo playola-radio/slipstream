@@ -734,7 +734,8 @@ async function runServiceInstall(store: string): Promise<number> {
     return 1;
   }
   const cliPath = await realpath(fileURLToPath(import.meta.url));
-  const refusal = await appRefusal(store, cliPath, 'replace its LaunchAgent');
+  // Every store shares the one LaunchAgent, so the app's store guards it whatever --store says.
+  const refusal = await appRefusal(DEFAULT_DAEMON_STORE, cliPath, 'replace its LaunchAgent');
   if (refusal) {
     console.error(`slipstream: ${refusal}`);
     return 1;
@@ -767,7 +768,7 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
       err('slipstream: `conductor install` needs macOS launchd.');
       return 1;
     }
-    const refusal = await appRefusal(store, cliPath, 'replace its LaunchAgent');
+    const refusal = await appRefusal(DEFAULT_DAEMON_STORE, cliPath, 'replace its LaunchAgent');
     if (refusal) {
       err(`slipstream: ${refusal}`);
       return 1;
@@ -1039,6 +1040,13 @@ async function main(): Promise<void> {
       return;
     }
     await runControl(args.store, { verb: 'delete_session', session_id: args.sessionId });
+    return;
+  }
+
+  const refusal = await appRefusal(args.store, await realpath(fileURLToPath(import.meta.url)), 'record into that store');
+  if (refusal) {
+    console.error(`slipstream: ${refusal}`);
+    process.exitCode = 1;
     return;
   }
 
