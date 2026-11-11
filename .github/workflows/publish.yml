@@ -124,13 +124,6 @@ jobs:
             exit 1
           fi
           if [ "$published" = false ]; then
-            # A dispatched run publishes only a release commit. A merge that lands
-            # just as the bump job starts Publish is left to its push run, which
-            # would otherwise find it published and bump it again.
-            if [ "$TRIGGER" = dispatch ] && [ "$version" = "$previous" ]; then
-              echo "$SHA doesn't change the version; leaving the publish to its push run."
-              exit 0
-            fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
           elif [ "$TRIGGER" = push ] && [ "$version" = "$previous" ]; then
             # A merge can be published with the version it inherited from a
@@ -233,8 +226,13 @@ jobs:
             sleep 2
           done
           if [ "$tip" != "$release" ]; then
-            echo "::warning::develop is at $tip, not the release commit $release; leaving the release to that commit's run."
-            exit 0
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$release...$tip" --jq .status)
+            if [ "$status" = ahead ]; then
+              echo "develop moved on from the release commit $release to $tip; leaving the release to that commit's run."
+              exit 0
+            fi
+            echo "::error::GitHub still serves develop at $tip ($status), not the release commit $release. Re-run this job, or run Publish by hand on develop."
+            exit 1
           fi
           gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref develop -f release_sha="$release"
 
