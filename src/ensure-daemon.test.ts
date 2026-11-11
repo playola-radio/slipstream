@@ -8,6 +8,19 @@ const same = async (): Promise<BuildCheck> => ({ kind: 'same' });
 const refuse: EnsureDaemonDeps['mismatch'] = async () => ({ message: 'The daemon is 0.1.0; this CLI is 0.3.0. Restart it with `x`.' });
 
 describe('ensureDaemon', () => {
+  it('refuses before touching the daemon when Slipstream.app owns the recorder', async () => {
+    const touched: string[] = [];
+    await assert.rejects(ensureDaemon('/s', {
+      appRefusal: async () => 'Slipstream.app manages the recorder for /s.',
+      probe: async () => { touched.push('probe'); return 'stale'; },
+      startDaemon: () => { touched.push('start'); return never(); },
+      checkBuild: async () => { touched.push('checkBuild'); return { kind: 'different', daemon: null }; },
+      mismatch: async () => { touched.push('mismatch'); return { message: 'm', restart: () => { touched.push('restart'); return never(); } }; },
+    }), (err: Error) => err instanceof DaemonUnavailableError
+      && err.message === 'Slipstream.app manages the recorder for /s. Nothing was recorded.');
+    assert.deepEqual(touched, []);
+  });
+
   it('keeps a live daemon of this build without starting another', async () => {
     let started = 0;
     await ensureDaemon('/s', { probe: async () => 'live', startDaemon: () => { started++; return never(); }, checkBuild: same, mismatch: refuse });

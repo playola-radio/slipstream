@@ -9,6 +9,8 @@ import { unreadableMessage, type Build, type BuildCheck } from './daemon-version
  */
 
 export interface EnsureDaemonDeps {
+  /** Why this CLI must leave the store's recorder to Slipstream.app, if it must. */
+  appRefusal?: () => Promise<string | null>;
   probe: () => Promise<'live' | 'stale' | 'ambiguous'>;
   /** Start a daemon for the store: a detached `slipstream start`, or the
    * LaunchAgent for a managed install. `exited` settles if the start is known
@@ -29,6 +31,8 @@ export class DaemonUnavailableError extends Error {}
 const DAEMON_START_MS = 10_000;
 
 export async function ensureDaemon(store: string, deps: EnsureDaemonDeps): Promise<void> {
+  const refusal = await deps.appRefusal?.();
+  if (refusal) throw new DaemonUnavailableError(`${refusal} Nothing was recorded.`);
   const verdict = await deps.probe();
   if (verdict === 'ambiguous') {
     throw new DaemonUnavailableError(`the daemon for ${store} is not answering; run \`slipstream status --store ${store}\`. `
