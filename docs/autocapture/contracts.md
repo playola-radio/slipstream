@@ -442,6 +442,10 @@ Rules:
   "detached"`, `last_failure: null` (paused) before validating; nothing is written
   at startup, and the next ordinary intent write saves the new form. The record
   stays `version: 1`.
+- `version` is the store's compatibility gate: a change an older recorder cannot
+  safely read or rewrite bumps it. A loader that finds a higher version refuses
+  to start, saying a newer Slipstream wrote the record; it never offers to move
+  the record aside.
 - `(harness, harness_session_id)` is unique among linked bindings (4).
 - Connection state is **not** persisted. Recovery restores every linked binding
   as `setup_pending`; only a fresh round trip makes it `connected`.

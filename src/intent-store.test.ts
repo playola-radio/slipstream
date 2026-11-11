@@ -40,11 +40,20 @@ describe('durable intent record', () => {
     await assert.rejects(loadIntent(dir), IntentCorruptError);
   });
 
-  it('refuses an unknown version or a malformed entry', async () => {
+  it('refuses a record from a newer Slipstream without suggesting it be moved aside', async () => {
     const dir = await store();
     await mkdir(join(dir, 'control'), { mode: 0o700 });
     await writeFile(intentPath(dir), JSON.stringify({ ...emptyIntent(), version: 2 }), { mode: 0o600 });
-    await assert.rejects(loadIntent(dir), /unsupported version 2/);
+    await assert.rejects(loadIntent(dir), (err: Error) => !(err instanceof IntentCorruptError)
+      && /written by a newer Slipstream \(intent version 2; this one reads version 1\)/.test(err.message)
+      && !/move the file aside/.test(err.message));
+  });
+
+  it('refuses an unknown version or a malformed entry', async () => {
+    const dir = await store();
+    await mkdir(join(dir, 'control'), { mode: 0o700 });
+    await writeFile(intentPath(dir), JSON.stringify({ ...emptyIntent(), version: 0 }), { mode: 0o600 });
+    await assert.rejects(loadIntent(dir), /unsupported version 0/);
     const bad = emptyIntent();
     admitCapture(bad, capture(1));
     (bad.captures[0] as { intent: string }).intent = 'paused';
