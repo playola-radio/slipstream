@@ -139,6 +139,10 @@ It works out which chat it is in, starts the daemon if needed, and starts
 recording. It also installs a hook and a tool in that workspace's agent config,
 which let you [ask the agent about a change](#experimental-ask-the-agent-about-a-change).
 If the chat has to reload to pick those up, `attach` prints the exact command.
+The agent also gets a tool to name the workspace: it names it once, on its
+first task, in 2-5 words, replaces that name only if the work changes
+direction, and doesn't rename it per task. A name the person sets always
+wins.
 Then:
 
 ```sh
@@ -344,7 +348,7 @@ curl -H @"$HDR" "$URL/v1/sessions/<id>/events?after=0&follow=true"
 
 | Route | Returns |
 |---|---|
-| `GET /v1/sessions` | Captured sessions |
+| `GET /v1/sessions` | Captured sessions, with each one's agent and user `naming` ([contract](docs/ask-agent/contract.md#workspace-names)) |
 | `GET /v1/sessions/:id/events?after=N[&follow=true]` | Events after sequence `N`, streamed live with `follow=true` |
 | `GET /v1/blobs/sha256/:hash` | Raw file contents |
 | `GET /v1/sessions/:id/changes/:seq/clips` | The changed regions of one file change ([CLIP-PROJECTION.md](CLIP-PROJECTION.md)) |

@@ -40,6 +40,23 @@ concrete and specific ("Add retry to the upload client"), not vague ("changes"
 or "work"). Then do the work as usual — the changes you make are grouped under
 the task automatically; you do not call anything again to "end" it.
 
+### Name the workspace once
+
+Once you know what this workspace's work is about — usually on your first
+task — also call `slipstream_name_workspace` with a 2-5 word name, so the
+person watching can tell workspaces apart:
+
+```
+slipstream_name_workspace(name: "Pagination cursor fix")
+```
+
+Name it once. Don't rename it per task: a second call without
+`replace_existing` keeps the first name and says so. Pass
+`replace_existing: true` only if the work changes direction. You cannot
+override a name the person chose; the tool still succeeds, and the person's
+name keeps showing. If it returns `OUTCOME_UNKNOWN`, don't call it again just
+to retry.
+
 ## Reading the result
 
 On success the tool returns identifiers for the task it recorded
