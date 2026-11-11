@@ -3,7 +3,7 @@
  * owner-only `node:net` unix socket. This is a PRIVATE CONTROL channel — its
  * verbs (attach / detach / unlink / status / begin_task / ask / record_question_exchange /
  * record_question_relay_update / claim_question / answer_question / delete_session / gc /
- * rename_session) WRITE
+ * rename_session / name_workspace) WRITE
  * public events or maintain the store and never read or serve the feed. Readers
  * keep serving the public HTTP/disk view; there is no privileged back channel
  * for reading.
