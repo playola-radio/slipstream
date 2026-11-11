@@ -6,6 +6,8 @@ import { startCapture, InvalidTitleError, RootChangedError, type CaptureSession 
 import type { HealthFailure } from './health.ts';
 import { createTranscriptScheduler, type TranscriptScheduler } from './transcript/scheduler.ts';
 import { QuestionError, assertAnswerText, normalizeRelayUpdate } from './questions.ts';
+import { readNaming, writeNaming, type Naming } from './session-name.ts';
+import { validateName } from './workspace-name.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
@@ -48,8 +50,9 @@ import {
  * captures start and stop beneath it.
  *
  * It speaks the PRIVATE control protocol (attach / detach / unlink / status /
- * begin_task / ask / claim_question / answer_question / delete_session / gc). Every
- * verb WRITES public events, maintains the store, or reports state; none reads or
+ * begin_task / ask / claim_question / answer_question / delete_session / gc /
+ * rename_session). Every verb WRITES public events, maintains the store, or reports
+ * state; none reads or
  * serves the feed — readers get the feed through the public HTTP view like any
  * other client. There is no privileged back channel for reading. delete_session
  * removes an inactive session while other captures keep recording; gc stops every
@@ -87,6 +90,8 @@ export interface DaemonOptions {
   /** Replaces the transcript scheduler the config would build, so a test can count
    * one shared discovery cycle across captures. */
   transcriptScheduler?: TranscriptScheduler;
+  /** Allows a name write to be held under the metadata lock deterministically. */
+  metadataWriteGate?: () => Promise<void>;
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
@@ -398,6 +403,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
+  /** Name writes run one at a time; teardown waits for the queue before it
+   * releases the store lock. */
+  let metadataTail: Promise<void> = Promise.resolve();
   // Gates DISPATCH, not acceptance: connections are tracked and given a deadline
   // from the moment they arrive (so bind/chmod-window sockets can never orphan or
   // hang shutdown), but no verb runs until startup is fully ready — which is also
@@ -465,6 +473,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
       c.session = undefined;
     }
+    await metadataTail;
     await reader?.close().catch(() => {});
     // Unlink the socket only while we still hold the store lock. On the compromise
     // path the lock is already lost, so a successor may have bound the path — an
@@ -1836,6 +1845,53 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  function withMetadataLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = metadataTail.then(fn);
+    metadataTail = run.then(() => {}, () => {});
+    return run;
+  }
+
+  /** Publish one session's names, starting from what is on disk so a malformed
+   * file is replaced rather than failing the write. */
+  async function updateNaming(id: string, change: (naming: Naming) => Naming | undefined, assertOwnership: () => void): Promise<boolean> {
+    const { naming, malformed } = await readNaming(storeDir, id);
+    if (malformed) console.error(`slipstream daemon: name.json for ${id} is malformed (${malformed}); replacing it`);
+    const next = change(naming);
+    if (!next) return false;
+    await opts.metadataWriteGate?.();
+    await writeNaming(storeDir, id, next, assertOwnership);
+    return true;
+  }
+
+  async function renameSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.session_id) || !isValidSessionId(req.session_id)) {
+      return errFields('PROTOCOL', 'rename_session requires a valid session_id');
+    }
+    if (!('name' in req) || (req.name !== null && typeof req.name !== 'string')) {
+      return errFields('PROTOCOL', 'rename_session requires name, a string or null');
+    }
+    let name: string | null = null;
+    if (req.name !== null) {
+      const valid = validateName(req.name);
+      if (!valid.ok) return errFields('INVALID_NAME', valid.message);
+      name = valid.name;
+    }
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const id = req.session_id;
+    try {
+      return await withMetadataLock(async () => {
+        if (!await sessionExists(storeDir, id)) return errFields('SESSION_NOT_FOUND', `no session ${id} to rename`);
+        if (await readTombstone(storeDir, id) !== null) return errFields('SESSION_NOT_FOUND', `session ${id} was deleted`);
+        await updateNaming(id, (naming) => ({ ...naming, user_name: name }), () => {
+          if (compromised || torn) throw new QuestionError('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+        });
+        return {};
+      });
+    } catch (err) {
+      return controlFailure(err);
+    }
+  }
+
   async function deleteSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     // Validate the id shape before admission: it names an on-disk path, so a
     // malformed or traversing id is a protocol fault, never a lookup miss.
@@ -2078,6 +2134,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'claim_question': outcome = await claimQuestion(req); break;
       case 'answer_question': outcome = await answerQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
+      case 'rename_session': outcome = await renameSession(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };
     }

@@ -2,7 +2,8 @@
  * The Slipstream daemon control protocol: newline-delimited JSON over an
  * owner-only `node:net` unix socket. This is a PRIVATE CONTROL channel — its
  * verbs (attach / detach / unlink / status / begin_task / ask / record_question_exchange /
- * record_question_relay_update / claim_question / answer_question / delete_session / gc) WRITE
+ * record_question_relay_update / claim_question / answer_question / delete_session / gc /
+ * rename_session) WRITE
  * public events or maintain the store and never read or serve the feed. Readers
  * keep serving the public HTTP/disk view; there is no privileged back channel
  * for reading.
@@ -17,7 +18,8 @@
 /** Client-facing control error codes (the subset this PR owns). `DAEMON_UNAVAILABLE`
  * is synthesized client-side; `INVALID_TITLE` originates in P2's beginTask;
  * `SESSION_ACTIVE` refuses delete or gc while a capture is live; `SESSION_NOT_FOUND` refuses a
- * delete of a well-formed session id that names no session on disk.
+ * delete or rename of a well-formed session id that names no session on disk.
+ * `INVALID_NAME`: a workspace name failed validation (see workspace-name.ts).
  * `SESSION_RESUME_FAILED`: attach found the workspace's existing session but could
  * not resume it; the message names the session and whether to retry or
  * restore/delete it. Attach never falls back to a new session. The capture-table
@@ -39,6 +41,7 @@ export type ControlErrorCode =
   | 'REQUEST_CONFLICT'
   | 'QUESTION_LIMIT'
   | 'INVALID_TITLE'
+  | 'INVALID_NAME'
   | 'INVALID_ANSWER'
   | 'INVALID_RELAY_UPDATE'
   | 'QUESTION_NOT_FOUND'
