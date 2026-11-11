@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { appOwnedRefusal, appRecorderRoot, appRuntimeRoot } from './app-recorder-owner.ts';
 
 async function withHome(run: (home: string) => Promise<void>): Promise<void> {
@@ -80,6 +80,29 @@ describe('appRecorderRoot', () => {
     });
   });
 
+  it('recognizes a missing default store with different casing on a case-insensitive volume', async (t) => {
+    await withHome(async (home) => {
+      await prepareRuntime(home);
+      const store = join(home, '.SLIPSTREAM');
+      const caseInsensitive = await realpath(join(dirname(home), basename(home).toUpperCase())).then(
+        (aliased) => aliased === home,
+        () => false,
+      );
+      if (!caseInsensitive) t.diagnostic('case-sensitive filesystem: verifying the paths remain distinct');
+      assert.equal(await appRecorderRoot({ home, store, env: {}, cliPath: npmCli }),
+        caseInsensitive ? appRuntimeRoot(home) : null);
+    });
+  });
+
+  it('recognizes the target of a dangling default-store symlink', async () => {
+    await withHome(async (home) => {
+      await prepareRuntime(home);
+      const target = join(home, 'data');
+      await symlink(target, join(home, '.slipstream'));
+      assert.equal(await appRecorderRoot({ home, store: target, env: {}, cliPath: npmCli }), appRuntimeRoot(home));
+    });
+  });
+
   for (const [what, unreadable] of [['runtime folder', ''], ['prepared runtime', '0.3.1-abcdef12']] as const) {
     it(`refuses to guess when the app's ${what} cannot be read`, async () => {
       await withHome(async (home) => {
@@ -106,9 +129,9 @@ describe('appRecorderRoot', () => {
 
 describe('appOwnedRefusal', () => {
   it('says the app manages the recorder, what to use instead, and how to undo it after an uninstall', () => {
-    const message = appOwnedRefusal('/h/.slipstream', '/h/rt', npmCli, 'start a recorder');
+    const message = appOwnedRefusal('/h/.slipstream', '/h/Application Support/rt', npmCli, 'start a recorder');
     assert.equal(message, `Slipstream.app manages the recorder for /h/.slipstream, so this copy of slipstream (${npmCli}) `
-      + 'will not start a recorder. Open Slipstream.app, and run slipstream through its command, /h/rt/bin/slipstream. '
-      + 'If you uninstalled Slipstream.app, remove /h/rt to let this copy run the recorder again.');
+      + "will not start a recorder. Open Slipstream.app, and run slipstream through its command, '/h/Application Support/rt/bin/slipstream'. "
+      + 'If you uninstalled Slipstream.app, remove /h/Application Support/rt to let this copy run the recorder again.');
   });
 });

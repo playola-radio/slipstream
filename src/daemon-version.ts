@@ -132,7 +132,12 @@ export async function remedyFor(store: string, daemon: Build | null, own: Build,
   if (appRuntime(env)) {
     return { text: `The Slipstream app is switching this recorder to ${own.version}; open Slipstream if it doesn't finish.` };
   }
-  const appRoot = await appRecorderRoot({ home, store, env, cliPath: await thisCliPath() }).catch(() => null);
+  let appRoot: string | null;
+  try {
+    appRoot = await appRecorderRoot({ home, store, env, cliPath: await thisCliPath() });
+  } catch (err) {
+    return { text: (err as Error).message };
+  }
   if (appRoot) {
     return { text: `Slipstream.app manages this recorder; open Slipstream.app, and run slipstream through ${shellWord(join(appRoot, 'bin', 'slipstream'))}.` };
   }

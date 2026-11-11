@@ -11,10 +11,11 @@
  * exactly the machine this guards. Not the runtime root alone: the app creates
  * it for its lock before the copy can fail.
  */
-import { readdir, realpath, stat } from 'node:fs/promises';
+import { readdir, readlink, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { appRuntime } from './app-runtime.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
+import { shellWord } from './shell-word.ts';
 
 export function appRuntimeRoot(home: string): string {
   return join(home, 'Library', 'Application Support', 'com.playola.SlipstreamViewer', 'runtime');
@@ -53,8 +54,37 @@ async function canonical(path: string): Promise<string> {
   try { return await realpath(path); } catch (err) {
     const parent = dirname(path);
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || parent === path) throw err;
-    return join(await canonical(parent), basename(path));
+    try {
+      const target = await readlink(path);
+      return canonical(isAbsolute(target) ? target : join(parent, target));
+    } catch (linkErr) {
+      if (!['ENOENT', 'EINVAL'].includes((linkErr as NodeJS.ErrnoException).code ?? '')) throw linkErr;
+    }
+    const name = basename(path);
+    return join(await canonical(parent), await isCaseInsensitive(parent) ? name.toLowerCase() : name);
   }
+}
+
+/** Whether an existing ancestor of `path` treats two case variants as the same path. */
+async function isCaseInsensitive(path: string): Promise<boolean> {
+  let existing = path;
+  while (true) {
+    try { existing = await realpath(existing); break; } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(existing) === existing) throw err;
+      existing = dirname(existing);
+    }
+  }
+  for (let part = existing; dirname(part) !== part; part = dirname(part)) {
+    const name = basename(part);
+    const index = name.search(/[a-zA-Z]/);
+    if (index < 0) continue;
+    const alternate = `${name.slice(0, index)}${name[index] === name[index]!.toLowerCase()
+      ? name[index]!.toUpperCase() : name[index]!.toLowerCase()}${name.slice(index + 1)}`;
+    try { return await realpath(join(dirname(part), alternate)) === part; } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+  return false;
 }
 
 async function isFile(path: string): Promise<boolean> {
@@ -67,6 +97,6 @@ async function isFile(path: string): Promise<boolean> {
 
 export function appOwnedRefusal(store: string, root: string, cliPath: string, wontDo: string): string {
   return `Slipstream.app manages the recorder for ${store}, so this copy of slipstream (${cliPath}) will not ${wontDo}. `
-    + `Open Slipstream.app, and run slipstream through its command, ${join(root, 'bin', 'slipstream')}. `
+    + `Open Slipstream.app, and run slipstream through its command, ${shellWord(join(root, 'bin', 'slipstream'))}. `
     + `If you uninstalled Slipstream.app, remove ${root} to let this copy run the recorder again.`;
 }

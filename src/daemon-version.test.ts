@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonLogPath, plistPath, renderPlist } from './launch-agent.ts';
 import { appRuntimeRoot } from './app-recorder-owner.ts';
@@ -148,6 +148,18 @@ describe('remedyFor', () => {
       assert.equal(remedy.restart, undefined);
       assert.equal(remedy.text, 'Slipstream.app manages this recorder; open Slipstream.app, and run slipstream through '
         + `${shellWord(join(appRuntimeRoot(home), 'bin', 'slipstream'))}.`);
+    });
+  });
+
+  it('reports an app ownership check error instead of restart advice', async () => {
+    await withTempDir(async (home) => {
+      const store = join(home, '.slipstream'); await mkdir(store);
+      await mkdir(dirname(appRuntimeRoot(home)), { recursive: true });
+      await writeFile(appRuntimeRoot(home), 'not a directory');
+      const remedy = await remedyFor(store, null, OWN, home, {});
+      assert.equal(remedy.restart, undefined);
+      assert.match(remedy.text, /^couldn't tell whether Slipstream\.app manages the recorder.*ENOTDIR/);
+      assert.doesNotMatch(remedy.text, /Restart|Stop|conductor install/);
     });
   });
 
