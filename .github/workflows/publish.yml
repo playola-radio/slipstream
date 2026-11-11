@@ -1,7 +1,14 @@
 name: Publish
 
-# Publishes package.json's version to npm once Tests pass on a push to develop.
-# A merge that doesn't change the version finds it already on npm and stops.
+# Publishes a new npm version for every merge to develop that passes Tests.
+#
+# A merge whose version is already on npm gets the next patch version: the bump
+# job commits it to develop as `chore: release v<version>` and runs Tests on
+# that commit. That run's success brings this workflow back, and it publishes
+# the release commit. Publishing in a later run keeps npm provenance pointing
+# at the commit that holds the version. A merge that changes the version itself
+# (e.g. a minor bump) publishes as is. A commit that changes the version is
+# never bumped again, so a re-run of a published release does nothing.
 on:
   workflow_run:
     workflows: [Tests]
@@ -15,12 +22,14 @@ concurrency:
 
 jobs:
   publish:
-    # `event == 'push'` also rules out a pull request from a fork whose branch
-    # happens to be named develop.
+    # Checking the event also rules out a pull request from a fork whose branch
+    # happens to be named develop. A `workflow_dispatch` Tests run is the bump
+    # job's, or one started by hand.
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch') &&
        github.event.workflow_run.head_branch == 'develop')
     permissions:
       contents: read
@@ -31,15 +40,19 @@ jobs:
     timeout-minutes: 15
     env:
       SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TESTS_EVENT: ${{ github.event.workflow_run.event }}
     outputs:
       version: ${{ steps.check.outputs.version }}
       published: ${{ steps.publish.outcome == 'success' }}
+      bump: ${{ steps.check.outputs.bump }}
 
     steps:
       - name: Check out the tested commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.SHA }}
+          # The parent tells whether this commit changed the version.
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Set up Node.js
@@ -56,10 +69,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
-            --branch develop --event push --commit "$SHA" \
-            --json conclusion --jq 'map(select(.conclusion == "success")) | length')
+            --branch develop --commit "$SHA" --json conclusion,event \
+            --jq 'map(select(.conclusion == "success" and
+              (.event == "push" or .event == "workflow_dispatch"))) | length')
           if [ "$passed" = "0" ]; then
-            echo "::error::Tests have not passed on a push of $SHA to develop; refusing to publish."
+            echo "::error::Tests have not passed on $SHA on develop; refusing to publish."
             exit 1
           fi
 
@@ -75,14 +89,25 @@ jobs:
           fi
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
+          previous=$(git show HEAD^:package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # A missing version exits non-zero (E404). Any other lookup failure
           # also falls through to publish, which npm refuses for a duplicate.
-          if [ "$(npm view "$name@$version" version 2>/dev/null)" = "$version" ]; then
+          if [ "$(npm view "$name@$version" version 2>/dev/null)" != "$version" ]; then
+            # A dispatched run publishes only a release commit. A merge that lands
+            # just as the bump job dispatches Tests is left to its push run, which
+            # would otherwise find it published and bump it again.
+            if [ "$TESTS_EVENT" = workflow_dispatch ] && [ "$version" = "$previous" ]; then
+              echo "$SHA doesn't change the version; leaving the publish to its push run."
+              exit 0
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$TESTS_EVENT" = push ] && [ "$version" = "$previous" ]; then
+            echo "$name@$version is already published; bumping the patch version."
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          else
             echo "$name@$version is already published; nothing to do."
-            exit 0
           fi
-          echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Make sure npm supports trusted publishing
         if: steps.check.outputs.publish == 'true'
@@ -103,6 +128,48 @@ jobs:
         if: steps.check.outputs.publish == 'true'
         # `prepack` builds dist.
         run: npm publish --provenance
+
+  bump:
+    needs: publish
+    if: needs.publish.outputs.bump == 'true'
+    permissions:
+      contents: write # push the release commit to develop
+      actions: write # run Tests on it
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_TOKEN: ${{ github.token }}
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Commit the next patch version to develop and run Tests on it
+        run: |
+          version=$(npm version patch --no-git-tag-version)
+          git commit --quiet -m "chore: release $version" package.json package-lock.json
+          if ! git push origin HEAD:refs/heads/develop; then
+            git fetch --quiet origin develop
+            remote=$(git rev-parse FETCH_HEAD)
+            # A push can land even though its reply was lost.
+            if [ "$remote" != "$(git rev-parse HEAD)" ]; then
+              if [ "$remote" != "$SHA" ]; then
+                echo "develop moved on to $remote while bumping to $version; leaving the release to that commit's run."
+                exit 0
+              fi
+              echo "::error::Could not push the $version release commit to develop."
+              exit 1
+            fi
+          fi
+          # A push made with GITHUB_TOKEN starts no workflows; a dispatch does.
+          gh workflow run tests.yml --repo "$GITHUB_REPOSITORY" --ref develop
 
   release:
     needs: publish

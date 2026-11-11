@@ -5,6 +5,8 @@ on:
     branches: [develop, main]
   pull_request:
     branches: [develop, main]
+  # Publish's bump job runs Tests on the release commit it pushes.
+  workflow_dispatch:
 
 jobs:
   test:
