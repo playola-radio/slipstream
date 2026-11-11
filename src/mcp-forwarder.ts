@@ -15,9 +15,11 @@
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
  */
-import { dirname } from 'node:path';
+import { readFile, realpath } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { appRuntime } from './app-runtime.ts';
 import { isMainModule } from './entrypoint.ts';
-import { dispatch, parseMessage, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
+import { dispatch, parseMessage, type JsonRpcRequest, type JsonRpcResponse, type McpHandlers, type ToolDef } from './mcp-protocol.ts';
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
 import { forwardAnswer } from './answer-forwarder.ts';
@@ -64,6 +66,38 @@ export interface ForwarderHandlerOpts {
   socketPath: string;
   /** The subprocess env, read once at initialize for the Claude identity triple. */
   env: Env;
+  /** Replaces this process; the app's shim after an update. Defaults to `process.execve`. */
+  execve?: (file: string, args: string[], env: Env) => void | Promise<void>;
+  /** The build the app's runtime `<root>/current` now holds, or null if unreadable. */
+  readCurrentBuild?: (root: string) => Promise<string | null>;
+  /** Input read from stdin but not handled yet, which a successor must handle first. */
+  unreadInput?: () => Buffer;
+  /** Flushes responses written before replacement. */
+  flushOutput?: () => Promise<void>;
+  /** Durable begin-task idempotency key recovered from a predecessor. */
+  replayRequestId?: string;
+}
+
+/** The env var a replaced forwarder hands its successor the call it was answering. */
+export const REPLAY_ENV = 'SLIPSTREAM_MCP_REPLAY';
+
+interface Replay { initialize: JsonRpcRequest | null; call: JsonRpcRequest; requestId?: string; input: string }
+
+async function currentBuild(root: string): Promise<string | null> {
+  try {
+    return (await readFile(join(await realpath(join(root, 'current')), 'app', 'dist', 'build-id'), 'utf8')).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function flushOutput(): Promise<void> {
+  // Its callback runs once everything written before it has been flushed.
+  await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
+}
+
+function execveAfterFlush(file: string, args: string[], env: Env): void {
+  process.execve!(file, args, env);
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -80,23 +114,63 @@ function stringArg(params: unknown, key: string): string {
 
 export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers {
   const ctx = createHarnessContext();
+  const execve = opts.execve ?? execveAfterFlush;
+  const readCurrentBuild = opts.readCurrentBuild ?? currentBuild;
+  const unreadInput = opts.unreadInput ?? (() => Buffer.alloc(0));
+  const flush = opts.flushOutput ?? flushOutput;
+  let initialized: JsonRpcRequest | null = null;
+  let replayRequestId = opts.replayRequestId;
+
+  /** After an app update the daemon runs the new build and this process is the
+   * stale side: hand the call to the new shim instead of answering a mismatch. */
+  const replaceIfStale = async (call: JsonRpcRequest, request: RequestEnvelope) => {
+    const runtime = appRuntime(opts.env);
+    if (!runtime) return;
+    const current = await readCurrentBuild(runtime.root);
+    if (current === null || current === (await thisBuild()).build) return;
+    try {
+      await flush();
+      const requestId = request.verb === 'begin_task' && typeof request.request_id === 'string'
+        ? request.request_id
+        : undefined;
+      const replay: Replay = {
+        initialize: initialized,
+        call,
+        ...(requestId === undefined ? {} : { requestId }),
+        input: unreadInput().toString('base64'),
+      };
+      await execve(runtime.mcp, [runtime.mcp, ...process.argv.slice(2)],
+        { ...opts.env, [REPLAY_ENV]: Buffer.from(JSON.stringify(replay)).toString('base64') });
+    } catch (err) {
+      process.stderr.write(`slipstream-forwarder: could not switch to ${runtime.mcp}: ${(err as Error).message}\n`);
+    }
+  };
 
   return {
     serverInfo: { name: 'slipstream-forwarder', version: '0.0.0' },
     protocolVersion: '2025-06-18',
     tools: [BEGIN_TASK_TOOL, ANSWER_QUESTION_TOOL],
     onInitialize: (params) => {
+      initialized = { jsonrpc: '2.0', method: 'initialize', params };
       const clientInfo = isObject(params) ? params.clientInfo : undefined;
       ctx.initialize(clientInfo, opts.env);
     },
-    callTool: (name, params) => {
+    callTool: (name, params, id) => {
       const identity = ctx.identityForCall(params);
       const raw = (request: RequestEnvelope) => sendControlRequest({ socketPath: opts.socketPath, request });
-      const send = async (request: RequestEnvelope) =>
-        versionGate(raw, dirname(opts.socketPath), await thisBuild())(request);
-      return name === ANSWER_QUESTION_TOOL.name
-        ? forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send })
-        : forwardBeginTask({ identity, title: stringArg(params, 'title'), send });
+      const send = async (request: RequestEnvelope) => {
+        const response = await versionGate(raw, dirname(opts.socketPath), await thisBuild())(request);
+        if (!response.ok && response.code === 'DAEMON_VERSION_MISMATCH') {
+          await replaceIfStale({ jsonrpc: '2.0', id, method: 'tools/call', params }, request);
+        }
+        return response;
+      };
+      if (name === ANSWER_QUESTION_TOOL.name) {
+        return forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send });
+      }
+      const requestId = replayRequestId;
+      replayRequestId = undefined;
+      return forwardBeginTask({ identity, title: stringArg(params, 'title'), requestId, send });
     },
   };
 }
@@ -144,7 +218,29 @@ export function createStdinFramer(maxBytes: number = MAX_STDIN_LINE_BYTES) {
       }
       return out;
     },
+    /** The partial line held for the next push. */
+    buffered(): Buffer {
+      return discarding ? Buffer.alloc(0) : buf;
+    },
   };
+}
+
+/** Decode the replay passed by a predecessor, without exposing its contents in output. */
+function parseReplay(text: string): Replay | null {
+  try {
+    return JSON.parse(Buffer.from(text, 'base64').toString('utf8')) as Replay;
+  } catch (err) {
+    process.stderr.write(`slipstream-forwarder: ${REPLAY_ENV} is unreadable: ${(err as Error).message}\n`);
+    return null;
+  }
+}
+
+/** A replaced forwarder's successor answers the call its predecessor was holding,
+ * under the original id; the saved initialize only primes the identity. */
+async function answerReplay(saved: Replay, handlers: McpHandlers, write: (res: JsonRpcResponse) => void): Promise<void> {
+  if (saved.initialize) await dispatch(saved.initialize, handlers);
+  const res = await dispatch(saved.call, handlers);
+  if (res) write(res);
 }
 
 export async function runForwarder(): Promise<void> {
@@ -157,26 +253,57 @@ export async function runForwarder(): Promise<void> {
     return;
   }
 
-  const handlers = createForwarderHandlers({ socketPath, env: process.env });
-  const writeError = (code: number, message: string) =>
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code, message } }) + '\n');
-
   const framer = createStdinFramer();
-  for await (const chunk of process.stdin) {
-    for (const frame of framer.push(chunk as Buffer)) {
-      if ('overflow' in frame) {
-        writeError(-32700, 'message exceeds byte cap');
-        continue;
-      }
-      const parsed = parseMessage(frame.line);
-      if (!parsed.ok) {
-        writeError(parsed.code, parsed.code === -32700 ? 'parse error' : 'invalid request');
-        continue;
-      }
-      const res = await dispatch(parsed.value, handlers);
-      if (res) process.stdout.write(JSON.stringify(res) + '\n');
+  const pending: StdinFrame[] = [];
+  // Left in place, so a failed switch carries on reading where it was.
+  const unreadInput = () => {
+    const streamed = process.stdin.read() as Buffer | null;
+    if (streamed !== null) process.stdin.unshift(streamed);
+    return Buffer.concat([
+      ...pending.flatMap((f) => ('line' in f ? [Buffer.from(f.line + '\n')] : [])),
+      framer.buffered(),
+      ...(streamed !== null ? [streamed] : []),
+    ]);
+  };
+
+  const replay = process.env[REPLAY_ENV];
+  delete process.env[REPLAY_ENV];
+  const savedReplay = replay === undefined ? null : parseReplay(replay);
+  const handlers = createForwarderHandlers({
+    socketPath,
+    env: process.env,
+    unreadInput,
+    replayRequestId: savedReplay?.requestId,
+  });
+  const write = (res: JsonRpcResponse) => process.stdout.write(JSON.stringify(res) + '\n');
+  const writeError = (code: number, message: string) => write({ jsonrpc: '2.0', id: null, error: { code, message } });
+
+  const handle = async (frame: StdinFrame) => {
+    if ('overflow' in frame) {
+      writeError(-32700, 'message exceeds byte cap');
+      return;
     }
+    const parsed = parseMessage(frame.line);
+    if (!parsed.ok) {
+      writeError(parsed.code, parsed.code === -32700 ? 'parse error' : 'invalid request');
+      return;
+    }
+    const res = await dispatch(parsed.value, handlers);
+    if (res) write(res);
+  };
+  const take = async (chunk: Buffer) => {
+    pending.push(...framer.push(chunk));
+    while (pending.length > 0) await handle(pending.shift()!);
+  };
+
+  if (savedReplay) {
+    // Queue inherited input before dispatching the replayed call. That makes it
+    // part of any immediate second handoff instead of losing it between builds.
+    pending.push(...framer.push(Buffer.from(savedReplay.input, 'base64')));
+    await answerReplay(savedReplay, handlers, write);
+    while (pending.length > 0) await handle(pending.shift()!);
   }
+  for await (const chunk of process.stdin) await take(chunk as Buffer);
 }
 
 if (process.argv[1] && isMainModule(import.meta.url, process.argv[1])) {

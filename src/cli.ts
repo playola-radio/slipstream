@@ -28,6 +28,11 @@
  *
  *   slipstream conductor install|setup|archive|enroll [--store <dir>]
  *
+ * The background daemon on its own, as the Slipstream app installs it:
+ *
+ *   slipstream service install [--store <dir>]
+ *   slipstream adopt-app [--store <dir>]   (move attach's hooks and answer tools onto the app's commands)
+ *
  * Workspaces without Conductor: a git worktree under ~/slipstream/workspaces,
  * set up and recorded, and later archived.
  *
@@ -59,7 +64,7 @@ import { runTui } from './tui.ts';
 import { runAttachWorkflow, runWatchOnlyAttach, runIdentityAttach } from './attach-workflow.ts';
 import { runUnlink, runWithdraw, type WithdrawDeps } from './withdraw-workflow.ts';
 import { DaemonUnavailableError, ensureDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
-import { kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
+import { InstallError, installService, kickstartLaunchAgent, readManagedInstall, type Run } from './launch-agent.ts';
 import {
   checkDaemonBuild, describeBuild, mismatchMessage, remedyFor, reportedBuild, sameBuild, thisBuild, versionGate,
   type Build, type Send,
@@ -70,6 +75,8 @@ import {
 } from './conductor.ts';
 import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
+import { agentEntries } from './app-runtime.ts';
+import { runAdoptApp } from './adopt-app.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
@@ -84,6 +91,7 @@ type Args =
   | { command: 'watch'; dir: string; store: string }
   | { command: 'serve'; dir: string; store: string }
   | { command: 'view' }
+  | { command: 'version' }
   | { command: 'start'; store: string; configPath?: string; overrides: ConfigOverrides }
   | { command: 'status'; store: string; target?: string }
   | { command: 'detach'; store: string; target: string }
@@ -96,6 +104,8 @@ type Args =
   | { command: 'delete'; store: string; sessionId: string }
   | { command: 'gc'; store: string }
   | { command: 'conductor'; action: ConductorAction; store: string }
+  | { command: 'service-install'; store: string }
+  | { command: 'adopt-app'; store: string }
   | { command: 'workspace'; action: WorkspaceAction; dir: string; store: string };
 
 const CONDUCTOR_ACTIONS = ['install', 'setup', 'archive', 'enroll'] as const;
@@ -362,6 +372,14 @@ export function parseArgs(argv: string[]): Args | null {
     const store = parseStoreOnly(argv.slice(2));
     return store === null ? null : { command, action: argv[1] as ConductorAction, store };
   }
+  if (command === 'service' && argv[1] === 'install') {
+    const store = parseStoreOnly(argv.slice(2));
+    return store === null ? null : { command: 'service-install', store };
+  }
+  if (command === 'adopt-app') {
+    const store = parseStoreOnly(argv.slice(1));
+    return store === null ? null : { command, store };
+  }
   if (command === 'workspace' && (WORKSPACE_ACTIONS as readonly string[]).includes(argv[1] ?? '')) {
     const dir = argv[2];
     if (dir === undefined || dir.startsWith('--')) return null;
@@ -369,6 +387,7 @@ export function parseArgs(argv: string[]): Args | null {
     return store === null ? null : { command, action: argv[1] as WorkspaceAction, dir: resolve(dir), store };
   }
   if (command === 'view') return { command: 'view' };
+  if (command === '--version' && argv.length === 1) return { command: 'version' };
   return null;
 }
 
@@ -378,7 +397,8 @@ async function countRecords(logPath: string): Promise<number> {
 }
 
 function usage(): void {
-  console.error('Usage: slipstream watch  [dir] [--store <dir>]');
+  console.error('Usage: slipstream --version');
+  console.error('       slipstream watch  [dir] [--store <dir>]');
   console.error('       slipstream serve  [dir] [--store <dir>]');
   console.error('       slipstream start  [--store <dir>] [--config <file>] [--enable <harness>]');
   console.error('                         [--window-ms N] [--grace-ms N] [--claude-home <dir>] [--codex-home <dir>] [--codex-scan-limit N]');
@@ -393,6 +413,8 @@ function usage(): void {
   console.error('       slipstream conductor install [--store <dir>]   (LaunchAgent + Conductor setup/archive scripts)');
   console.error('       slipstream conductor enroll  [--store <dir>]   (capture every existing Conductor workspace)');
   console.error('       slipstream conductor setup|archive [--store <dir>]   (run by Conductor\'s scripts)');
+  console.error('       slipstream service install [--store <dir>]   (the background daemon\'s LaunchAgent, without Conductor)');
+  console.error('       slipstream adopt-app [--store <dir>]   (run by the Slipstream app: hooks and answer tools onto its commands)');
   console.error('       slipstream workspace create <repo-dir> [--store <dir>]   (new worktree under ~/slipstream/workspaces)');
   console.error('       slipstream workspace archive <workspace-dir> [--store <dir>]');
   console.error('       slipstream ask --store <dir> --session <capture-id> --request-id <uuid> --input <json-file>');
@@ -698,6 +720,28 @@ async function packageVersion(): Promise<string> {
   return (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 }
 
+async function runServiceInstall(store: string): Promise<number> {
+  if (!process.getuid) {
+    console.error('slipstream: `service install` needs macOS launchd.');
+    return 1;
+  }
+  const cliPath = await realpath(fileURLToPath(import.meta.url));
+  const version = await packageVersion();
+  try {
+    const agent = await installService({ execPath: process.execPath, nodeVersion: process.versions.node, cliPath,
+      home: homedir(), store, uid: process.getuid(), packageVersion: version, run: runCommand });
+    console.log(`LaunchAgent: ${agent.plist}${agent.reloaded ? ' (loaded; the daemon was started on these paths)' : ' (unchanged)'}`);
+    console.log(`Daemon log: ${agent.log}`);
+    console.log(`Node: ${process.execPath}`);
+    console.log(`Slipstream: ${cliPath} (${version})`);
+    return 0;
+  } catch (err) {
+    if (!(err instanceof InstallError)) throw err;
+    console.error(`slipstream: ${err.message}`);
+    return 1;
+  }
+}
+
 async function runConductor(action: ConductorAction, store: string): Promise<number> {
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   const send = await daemonSend(store);
@@ -786,23 +830,29 @@ async function runIdentity(store: string, request: Record<string, unknown> & { v
   }
 }
 
+/** Run a helper command such as `claude mcp` in a directory; a command that
+ * cannot start (not on PATH, say) has a null code and its error as output. */
+function runIn(command: string, commandArgs: string[], cwd: string): Promise<{ code: number | null; output: string }> {
+  return new Promise((done) => {
+    execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
+      const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
+      done({ code, output: `${stdout}${stderr}` || (err?.message ?? '') });
+    });
+  });
+}
+
 /** `slipstream attach` without identity flags connects the chat it runs in. */
 async function runThisChatAttach(dir: string, store: string): Promise<void> {
   const send = await daemonSend(store);
   const cliPath = await realpath(fileURLToPath(import.meta.url));
   try {
     process.exitCode = await runAttachWorkflow({ dir, store }, {
-      env: process.env, home: homedir(), nodePath: process.execPath, cliPath,
+      env: process.env, home: homedir(), ...agentEntries(process.env, process.execPath, cliPath),
       out: (line) => console.log(line),
       err: (line) => console.error(line),
       ...await daemonStarter(store, cliPath),
       control: (request) => send({ v: 1, ...request }),
-      run: (command, commandArgs, cwd) => new Promise((done) => {
-        execFile(command, commandArgs, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
-          const code = err ? (typeof err.code === 'number' ? err.code : null) : 0;
-          done({ code, output: `${stdout}${stderr}` });
-        });
-      }),
+      run: runIn,
     });
   } catch (err) {
     if (!(err instanceof OutcomeUnknownError)) throw err;
@@ -817,6 +867,11 @@ async function main(): Promise<void> {
   if (!args) {
     usage();
     process.exitCode = 2;
+    return;
+  }
+
+  if (args.command === 'version') {
+    console.log(await packageVersion());
     return;
   }
 
@@ -910,6 +965,17 @@ async function main(): Promise<void> {
 
   if (args.command === 'conductor') {
     process.exitCode = await runConductor(args.action, args.store);
+    return;
+  }
+
+  if (args.command === 'service-install') {
+    process.exitCode = await runServiceInstall(args.store);
+    return;
+  }
+
+  if (args.command === 'adopt-app') {
+    process.exitCode = await runAdoptApp({ env: process.env, home: homedir(), store: args.store,
+      run: runIn, out: (line) => console.log(line), err: (line) => console.error(line) });
     return;
   }
 

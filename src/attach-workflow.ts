@@ -7,13 +7,14 @@
  * is reported as pending or refused, never as attached.
  */
 import { readdir, readFile, writeFile, rename, mkdir, lstat, realpath, unlink, chmod, stat } from 'node:fs/promises';
-import { dirname, extname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResponseEnvelope } from './control-protocol.ts';
 import { defaultDaemonStore } from './daemon-location.ts';
 import { shellWord } from './shell-word.ts';
+import type { Entry } from './app-runtime.ts';
 import { DaemonUnavailableError, ensureDaemon as ensureStoreDaemon, type EnsureDaemonDeps } from './ensure-daemon.ts';
 
 type Harness = 'claude-code' | 'codex';
@@ -21,9 +22,10 @@ type Harness = 'claude-code' | 'codex';
 export interface AttachDeps extends EnsureDaemonDeps {
   env: Record<string, string | undefined>;
   home: string;
-  nodePath: string;
-  /** The real path of the running `slipstream` entry; the answer tool is its sibling. */
-  cliPath: string;
+  /** How the question hook runs `slipstream`. */
+  entry: Entry;
+  /** How the answer tool runs `slipstream-mcp`. */
+  mcpEntry: Entry;
   out: (line: string) => void;
   err: (line: string) => void;
   control: (request: Record<string, unknown> & { verb: string }) => Promise<ResponseEnvelope>;
@@ -315,27 +317,32 @@ interface ConfigPlan { hookEdit: Edit | null; toolEdit: Edit | null; claudeTool:
  * are kept, an identical entry is left alone, and a different Slipstream entry
  * is refused rather than replaced. Nothing is written yet. */
 async function planAgentConfig(chat: Chat, worktree: string, store: string, deps: AttachDeps): Promise<ConfigPlan> {
-  const forwarder = join(dirname(deps.cliPath), `mcp-forwarder${extname(deps.cliPath)}`);
-  if (!await isFile(forwarder)) {
-    throw new Refusal(`the Slipstream answer tool is missing next to ${deps.cliPath}; reinstall Slipstream. `
-      + 'Nothing was recorded.');
+  const { entry, mcpEntry } = deps;
+  // Outside the app the forwarder is a script beside the CLI; the app's shim is always there.
+  const forwarder = mcpEntry.args[0];
+  if (forwarder !== undefined && !await isFile(forwarder)) {
+    throw new Refusal(`the Slipstream answer tool ${forwarder} is missing; reinstall Slipstream. Nothing was recorded.`);
   }
-  const hook = [deps.nodePath, deps.cliPath, 'hook', chat.harness, 'post-tool-use', '--store', store]
-    .map(shellWord).join(' ');
+  const hook = hookCommand(entry, chat.harness, store);
   const hookFile = chat.harness === 'claude-code' ? '.claude/settings.local.json' : '.codex/hooks.json';
   const hookEdit = await planHook(join(worktree, hookFile), hook);
-  const toolArgs = [forwarder, '--store', store];
+  const toolArgs = [...mcpEntry.args, '--store', store];
   if (chat.harness === 'codex') {
     const userConfig = join(deps.env.CODEX_HOME ?? join(deps.home, '.codex'), 'config.toml');
-    const userTool = await readCodexTool(userConfig, deps.nodePath, toolArgs, 'user-wide');
+    const userTool = await readCodexTool(userConfig, mcpEntry.command, toolArgs, 'user-wide');
     // A project server takes precedence over the user-wide server. Plan it even
     // when the user entry matches so a conflicting project entry is refused.
-    const projectTool = await planCodexTool(join(worktree, '.codex', 'config.toml'), deps.nodePath, toolArgs);
+    const projectTool = await planCodexTool(join(worktree, '.codex', 'config.toml'), mcpEntry.command, toolArgs);
     return { hookEdit, toolEdit: userTool ? null : projectTool,
       claudeTool: null };
   }
   const missing = await claudeToolMissing(chat, worktree, deps, toolArgs);
-  return { hookEdit, toolEdit: null, claudeTool: missing ? [deps.nodePath, ...toolArgs] : null };
+  return { hookEdit, toolEdit: null, claudeTool: missing ? [mcpEntry.command, ...toolArgs] : null };
+}
+
+/** The question hook's command line for one harness and store. */
+export function hookCommand(entry: Entry, harness: Harness, store: string): string {
+  return [entry.command, ...entry.args, 'hook', harness, 'post-tool-use', '--store', store].map(shellWord).join(' ');
 }
 
 /** Write the plan, refusing if a file changed since it was planned. Returns
@@ -422,12 +429,17 @@ async function planCodexTool(path: string, node: string, args: string[]): Promis
   const text = await readWorkspaceConfig(path);
   const existing = codexToolMatches(path, text, node, args, 'workspace');
   if (existing) return null;
-  const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
-    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
+  const block = codexServerBlock(node, args);
   if (text === null) return { path, text: block, original: null };
   const lines = text.split('\n');
   const sep = text === '' ? '' : text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
   return { path, text: `${text}${sep}${block}`, original: text };
+}
+
+/** Slipstream's own Codex server table, as attach writes it. */
+export function codexServerBlock(command: string, args: string[]): string {
+  return `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(command)}\n`
+    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
 }
 
 async function readCodexTool(path: string, node: string, args: string[], scope: string): Promise<boolean> {
@@ -436,8 +448,7 @@ async function readCodexTool(path: string, node: string, args: string[], scope: 
 
 function codexToolMatches(path: string, text: string | null, node: string, args: string[], scope: string): boolean {
   if (text === null) return false;
-  const block = `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(node)}\n`
-    + `args = [${args.map((a) => JSON.stringify(a)).join(', ')}]\n`;
+  const block = codexServerBlock(node, args);
   const lines = text.split('\n');
   const header = lines.findIndex((l) => l.trim() === '[mcp_servers.slipstream]');
   if (header >= 0) {
@@ -486,7 +497,7 @@ async function claudeToolMissing(chat: Chat, worktree: string, deps: AttachDeps,
   } catch { throw new Refusal(`${path} is not valid JSON; cannot check for an existing Slipstream answer tool.`); }
   for (const [scope, server] of [['workspace', local], ['user-wide', user]] as const) {
     if (server === undefined) continue;
-    if (server !== null && typeof server === 'object' && server.command === deps.nodePath
+    if (server !== null && typeof server === 'object' && server.command === deps.mcpEntry.command
       && JSON.stringify(server.args) === JSON.stringify(args)) return false;
     throw new Refusal(`this ${scope} has a different \`slipstream\` MCP server for ${chat.harness} `
       + '(see `claude mcp get slipstream`). It was kept; remove it or make it use this store. Nothing was recorded.');

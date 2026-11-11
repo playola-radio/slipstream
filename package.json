@@ -47,7 +47,8 @@
     "qa:daemon": "node tools/qa-daemon.ts",
     "qa:check": "node tools/projection-check.ts acceptance",
     "check:fold-release": "node tools/projection-check.ts fold-release",
-    "check:package": "node tools/package-check.ts"
+    "check:package": "node tools/package-check.ts",
+    "build:payload": "node tools/build-payload.ts"
   },
   "dependencies": {
     "@parcel/watcher": "^2.5.1",

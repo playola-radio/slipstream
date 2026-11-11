@@ -52,9 +52,14 @@ async function codexTranscript(f: Fixture, version = '0.155.1'): Promise<string>
 
 interface Daemon { live: boolean; build?: BuildCheck; status?: Record<string, unknown>; attach?: Record<string, unknown> }
 
+const APP_ENTRIES = { entry: { command: '/rt/bin/slipstream', args: [] },
+  mcpEntry: { command: '/rt/bin/slipstream-mcp', args: [] } };
+
 function deps(f: Fixture, env: Record<string, string>, daemon: Daemon): AttachDeps {
   return {
-    env, home: f.home, nodePath: NODE, cliPath: f.cli,
+    env, home: f.home,
+    entry: { command: NODE, args: [f.cli] },
+    mcpEntry: { command: NODE, args: [join(f.root, 'pkg', 'mcp-forwarder.js')] },
     out: (line) => f.out.push(line),
     err: (line) => f.err.push(line),
     probe: async () => daemon.live ? 'live' : 'stale',
@@ -396,6 +401,56 @@ describe('slipstream attach (one command)', () => {
         harness_session_id: CODEX_ID, root_transcript: transcript });
       assert.match(f.out.join('\n'), new RegExp(`codex resume ${CODEX_ID}`));
       assert.deepEqual(f.commands, []);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('points the Claude hook and tool at the app\'s stable commands in the app', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const code = await runAttachWorkflow({ dir: f.worktree, store: f.store },
+        { ...deps(f, claudeEnv, { live: true }), ...APP_ENTRIES });
+      assert.equal(code, 0, f.err.join('\n'));
+      const settings = JSON.parse(await readFile(join(f.worktree, '.claude', 'settings.local.json'), 'utf8'));
+      assert.equal(settings.hooks.PostToolUse[0].hooks[0].command,
+        `/rt/bin/slipstream hook claude-code post-tool-use --store ${f.store}`);
+      assert.deepEqual(f.commands, [['/opt/claude', 'mcp', 'add', '--scope', 'local', 'slipstream', '--',
+        '/rt/bin/slipstream-mcp', '--store', f.store]]);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('recognises the app\'s Claude entries as Slipstream\'s on a second attach', async () => {
+    const f = await fixture();
+    try {
+      await claudeTranscript(f);
+      const appDeps = () => ({ ...deps(f, claudeEnv, { live: true }), ...APP_ENTRIES });
+      assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, appDeps()), 0, f.err.join('\n'));
+      await mkdir(f.home, { recursive: true });
+      await writeFile(join(f.home, '.claude.json'), JSON.stringify({ projects: { [f.worktree]: { mcpServers: {
+        slipstream: { type: 'stdio', command: '/rt/bin/slipstream-mcp', args: ['--store', f.store], env: {} },
+      } } } }));
+      const settings = await readFile(join(f.worktree, '.claude', 'settings.local.json'), 'utf8');
+      f.commands.length = 0;
+      assert.equal(await runAttachWorkflow({ dir: f.worktree, store: f.store }, appDeps()), 0, f.err.join('\n'));
+      assert.equal(await readFile(join(f.worktree, '.claude', 'settings.local.json'), 'utf8'), settings);
+      assert.deepEqual(f.commands, []);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it('points the Codex hook and tool at the app\'s stable commands, once', async () => {
+    const f = await fixture();
+    try {
+      await codexTranscript(f);
+      for (let i = 0; i < 2; i++) {
+        const code = await runAttachWorkflow({ dir: f.worktree, store: f.store },
+          { ...deps(f, codexEnv, { live: true }), ...APP_ENTRIES });
+        assert.equal(code, 0, f.err.join('\n'));
+      }
+      const hooks = JSON.parse(await readFile(join(f.worktree, '.codex', 'hooks.json'), 'utf8'));
+      assert.deepEqual(hooks.hooks.PostToolUse.map((g: { hooks: { command: string }[] }) => g.hooks[0]!.command),
+        [`/rt/bin/slipstream hook codex post-tool-use --store ${f.store}`]);
+      assert.equal(await readFile(join(f.worktree, '.codex', 'config.toml'), 'utf8'),
+        `[mcp_servers.slipstream]\ncommand = "/rt/bin/slipstream-mcp"\nargs = ["--store", ${JSON.stringify(f.store)}]\n`);
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 

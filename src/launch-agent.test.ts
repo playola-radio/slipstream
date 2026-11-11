@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  InstallError, entryPaths, installLaunchAgent, kickstartLaunchAgent, plistPath, readManagedInstall, renderPlist, writeManagedInstall,
+  InstallError, entryPaths, installLaunchAgent, installService, kickstartLaunchAgent, plistPath, readManagedInstall, renderPlist, writeManagedInstall,
   type ManagedInstall, type Run,
 } from './launch-agent.ts';
 import { acquireSessionLock } from './lock.ts';
@@ -193,6 +193,58 @@ describe('recorded entry paths', () => {
       await assert.rejects(entryPaths('/opt/node/bin/node', '22.4.0', cli), /Node 24/);
       await assert.rejects(entryPaths('node', '24.1.0', cli), /not absolute/);
       await assert.rejects(entryPaths('/opt/node/bin/node', '24.1.0', join(home, 'missing.js')), /not a file/);
+    });
+  });
+});
+
+describe('installing the background service', () => {
+  async function serviceDeps(home: string, run: Run) {
+    const cli = join(home, 'pkg', 'dist', 'cli.js');
+    await mkdir(join(home, 'pkg', 'dist'), { recursive: true });
+    await writeFile(cli, '');
+    return { execPath: '/rt/0.3.1-abcdef12/bin/node', nodeVersion: '24.11.0', cliPath: cli, home,
+      store: join(home, '.slipstream'), uid: 501, packageVersion: '0.3.1', run };
+  }
+
+  it('writesPlistWithConcretePaths', async () => {
+    await withHome(async (home) => {
+      const deps = await serviceDeps(home, fakeLaunchctl().run);
+      const res = await installService(deps);
+      assert.equal(res.plist, plistPath(home));
+      const text = await readFile(plistPath(home), 'utf8');
+      assert.match(text, new RegExp(`<string>/rt/0\\.3\\.1-abcdef12/bin/node</string>\\s*<string>${deps.cliPath}</string>\\s*<string>start</string>`));
+      assert.deepEqual(await readManagedInstall(deps.store), {
+        version: 1, package_version: '0.3.1', node: deps.execPath, cli: deps.cliPath, log: res.log, repos: [],
+      });
+    });
+  });
+
+  it('keepsPriorRepos', async () => {
+    await withHome(async (home) => {
+      const deps = await serviceDeps(home, fakeLaunchctl().run);
+      const repos = [{ root: '/src/app', setup: 'make setup', archive: null }];
+      await writeManagedInstall(deps.store, { version: 1, package_version: '0.3.0', ...paths, log: '/l', repos });
+      await installService(deps);
+      assert.deepEqual((await readManagedInstall(deps.store))?.repos, repos);
+    });
+  });
+
+  it('kickstartsWithoutKill', async () => {
+    await withHome(async (home) => {
+      const l = fakeLaunchctl(true);
+      const deps = await serviceDeps(home, l.run);
+      await installService(deps);
+      await installService(deps);
+      assert.ok(l.calls.every((c) => !c.includes('-k')));
+      assert.deepEqual(l.calls.at(-1), ['launchctl', 'kickstart', 'gui/501/radio.playola.slipstream']);
+    });
+  });
+
+  it('reportsLaunchctlFailureVerbatim', async () => {
+    await withHome(async (home) => {
+      const deps = await serviceDeps(home, fakeLaunchctl(false, 99).run);
+      await assert.rejects(installService(deps), (err: Error) => err instanceof InstallError
+        && err.message === `launchctl could not load ${plistPath(home)} (exit 5): Bootstrap failed: 5: Input/output error`);
     });
   });
 });
