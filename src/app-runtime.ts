@@ -6,7 +6,7 @@
  * so an app update moves them along without rewriting any of them.
  */
 import { readdir, realpath, stat } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { defaultDaemonStore } from './daemon-location.ts';
 
 export interface AppRuntime { root: string; cli: string; mcp: string }
@@ -62,7 +62,9 @@ async function isDefaultStore(store: string, home: string): Promise<boolean> {
   const own = defaultDaemonStore(home);
   if (resolve(store) === own) return true;
   const [a, b] = await Promise.all([stat(store).catch(absent), stat(own).catch(absent)]);
-  return !!a && !!b && a.dev === b.dev && a.ino === b.ino;
+  if (a && b) return a.dev === b.dev && a.ino === b.ino;
+  const [parent, realHome] = await Promise.all([realpath(dirname(resolve(store))).catch(absent), realpath(home).catch(absent)]);
+  return parent !== null && realHome !== null && join(parent, basename(store)) === defaultDaemonStore(realHome);
 }
 
 /** Only a missing path means there is nothing there; any other error is reported. */
@@ -75,7 +77,7 @@ function absent(err: NodeJS.ErrnoException): null {
 async function hasPreparedRuntime(root: string): Promise<boolean> {
   for (const name of await readdir(root)) {
     if (name.startsWith('.')) continue;
-    const files = ['app/package.json', 'app/dist/cli.js', 'bin/node'].map((f) => stat(join(root, name, f)).then((s) => s.isFile(), () => false));
+    const files = ['app/package.json', 'app/dist/cli.js', 'bin/node'].map((f) => stat(join(root, name, f)).then((s) => s.isFile(), absent));
     if ((await Promise.all(files)).every(Boolean)) return true;
   }
   return false;

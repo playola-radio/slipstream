@@ -70,20 +70,25 @@ describe('appRecorderRefusal', () => {
 
   it('refuses for the default store reached through another path', () => withHome(async (home) => {
     await prepareRuntime(home);
-    await mkdir(join(home, '.slipstream'));
     const alias = `${home}-alias`;
     await symlink(home, alias);
     try {
-      assert.notEqual(await appRecorderRefusal({ env: {}, home, cliPath: npmCli, store: join(alias, '.slipstream') }), null);
+      const refusal = () => appRecorderRefusal({ env: {}, home, cliPath: npmCli, store: join(alias, '.slipstream') });
+      assert.notEqual(await refusal(), null);
+      await mkdir(join(home, '.slipstream'));
+      assert.notEqual(await refusal(), null);
     } finally { await rm(alias); }
   }));
 
   it('reports a runtime folder it cannot read instead of taking the recorder', { skip: process.getuid?.() === 0 }, () => withHome(async (home) => {
     await prepareRuntime(home);
-    await chmod(appRuntimeRoot(home), 0o300);
-    try {
-      await assert.rejects(appRecorderRefusal({ env: {}, home, cliPath: npmCli, store: join(home, '.slipstream') }), { code: 'EACCES' });
-    } finally { await chmod(appRuntimeRoot(home), 0o700); }
+    const root = appRuntimeRoot(home);
+    for (const [dir, mode] of [[root, 0o300], [join(root, '0.3.1-91e380a6'), 0o000]] as const) {
+      await chmod(dir, mode);
+      try {
+        await assert.rejects(appRecorderRefusal({ env: {}, home, cliPath: npmCli, store: join(home, '.slipstream') }), { code: 'EACCES' });
+      } finally { await chmod(dir, 0o700); }
+    }
   }));
 
   it('leaves any other store to this copy', () => withHome(async (home) => {
