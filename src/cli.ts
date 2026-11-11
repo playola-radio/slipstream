@@ -75,7 +75,7 @@ import {
 } from './conductor.ts';
 import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
-import { agentEntries } from './app-runtime.ts';
+import { agentEntries, appRecorderRefusal } from './app-runtime.ts';
 import { runAdoptApp } from './adopt-app.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
@@ -676,12 +676,18 @@ const runCommand: Run = (command, commandArgs) => new Promise((done) => {
   });
 });
 
+/** Why this copy must leave the store's recorder to Slipstream.app, or null. */
+async function appRefusal(store: string): Promise<string | null> {
+  return appRecorderRefusal({ env: process.env, home: homedir(), cliPath: await realpath(fileURLToPath(import.meta.url)), store });
+}
+
 /** How to start this store's daemon: through launchd when `conductor install`
  * manages it, so there is only ever the supervised one; otherwise detached. */
 async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaemonDeps> {
   const socketPath = controlSocketPath(store);
   const own = await thisBuild();
   const checks = {
+    refusal: await appRefusal(store) ?? undefined,
     probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
     checkBuild: () => checkDaemonBuild((request) => sendControlRequest({ socketPath, request }), own),
     mismatch: async (daemon: Build | null) => {
@@ -721,6 +727,11 @@ async function packageVersion(): Promise<string> {
 }
 
 async function runServiceInstall(store: string): Promise<number> {
+  const refusal = await appRefusal(store);
+  if (refusal) {
+    console.error(`slipstream: ${refusal}`);
+    return 1;
+  }
   if (!process.getuid) {
     console.error('slipstream: `service install` needs macOS launchd.');
     return 1;
@@ -750,6 +761,11 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
   const control = (request: Record<string, unknown> & { verb: string }) => send({ v: 1, ...request });
   const ensure = async () => ensureDaemon(store, await daemonStarter(store, cliPath));
   if (action === 'install') {
+    const refusal = await appRefusal(store);
+    if (refusal) {
+      err(`slipstream: ${refusal}`);
+      return 1;
+    }
     if (!process.getuid) {
       err('slipstream: `conductor install` needs macOS launchd.');
       return 1;
@@ -891,6 +907,12 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'start') {
+    // Exit 0 so launchd's KeepAlive leaves an old npm LaunchAgent stopped.
+    const refusal = await appRefusal(args.store);
+    if (refusal) {
+      console.error(`slipstream: ${refusal}`);
+      return;
+    }
     const configIO: ConfigIO = { readFile: (p) => readFile(p, 'utf8').then((s) => s).catch(() => undefined) };
     const { config, warnings } = await loadConfig({
       path: args.configPath,

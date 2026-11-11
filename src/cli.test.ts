@@ -884,3 +884,69 @@ describe('cli conductor', () => {
     }
   });
 });
+
+describe('cli beside Slipstream.app', () => {
+  const run = async (args: string[], env: NodeJS.ProcessEnv) => {
+    const { execFile } = await import('node:child_process');
+    return new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+      execFile(process.execPath, ['src/cli.ts', ...args], { env, timeout: 20_000 }, (error, stdout, stderr) =>
+        done({ code: error ? Number(error.code) : 0, stdout, stderr }));
+    });
+  };
+  /** A home where the app has copied a runtime out of its bundle. */
+  const withAppHome = async (body: (home: string, runtimeRoot: string) => Promise<void>) => {
+    const { mkdtemp, mkdir, writeFile, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { appRuntimeRoot } = await import('./app-runtime.ts');
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-app-')));
+    const runtime = join(appRuntimeRoot(home), '0.3.1-91e380a6');
+    await mkdir(join(runtime, 'app', 'dist'), { recursive: true });
+    await mkdir(join(runtime, 'bin'));
+    for (const file of ['app/package.json', 'app/dist/cli.js', 'bin/node']) await writeFile(join(runtime, file), '');
+    try { await body(home, appRuntimeRoot(home)); } finally { await rm(home, { recursive: true, force: true }); }
+  };
+
+  it('start leaves the recorder to the app with one line and a successful exit', () => withAppHome(async (home) => {
+    const { access } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const result = await run(['start'], { PATH: process.env.PATH, HOME: home });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /^slipstream: Slipstream\.app manages the recorder for [^\n]*\n$/);
+    await assert.rejects(access(join(home, '.slipstream')), { code: 'ENOENT' });
+  }));
+
+  it('start through the app\'s shims runs the recorder as before', () => withAppHome(async (home, runtimeRoot) => {
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, ['src/cli.ts', 'start'],
+      { env: { PATH: process.env.PATH, HOME: home, SLIPSTREAM_APP_RUNTIME: runtimeRoot }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const exited = new Promise<number | null>((done) => child.once('exit', done));
+    let stderr = '';
+    try {
+      await new Promise<void>((done, fail) => {
+        child.stderr.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+          if (stderr.includes('daemon control')) done();
+        });
+        void exited.then(() => fail(new Error(`start exited: ${stderr}`)));
+      });
+      assert.doesNotMatch(stderr, /Slipstream\.app manages/);
+    } finally {
+      child.kill('SIGTERM');
+      await exited;
+    }
+  }));
+
+  for (const args of [['attach', '--watch-only'], ['service', 'install'], ['conductor', 'install']]) {
+    it(`${args.join(' ')} refuses without starting or installing a recorder`, () => withAppHome(async (home) => {
+      const { access } = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const result = await run([...args, ...(args[0] === 'attach' ? [home] : [])], { PATH: process.env.PATH, HOME: home });
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /Slipstream\.app manages the recorder for /);
+      assert.doesNotMatch(result.stderr, /did not start/);
+      await assert.rejects(access(join(home, '.slipstream', 'control.sock')), { code: 'ENOENT' });
+      await assert.rejects(access(join(home, 'Library', 'LaunchAgents')), { code: 'ENOENT' });
+    }));
+  }
+});
