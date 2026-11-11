@@ -469,10 +469,10 @@ For a minor or major release, set `version` in `package.json` (and
 `package-lock.json`) in a `chore:` pull request. Once it merges and Tests pass,
 that version publishes as is.
 
-If the publish fails, fix the cause and run the Publish workflow by hand on
-`develop` (Actions → Publish → Run workflow); it refuses a commit Tests haven't
-passed on. If only the bump, tag, or release failed, use "Re-run failed jobs" on
-that run instead.
+If a Publish run fails, fix the cause and use "Re-run failed jobs" on it.
+Running the Publish workflow by hand on `develop` (Actions → Publish → Run
+workflow) publishes `develop`'s version if npm doesn't have it yet. It never bumps
+the version, and it refuses a commit Tests haven't passed on.
 
 ### Design documents
 
