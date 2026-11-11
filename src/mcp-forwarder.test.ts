@@ -280,11 +280,16 @@ test('forwarderReplacesItselfOnNewerBuild', async () => {
     assert.deepEqual(exec!.args, ['/rt/bin/slipstream-mcp', ...process.argv.slice(2)]);
     assert.equal(exec!.env.SLIPSTREAM_APP_RUNTIME, '/rt');
     const replay = JSON.parse(Buffer.from(exec!.env.SLIPSTREAM_MCP_REPLAY!, 'base64').toString('utf8'));
-    assert.deepEqual(replay, {
+    assert.deepEqual({
+      initialize: replay.initialize,
+      call: replay.call,
+      input: replay.input,
+    }, {
       initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
       call: callBeginTask({ title: 't' }, CODEX_META),
       input: Buffer.from(UNREAD).toString('base64'),
     });
+    assert.match(replay.requestId, /^[0-9a-f-]{36}$/);
   } finally {
     await daemon.close();
   }
@@ -300,6 +305,27 @@ test('forwarderDoesNotReplaceOnSameBuild', async () => {
     assert.equal(execs.length, 0);
     assert.equal(res.isError, true);
     assert.match(res.text, /DAEMON_VERSION_MISMATCH/);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('forwarder snapshots unread input only after flushing output', async () => {
+  const daemon = await olderDaemon();
+  try {
+    const order: string[] = [];
+    const handlers = createForwarderHandlers({
+      socketPath: daemon.socketPath,
+      env: { SLIPSTREAM_APP_RUNTIME: '/rt' },
+      readCurrentBuild: async () => 'a-newer-build',
+      flushOutput: async () => { order.push('flush'); },
+      unreadInput: () => { order.push('input'); return Buffer.alloc(0); },
+      execve: () => { order.push('exec'); },
+    });
+    await dispatch(initialize('codex-mcp-client'), handlers);
+    await dispatch(callBeginTask({ title: 't' }, CODEX_META), handlers);
+
+    assert.deepEqual(order, ['flush', 'input', 'exec']);
   } finally {
     await daemon.close();
   }
@@ -325,6 +351,7 @@ test('replayAnswersPendingCallOnce', async () => {
     const replay = Buffer.from(JSON.stringify({
       initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
       call: { ...callBeginTask({ title: 'replayed' }, CODEX_META), id: 'call-41' },
+      requestId: 'replayed-request-id',
       input: '',
     })).toString('base64');
     const forwarder = fileURLToPath(new URL('./mcp-forwarder.ts', import.meta.url));
@@ -341,6 +368,7 @@ test('replayAnswersPendingCallOnce', async () => {
     assert.equal(resultOf(lines[0]!).isError, false);
     assert.equal(daemon.received[0]!.title, 'replayed');
     assert.equal(daemon.received[0]!.harness, 'codex');
+    assert.equal(daemon.received[0]!.request_id, 'replayed-request-id');
   } finally {
     await daemon.close();
   }
@@ -400,5 +428,36 @@ test('replayHandlesHandedInputBeforeStdin', async () => {
     assert.deepEqual(stdout.trim().split('\n').map((l) => (JSON.parse(l) as JsonRpcResponse).id), ['call-41', 8, 9]);
   } finally {
     await daemon.close();
+  }
+});
+
+test('a second replacement keeps input inherited from its predecessor', async () => {
+  const daemon = await olderDaemon();
+  const rt = await mkdtemp(join(tmpdir(), 'slip-fwd-rt-'));
+  try {
+    await mkdir(join(rt, 'builds', 'b1', 'app', 'dist'), { recursive: true });
+    await writeFile(join(rt, 'builds', 'b1', 'app', 'dist', 'build-id'), 'a-newer-build\n');
+    await symlink(join(rt, 'builds', 'b1'), join(rt, 'current'));
+    await mkdir(join(rt, 'bin'));
+    await writeFile(join(rt, 'bin', 'slipstream-mcp'), `#!/bin/sh\nprintf '%s' "$SLIPSTREAM_MCP_REPLAY" > '${rt}/replay'\n`);
+    await chmod(join(rt, 'bin', 'slipstream-mcp'), 0o755);
+    const inherited = `${JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/list' })}\n{"jsonrpc":"2.0","id":9,`;
+    const replay = Buffer.from(JSON.stringify({
+      initialize: { jsonrpc: '2.0', method: 'initialize', params: initialize('codex-mcp-client').params },
+      call: callBeginTask({ title: 'replayed' }, CODEX_META),
+      requestId: 'replayed-request-id',
+      input: Buffer.from(inherited).toString('base64'),
+    })).toString('base64');
+
+    await runForwarderProcess(dirname(daemon.socketPath), {
+      SLIPSTREAM_APP_RUNTIME: rt,
+      SLIPSTREAM_MCP_REPLAY: replay,
+    }, (stdin) => stdin.end());
+
+    const secondReplay = JSON.parse(Buffer.from(await readFile(join(rt, 'replay'), 'utf8'), 'base64').toString('utf8'));
+    assert.equal(Buffer.from(secondReplay.input, 'base64').toString('utf8'), inherited);
+  } finally {
+    await daemon.close();
+    await rm(rt, { recursive: true, force: true });
   }
 });
