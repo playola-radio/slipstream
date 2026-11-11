@@ -927,8 +927,8 @@ async function main(): Promise<void> {
     let daemon;
     try { daemon = await startDaemon({ storeDir: args.store, config }); } catch (err) {
       if (!(err instanceof IntentFromNewerVersionError)) throw err;
+      // Exits 0 so launchd's KeepAlive does not retry a store this copy can never read.
       console.error(`slipstream: ${err.message}`);
-      process.exitCode = 1;
       return;
     }
     console.error(`slipstream: daemon control ${daemon.socketPath}`);
