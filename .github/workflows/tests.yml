@@ -79,3 +79,9 @@ jobs:
         # which the checker already fails closed on (unresolved base = non-zero exit),
         # so this never silently skips the gate.
         run: npm run check:fold-release -- --base ${{ github.event.before }}
+
+      - name: Check display-fold release immutability (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        # A dispatched run can approve a publish, so it checks the commit against
+        # its first parent: the previous develop tip.
+        run: npm run check:fold-release -- --base HEAD^

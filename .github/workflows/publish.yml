@@ -158,8 +158,9 @@ jobs:
           if ! git push origin HEAD:refs/heads/develop; then
             git fetch --quiet origin develop
             remote=$(git rev-parse FETCH_HEAD)
-            # A push can land even though its reply was lost.
-            if [ "$remote" != "$(git rev-parse HEAD)" ]; then
+            # The bump is already there if a push landed though its reply was
+            # lost, or an earlier attempt of this job pushed it before failing.
+            if [ "$(git rev-parse "$remote^{tree}")" != "$(git rev-parse "HEAD^{tree}")" ]; then
               if [ "$remote" != "$SHA" ]; then
                 echo "develop moved on to $remote while bumping to $version; leaving the release to that commit's run."
                 exit 0
