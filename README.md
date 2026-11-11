@@ -62,8 +62,9 @@ again. `slipstream status` shows both versions.
 
 **With Slipstream.app:** once the app has set itself up, it runs the recorder
 for `~/.slipstream`, and this install leaves that recorder alone: `slipstream
-start` exits without starting one, commands that would start or restart it stop
-and say so, and `service install` and `conductor install` refuse. Use the app's
+start` exits without starting one, commands that would start, restart or record
+into it stop and say so, and `service install` and `conductor install` refuse
+(for any store, since every store shares the one LaunchAgent). Use the app's
 own `slipstream` command, which it names in those messages. Other stores are
 unaffected. If you uninstall the app, remove its runtime folder (also named in
 the messages) to let this install run the recorder again.
