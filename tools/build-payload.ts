@@ -39,6 +39,7 @@ async function main(argv: string[]): Promise<void> {
     const tarball = join(work, packed[0]!.filename.replace(/^.*\//, ''));
     await mkdir(app, { recursive: true });
     const tar = spawnSync('tar', ['-xzf', tarball, '-C', app, '--strip-components', '1'], { stdio: 'inherit' });
+    if (tar.error) fail(`tar could not run: ${tar.error.message}`);
     if (tar.status !== 0) fail(`could not extract ${tarball} into ${app}`);
   } finally {
     await rm(work, { recursive: true, force: true });
