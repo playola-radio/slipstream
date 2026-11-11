@@ -48,6 +48,11 @@ export async function loadIntent(storeDir: string): Promise<IntentRecord> {
   } catch {
     throw new IntentCorruptError(path, 'not JSON');
   }
+  // A newer Slipstream wrote it; the record is fine, so it is not called unreadable.
+  if (isObject(parsed) && typeof parsed.version === 'number' && parsed.version > 1) {
+    throw new Error(`the capture intent record ${path} was written by a newer Slipstream (intent version ${parsed.version}; `
+      + 'this one reads version 1). Update Slipstream, or Slipstream.app, to the version that last ran.');
+  }
   readLegacyWaitingAsPaused(parsed);
   const problem = intentProblem(parsed);
   if (problem) throw new IntentCorruptError(path, problem);
