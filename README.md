@@ -60,15 +60,14 @@ install --store …` again. Other commands refuse the mismatch. For a detached
 daemon, the command prints which process to stop; stop it and run the command
 again. `slipstream status` shows both versions.
 
-**Beside Slipstream.app:** once the app has set up its own copy of Slipstream
-on this Mac, the app runs the recorder for the default store, `~/.slipstream`.
-An npm install then never starts one there: `slipstream start` prints why and
-exits, and commands that would start or restart the recorder (`attach`,
-`conductor setup` or `enroll`, `workspace create`, `service install`,
-`conductor install`) stop and say to open Slipstream.app. Commands run through
-the app's copy, `~/Library/Application Support/com.playola.SlipstreamViewer/runtime/bin/slipstream`,
-work as usual. If you removed the app, delete that `runtime` folder to let the
-npm install run the recorder again.
+**With Slipstream.app:** once the app has set itself up, it runs the recorder
+for `~/.slipstream`, and this install leaves that recorder alone: `slipstream
+start` exits without starting one, commands that would start, restart or record
+into it stop and say so, and `service install` and `conductor install` refuse
+(for any store, since every store shares the one LaunchAgent). Use the app's
+own `slipstream` command, which it names in those messages. Other stores are
+unaffected. If you uninstall the app, remove its runtime folder (also named in
+the messages) to let this install run the recorder again.
 
 **From a clone:** run `npm ci`, then `npm run slipstream -- <command>`. That
 runs the TypeScript sources directly, with no build step. To put a clone's

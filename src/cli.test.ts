@@ -885,68 +885,101 @@ describe('cli conductor', () => {
   });
 });
 
-describe('cli beside Slipstream.app', () => {
-  const run = async (args: string[], env: NodeJS.ProcessEnv) => {
-    const { execFile } = await import('node:child_process');
-    return new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
-      execFile(process.execPath, ['src/cli.ts', ...args], { env, timeout: 20_000 }, (error, stdout, stderr) =>
-        done({ code: error ? Number(error.code) : 0, stdout, stderr }));
-    });
-  };
-  /** A home where the app has copied a runtime out of its bundle. */
-  const withAppHome = async (body: (home: string, runtimeRoot: string) => Promise<void>) => {
-    const { mkdtemp, mkdir, writeFile, realpath, rm } = await import('node:fs/promises');
+describe('cli when Slipstream.app owns the recorder', () => {
+  /** A home where the app has prepared its runtime (no `current` yet), with a
+   * `launchctl` on PATH that only records its calls. */
+  async function withAppHome(run: (o: { home: string; store: string; launchctl: () => Promise<string>;
+    cli: (argv: string[], env?: Record<string, string>) => Promise<{ code: number; stderr: string }> }) => Promise<void>) {
+    const { mkdtemp, mkdir, readFile, realpath, rm, writeFile } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
-    const { appRuntimeRoot } = await import('./app-runtime.ts');
+    const { execFile } = await import('node:child_process');
+    const { appRuntimeRoot } = await import('./app-recorder-owner.ts');
     const home = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-app-')));
-    const runtime = join(appRuntimeRoot(home), '0.3.1-91e380a6');
-    await mkdir(join(runtime, 'app', 'dist'), { recursive: true });
-    await mkdir(join(runtime, 'bin'));
-    for (const file of ['app/package.json', 'app/dist/cli.js', 'bin/node']) await writeFile(join(runtime, file), '');
-    try { await body(home, appRuntimeRoot(home)); } finally { await rm(home, { recursive: true, force: true }); }
-  };
-
-  it('start leaves the recorder to the app with one line and a successful exit', () => withAppHome(async (home) => {
-    const { access } = await import('node:fs/promises');
-    const { join } = await import('node:path');
-    const result = await run(['start'], { PATH: process.env.PATH, HOME: home });
-    assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stderr, /^slipstream: Slipstream\.app manages the recorder for [^\n]*\n$/);
-    await assert.rejects(access(join(home, '.slipstream')), { code: 'ENOENT' });
-  }));
-
-  it('start through the app\'s shims runs the recorder as before', () => withAppHome(async (home, runtimeRoot) => {
-    const { spawn } = await import('node:child_process');
-    const child = spawn(process.execPath, ['src/cli.ts', 'start'],
-      { env: { PATH: process.env.PATH, HOME: home, SLIPSTREAM_APP_RUNTIME: runtimeRoot }, stdio: ['ignore', 'ignore', 'pipe'] });
-    const exited = new Promise<number | null>((done) => child.once('exit', done));
-    let stderr = '';
     try {
-      await new Promise<void>((done, fail) => {
-        child.stderr.on('data', (chunk: Buffer) => {
-          stderr += chunk.toString();
-          if (stderr.includes('daemon control')) done();
-        });
-        void exited.then(() => fail(new Error(`start exited: ${stderr}`)));
-      });
-      assert.doesNotMatch(stderr, /Slipstream\.app manages/);
-    } finally {
-      child.kill('SIGTERM');
-      await exited;
-    }
-  }));
+      const dist = join(appRuntimeRoot(home), '0.3.1-abcdef12', 'app', 'dist');
+      await mkdir(dist, { recursive: true });
+      await writeFile(join(dist, 'cli.js'), '');
+      const bin = join(home, 'fake-bin');
+      await mkdir(bin);
+      await writeFile(join(bin, 'launchctl'), `#!/bin/sh\necho "$@" >> '${join(home, 'launchctl.log')}'\n`, { mode: 0o755 });
+      const cli = (argv: string[], env: Record<string, string> = {}) => new Promise<{ code: number; stderr: string }>((done) =>
+        execFile(process.execPath, ['src/cli.ts', ...argv],
+          { env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, ...env }, cwd: process.cwd(), timeout: 20_000 },
+          (error, _stdout, stderr) => done({ code: error ? Number(error.code) : 0, stderr })));
+      const launchctl = () => readFile(join(home, 'launchctl.log'), 'utf8').catch(() => '');
+      await run({ home, store: join(home, '.slipstream'), launchctl, cli });
+    } finally { await rm(home, { recursive: true, force: true }); }
+  }
 
-  for (const args of [['attach', '--watch-only'], ['service', 'install'], ['conductor', 'install']]) {
-    it(`${args.join(' ')} refuses without starting or installing a recorder`, () => withAppHome(async (home) => {
+  it('`start` from npm says why in one line and exits 0 without opening the store', async () => {
+    const { access } = await import('node:fs/promises');
+    await withAppHome(async ({ store, cli }) => {
+      const result = await cli(['start', '--store', store]);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stderr, /^slipstream: Slipstream\.app manages the recorder for .*will not start a recorder\. Open Slipstream\.app/);
+      assert.equal(result.stderr.trim().split('\n').length, 1, result.stderr);
+      await assert.rejects(access(store), { code: 'ENOENT' });
+    });
+  });
+
+  it('`start` through the app\'s shim runs the recorder as before', async () => {
+    const { spawn } = await import('node:child_process');
+    const { join } = await import('node:path');
+    const { probeSocket } = await import('./daemon.ts');
+    const { appRuntimeRoot } = await import('./app-recorder-owner.ts');
+    await withAppHome(async ({ home, store }) => {
+      const daemon = spawn(process.execPath, ['src/cli.ts', 'start', '--store', store],
+        { env: { PATH: process.env.PATH, HOME: home, SLIPSTREAM_APP_RUNTIME: appRuntimeRoot(home) }, stdio: 'ignore' });
+      try {
+        while (await probeSocket(join(store, 'control.sock'), 200) !== 'live') {
+          assert.equal(daemon.exitCode, null, 'the recorder exited instead of starting');
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        daemon.kill('SIGTERM');
+        while (await probeSocket(join(store, 'control.sock'), 200) === 'live') await new Promise((r) => setTimeout(r, 50));
+      }
+    });
+  });
+
+  for (const command of [['service', 'install'], ['conductor', 'install']]) {
+    it(`\`${command.join(' ')}\` from npm refuses without touching launchd, whichever store it names`, async () => {
       const { access } = await import('node:fs/promises');
       const { join } = await import('node:path');
-      const result = await run([...args, ...(args[0] === 'attach' ? [home] : [])], { PATH: process.env.PATH, HOME: home });
-      assert.equal(result.code, 1, result.stderr);
-      assert.match(result.stderr, /Slipstream\.app manages the recorder for /);
-      assert.doesNotMatch(result.stderr, /did not start/);
-      await assert.rejects(access(join(home, '.slipstream', 'control.sock')), { code: 'ENOENT' });
-      await assert.rejects(access(join(home, 'Library', 'LaunchAgents')), { code: 'ENOENT' });
-    }));
+      await withAppHome(async ({ home, cli, launchctl }) => {
+        const result = await cli([...command, '--store', join(home, 'other-store')]);
+        assert.equal(result.code, 1, result.stderr);
+        assert.match(result.stderr, /Slipstream\.app manages the recorder for .*will not replace its LaunchAgent/);
+        assert.equal(await launchctl(), '');
+        await assert.rejects(access(join(home, 'Library', 'LaunchAgents')), { code: 'ENOENT' });
+      });
+    });
   }
+
+  it('`watch` from npm will not record into the app\'s store', async () => {
+    const { access, mkdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await withAppHome(async ({ home, store, cli }) => {
+      await mkdir(join(home, 'work'));
+      const result = await cli(['watch', join(home, 'work'), '--store', store]);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /Slipstream\.app manages the recorder for .*will not record into that store\./);
+      await assert.rejects(access(store), { code: 'ENOENT' });
+    });
+  });
+
+  it('`attach --watch-only` from npm names the app instead of starting a recorder', async () => {
+    const { access, mkdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await withAppHome(async ({ home, store, cli, launchctl }) => {
+      await mkdir(join(home, 'work'));
+      const result = await cli(['attach', '--watch-only', join(home, 'work'), '--store', store]);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /Slipstream\.app manages the recorder for .*will not start or restart a recorder\..* Nothing was recorded\./);
+      assert.doesNotMatch(result.stderr, /did not start/);
+      assert.equal(await launchctl(), '');
+      await assert.rejects(access(store), { code: 'ENOENT' });
+    });
+  });
 });

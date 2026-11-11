@@ -5,9 +5,7 @@
  * as given. Hooks and connector configs written in the app point at the shims,
  * so an app update moves them along without rewriting any of them.
  */
-import { readdir, realpath, stat } from 'node:fs/promises';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
-import { defaultDaemonStore } from './daemon-location.ts';
+import { dirname, extname, join } from 'node:path';
 
 export interface AppRuntime { root: string; cli: string; mcp: string }
 
@@ -27,58 +25,4 @@ export function agentEntries(env: NodeJS.ProcessEnv, nodePath: string, cliPath: 
   if (runtime) return { entry: { command: runtime.cli, args: [] }, mcpEntry: { command: runtime.mcp, args: [] } };
   const forwarder = join(dirname(cliPath), `mcp-forwarder${extname(cliPath)}`);
   return { entry: { command: nodePath, args: [cliPath] }, mcpEntry: { command: nodePath, args: [forwarder] } };
-}
-
-/** Where the app keeps the runtimes it copies out of its bundle. */
-export function appRuntimeRoot(home: string): string {
-  return join(home, 'Library', 'Application Support', 'com.playola.SlipstreamViewer', 'runtime');
-}
-
-/**
- * Why this copy must not start or restart the recorder for `store`, or null when
- * it may. The app manages the recorder for the default store once it has copied
- * a complete runtime, whether or not it has activated one yet: it only activates
- * when no other recorder runs, so an npm recorder started at every login would
- * keep it from ever doing so. The app's own copy may run it, whether started
- * through the shims or by the LaunchAgent the app installed, which runs the
- * runtime's cli.js without them.
- */
-export async function appRecorderRefusal(o: { env: NodeJS.ProcessEnv; home: string; cliPath: string; store: string }):
-  Promise<string | null> {
-  if (appRuntime(o.env) || !await isDefaultStore(o.store, o.home)) return null;
-  const root = appRuntimeRoot(o.home);
-  const realRoot = await realpath(root).catch(absent);
-  if (!realRoot) return null;
-  const inside = relative(realRoot, await realpath(o.cliPath).catch(() => resolve(o.cliPath)));
-  if (inside && !inside.startsWith('..') && !isAbsolute(inside)) return null;
-  if (!await hasPreparedRuntime(realRoot)) return null;
-  return `Slipstream.app manages the recorder for ${o.store}, so this slipstream (${o.cliPath}) will not start or restart one. `
-    + `Open Slipstream.app, and run slipstream through the app's copy, ${join(root, 'bin', 'slipstream')}. `
-    + `If Slipstream.app was removed, delete ${root} to let this copy run the recorder again.`;
-}
-
-/** The same folder as the default store, also when reached through another path. */
-async function isDefaultStore(store: string, home: string): Promise<boolean> {
-  const own = defaultDaemonStore(home);
-  if (resolve(store) === own) return true;
-  const [a, b] = await Promise.all([stat(store).catch(absent), stat(own).catch(absent)]);
-  if (a && b) return a.dev === b.dev && a.ino === b.ino;
-  const [parent, realHome] = await Promise.all([realpath(dirname(resolve(store))).catch(absent), realpath(home).catch(absent)]);
-  return parent !== null && realHome !== null && join(parent, basename(store)) === defaultDaemonStore(realHome);
-}
-
-/** Only a missing path means there is nothing there; any other error is reported. */
-function absent(err: NodeJS.ErrnoException): null {
-  if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
-  throw err;
-}
-
-/** A runtime the app finished copying; staging folders are hidden until renamed. */
-async function hasPreparedRuntime(root: string): Promise<boolean> {
-  for (const name of await readdir(root)) {
-    if (name.startsWith('.')) continue;
-    const files = ['app/package.json', 'app/dist/cli.js', 'bin/node'].map((f) => stat(join(root, name, f)).then((s) => s.isFile(), absent));
-    if ((await Promise.all(files)).every(Boolean)) return true;
-  }
-  return false;
 }

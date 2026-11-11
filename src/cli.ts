@@ -75,8 +75,9 @@ import {
 } from './conductor.ts';
 import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './workspace.ts';
 import { isMainModule } from './entrypoint.ts';
-import { agentEntries, appRecorderRefusal } from './app-runtime.ts';
+import { agentEntries } from './app-runtime.ts';
 import { runAdoptApp } from './adopt-app.ts';
+import { appOwnedRefusal, appRecorderRoot } from './app-recorder-owner.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
@@ -676,18 +677,13 @@ const runCommand: Run = (command, commandArgs) => new Promise((done) => {
   });
 });
 
-/** Why this copy must leave the store's recorder to Slipstream.app, or null. */
-async function appRefusal(store: string): Promise<string | null> {
-  return appRecorderRefusal({ env: process.env, home: homedir(), cliPath: await realpath(fileURLToPath(import.meta.url)), store });
-}
-
 /** How to start this store's daemon: through launchd when `conductor install`
  * manages it, so there is only ever the supervised one; otherwise detached. */
 async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaemonDeps> {
   const socketPath = controlSocketPath(store);
   const own = await thisBuild();
   const checks = {
-    refusal: await appRefusal(store) ?? undefined,
+    appRefusal: () => appRefusal(store, cliPath, 'start or restart a recorder'),
     probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
     checkBuild: () => checkDaemonBuild((request) => sendControlRequest({ socketPath, request }), own),
     mismatch: async (daemon: Build | null) => {
@@ -722,21 +718,28 @@ async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaem
   };
 }
 
+/** Why this CLI must leave `store`'s recorder to Slipstream.app, if it must. */
+async function appRefusal(store: string, cliPath: string, wontDo: string): Promise<string | null> {
+  const root = await appRecorderRoot({ home: homedir(), store, env: process.env, cliPath });
+  return root && appOwnedRefusal(store, root, cliPath, wontDo);
+}
+
 async function packageVersion(): Promise<string> {
   return (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 }
 
 async function runServiceInstall(store: string): Promise<number> {
-  const refusal = await appRefusal(store);
-  if (refusal) {
-    console.error(`slipstream: ${refusal}`);
-    return 1;
-  }
   if (!process.getuid) {
     console.error('slipstream: `service install` needs macOS launchd.');
     return 1;
   }
   const cliPath = await realpath(fileURLToPath(import.meta.url));
+  // Every store shares the one LaunchAgent, so the app's store guards it whatever --store says.
+  const refusal = await appRefusal(DEFAULT_DAEMON_STORE, cliPath, 'replace its LaunchAgent');
+  if (refusal) {
+    console.error(`slipstream: ${refusal}`);
+    return 1;
+  }
   const version = await packageVersion();
   try {
     const agent = await installService({ execPath: process.execPath, nodeVersion: process.versions.node, cliPath,
@@ -761,13 +764,13 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
   const control = (request: Record<string, unknown> & { verb: string }) => send({ v: 1, ...request });
   const ensure = async () => ensureDaemon(store, await daemonStarter(store, cliPath));
   if (action === 'install') {
-    const refusal = await appRefusal(store);
-    if (refusal) {
-      err(`slipstream: ${refusal}`);
-      return 1;
-    }
     if (!process.getuid) {
       err('slipstream: `conductor install` needs macOS launchd.');
+      return 1;
+    }
+    const refusal = await appRefusal(DEFAULT_DAEMON_STORE, cliPath, 'replace its LaunchAgent');
+    if (refusal) {
+      err(`slipstream: ${refusal}`);
       return 1;
     }
     return runConductorInstall({
@@ -907,8 +910,8 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'start') {
-    // Exit 0 so launchd's KeepAlive leaves an old npm LaunchAgent stopped.
-    const refusal = await appRefusal(args.store);
+    // Exits 0 so launchd's KeepAlive does not start this copy again.
+    const refusal = await appRefusal(args.store, await realpath(fileURLToPath(import.meta.url)), 'start a recorder');
     if (refusal) {
       console.error(`slipstream: ${refusal}`);
       return;
@@ -1037,6 +1040,13 @@ async function main(): Promise<void> {
       return;
     }
     await runControl(args.store, { verb: 'delete_session', session_id: args.sessionId });
+    return;
+  }
+
+  const refusal = await appRefusal(args.store, await realpath(fileURLToPath(import.meta.url)), 'record into that store');
+  if (refusal) {
+    console.error(`slipstream: ${refusal}`);
+    process.exitCode = 1;
     return;
   }
 

@@ -9,6 +9,8 @@ import { unreadableMessage, type Build, type BuildCheck } from './daemon-version
  */
 
 export interface EnsureDaemonDeps {
+  /** Why this CLI must leave the store's recorder to Slipstream.app, if it must. */
+  appRefusal?: () => Promise<string | null>;
   probe: () => Promise<'live' | 'stale' | 'ambiguous'>;
   /** Start a daemon for the store: a detached `slipstream start`, or the
    * LaunchAgent for a managed install. `exited` settles if the start is known
@@ -19,9 +21,6 @@ export interface EnsureDaemonDeps {
   /** Describes a daemon of another build and what to run about it, with a
    * restart when the install can replace it in place. */
   mismatch: (daemon: Build | null) => Promise<{ message: string; restart?: () => { exited: Promise<number | null> } }>;
-  /** Why this CLI must leave the recorder to another install; nothing is started
-   * or restarted when set. */
-  refusal?: string;
   /** Where a failed start leaves its diagnostics, when known. */
   logPath?: string;
   pollIntervalMs?: number;
@@ -32,7 +31,8 @@ export class DaemonUnavailableError extends Error {}
 const DAEMON_START_MS = 10_000;
 
 export async function ensureDaemon(store: string, deps: EnsureDaemonDeps): Promise<void> {
-  if (deps.refusal) throw new DaemonUnavailableError(`${deps.refusal} Nothing was recorded.`);
+  const refusal = await deps.appRefusal?.().catch((err: Error) => { throw new DaemonUnavailableError(err.message); });
+  if (refusal) throw new DaemonUnavailableError(`${refusal} Nothing was recorded.`);
   const verdict = await deps.probe();
   if (verdict === 'ambiguous') {
     throw new DaemonUnavailableError(`the daemon for ${store} is not answering; run \`slipstream status --store ${store}\`. `
