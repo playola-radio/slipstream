@@ -9,6 +9,7 @@ import { shellWord } from './shell-word.ts';
 import { daemonLogPath, LAUNCH_AGENT_LABEL, plistPath, readManagedInstall, renderPlist } from './launch-agent.ts';
 import { parseLock } from './lock.ts';
 import { appRuntime } from './app-runtime.ts';
+import { appRecorderRoot } from './app-recorder-owner.ts';
 
 /**
  * Which Slipstream a CLI or daemon is. A CLI only talks to a daemon of exactly
@@ -130,6 +131,10 @@ export async function remedyFor(store: string, daemon: Build | null, own: Build,
   env = process.env): Promise<Remedy> {
   if (appRuntime(env)) {
     return { text: `The Slipstream app is switching this recorder to ${own.version}; open Slipstream if it doesn't finish.` };
+  }
+  const appRoot = await appRecorderRoot({ home, store, env, cliPath: await thisCliPath() }).catch(() => null);
+  if (appRoot) {
+    return { text: `Slipstream.app manages this recorder; open Slipstream.app, and run slipstream through ${shellWord(join(appRoot, 'bin', 'slipstream'))}.` };
   }
   const managed = await readManagedInstall(store).catch(() => null);
   if (managed) {

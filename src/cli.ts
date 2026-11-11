@@ -77,6 +77,7 @@ import { runWorkspaceArchive, runWorkspaceCreate, type WorkspaceDeps } from './w
 import { isMainModule } from './entrypoint.ts';
 import { agentEntries } from './app-runtime.ts';
 import { runAdoptApp } from './adopt-app.ts';
+import { appOwnedRefusal, appRecorderRoot } from './app-recorder-owner.ts';
 import { loadConfig, type ConfigIO, type ConfigOverrides } from './config.ts';
 import { homedir } from 'node:os';
 import type { HarnessName } from './event.ts';
@@ -682,6 +683,7 @@ async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaem
   const socketPath = controlSocketPath(store);
   const own = await thisBuild();
   const checks = {
+    appRefusal: () => appRefusal(store, cliPath, 'start or restart a recorder'),
     probe: () => probeSocket(socketPath, PROBE_TIMEOUT_MS),
     checkBuild: () => checkDaemonBuild((request) => sendControlRequest({ socketPath, request }), own),
     mismatch: async (daemon: Build | null) => {
@@ -716,6 +718,12 @@ async function daemonStarter(store: string, cliPath: string): Promise<EnsureDaem
   };
 }
 
+/** Why this CLI must leave `store`'s recorder to Slipstream.app, if it must. */
+async function appRefusal(store: string, cliPath: string, wontDo: string): Promise<string | null> {
+  const root = await appRecorderRoot({ home: homedir(), store, env: process.env, cliPath });
+  return root && appOwnedRefusal(store, root, cliPath, wontDo);
+}
+
 async function packageVersion(): Promise<string> {
   return (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 }
@@ -726,6 +734,11 @@ async function runServiceInstall(store: string): Promise<number> {
     return 1;
   }
   const cliPath = await realpath(fileURLToPath(import.meta.url));
+  const refusal = await appRefusal(store, cliPath, 'replace its LaunchAgent');
+  if (refusal) {
+    console.error(`slipstream: ${refusal}`);
+    return 1;
+  }
   const version = await packageVersion();
   try {
     const agent = await installService({ execPath: process.execPath, nodeVersion: process.versions.node, cliPath,
@@ -752,6 +765,11 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
   if (action === 'install') {
     if (!process.getuid) {
       err('slipstream: `conductor install` needs macOS launchd.');
+      return 1;
+    }
+    const refusal = await appRefusal(store, cliPath, 'replace its LaunchAgent');
+    if (refusal) {
+      err(`slipstream: ${refusal}`);
       return 1;
     }
     return runConductorInstall({
@@ -891,6 +909,12 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'start') {
+    // Exits 0 so launchd's KeepAlive does not start this copy again.
+    const refusal = await appRefusal(args.store, await realpath(fileURLToPath(import.meta.url)), 'start a recorder');
+    if (refusal) {
+      console.error(`slipstream: ${refusal}`);
+      return;
+    }
     const configIO: ConfigIO = { readFile: (p) => readFile(p, 'utf8').then((s) => s).catch(() => undefined) };
     const { config, warnings } = await loadConfig({
       path: args.configPath,
