@@ -18,6 +18,7 @@ import { DISPLAY_FOLD_CONTRACT } from './display-fold.ts';
 import { createProjectionAdmission, PROVISIONAL_SHARED_ADMISSION, type AdmissionConfig } from './projection-admission.ts';
 import { createInterfaceService, type InterfaceServiceOptions } from './interface-service.ts';
 import { emitProjectionPhase, type ProjectionTraceObserver } from './projection-trace.ts';
+import { readNaming, type Naming } from './session-name.ts';
 
 export interface ActiveSession { id: string; health: Health; logPath: string }
 export interface ReaderServerOptions {
@@ -50,6 +51,7 @@ export interface ReaderServer {
   url: string; port: number; token: string; descriptorPath: string; close(): Promise<void>;
 }
 
+const UNNAMED: Naming = { agent_name: null, user_name: null };
 const DURABLE_SEQ_HEADER = 'slipstream-durable-seq';
 // The display-rules version every successful /events reply is interpreted under
 // (DA-2). Sourced from the single contract constant, never a second literal.
@@ -153,6 +155,18 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
     throw err;
   }
 
+  // Names are display-only: a malformed name.json reads as unnamed and logs once
+  // per session for this reader's lifetime, so one bad file never fails the list.
+  const warnedMalformedNames = new Set<string>();
+  async function sessionNaming(id: string): Promise<Naming> {
+    const { naming, malformed } = await readNaming(opts.storeDir, id);
+    if (malformed !== undefined && !warnedMalformedNames.has(id)) {
+      warnedMalformedNames.add(id);
+      console.error(`slipstream reader: name.json for ${id} is malformed (${malformed}); showing no name`);
+    }
+    return naming;
+  }
+
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'GET') { send(res, 405, 'method not allowed', { allow: 'GET' }); return; }
     if (!checkHostOrigin(
@@ -173,11 +187,12 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
 
     if (pathname === '/v1/sessions') {
       const sessions = await listSessions(opts.storeDir);
+      const namings = await Promise.all(sessions.map((s) => s.removed ? UNNAMED : sessionNaming(s.id)));
       // A registry-known session's authoritative durable high-water is its
       // boundary, not the disk-derived value (a written-but-not-yet-committed
       // record would otherwise advertise H+1 while /events still uses H; a
       // reserved-but-not-yet-active session reads 0 until capture commits).
-      sendJson(res, 200, sessions.map((s) => {
+      sendJson(res, 200, sessions.map((s, i) => {
         // A removed session advertises no history: report durable_seq 0 regardless
         // of any stale registry entry (a prior detach left one frozen at its final
         // seq, and a delete does not clear it). Otherwise trust the registry over
@@ -189,7 +204,10 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
         const agent = s.removed ? undefined : runtime?.agentConnection;
         const agentConnection = agent === undefined ? { state: 'disconnected', reason: 'capture_not_live' }
           : agent === 'none' ? { state: 'disconnected', reason: 'no_agent' } : { state: agent };
-        return { id: s.id, durable_seq: durableSeq.toString(), removed: s.removed, agent_connection: agentConnection };
+        return {
+          id: s.id, durable_seq: durableSeq.toString(), removed: s.removed, agent_connection: agentConnection,
+          naming: namings[i],
+        };
       }));
       return;
     }

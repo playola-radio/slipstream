@@ -14,7 +14,9 @@ import { liveBoundary, staticBoundary } from './reader-runtime.ts';
 import type { ProjectionTraceEvent } from './projection-trace.ts';
 
 const UUID = '22222222-2222-4222-8222-222222222222';
+const OTHER = '33333333-3333-4333-8333-333333333333';
 const NOT_LIVE = { state: 'disconnected', reason: 'capture_not_live' };
+const UNNAMED = { agent_name: null, user_name: null };
 
 async function storeWithSession(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'slip-http-'));
@@ -58,7 +60,7 @@ describe('http-reader core', () => {
     assert.equal(res.headers.get('cache-control'), 'no-store');
     const body = await res.json();
     assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false,
-      agent_connection: NOT_LIVE }]);
+      agent_connection: NOT_LIVE, naming: UNNAMED }]);
   });
 
   it('projects a live capture\'s agent connection, and no agent when none is bound', async () => {
@@ -83,8 +85,65 @@ describe('http-reader core', () => {
     try {
       const body = await (await GET(serve, '/v1/sessions')).json();
       assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false,
-        agent_connection: { state: 'disconnected', reason: 'no_agent' } }]);
+        agent_connection: { state: 'disconnected', reason: 'no_agent' }, naming: UNNAMED }]);
     } finally { await serve.close(); }
+  });
+
+  async function namedStore(sessions: Record<string, { name?: string; removed?: boolean }>): Promise<string> {
+    const d = await mkdtemp(join(tmpdir(), 'slip-http-'));
+    for (const [id, s] of Object.entries(sessions)) {
+      await mkdir(join(d, 'sessions', id), { recursive: true });
+      await writeFile(join(d, 'sessions', id, 'events.jsonl'), '{"seq":"1","type":"test","data":{}}\n', 'utf8');
+      if (s.name !== undefined) await writeFile(join(d, 'sessions', id, 'name.json'), s.name, 'utf8');
+      if (s.removed) await writeFile(join(d, 'sessions', id, 'removed.json'), '{"version":1}', 'utf8');
+    }
+    return d;
+  }
+  const namingOf = async (s: ReaderServer) => Object.fromEntries(
+    ((await (await GET(s, '/v1/sessions')).json()) as Array<{ id: string; naming: unknown }>).map((x) => [x.id, x.naming]));
+
+  it('lists naming for each session', async () => {
+    const d = await namedStore({
+      [UUID]: { name: '{"version":1,"agent_name":"Workspace rename menu","user_name":"Mine"}' },
+      [OTHER]: {},
+    });
+    const s = await startReaderServer({ storeDir: d });
+    try {
+      assert.deepEqual(await namingOf(s), {
+        [UUID]: { agent_name: 'Workspace rename menu', user_name: 'Mine' },
+        [OTHER]: UNNAMED,
+      });
+    } finally { await s.close(); await rm(d, { recursive: true, force: true }); }
+  });
+
+  it('removed session reports null naming without reading the file', async () => {
+    const d = await namedStore({
+      [UUID]: { name: '{"version":1,"agent_name":"Gone","user_name":null}', removed: true },
+    });
+    const s = await startReaderServer({ storeDir: d });
+    try {
+      assert.deepEqual(await namingOf(s), { [UUID]: UNNAMED });
+    } finally { await s.close(); await rm(d, { recursive: true, force: true }); }
+  });
+
+  it('malformed name.json leaves the rest of the list intact and warns once', async () => {
+    const d = await namedStore({
+      [UUID]: { name: 'not json' },
+      [OTHER]: { name: '{"version":1,"agent_name":"Kept","user_name":null}' },
+    });
+    const s = await startReaderServer({ storeDir: d });
+    const warn = mock.method(console, 'error', () => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        const res = await GET(s, '/v1/sessions');
+        assert.equal(res.status, 200);
+        const naming = Object.fromEntries(((await res.json()) as Array<{ id: string; naming: unknown }>).map((x) => [x.id, x.naming]));
+        assert.deepEqual(naming, { [UUID]: UNNAMED, [OTHER]: { agent_name: 'Kept', user_name: null } });
+      }
+      const warnings = warn.mock.calls.map((c) => String(c.arguments[0])).filter((m) => m.includes('name.json'));
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0]!, new RegExp(UUID));
+    } finally { warn.mock.restore(); await s.close(); await rm(d, { recursive: true, force: true }); }
   });
 
   it('rejects a missing bearer with 401', async () => {
@@ -189,7 +248,7 @@ describe('http-reader corruption honesty', () => {
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
       assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false,
-        agent_connection: { state: 'disconnected', reason: 'no_agent' } }]);
+        agent_connection: { state: 'disconnected', reason: 'no_agent' }, naming: UNNAMED }]);
     } finally { await srv.close(); }
   });
 
@@ -616,7 +675,7 @@ describe('http-reader deletion', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: true, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: true, agent_connection: NOT_LIVE, naming: UNNAMED }]);
     } finally { await srv.close(); }
   });
 
@@ -768,11 +827,11 @@ describe('http-reader with a boundary registry', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       let body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: false, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '0', removed: false, agent_connection: NOT_LIVE, naming: UNNAMED }]);
       const health = createHealth(2n);
       registry.activate(UUID, liveBoundary(health));
       body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE, naming: UNNAMED }]);
     } finally { await srv.close(); }
   });
 
@@ -782,7 +841,7 @@ describe('http-reader with a boundary registry', () => {
     const srv = await startReaderServer({ storeDir: dir, registry });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '2', removed: false, agent_connection: NOT_LIVE, naming: UNNAMED }]);
       const res = await GET(srv, `/v1/sessions/${UUID}/events?after=0`);
       assert.equal(res.status, 200);
       assert.equal((await res.text()).trimEnd().split('\n').length, 2);
@@ -835,7 +894,7 @@ describe('http-reader with a boundary registry', () => {
     });
     try {
       const body = await (await GET(srv, '/v1/sessions')).json();
-      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false, agent_connection: NOT_LIVE }]);
+      assert.deepEqual(body, [{ id: UUID, durable_seq: '1', removed: false, agent_connection: NOT_LIVE, naming: UNNAMED }]);
     } finally { await srv.close(); }
   });
 });
