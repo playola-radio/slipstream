@@ -82,6 +82,9 @@ jobs:
 
       - name: Check display-fold release immutability (dispatch)
         if: github.event_name == 'workflow_dispatch'
-        # A dispatched run can approve a publish, so it checks the commit against
-        # its first parent: the previous develop tip.
-        run: npm run check:fold-release -- --base HEAD^
+        # A dispatched run can approve a publish, so it checks every commit
+        # since the most recent release. HEAD^ would miss a contract change in
+        # an earlier commit of a multi-commit push.
+        run: |
+          base=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ || printf '%s\n' HEAD^)
+          npm run check:fold-release -- --base "$base"
