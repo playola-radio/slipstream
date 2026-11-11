@@ -16,6 +16,9 @@ on:
     branches: [develop]
   workflow_dispatch:
 
+# Each job grants only the token scopes it needs.
+permissions: {}
+
 concurrency:
   group: publish-npm
   cancel-in-progress: false
@@ -172,7 +175,19 @@ jobs:
 
       - name: Commit the next patch version to develop and run Tests on it
         run: |
+          name=$(node -p "require('./package.json').name")
           version=$(npm version patch --no-git-tag-version)
+          while true; do
+            if npm view "$name@$version" version >/dev/null 2>"$RUNNER_TEMP/npm-view.log"; then
+              version=$(npm version patch --no-git-tag-version)
+            elif grep -q E404 "$RUNNER_TEMP/npm-view.log"; then
+              break
+            else
+              cat "$RUNNER_TEMP/npm-view.log"
+              echo "::error::Could not look up $name@$version on npm."
+              exit 1
+            fi
+          done
           git commit --quiet -m "chore: release $version" package.json package-lock.json
           if ! git push origin HEAD:refs/heads/develop; then
             git fetch --quiet origin develop
