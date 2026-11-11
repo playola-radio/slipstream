@@ -55,7 +55,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 });
 
 const INIT_REPLY = `JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} } } })`;
-const TOOLS_REPLY = `JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [{ name: 'slipstream_begin_task' }, { name: 'slipstream_answer_question' }] } })`;
+const TOOLS_REPLY = `JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [{ name: 'slipstream_begin_task' }, { name: 'slipstream_answer_question' }, { name: 'slipstream_name_workspace' }] } })`;
 
 test('checkForwarder rejects a launcher that prints non-JSON output', async () => {
   // A valid handshake + tool list is still a failure if a banner line precedes

@@ -7,10 +7,12 @@
  *   - {@link ./harness-context.ts} — fail-closed harness-identity resolver (SC3).
  *   - {@link ./task-forwarder.ts} — begin_task orchestration with honest retry.
  *   - {@link ./answer-forwarder.ts} — answer_question orchestration with honest retry.
+ *   - {@link ./name-forwarder.ts} — name_workspace orchestration, sent once.
  *   - {@link ./control-client.ts} — the unix-socket control channel to the daemon.
  *
- * It exposes two tools, `slipstream_begin_task(title)` and
- * `slipstream_answer_question(question_id, text)`. The forwarder is a control
+ * It exposes three tools, `slipstream_begin_task(title)`,
+ * `slipstream_answer_question(question_id, text)` and
+ * `slipstream_name_workspace(name, replace_existing?)`. The forwarder is a control
  * client: it never attaches, never captures, and never touches the store — it resolves the daemon's control socket from `--store` (shared with the CLI)
  * and forwards a verified identity triple. A missing daemon fails fast as
  * DAEMON_UNAVAILABLE rather than hanging, because the tool must return promptly.
@@ -23,6 +25,7 @@ import { dispatch, parseMessage, type JsonRpcRequest, type JsonRpcResponse, type
 import { createHarnessContext } from './harness-context.ts';
 import { forwardBeginTask } from './task-forwarder.ts';
 import { forwardAnswer } from './answer-forwarder.ts';
+import { forwardNameWorkspace } from './name-forwarder.ts';
 import { sendControlRequest } from './control-client.ts';
 import { thisBuild, versionGate } from './daemon-version.ts';
 import { controlSocketPath, resolveStoreDir } from './daemon-location.ts';
@@ -32,7 +35,9 @@ export const BEGIN_TASK_TOOL: ToolDef = {
   name: 'slipstream_begin_task',
   description:
     'Declare the start of a task so the Slipstream feed groups the file changes you are about ' +
-    'to make under it. Call it right before you start working on a distinct piece of work.',
+    'to make under it. Call it right before you start working on a distinct piece of work. ' +
+    'Once you know what this workspace\'s work is about, also call slipstream_name_workspace ' +
+    'with a 2-5 word name — usually on your first task.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -55,6 +60,24 @@ export const ANSWER_QUESTION_TOOL: ToolDef = {
       text: { type: 'string', description: 'Your complete answer for the user.' },
     },
     required: ['question_id', 'text'],
+    additionalProperties: false,
+  },
+};
+
+export const NAME_WORKSPACE_TOOL: ToolDef = {
+  name: 'slipstream_name_workspace',
+  description:
+    'Give this workspace a short name (2-5 words) that says what the work is about, so the person ' +
+    'watching can tell workspaces apart. Call it once, on your first task, when the work is clear. ' +
+    'Call it again with replace_existing: true only if the work changes direction. You cannot ' +
+    'override a name the person chose.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: '2-5 words, e.g. "Workspace rename menu".' },
+      replace_existing: { type: 'boolean', description: 'Replace your earlier name. Default false.' },
+    },
+    required: ['name'],
     additionalProperties: false,
   },
 };
@@ -104,11 +127,16 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
 
+/** The argument as the caller sent it, or undefined when the key is absent. */
+function rawArg(params: unknown, key: string): unknown | undefined {
+  return isObject(params) && isObject(params.arguments) ? params.arguments[key] : undefined;
+}
+
 function stringArg(params: unknown, key: string): string {
   // Pass the raw value through; the daemon is the authority on validity (an
   // empty/absent title or answer becomes its INVALID_TITLE / INVALID_ANSWER,
   // not a second local rule).
-  const value = isObject(params) && isObject(params.arguments) ? params.arguments[key] : undefined;
+  const value = rawArg(params, key);
   return typeof value === 'string' ? value : '';
 }
 
@@ -149,7 +177,7 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
   return {
     serverInfo: { name: 'slipstream-forwarder', version: '0.0.0' },
     protocolVersion: '2025-06-18',
-    tools: [BEGIN_TASK_TOOL, ANSWER_QUESTION_TOOL],
+    tools: [BEGIN_TASK_TOOL, ANSWER_QUESTION_TOOL, NAME_WORKSPACE_TOOL],
     onInitialize: (params) => {
       initialized = { jsonrpc: '2.0', method: 'initialize', params };
       const clientInfo = isObject(params) ? params.clientInfo : undefined;
@@ -165,12 +193,17 @@ export function createForwarderHandlers(opts: ForwarderHandlerOpts): McpHandlers
         }
         return response;
       };
-      if (name === ANSWER_QUESTION_TOOL.name) {
-        return forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send });
+      switch (name) {
+        case ANSWER_QUESTION_TOOL.name:
+          return forwardAnswer({ identity, questionId: stringArg(params, 'question_id'), text: stringArg(params, 'text'), send });
+        case NAME_WORKSPACE_TOOL.name:
+          return forwardNameWorkspace({ identity, name: rawArg(params, 'name'), replaceExisting: rawArg(params, 'replace_existing'), send });
+        default: {
+          const requestId = replayRequestId;
+          replayRequestId = undefined;
+          return forwardBeginTask({ identity, title: stringArg(params, 'title'), requestId, send });
+        }
       }
-      const requestId = replayRequestId;
-      replayRequestId = undefined;
-      return forwardBeginTask({ identity, title: stringArg(params, 'title'), requestId, send });
     },
   };
 }

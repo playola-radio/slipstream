@@ -1,12 +1,12 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile, stat, rename, realpath, symlink, readFile, readdir, utimes, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { startDaemon, DaemonAlreadyRunningError, type Daemon } from './daemon.ts';
-import { blobPath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
+import { startDaemon, DaemonAlreadyRunningError, type Daemon, type DaemonOptions } from './daemon.ts';
+import { blobPath, namePath, sessionLogPath, tombstonePath, findWorkspaceSession, WorkspaceLookupError } from './store-reader.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
 import { createLog } from './log.ts';
 import { readQuestionContext } from './questions.ts';
@@ -78,6 +78,7 @@ async function withDaemon(
     store: string;
     call: (req: CallRequest) => Promise<ResponseEnvelope>;
   }) => Promise<void>,
+  options: Partial<DaemonOptions> = {},
 ): Promise<void> {
   const store = await mkdtemp(join(tmpdir(), 'slip-daemon-'));
   const worktree = await mkdtemp(join(tmpdir(), 'slip-daemon-wt-'));
@@ -86,6 +87,7 @@ async function withDaemon(
     daemon = await startDaemon({
       storeDir: store,
       captureDependencies: { platform: createFakePlatform(), enumerate: async () => {} },
+      ...options,
     });
     const d = daemon;
     await fn({
@@ -2659,5 +2661,273 @@ describe('daemon record_question_exchange', () => {
       const res = await call({ verb: 'ask', session_id: id, request_id: ASK_REQUEST, text: 'Why?', context: ASK_CONTEXT });
       assert.equal(res.ok === false && res.code, 'AGENT_NOT_CONNECTED');
     });
+  });
+});
+
+/** Holds a name write under the metadata lock until the test releases it. */
+function nameWriteGate() {
+  let entered!: () => void;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { entered = resolve; });
+  const opened = new Promise<void>((resolve) => { release = resolve; });
+  return { held, release, wait: async () => { entered(); await opened; } };
+}
+
+describe('daemon workspace names', () => {
+  const NAMED = '0f8c2a4e-5b1d-4c3e-9a7f-2d6b8e1c4a90';
+  const readName = async (store: string, id: string) => JSON.parse(await readFile(namePath(store, id), 'utf8')) as unknown;
+  const seedName = (store: string, id: string, naming: { agent_name: string | null; user_name: string | null }) =>
+    writeFile(namePath(store, id), JSON.stringify({ version: 1, ...naming }));
+
+  it('rename_session sets user_name and keeps agent_name', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await seedName(store, NAMED, { agent_name: 'Agent picked', user_name: null });
+      const res = await call({ verb: 'rename_session', session_id: NAMED, name: '  Mine  ' });
+      assert.deepEqual(res, { v: 1, ok: true });
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: 'Agent picked', user_name: 'Mine' });
+    });
+  });
+
+  it('rename_session null clears user_name', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await seedName(store, NAMED, { agent_name: 'Agent picked', user_name: 'Mine' });
+      assert.equal((await call({ verb: 'rename_session', session_id: NAMED, name: null })).ok, true);
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: 'Agent picked', user_name: null });
+    });
+  });
+
+  it('rename_session requires the name key', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const res = await call({ verb: 'rename_session', session_id: NAMED });
+      assert.equal(res.ok === false && res.code, 'PROTOCOL');
+      const wrongType = await call({ verb: 'rename_session', session_id: NAMED, name: 7 });
+      assert.equal(wrongType.ok === false && wrongType.code, 'PROTOCOL');
+    });
+  });
+
+  it('rename_session rejects a non-UUID id with PROTOCOL', async () => {
+    await withDaemon(async ({ call }) => {
+      for (const session_id of ['../escape', NAMED.toUpperCase(), undefined]) {
+        const res = await call({ verb: 'rename_session', session_id, name: 'Mine' });
+        assert.equal(res.ok === false && res.code, 'PROTOCOL', String(session_id));
+      }
+    });
+  });
+
+  it('rename_session rejects an invalid name with INVALID_NAME', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const res = await call({ verb: 'rename_session', session_id: NAMED, name: 'two\nlines' });
+      assert.equal(res.ok === false && res.code, 'INVALID_NAME');
+      assert.equal(await exists(namePath(store, NAMED)), false);
+    });
+  });
+
+  it('rename_session on an unknown or deleted session is SESSION_NOT_FOUND', async () => {
+    await withDaemon(async ({ store, call }) => {
+      const missing = await call({ verb: 'rename_session', session_id: ABSENT_ID, name: 'Mine' });
+      assert.equal(missing.ok === false && missing.code, 'SESSION_NOT_FOUND');
+      await seedSession(store, NAMED, HEX_LIVE);
+      assert.equal((await call({ verb: 'delete_session', session_id: NAMED })).ok, true);
+      const deleted = await call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' });
+      assert.equal(deleted.ok === false && deleted.code, 'SESSION_NOT_FOUND');
+      assert.match(deleted.ok === false ? deleted.message : '', /deleted/);
+      assert.equal(await exists(namePath(store, NAMED)), false);
+    });
+  });
+
+  it('rename_session works on a stopped (archived) session', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = await attachWatchOnly(call, worktree);
+      assert.equal((await call({ verb: 'detach', target: worktree })).ok, true);
+      assert.equal((await call({ verb: 'rename_session', session_id: id, name: 'Archived work' })).ok, true);
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: null, user_name: 'Archived work' });
+    });
+  });
+
+  it('rename_session replaces a malformed name.json', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await writeFile(namePath(store, NAMED), 'not json');
+      const logged = mock.method(console, 'error', () => {});
+      try {
+        assert.equal((await call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' })).ok, true);
+      } finally { logged.mock.restore(); }
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: null, user_name: 'Mine' });
+      assert.ok(logged.mock.calls.some((c) => String(c.arguments[0]).includes(NAMED)));
+    });
+  });
+
+  it('rename_session on an unreadable name.json is STORAGE_UNAVAILABLE', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await mkdir(namePath(store, NAMED));
+      const res = await call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' });
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+    });
+  });
+
+  it('concurrent renames serialize', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const first = call({ verb: 'rename_session', session_id: NAMED, name: 'First' });
+      const second = call({ verb: 'rename_session', session_id: NAMED, name: 'Second' });
+      assert.deepEqual([(await first).ok, (await second).ok], [true, true]);
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: null, user_name: 'Second' });
+    });
+  });
+
+  it('teardown waits for a queued rename', async () => {
+    const gate = nameWriteGate();
+    await withDaemon(async ({ daemon, store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const renaming = call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' }).catch((err: Error) => err);
+      await gate.held;
+      let stopped = false;
+      const stopping = daemon.stop().then(() => { stopped = true; });
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(stopped, false, 'teardown is waiting for the rename');
+      assert.equal(await exists(join(store, 'owner.lock')), true, 'the store lock is still held');
+      gate.release();
+      await stopping;
+      await renaming;
+      assert.equal(await exists(join(store, 'owner.lock')), false);
+      assert.equal(await exists(namePath(store, NAMED)), false, 'a rename that runs after teardown starts writes nothing');
+    }, { metadataWriteGate: gate.wait });
+  });
+
+  const nameOf = (worktree: string, name: string, extra: Record<string, unknown> = {}) =>
+    ({ verb: 'name_workspace', worktree, ...IDENTITY, name, ...extra });
+
+  it('name_workspace sets agent_name once', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const res = await call(nameOf(worktree, '  Workspace rename menu '));
+      assert.deepEqual(res, { v: 1, ok: true, changed: true });
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Workspace rename menu', user_name: null });
+    });
+  });
+
+  it('secondNameKeepsFirst', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      assert.equal((await call(nameOf(worktree, 'First name'))).ok, true);
+      const before = await readFile(namePath(store, id), 'utf8');
+      assert.deepEqual(await call(nameOf(worktree, 'Second name')), { v: 1, ok: true, changed: false });
+      assert.equal(await readFile(namePath(store, id), 'utf8'), before);
+    });
+  });
+
+  it('replace_existing replaces; same name is changed:false', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      assert.equal((await call(nameOf(worktree, 'First name'))).ok, true);
+      assert.deepEqual(await call(nameOf(worktree, 'New direction', { replace_existing: true })), { v: 1, ok: true, changed: true });
+      assert.deepEqual(await call(nameOf(worktree, ' New direction ', { replace_existing: true })), { v: 1, ok: true, changed: false });
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'New direction', user_name: null });
+    });
+  });
+
+  it('name_workspace never touches user_name', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      await seedName(store, id, { agent_name: null, user_name: 'Mine' });
+      assert.equal((await call(nameOf(worktree, 'Agent picked'))).ok, true);
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Agent picked', user_name: 'Mine' });
+    });
+  });
+
+  it('interleaved name_workspace and rename_session keep both fields', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const naming = call(nameOf(worktree, 'Agent picked'));
+      const renaming = call({ verb: 'rename_session', session_id: id, name: 'Mine' });
+      assert.deepEqual([(await naming).ok, (await renaming).ok], [true, true]);
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Agent picked', user_name: 'Mine' });
+    });
+  });
+
+  it('non-boolean replace_existing is PROTOCOL', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      for (const replace_existing of ['true', 1, null]) {
+        const res = await call(nameOf(worktree, 'Agent picked', { replace_existing }));
+        assert.equal(res.ok === false && res.code, 'PROTOCOL', String(replace_existing));
+      }
+      assert.equal(await exists(namePath(store, id)), false);
+    });
+  });
+
+  it('name_workspace validates identity before the name', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      await attachConnected(call, worktree, store);
+      const anonymous = await call({ verb: 'name_workspace', worktree, name: 'Agent picked' });
+      assert.equal(anonymous.ok === false && anonymous.code, 'IDENTITY_UNRESOLVED');
+      const invalid = await call(nameOf(worktree, 'two\nlines'));
+      assert.equal(invalid.ok === false && invalid.code, 'INVALID_NAME');
+    });
+  });
+
+  it('store lock loss before publication publishes nothing', async () => {
+    const gate = nameWriteGate();
+    await withDaemon(async ({ daemon, store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const naming = call(nameOf(worktree, 'Agent picked')).catch((err: Error) => err);
+      await gate.held;
+      const thief = join(store, 'thief');
+      await writeFile(thief, JSON.stringify({ pid: process.pid, nonce: 'thief' }));
+      await rename(thief, join(store, 'owner.lock'));
+      // Teardown after the loss waits on the held write; release it once the
+      // control socket is gone, which shows the loss was seen.
+      for (let i = 0; i < 300 && await exists(join(store, 'control.sock')); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      gate.release();
+      const res = await naming;
+      assert.ok(res instanceof Error || (res.ok === false && res.code === 'STORAGE_UNAVAILABLE'), JSON.stringify(res));
+      await daemon.stop().catch(() => {});
+      assert.equal(await exists(namePath(store, id)), false);
+      assert.deepEqual((await readdir(join(store, 'sessions', id))).filter((f) => f.startsWith('name.json')), []);
+    }, { metadataWriteGate: gate.wait });
+  });
+
+  it('capture lock loss before publication publishes nothing and replies STORAGE_UNAVAILABLE', async () => {
+    const gate = nameWriteGate();
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const naming = call(nameOf(worktree, 'Agent picked'));
+      await gate.held;
+      const lockPath = join(store, 'sessions', id, 'owner.lock');
+      await writeFile(`${lockPath}.thief`, JSON.stringify({ pid: process.pid, nonce: 'thief-nonce' }));
+      await rename(`${lockPath}.thief`, lockPath);
+      try {
+        await waitForRow(call, id, (r) => r.state === 'not_recording', 'not_recording');
+      } finally { gate.release(); }
+      const res = await naming;
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE');
+      assert.equal(await exists(namePath(store, id)), false);
+    }, { metadataWriteGate: gate.wait });
+  });
+
+  it('unlink drains an in-flight name', async () => {
+    const gate = nameWriteGate();
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const naming = call(nameOf(worktree, 'Agent picked'));
+      await gate.held;
+      let unlinked = false;
+      const unlinking = call({ verb: 'unlink', session_id: id }).then((res) => { unlinked = true; return res; });
+      try {
+        await waitForRow(call, id, (r) => (r.binding as { state?: string } | null)?.state === 'unlinked', 'the unlink');
+        for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.equal(unlinked, false, 'unlink is waiting for the name');
+      } finally { gate.release(); }
+      assert.deepEqual(await naming, { v: 1, ok: true, changed: true });
+      assert.equal((await unlinking).ok, true);
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Agent picked', user_name: null });
+    }, { metadataWriteGate: gate.wait });
   });
 });

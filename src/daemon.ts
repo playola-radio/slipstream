@@ -6,6 +6,8 @@ import { startCapture, InvalidTitleError, RootChangedError, type CaptureSession 
 import type { HealthFailure } from './health.ts';
 import { createTranscriptScheduler, type TranscriptScheduler } from './transcript/scheduler.ts';
 import { QuestionError, assertAnswerText, normalizeRelayUpdate } from './questions.ts';
+import { readNaming, writeNaming, type Naming } from './session-name.ts';
+import { validateName } from './workspace-name.ts';
 import { verifyClaudeRootTranscript } from './claude-root-transcript.ts';
 import { verifyCodexRootTranscript } from './codex-root-transcript.ts';
 import type { ResolvedConfig } from './config.ts';
@@ -48,8 +50,9 @@ import {
  * captures start and stop beneath it.
  *
  * It speaks the PRIVATE control protocol (attach / detach / unlink / status /
- * begin_task / ask / claim_question / answer_question / delete_session / gc). Every
- * verb WRITES public events, maintains the store, or reports state; none reads or
+ * begin_task / ask / claim_question / answer_question / delete_session / gc /
+ * rename_session / name_workspace). Every verb WRITES public events, maintains the store, or reports
+ * state; none reads or
  * serves the feed — readers get the feed through the public HTTP view like any
  * other client. There is no privileged back channel for reading. delete_session
  * removes an inactive session while other captures keep recording; gc stops every
@@ -87,6 +90,8 @@ export interface DaemonOptions {
   /** Replaces the transcript scheduler the config would build, so a test can count
    * one shared discovery cycle across captures. */
   transcriptScheduler?: TranscriptScheduler;
+  /** Allows a name write to be held under the metadata lock deterministically. */
+  metadataWriteGate?: () => Promise<void>;
 }
 
 const HARNESSES: readonly HarnessName[] = ['claude-code', 'codex'];
@@ -398,6 +403,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   let reader: ReaderServer | undefined;
   let torn = false;
   let compromised = false; // store lock lost
+  /** Name writes run one at a time; teardown waits for the queue before it
+   * releases the store lock. */
+  let metadataTail: Promise<void> = Promise.resolve();
   // Gates DISPATCH, not acceptance: connections are tracked and given a deadline
   // from the moment they arrive (so bind/chmod-window sockets can never orphan or
   // hang shutdown), but no verb runs until startup is fully ready — which is also
@@ -465,6 +473,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
       c.session = undefined;
     }
+    await metadataTail;
     await reader?.close().catch(() => {});
     // Unlink the socket only while we still hold the store lock. On the compromise
     // path the lock is already lost, so a successor may have bound the path — an
@@ -1648,6 +1657,28 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  /** Resolve a chat-facing request to the capture its chat is linked to at
+   * `worktree`. Synchronous, so a caller that calls `track` straight after it is
+   * seen by a concurrent unlink or detach. */
+  function admitChat(req: RequestEnvelope, worktree: string, atEntry: Binding | undefined): { c: Capture; b: Binding } | ErrorFields {
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const linked = captureForChat(req.harness as string, req.harness_session_id as string);
+    if (!linked || linked.root !== worktree) {
+      const here = liveCaptureAt(worktree);
+      if (here && !here.binding) return errFields('AGENT_NOT_CONNECTED', WATCH_ONLY_MESSAGE);
+      return errFields('SESSION_NOT_SELECTED', `this chat is not linked to a capture of ${worktree}`);
+    }
+    if (linked.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
+    const target = chatTarget(linked);
+    if (!target) return errFields('CAPTURE_NOT_READY', 'the linked capture is not recording yet');
+    if (target.b !== atEntry) return errFields('SESSION_NOT_SELECTED', 'this chat was unlinked or relinked while the request was in flight');
+    const { c, b } = target;
+    const stale = staleBinding(req, c, b);
+    if (stale) return stale;
+    if (b.check.state !== 'connected') return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
+    return target;
+  }
+
   async function beginTask(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     // The caller ships its verified identity triple; a missing one is a contract
     // violation, so fail closed rather than declare into whatever is selected.
@@ -1663,24 +1694,43 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     try { worktree = await identityRealpath(req.worktree); } catch { worktree = req.worktree; }
     // Everything below runs without an await until the append is admitted, so a
     // concurrent unlink or detach either sees it in flight or is seen here.
-    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
-    const linked = captureForChat(req.harness, req.harness_session_id);
-    if (!linked || linked.root !== worktree) {
-      const here = liveCaptureAt(worktree);
-      if (here && !here.binding) return errFields('AGENT_NOT_CONNECTED', WATCH_ONLY_MESSAGE);
-      return errFields('SESSION_NOT_SELECTED', `this chat is not linked to a capture of ${worktree}`);
-    }
-    if (linked.activation?.lost) return errFields('STORAGE_UNAVAILABLE', 'capture storage is no longer trustworthy');
-    const target = chatTarget(linked);
-    if (!target) return errFields('CAPTURE_NOT_READY', 'the linked capture is not recording yet');
-    if (target.b !== atEntry) return errFields('SESSION_NOT_SELECTED', 'this chat was unlinked or relinked while the request was in flight');
-    const { c, b } = target;
-    const stale = staleBinding(req, c, b);
-    if (stale) return stale;
-    if (b.check.state !== 'connected') return errFields('AGENT_NOT_CONNECTED', SETUP_PENDING_MESSAGE);
+    const admitted = admitChat(req, worktree, atEntry);
+    if (isErrorFields(admitted)) return admitted;
+    const { c, b } = admitted;
     return track(c, c.session!.beginTask({ title: req.title, requestId: req.request_id }), (r) => c.binding !== b
       ? errFields('STALE_BINDING', `task ${r.task_id} was recorded, but this chat was unlinked before it could be acknowledged`)
       : { session_id: r.session_id, task_id: r.task_id, event_id: r.event_id, seq: r.seq });
+  }
+
+  /** Set the agent's name for the session its chat is linked to. A name is kept
+   * once set unless the agent asks to replace it; the user's name is never
+   * touched. No event: the app reads names from the session list. */
+  async function nameWorkspace(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.harness) || !nonEmptyString(req.harness_session_id) || !nonEmptyString(req.worktree)) {
+      return errFields('IDENTITY_UNRESOLVED', 'name_workspace requires harness, harness_session_id, and worktree');
+    }
+    if (req.replace_existing !== undefined && typeof req.replace_existing !== 'boolean') {
+      return errFields('PROTOCOL', 'replace_existing must be a boolean');
+    }
+    const valid = validateName(req.name);
+    if (!valid.ok) return errFields('INVALID_NAME', valid.message);
+    const name = valid.name;
+    const replace = req.replace_existing === true;
+    const atEntry = bindingAtEntry(req);
+    let worktree: string;
+    try { worktree = await identityRealpath(req.worktree); } catch { worktree = req.worktree; }
+    const admitted = admitChat(req, worktree, atEntry);
+    if (isErrorFields(admitted)) return admitted;
+    const { c } = admitted;
+    const id = c.session!.sessionId;
+    return track(c, withMetadataLock(() => updateNaming(id, (naming) => {
+      if ((naming.agent_name !== null && !replace) || naming.agent_name === name) return undefined;
+      return { ...naming, agent_name: name };
+    }, () => {
+      if (compromised || torn || c.activation?.lost) {
+        throw new QuestionError('STORAGE_UNAVAILABLE', 'the daemon is shutting down or the capture lost its storage');
+      }
+    })), (changed) => ({ changed }));
   }
 
   /** Queue a question on the capture the app names. `askQuestion` installs its own
@@ -1833,6 +1883,53 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     } finally {
       release();
       if (maintenanceInFlight === slot) maintenanceInFlight = undefined;
+    }
+  }
+
+  function withMetadataLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = metadataTail.then(fn);
+    metadataTail = run.then(() => {}, () => {});
+    return run;
+  }
+
+  /** Publish one session's names, starting from what is on disk so a malformed
+   * file is replaced rather than failing the write. */
+  async function updateNaming(id: string, change: (naming: Naming) => Naming | undefined, assertOwnership: () => void): Promise<boolean> {
+    const { naming, malformed } = await readNaming(storeDir, id);
+    if (malformed) console.error(`slipstream daemon: name.json for ${id} is malformed (${malformed}); replacing it`);
+    const next = change(naming);
+    if (!next) return false;
+    await opts.metadataWriteGate?.();
+    await writeNaming(storeDir, id, next, assertOwnership);
+    return true;
+  }
+
+  async function renameSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.session_id) || !isValidSessionId(req.session_id)) {
+      return errFields('PROTOCOL', 'rename_session requires a valid session_id');
+    }
+    if (!('name' in req) || (req.name !== null && typeof req.name !== 'string')) {
+      return errFields('PROTOCOL', 'rename_session requires name, a string or null');
+    }
+    let name: string | null = null;
+    if (req.name !== null) {
+      const valid = validateName(req.name);
+      if (!valid.ok) return errFields('INVALID_NAME', valid.message);
+      name = valid.name;
+    }
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const id = req.session_id;
+    try {
+      return await withMetadataLock(async () => {
+        if (!await sessionExists(storeDir, id)) return errFields('SESSION_NOT_FOUND', `no session ${id} to rename`);
+        if (await readTombstone(storeDir, id) !== null) return errFields('SESSION_NOT_FOUND', `session ${id} was deleted`);
+        await updateNaming(id, (naming) => ({ ...naming, user_name: name }), () => {
+          if (compromised || torn) throw new QuestionError('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+        });
+        return {};
+      });
+    } catch (err) {
+      return controlFailure(err);
     }
   }
 
@@ -2078,6 +2175,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'claim_question': outcome = await claimQuestion(req); break;
       case 'answer_question': outcome = await answerQuestion(req); break;
       case 'delete_session': outcome = await deleteSession(req); break;
+      case 'rename_session': outcome = await renameSession(req); break;
+      case 'name_workspace': outcome = await nameWorkspace(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };
     }

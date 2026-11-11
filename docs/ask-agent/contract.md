@@ -554,7 +554,8 @@ one real round trip through the same path a question takes.
 `connected` proves the round trip at the time of the event, not afterwards.
 There is no heartbeat or expiry: a chat that exits after connecting still shows
 `connected` until detach. Liveness of the capture itself comes from
-`GET /v1/sessions`, whose items carry `agent_connection`:
+`GET /v1/sessions`, whose items carry `agent_connection` (and `naming`, see
+[Workspace names](#workspace-names)):
 
 ```ts
 type AgentConnection =
@@ -574,3 +575,171 @@ recorded, and the existing binding is unchanged.
 
 `attach` from a detached daemon resumes the workspace's existing session: the newest non-removed session whose `session.started` root equals the canonical worktree. The `session_id` is unchanged and `seq` continues after a `session.resumed` record and a `capture.gap` with reason `restart`. A new session is created only when the workspace has none. A session whose first record cannot be read is skipped with a daemon-log warning. If the selected session cannot be resumed (its lock is held, storage fails, or its history is corrupt), attach returns `SESSION_RESUME_FAILED` naming the session and never starts a second one. Retry for a lock or storage problem; restore the data, or `slipstream delete <session-id>` to discard that history, for corruption. A resumed capture has no current task until the agent calls `begin_task` again.
 
+
+## Workspace names
+
+Each session can carry two display names: one the linked agent chooses and one
+the person sets. Names live in `sessions/<id>/name.json`, never in the event
+log, so naming a session never changes which session a workspace resumes and
+writes no event.
+
+```json
+{ "version": 1, "agent_name": "Workspace rename menu", "user_name": null }
+```
+
+- `agent_name` is written only by `name_workspace`; `user_name` is written or
+  cleared only by `rename_session`. Each writer keeps the other's field.
+- A missing file means both names are `null` (every session created before this
+  feature, and every session not yet named).
+- A malformed file (bad JSON, `version` other than `1`, a missing key, or a value
+  that is neither a string nor `null`) reads as both names `null` and logs one
+  daemon warning naming the session; the rest of the list is unaffected. The next
+  write replaces it and logs that it did. A file that cannot be read at all also
+  lists as both names `null` with one warning, but a write to it fails with
+  `STORAGE_UNAVAILABLE` rather than replacing a name it could not read.
+- Writes are crash-safe: a unique temp file (`wx`, mode 0600) in the existing
+  session directory, full write, fsync, atomic rename over `name.json`, fsync of
+  the directory. A write never creates the directory.
+- Both verbs queue on one daemon-wide metadata lock, separate from
+  `delete_session` / `gc`, so an agent name and a rename never lose each other's
+  field and the recording session can be renamed. Shutdown waits for the queue
+  before releasing the store lock. Deleting a session removes `name.json`.
+
+### Valid names
+
+Checked in this order; the first failure is reported as `INVALID_NAME` with a
+message naming the rule:
+
+1. It is a string.
+2. It is well-formed UTF-16 (no unpaired surrogates).
+3. It contains none of U+0000–U+001F, U+007F–U+009F, U+2028 or U+2029. Checked
+   before trimming, so tabs and line breaks are rejected rather than trimmed.
+4. Trim with ECMAScript `String.prototype.trim`.
+5. It is not empty.
+6. It is at most 64 UTF-8 bytes.
+
+There is no Unicode normalization; the stored value is the trimmed string. The
+2–5 word target is guidance in the tool description, not a rule.
+
+### `GET /v1/sessions`
+
+Every item gains `naming`:
+
+```ts
+interface Naming { agent_name: string | null; user_name: string | null }
+```
+
+On a daemon with this feature the key is always present. A removed session
+always reports both names `null` without reading the file. An absent key means
+an older daemon.
+
+### Control verb `name_workspace`
+
+```typescript
+interface NameWorkspaceRequest {
+  v: 1;
+  verb: 'name_workspace';
+  harness: 'claude-code' | 'codex';
+  harness_session_id: string;
+  worktree: string; // absolute; the daemon canonicalizes it
+  name: string;
+  replace_existing?: boolean; // default false
+}
+// ok: { v: 1, ok: true, changed: boolean }
+```
+
+Checks, in order, after the usual envelope, compromise and readiness guards:
+
+1. `harness`, `harness_session_id` and `worktree` are non-empty strings, else
+   `IDENTITY_UNRESOLVED`.
+2. `replace_existing` is absent or a boolean, else `PROTOCOL`.
+3. `name` is valid, else `INVALID_NAME`.
+4. The chat resolves to its linked capture exactly as for `begin_task`:
+   `AGENT_NOT_CONNECTED` (watch-only, or setup not finished),
+   `SESSION_NOT_SELECTED`, `CAPTURE_NOT_READY`, `STALE_BINDING`, or
+   `STORAGE_UNAVAILABLE` when the capture lost its storage.
+5. The write is admitted to the capture's in-flight work, so unlink, detach and
+   shutdown wait for it, then queued on the metadata lock.
+6. Under the lock: if `agent_name` is already set and `replace_existing` is not
+   `true`, or it already equals the trimmed name, reply `changed: false` without
+   writing.
+7. Immediately before the atomic rename: the store lock is held, the daemon is
+   not shutting down, and the capture has not lost its storage, else
+   `STORAGE_UNAVAILABLE` and nothing is published. The target is the session the
+   chat was linked to when the request arrived; a name that lands after an
+   unlink still names the session the agent worked in.
+
+`user_name` is never touched. A failure after the rename is
+`STORAGE_UNAVAILABLE` (the name may have landed).
+
+### Control verb `rename_session`
+
+```typescript
+interface RenameSessionRequest {
+  v: 1;
+  verb: 'rename_session';
+  session_id: string; // lowercase UUIDv4
+  name: string | null; // required; null clears the person's name
+}
+// ok: { v: 1, ok: true }
+```
+
+Checks, in order:
+
+1. `session_id` is a lowercase UUIDv4, else `PROTOCOL`.
+2. `name` is present and a string or `null`, else `PROTOCOL`.
+3. A string `name` is valid, else `INVALID_NAME`; a value that is neither a
+   string nor `null` was rejected as `PROTOCOL` in step 2.
+4. Queue on the metadata lock.
+5. The session directory exists with no tombstone, else `SESSION_NOT_FOUND`
+   (the message says the session was deleted when tombstoned).
+6. Read `name.json`, set `user_name`, write the temp file.
+7. Immediately before the atomic rename: the store lock is held and the daemon
+   is not shutting down, else `STORAGE_UNAVAILABLE`.
+
+Any capture state is fine: the recording session, a stopped capture, or an
+archived session. It is not routed through `delete_session` / `gc`
+maintenance. A write can land even when the reply is lost; a client treats any
+failure after sending as "may have saved", re-reads `GET /v1/sessions`, and does
+not resend on its own. If the connection closes while the write is queued, that
+first re-read can precede the eventual write and cannot establish the final
+value.
+
+### MCP tool `slipstream_name_workspace`
+
+```json
+{
+  "name": "slipstream_name_workspace",
+  "description": "Give this workspace a short name (2-5 words) that says what the work is about, so the person watching can tell workspaces apart. Call it once, on your first task, when the work is clear. Call it again with replace_existing: true only if the work changes direction. You cannot override a name the person chose.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "description": "2-5 words, e.g. \"Workspace rename menu\"." },
+      "replace_existing": { "type": "boolean", "description": "Replace your earlier name. Default false." }
+    },
+    "required": ["name"],
+    "additionalProperties": false
+  }
+}
+```
+
+- The forwarder sends one `name_workspace` with the chat's identity and the raw
+  arguments (`replace_existing` only when the caller passed it), so the daemon
+  rejects a non-boolean.
+- Success: `Agent name saved.`, or `An agent name was already set; kept it.`
+  when `changed` is `false`, with structured `{changed}`. The text never claims
+  the visible name changed, because the person's name may override it.
+- A daemon rejection passes through as `isError:true`, text
+  `<CODE>: <message>`, structured `{code}`.
+- A lost reply, or an `ok:true` reply without a boolean `changed`, is
+  `OUTCOME_UNKNOWN` ("the name was sent but whether it was saved could not be
+  confirmed"). It is never resent: a resend could overwrite a newer replacement
+  or reach a relinked session, so retrying is the agent's choice.
+- The call goes through the same build check as the other tools. When the app
+  has installed a newer build, the forwarder replaces itself and the new build
+  answers the pending call; the build check sends only a `status` probe before
+  refusing, so that call is the name's first and only send.
+
+The `slipstream_begin_task` description ends: "Once you know what this
+workspace's work is about, also call slipstream_name_workspace with a 2-5 word
+name — usually on your first task."

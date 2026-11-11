@@ -182,7 +182,7 @@ interface JsonRpcReply {
 
 /** Drive the installed `slipstream-mcp` launcher over stdio. The forwarder must
  * complete `initialize` and then answer `tools/list` without a daemon (it only
- * reaches one on a tool call), so a protocol-versioned handshake plus both tools
+ * reaches one on a tool call), so a protocol-versioned handshake plus every tool
  * proves the published `bin` entry resolves to compiled JS that loads its whole
  * import graph. A launcher that cannot start, or that prints anything other than
  * JSON-RPC lines, fails the check — the real MCP client parses every line. */
@@ -233,7 +233,7 @@ export async function checkForwarder(bin: string, cwd: string, requestTimeoutMs 
     }
     if (!listed) fail('slipstream-mcp', `no tools/list response:\n${stdout}\n${stderr}`);
     const names = (listed.result?.tools ?? []).map((t) => t.name).sort();
-    assert.deepEqual(names, ['slipstream_answer_question', 'slipstream_begin_task'],
+    assert.deepEqual(names, ['slipstream_answer_question', 'slipstream_begin_task', 'slipstream_name_workspace'],
       `unexpected tools from slipstream-mcp: ${JSON.stringify(names)}\n${stderr}`);
   } finally {
     try { child.stdin.end(); } catch { /* already closed */ }
