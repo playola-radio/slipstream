@@ -458,17 +458,21 @@ tier uses.
 
 ### Releasing
 
-Bump `version` in `package.json` (and `package-lock.json`) in a `chore:` pull
-request to `develop`. Once it merges and Tests pass on that commit,
-[`publish.yml`](.github/workflows/publish.yml) publishes it to npm with
-provenance, tags the commit `v<version>`, and creates a GitHub release. A merge
-that doesn't change the version publishes nothing. If another merge lands
-before Tests finish, the newer commit publishes instead.
+Every merge to `develop` that passes Tests is published; nobody bumps the
+version. [`publish.yml`](.github/workflows/publish.yml) commits the next patch
+version to `develop` as `chore: release v<version>`, runs Tests on that commit,
+and then publishes it to npm with provenance, tags it `v<version>`, and creates
+a GitHub release. If another merge lands first, the newer commit is released
+instead.
 
-If the publish fails, fix the cause and run the Publish workflow by hand on
-`develop` (Actions → Publish → Run workflow); it refuses a commit Tests haven't
-passed on. If only the tag or release failed, use "Re-run failed jobs" on that
-run instead.
+For a minor or major release, set `version` in `package.json` (and
+`package-lock.json`) in a `chore:` pull request. Once it merges and Tests pass,
+that version publishes as is.
+
+If a Publish run fails, fix the cause and use "Re-run failed jobs" on it.
+Running the Publish workflow by hand on `develop` (Actions → Publish → Run
+workflow) publishes `develop`'s version if npm doesn't have it yet. It never bumps
+the version, and it refuses a commit Tests haven't passed on.
 
 ### Design documents
 
