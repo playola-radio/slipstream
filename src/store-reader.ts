@@ -30,6 +30,9 @@ export function sessionLogPath(storeDir: string, id: string): string {
 export function tombstonePath(storeDir: string, id: string): string {
   return join(sessionsDir(storeDir), id, 'removed.json');
 }
+export function namePath(storeDir: string, id: string): string {
+  return join(sessionsDir(storeDir), id, 'name.json');
+}
 export function blobPath(storeDir: string, hex: string): string {
   return join(storeDir, 'blobs', 'sha256', hex.slice(0, 2), hex);
 }

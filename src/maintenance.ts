@@ -27,7 +27,7 @@ import { PUBLIC_EVENT_TYPES as EVENT_TYPES } from './public-events.ts';
  */
 
 const TOMBSTONE_BODY = Buffer.from('{"version":1}\n', 'utf8');
-const HISTORY_FILES = ['events.jsonl'] as const;
+const HISTORY_FILES = ['events.jsonl', 'name.json'] as const;
 const SHARD_RE = /^[0-9a-f]{2}$/;
 const KNOWN_EVENT_TYPES = new Set<string>(EVENT_TYPES);
 

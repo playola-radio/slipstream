@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import {
   publishTombstone, removeSessionHistory, sessionExists, reclaimUnreferencedBlobs,
 } from './maintenance.ts';
-import { readTombstone, blobPath, sessionLogPath, tombstonePath } from './store-reader.ts';
+import { readTombstone, blobPath, namePath, sessionLogPath, tombstonePath } from './store-reader.ts';
 import { StorageError } from './storage.ts';
 import { LogCorruptError } from './log-reader.ts';
 import { createCas } from './cas.ts';
@@ -78,6 +78,15 @@ describe('maintenance: history removal', () => {
     assert.equal(await exists(sessionLogPath(dir, A)), false);
     assert.equal(await exists(tombstonePath(dir, A)), true);
     assert.equal(await exists(join(dir, 'sessions', A)), true);
+  });
+
+  it('removeSessionHistory also removes name.json', async () => {
+    const dir = await emptyStore();
+    await writeSession(dir, A, [baselined(1, HEX_LIVE)], { removed: true });
+    await writeFile(namePath(dir, A), '{"version":1,"agent_name":"A name","user_name":null}', 'utf8');
+    await removeSessionHistory(dir, A);
+    assert.equal(await exists(namePath(dir, A)), false);
+    assert.equal(await exists(tombstonePath(dir, A)), true);
   });
 
   it('is a no-op when the history is already gone', async () => {
