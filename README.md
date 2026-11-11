@@ -60,6 +60,15 @@ install --store …` again. Other commands refuse the mismatch. For a detached
 daemon, the command prints which process to stop; stop it and run the command
 again. `slipstream status` shows both versions.
 
+**With Slipstream.app:** once the app has set itself up, it runs the recorder
+for `~/.slipstream`, and this install leaves that recorder alone: `slipstream
+start` exits without starting one, commands that would start, restart or record
+into it stop and say so, and `service install` and `conductor install` refuse
+(for any store, since every store shares the one LaunchAgent). Use the app's
+own `slipstream` command, which it names in those messages. Other stores are
+unaffected. If you uninstall the app, remove its runtime folder (also named in
+the messages) to let this install run the recorder again.
+
 **From a clone:** run `npm ci`, then `npm run slipstream -- <command>`. That
 runs the TypeScript sources directly, with no build step. To put a clone's
 commands on your PATH, run `npm run build && npm link`. Rebuild after pulling,

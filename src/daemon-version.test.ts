@@ -2,9 +2,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonLogPath, plistPath, renderPlist } from './launch-agent.ts';
+import { appRuntimeRoot } from './app-recorder-owner.ts';
+import { shellWord } from './shell-word.ts';
 import { withTempDir } from './test/helpers.ts';
 import type { RequestEnvelope, ResponseEnvelope } from './control-protocol.ts';
 import { checkDaemonBuild, mismatchMessage, remedyFor, thisBuild, versionGate, type Build } from './daemon-version.ts';
@@ -133,6 +135,31 @@ describe('remedyFor', () => {
       const remedy = await remedyFor(store, null, OWN, dir, { SLIPSTREAM_APP_RUNTIME: join(dir, 'rt') });
       assert.equal(remedy.restart, undefined);
       assert.equal(remedy.text, 'The Slipstream app is switching this recorder to 0.3.0; open Slipstream if it doesn\'t finish.');
+    });
+  });
+
+  it('points another copy at Slipstream.app, never restarting the recorder it manages', async () => {
+    await withTempDir(async (home) => {
+      const store = join(home, '.slipstream'); await mkdir(store);
+      await managedBy(store, home, await realpath(fileURLToPath(new URL('./cli.ts', import.meta.url))));
+      await mkdir(join(appRuntimeRoot(home), '0.3.1-abcdef12', 'app', 'dist'), { recursive: true });
+      await writeFile(join(appRuntimeRoot(home), '0.3.1-abcdef12', 'app', 'dist', 'cli.js'), '');
+      const remedy = await remedyFor(store, null, OWN, home, {});
+      assert.equal(remedy.restart, undefined);
+      assert.equal(remedy.text, 'Slipstream.app manages this recorder; open Slipstream.app, and run slipstream through '
+        + `${shellWord(join(appRuntimeRoot(home), 'bin', 'slipstream'))}.`);
+    });
+  });
+
+  it('reports an app ownership check error instead of restart advice', async () => {
+    await withTempDir(async (home) => {
+      const store = join(home, '.slipstream'); await mkdir(store);
+      await mkdir(dirname(appRuntimeRoot(home)), { recursive: true });
+      await writeFile(appRuntimeRoot(home), 'not a directory');
+      const remedy = await remedyFor(store, null, OWN, home, {});
+      assert.equal(remedy.restart, undefined);
+      assert.match(remedy.text, /^couldn't tell whether Slipstream\.app manages the recorder.*ENOTDIR/);
+      assert.doesNotMatch(remedy.text, /Restart|Stop|conductor install/);
     });
   });
 
