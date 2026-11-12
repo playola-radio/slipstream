@@ -445,7 +445,8 @@ Rules:
 - `version` is the store's compatibility gate: a change an older recorder cannot
   safely read or rewrite bumps it. A loader that finds a higher version refuses
   to start, saying a newer Slipstream wrote the record; it never offers to move
-  the record aside.
+  the record aside. A missing record reads as version 1, so the daemon that bumps
+  it also writes the record at startup, before writing anything in the new form.
 - `(harness, harness_session_id)` is unique among linked bindings (4).
 - Connection state is **not** persisted. Recovery restores every linked binding
   as `setup_pending`; only a fresh round trip makes it `connected`.
