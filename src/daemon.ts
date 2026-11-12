@@ -51,8 +51,8 @@ import {
  *
  * It speaks the PRIVATE control protocol (attach / detach / unlink / status /
  * begin_task / ask / claim_question / answer_question / delete_session / gc /
- * rename_session / name_workspace). Every verb WRITES public events, maintains the store, or reports
- * state; none reads or
+ * rename_session / name_workspace / name_session). Every verb WRITES public
+ * events, maintains the store, or reports state; none reads or
  * serves the feed — readers get the feed through the public HTTP view like any
  * other client. There is no privileged back channel for reading. delete_session
  * removes an inactive session while other captures keep recording; gc stops every
@@ -1933,6 +1933,33 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
+  /** Set the agent's name the app chose, only while the session has none. The
+   * app runs the naming model itself, so no linked chat is needed; the user's
+   * name is never touched. */
+  async function nameSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
+    if (!nonEmptyString(req.session_id) || !isValidSessionId(req.session_id)) {
+      return errFields('PROTOCOL', 'name_session requires a valid session_id');
+    }
+    if (typeof req.name !== 'string') return errFields('PROTOCOL', 'name_session requires name, a string');
+    const valid = validateName(req.name);
+    if (!valid.ok) return errFields('INVALID_NAME', valid.message);
+    const name = valid.name;
+    if (compromised || torn) return errFields('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+    const id = req.session_id;
+    try {
+      return await withMetadataLock(async () => {
+        if (!await sessionExists(storeDir, id)) return errFields('SESSION_NOT_FOUND', `no session ${id} to name`);
+        if (await readTombstone(storeDir, id) !== null) return errFields('SESSION_NOT_FOUND', `session ${id} was deleted`);
+        const changed = await updateNaming(id, (naming) => naming.agent_name === null ? { ...naming, agent_name: name } : undefined, () => {
+          if (compromised || torn) throw new QuestionError('STORAGE_UNAVAILABLE', 'the daemon is shutting down or its store lock was lost');
+        });
+        return { changed };
+      });
+    } catch (err) {
+      return controlFailure(err);
+    }
+  }
+
   async function deleteSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     // Validate the id shape before admission: it names an on-disk path, so a
     // malformed or traversing id is a protocol fault, never a lookup miss.
@@ -2177,6 +2204,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       case 'delete_session': outcome = await deleteSession(req); break;
       case 'rename_session': outcome = await renameSession(req); break;
       case 'name_workspace': outcome = await nameWorkspace(req); break;
+      case 'name_session': outcome = await nameSession(req); break;
       case 'gc': outcome = await gc(); break;
       default: return { v: 1, ok: false, code: 'PROTOCOL', message: `unknown verb: ${String(req.verb)}` };
     }
