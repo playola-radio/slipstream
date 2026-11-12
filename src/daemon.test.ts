@@ -24,6 +24,7 @@ import {
 import type { PublicEventInput } from './public-events.ts';
 import { defaultConfig, type ResolvedConfig } from './config.ts';
 import { thisBuild } from './daemon-version.ts';
+import { IntentFromNewerVersionError } from './intent-store.ts';
 import { createTranscriptScheduler } from './transcript/scheduler.ts';
 import { claudeSlug, type DiscoveryIO } from './transcript/discovery.ts';
 import { nodeDiscoveryIO } from './transcript/fs-io.ts';
@@ -1301,6 +1302,20 @@ for (const staleLock of [false, true]) {
     }
   });
 }
+
+it('refuses a store a newer Slipstream wrote, leaving its record as it was and the store unlocked', async () => {
+  const store = await mkdtemp(join(tmpdir(), 'slip-newer-'));
+  const record = `${JSON.stringify({ version: 2, captures: [{ intent: 'from-the-future' }] })}\n`;
+  await mkdir(join(store, 'control'), { recursive: true, mode: 0o700 });
+  await writeFile(join(store, 'control', 'intent.json'), record, { mode: 0o600 });
+  try {
+    await assert.rejects(startDaemon({ storeDir: store }), IntentFromNewerVersionError);
+    assert.equal(await readFile(join(store, 'control', 'intent.json'), 'utf8'), record);
+    await assert.rejects(stat(join(store, 'owner.lock')), { code: 'ENOENT' });
+  } finally {
+    await rm(store, { recursive: true, force: true });
+  }
+});
 
 it('holds the store lock until an in-flight attach settles before shutting down', async () => {
   const store = await mkdtemp(join(tmpdir(), 'slip-stall-'));

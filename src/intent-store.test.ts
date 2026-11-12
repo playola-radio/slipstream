@@ -4,7 +4,7 @@ import { mkdtemp, readdir, readFile, stat, writeFile, mkdir, chmod } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { admitCapture, emptyIntent, linkBinding } from './capture-intent.ts';
-import { IntentCorruptError, intentPath, loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
+import { IntentCorruptError, IntentFromNewerVersionError, intentPath, loadIntent, saveIntent, unlinkOffline, withdrawOffline } from './intent-store.ts';
 import { acquireSessionLock, SessionOwnedError } from './lock.ts';
 
 async function store(): Promise<string> {
@@ -44,7 +44,8 @@ describe('durable intent record', () => {
     const dir = await store();
     await mkdir(join(dir, 'control'), { mode: 0o700 });
     await writeFile(intentPath(dir), JSON.stringify({ ...emptyIntent(), version: 2 }), { mode: 0o600 });
-    await assert.rejects(loadIntent(dir), (err: Error) => /written by a newer Slipstream \(intent version 2; this one reads version 1\)/.test(err.message)
+    await assert.rejects(loadIntent(dir), (err: Error) => err instanceof IntentFromNewerVersionError
+      && /written by a newer Slipstream \(intent version 2; this one reads version 1\)/.test(err.message)
       && !/move the file aside/.test(err.message));
   });
 

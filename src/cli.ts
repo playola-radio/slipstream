@@ -52,7 +52,7 @@ import { defaultDaemonStore, controlSocketPath } from './daemon-location.ts';
 import { startCapture } from './session.ts';
 import { acquireSessionLock, SessionOwnedError } from './lock.ts';
 import { mkdirpDurable } from './storage.ts';
-import { intentPath } from './intent-store.ts';
+import { IntentFromNewerVersionError, intentPath } from './intent-store.ts';
 import { startReaderServer } from './http-reader.ts';
 import { startDaemon, probeSocket, PROBE_TIMEOUT_MS } from './daemon.ts';
 import { sendControlRequest, OutcomeUnknownError } from './control-client.ts';
@@ -924,7 +924,13 @@ async function main(): Promise<void> {
       homeDir: homedir(),
     });
     for (const w of warnings) console.error(`slipstream: ${w}`);
-    const daemon = await startDaemon({ storeDir: args.store, config });
+    let daemon;
+    try { daemon = await startDaemon({ storeDir: args.store, config }); } catch (err) {
+      if (!(err instanceof IntentFromNewerVersionError)) throw err;
+      // Exits 0 so launchd's KeepAlive does not retry a store this copy can never read.
+      console.error(`slipstream: ${err.message}`);
+      return;
+    }
     console.error(`slipstream: daemon control ${daemon.socketPath}`);
     console.error(`slipstream: reader ${daemon.readerUrl}`);
     console.error('slipstream: nothing is recording yet; `slipstream attach <dir>` a worktree to begin capture');
