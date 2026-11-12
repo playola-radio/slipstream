@@ -58,8 +58,16 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
         if (!name.startsWith(prefix) || !/^\d+$/.test(name.slice(prefix.length))) continue;
         const from = join(dir, name);
         const to = join(store, 'backups', from);
-        await mkdir(dirname(to), { recursive: true });
-        await copyFile(from, to, constants.COPYFILE_EXCL);
+        await mkdir(dirname(to), { recursive: true, mode: 0o700 });
+        try {
+          await copyFile(from, to, constants.COPYFILE_EXCL);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+          if (!(await readFile(from)).equals(await readFile(to))) {
+            fail(path, `backup ${to} has different contents; keeping both copies`);
+            continue;
+          }
+        }
         await unlink(from);
         deps.out(`moved ${from} to ${to}`);
       }
@@ -236,7 +244,7 @@ async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[])
 
 async function backUp(path: string, store: string): Promise<string> {
   const backup = join(store, 'backups', `${path}.slipstream-backup-${Date.now()}`);
-  await mkdir(dirname(backup), { recursive: true });
+  await mkdir(dirname(backup), { recursive: true, mode: 0o700 });
   await copyFile(path, backup, constants.COPYFILE_EXCL);
   return backup;
 }

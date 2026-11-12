@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { runAdoptApp, type AdoptDeps } from './adopt-app.ts';
@@ -186,6 +186,22 @@ describe('adopt-app', () => {
     } finally { await f.cleanup(); }
   });
 
+  it('leaves old backups in a symlinked worktree directory alone', async () => {
+    const f = await fixture();
+    try {
+      const path = join(f.roots[0]!, '.claude', 'settings.local.json');
+      const shared = join(f.dir, 'shared-claude');
+      const backup = join(shared, 'settings.local.json.slipstream-backup-1794438280389');
+      await put(backup, 'before\n');
+      await symlink(shared, dirname(path));
+
+      assert.equal(await runAdoptApp(f.deps), 0);
+
+      assert.equal(await readFile(backup, 'utf8'), 'before\n');
+      assert.deepEqual(await backups(f.store, path), []);
+    } finally { await f.cleanup(); }
+  });
+
   it('idempotent', async () => {
     const f = await fixture();
     try {
@@ -233,6 +249,42 @@ describe('adopt-app', () => {
       assert.deepEqual(await besideBackups(claude), ['notes.slipstream-backup-1.txt']);
       assert.deepEqual(await besideBackups(codex), []);
       assert.ok(f.lines.includes(`moved ${claude}.slipstream-backup-1794438280389 to ${moved}`), f.lines.join('\n'));
+    } finally { await f.cleanup(); }
+  });
+
+  it('finishes interrupted backup moves only when both copies match', async () => {
+    const f = await fixture();
+    try {
+      const claude = join(f.roots[0]!, '.claude', 'settings.local.json');
+      const codex = join(f.roots[1]!, '.codex', 'config.toml');
+      const claudeBackup = `${claude}.slipstream-backup-1794438280389`;
+      const codexBackup = `${codex}.slipstream-backup-1794438280390`;
+      await put(claudeBackup, 'same\n');
+      await put(codexBackup, 'source\n');
+      await put(join(f.store, 'backups', claudeBackup), 'same\n');
+      await put(join(f.store, 'backups', codexBackup), 'destination\n');
+
+      assert.equal(await runAdoptApp(f.deps), 1);
+
+      await assert.rejects(readFile(claudeBackup));
+      assert.equal(await readFile(codexBackup, 'utf8'), 'source\n');
+      assert.equal(await readFile(join(f.store, 'backups', codexBackup), 'utf8'), 'destination\n');
+      assert.ok(f.lines.some((l) => l.startsWith(`failed ${codex}: `) && l.includes('different contents')), f.lines.join('\n'));
+    } finally { await f.cleanup(); }
+  });
+
+  it('creates a fresh backup store owner-only', async () => {
+    const f = await fixture();
+    try {
+      await rm(f.store, { recursive: true, force: true });
+      const config = join(f.home, '.codex', 'config.toml');
+      await put(config, `[mcp_servers.slipstream]\ncommand = ${JSON.stringify(NODE)}\n`
+        + `args = [${JSON.stringify(OLD_FORWARDER)}, "--store", ${JSON.stringify(f.store)}]\n`);
+
+      assert.equal(await runAdoptApp(f.deps), 0);
+
+      assert.equal((await stat(f.store)).mode & 0o777, 0o700);
+      assert.equal((await stat(join(f.store, 'backups'))).mode & 0o777, 0o700);
     } finally { await f.cleanup(); }
   });
 
