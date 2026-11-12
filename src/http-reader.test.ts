@@ -225,6 +225,26 @@ describe('http-reader events (finite)', () => {
     assert.equal((await res.text()), '');
   });
 
+  it('a client that hangs up mid-read is not logged as a failed request', async () => {
+    const d = await mkdtemp(join(tmpdir(), 'slip-http-'));
+    await mkdir(join(d, 'sessions', UUID), { recursive: true });
+    const pad = 'x'.repeat(1024);
+    const lines = Array.from({ length: 8192 }, (_, i) => JSON.stringify({ seq: String(i + 1), type: 'test', data: { pad } }));
+    await writeFile(join(d, 'sessions', UUID, 'events.jsonl'), lines.join('\n') + '\n', 'utf8');
+    const s = await startReaderServer({ storeDir: d });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      const res = await GET(s, `/v1/sessions/${UUID}/events?after=0`);
+      assert.equal(res.status, 200);
+      const reader = res.body!.getReader();
+      await reader.read();
+      await reader.cancel();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const failures = errors.mock.calls.map((c) => String(c.arguments[0])).filter((m) => m.includes('request failed'));
+      assert.deepEqual(failures, []);
+    } finally { errors.mock.restore(); await s.close(); await rm(d, { recursive: true, force: true }); }
+  });
+
   it('400 on an invalid cursor', async () => {
     assert.equal((await GET(srv, `/v1/sessions/${UUID}/events?after=-1`)).status, 400);
   });
