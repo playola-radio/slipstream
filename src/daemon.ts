@@ -1933,9 +1933,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
   }
 
-  /** Set the agent's name the app chose, only while the session has none. The
-   * app runs the naming model itself, so no linked chat is needed; the user's
-   * name is never touched. */
+  /** Set the agent's name for any session, only while it has none. Needs no
+   * linked chat; the user's name is never touched. */
   async function nameSession(req: RequestEnvelope): Promise<Record<string, unknown> | ErrorFields> {
     if (!nonEmptyString(req.session_id) || !isValidSessionId(req.session_id)) {
       return errFields('PROTOCOL', 'name_session requires a valid session_id');

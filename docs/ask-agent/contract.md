@@ -579,7 +579,7 @@ recorded, and the existing binding is unchanged.
 ## Workspace names
 
 Each session can carry two display names: one chosen for the agent (by the
-linked agent, or by the app on the first chat message) and one the person sets.
+linked agent or by the app) and one the person sets.
 Names live in `sessions/<id>/name.json`, never in the event log, so naming a
 session never changes which session a workspace resumes and writes no event.
 
@@ -708,9 +708,7 @@ value.
 
 ### Control verb `name_session`
 
-The app names a session itself: it runs a one-shot model call on the first
-chat message and stores the result as the agent's name. No chat needs to be
-linked; the daemon still launches nothing.
+Sets the agent's name for a session named by id. No chat needs to be linked.
 
 ```typescript
 interface NameSessionRequest {
@@ -737,8 +735,7 @@ Checks, in order:
    is not shutting down, else `STORAGE_UNAVAILABLE`.
 
 `user_name` is never read for the decision, cleared or replaced: a session the
-person already named still gets an `agent_name`, which the app keeps hidden
-until the person chooses the agent's name. Because `name_session` and
+person already named still gets an `agent_name`. Because `name_session` and
 `name_workspace` share the metadata lock, whichever sets `agent_name` first
 wins and the other replies `changed: false` (unless `name_workspace` sends
 `replace_existing: true`). Any capture state is fine, as for `rename_session`,
