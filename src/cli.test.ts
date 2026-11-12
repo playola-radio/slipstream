@@ -983,3 +983,24 @@ describe('cli when Slipstream.app owns the recorder', () => {
     });
   });
 });
+
+describe('cli start on a store a newer Slipstream wrote', () => {
+  it('refuses in one line, leaving the record as it was', async () => {
+    const { mkdtemp, mkdir, writeFile, readFile, realpath, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFile } = await import('node:child_process');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-cli-newer-')));
+    const store = join(dir, 'store'); const record = '{"version":2}\n';
+    await mkdir(join(store, 'control'), { recursive: true, mode: 0o700 });
+    await writeFile(join(store, 'control', 'intent.json'), record, { mode: 0o600 });
+    try {
+      const result = await new Promise<{ code: number; stderr: string }>((done) => execFile(process.execPath,
+        ['src/cli.ts', 'start', '--store', store], { env: { PATH: process.env.PATH, HOME: dir }, timeout: 15_000 },
+        (error, _stdout, stderr) => done({ code: error ? Number(error.code) : 0, stderr })));
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /^slipstream: the capture intent record \S+ was written by a newer Slipstream \(.*\)\. Update Slipstream, .*\n$/);
+      assert.equal(await readFile(join(store, 'control', 'intent.json'), 'utf8'), record);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});

@@ -32,6 +32,15 @@ export class IntentCorruptError extends Error {
   }
 }
 
+/** A newer Slipstream wrote the record; it is fine, so it is not called unreadable. */
+export class IntentFromNewerVersionError extends Error {
+  constructor(path: string, version: number) {
+    super(`the capture intent record ${path} was written by a newer Slipstream (intent version ${version}; `
+      + 'this one reads version 1). Update Slipstream, or Slipstream.app, to the version that last ran.');
+    this.name = 'IntentFromNewerVersionError';
+  }
+}
+
 export async function loadIntent(storeDir: string): Promise<IntentRecord> {
   const path = intentPath(storeDir);
   let text: string;
@@ -48,10 +57,8 @@ export async function loadIntent(storeDir: string): Promise<IntentRecord> {
   } catch {
     throw new IntentCorruptError(path, 'not JSON');
   }
-  // A newer Slipstream wrote it; the record is fine, so it is not called unreadable.
   if (isObject(parsed) && typeof parsed.version === 'number' && parsed.version > 1) {
-    throw new Error(`the capture intent record ${path} was written by a newer Slipstream (intent version ${parsed.version}; `
-      + 'this one reads version 1). Update Slipstream, or Slipstream.app, to the version that last ran.');
+    throw new IntentFromNewerVersionError(path, parsed.version);
   }
   readLegacyWaitingAsPaused(parsed);
   const problem = intentProblem(parsed);
