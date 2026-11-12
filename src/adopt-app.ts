@@ -3,11 +3,11 @@
  * switches its runtime. Hooks and answer tools that `attach` wrote with a Node
  * and a package path (an nvm install, say) move onto the app's stable shims, so
  * the next update keeps them working. Only entries for this store change, and
- * each changed file is copied beside itself first.
+ * each changed file is first copied into the store's `backups` folder.
  */
 import { randomUUID } from 'node:crypto';
-import { chmod, constants, copyFile, lstat, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { chmod, constants, copyFile, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { appRuntime } from './app-runtime.ts';
 import { codexServerBlock, hookCommand } from './attach-workflow.ts';
@@ -47,8 +47,30 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
   try { roots = [...new Set((await loadIntent(store)).captures.map((c) => c.root))]; }
   catch (err) { fail(intentPath(store), (err as Error).message); }
 
+  // Earlier versions kept backups beside a worktree's config, where git sees
+  // them as untracked files and `workspace archive` refuses.
+  const moveOldBackups = async (path: string) => {
+    const dir = dirname(path);
+    const prefix = `${basename(path)}.slipstream-backup-`;
+    try {
+      if ((await lstat(dir)).isSymbolicLink()) return;
+      for (const name of await readdir(dir)) {
+        if (!name.startsWith(prefix) || !/^\d+$/.test(name.slice(prefix.length))) continue;
+        const from = join(dir, name);
+        const to = join(store, 'backups', from);
+        await mkdir(dirname(to), { recursive: true });
+        await copyFile(from, to, constants.COPYFILE_EXCL);
+        await unlink(from);
+        deps.out(`moved ${from} to ${to}`);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') fail(path, (err as Error).message);
+    }
+  };
+
   const seen = new Set<string>();
   const adopt = async (path: string, rewrite: Rewrite, inWorkspace: boolean) => {
+    if (inWorkspace) await moveOldBackups(path);
     try {
       const real = await existing(path);
       if (real === null || seen.has(real)) return;
@@ -66,7 +88,7 @@ export async function runAdoptApp(deps: AdoptDeps): Promise<number> {
         fail(path, `${link} is a symbolic link; adopt-app only edits this workspace's own config`);
         return;
       }
-      const backup = await backUp(path);
+      const backup = await backUp(path, store);
       await replaceFile(real, text, next);
       deps.out(`rewrote ${path} (backup ${backup})`);
     } catch (err) {
@@ -179,7 +201,7 @@ async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[])
     return true;
   }
   let backup: string;
-  try { backup = await backUp(path); } catch (err) {
+  try { backup = await backUp(path, deps.store); } catch (err) {
     deps.out(`failed ${path}: ${(err as Error).message}`);
     return false;
   }
@@ -212,8 +234,9 @@ async function adoptClaudeTool(deps: AdoptDeps, roots: string[], shim: string[])
   return ok;
 }
 
-async function backUp(path: string): Promise<string> {
-  const backup = `${path}.slipstream-backup-${Date.now()}`;
+async function backUp(path: string, store: string): Promise<string> {
+  const backup = join(store, 'backups', `${path}.slipstream-backup-${Date.now()}`);
+  await mkdir(dirname(backup), { recursive: true });
   await copyFile(path, backup, constants.COPYFILE_EXCL);
   return backup;
 }
