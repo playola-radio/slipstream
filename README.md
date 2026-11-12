@@ -469,9 +469,9 @@ tier uses.
 
 Every merge to `develop` that passes Tests is published; nobody bumps the
 version. [`publish.yml`](.github/workflows/publish.yml) commits the next patch
-version to `develop` as `chore: release v<version>`, runs Tests on that commit,
-and then publishes it to npm with provenance, tags it `v<version>`, and creates
-a GitHub release. If another merge lands first, the newer commit is released
+version to `develop` as `chore: release v<version>`, then starts Publish on
+that commit, which runs Tests on it and publishes it to npm with provenance,
+tags it `v<version>`, and creates a GitHub release. If another merge lands first, the newer commit is released
 instead.
 
 For a minor or major release, set `version` in `package.json` (and
@@ -480,8 +480,8 @@ that version publishes as is.
 
 If a Publish run fails, fix the cause and use "Re-run failed jobs" on it.
 Running the Publish workflow by hand on `develop` (Actions → Publish → Run
-workflow) publishes `develop`'s version if npm doesn't have it yet. It never bumps
-the version, and it refuses a commit Tests haven't passed on.
+workflow) runs Tests on `develop` and then publishes its version if npm doesn't
+have it yet. It never bumps the version.
 
 ### Design documents
 

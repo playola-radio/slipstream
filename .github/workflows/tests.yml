@@ -5,8 +5,8 @@ on:
     branches: [develop, main]
   pull_request:
     branches: [develop, main]
-  # Publish's bump job runs Tests on the release commit it pushes.
-  workflow_dispatch:
+  # A dispatched Publish run tests the commit it is about to publish.
+  workflow_call:
 
 jobs:
   test:
@@ -81,8 +81,9 @@ jobs:
         run: npm run check:fold-release -- --base ${{ github.event.before }}
 
       - name: Check display-fold release immutability (dispatch)
+        # Called from a dispatched Publish run, whose event this is.
         if: github.event_name == 'workflow_dispatch'
-        # A dispatched run can approve a publish, so it checks every commit
+        # That run can publish, so it checks every commit
         # since the most recent release. HEAD^ would miss a contract change in
         # an earlier commit of a multi-commit push.
         run: |
