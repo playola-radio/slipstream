@@ -1,7 +1,7 @@
 /**
- * The one validator for workspace display names, shared by `name_workspace` and
- * `rename_session`. Rules run in order and the first failure is reported. No
- * Unicode normalization; the stored value is the trimmed string.
+ * The one validator for workspace display names, shared by `name_workspace`,
+ * `name_session` and `rename_session`. Rules run in order and the first failure
+ * is reported. No Unicode normalization; the stored value is the trimmed string.
  */
 
 export type NameReason = 'not_string' | 'ill_formed' | 'control_character' | 'empty' | 'too_long';

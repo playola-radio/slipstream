@@ -578,17 +578,18 @@ recorded, and the existing binding is unchanged.
 
 ## Workspace names
 
-Each session can carry two display names: one the linked agent chooses and one
-the person sets. Names live in `sessions/<id>/name.json`, never in the event
-log, so naming a session never changes which session a workspace resumes and
-writes no event.
+Each session can carry two display names: one chosen for the agent (by the
+linked agent or by the app) and one the person sets.
+Names live in `sessions/<id>/name.json`, never in the event log, so naming a
+session never changes which session a workspace resumes and writes no event.
 
 ```json
 { "version": 1, "agent_name": "Workspace rename menu", "user_name": null }
 ```
 
-- `agent_name` is written only by `name_workspace`; `user_name` is written or
-  cleared only by `rename_session`. Each writer keeps the other's field.
+- `agent_name` is written only by `name_workspace` and `name_session`;
+  `user_name` is written or cleared only by `rename_session`. Each writer keeps
+  the other's field.
 - A missing file means both names are `null` (every session created before this
   feature, and every session not yet named).
 - A malformed file (bad JSON, `version` other than `1`, a missing key, or a value
@@ -600,7 +601,7 @@ writes no event.
 - Writes are crash-safe: a unique temp file (`wx`, mode 0600) in the existing
   session directory, full write, fsync, atomic rename over `name.json`, fsync of
   the directory. A write never creates the directory.
-- Both verbs queue on one daemon-wide metadata lock, separate from
+- All three verbs queue on one daemon-wide metadata lock, separate from
   `delete_session` / `gc`, so an agent name and a rename never lose each other's
   field and the recording session can be renamed. Shutdown waits for the queue
   before releasing the store lock. Deleting a session removes `name.json`.
@@ -704,6 +705,41 @@ failure after sending as "may have saved", re-reads `GET /v1/sessions`, and does
 not resend on its own. If the connection closes while the write is queued, that
 first re-read can precede the eventual write and cannot establish the final
 value.
+
+### Control verb `name_session`
+
+Sets the agent's name for a session named by id. No chat needs to be linked.
+
+```typescript
+interface NameSessionRequest {
+  v: 1;
+  verb: 'name_session';
+  session_id: string; // lowercase UUIDv4
+  name: string;
+}
+// ok: { v: 1, ok: true, changed: boolean }
+```
+
+Checks, in order:
+
+1. `session_id` is a lowercase UUIDv4, else `PROTOCOL`.
+2. `name` is present and a string, else `PROTOCOL`.
+3. `name` is valid, else `INVALID_NAME`.
+4. Queue on the metadata lock.
+5. The session directory exists with no tombstone, else `SESSION_NOT_FOUND`
+   (the message says the session was deleted when tombstoned).
+6. Read `name.json`. If `agent_name` is already set, reply `changed: false`
+   without writing. Otherwise set `agent_name` to the trimmed name and write
+   the temp file.
+7. Immediately before the atomic rename: the store lock is held and the daemon
+   is not shutting down, else `STORAGE_UNAVAILABLE`.
+
+`user_name` is never read for the decision, cleared or replaced: a session the
+person already named still gets an `agent_name`. Because `name_session` and
+`name_workspace` share the metadata lock, whichever sets `agent_name` first
+wins and the other replies `changed: false` (unless `name_workspace` sends
+`replace_existing: true`). Any capture state is fine, as for `rename_session`,
+and the same "may have saved" rule applies to a lost reply.
 
 ### MCP tool `slipstream_name_workspace`
 

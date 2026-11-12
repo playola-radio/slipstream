@@ -2945,4 +2945,111 @@ describe('daemon workspace names', () => {
       assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Agent picked', user_name: null });
     }, { metadataWriteGate: gate.wait });
   });
+
+  const nameSession = (session_id: unknown, name: unknown) => ({ verb: 'name_session', session_id, name });
+
+  it('name_session sets an absent agent_name, trimmed, and the session list shows it', async () => {
+    await withDaemon(async ({ daemon, store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      assert.deepEqual(await call(nameSession(NAMED, '  Fix login bug ')), { v: 1, ok: true, changed: true });
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: 'Fix login bug', user_name: null });
+      const listed = (await sessionsJson(daemon) as Array<{ id: string; naming?: unknown }>).find((s) => s.id === NAMED);
+      assert.deepEqual(listed?.naming, { agent_name: 'Fix login bug', user_name: null });
+    });
+  });
+
+  it('name_session keeps an existing agent_name', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await seedName(store, NAMED, { agent_name: 'Agent picked', user_name: null });
+      const before = await readFile(namePath(store, NAMED), 'utf8');
+      assert.deepEqual(await call(nameSession(NAMED, 'App picked')), { v: 1, ok: true, changed: false });
+      assert.equal(await readFile(namePath(store, NAMED), 'utf8'), before);
+    });
+  });
+
+  it('name_session writes agent_name beside a user_name and leaves it untouched', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await seedName(store, NAMED, { agent_name: null, user_name: 'Mine' });
+      assert.deepEqual(await call(nameSession(NAMED, 'App picked')), { v: 1, ok: true, changed: true });
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: 'App picked', user_name: 'Mine' });
+    });
+  });
+
+  it('name_session rejects a malformed request with PROTOCOL', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      for (const session_id of ['../escape', NAMED.toUpperCase(), undefined]) {
+        const res = await call(nameSession(session_id, 'App picked'));
+        assert.equal(res.ok === false && res.code, 'PROTOCOL', String(session_id));
+      }
+      for (const name of [undefined, null, 7]) {
+        const res = await call(nameSession(NAMED, name));
+        assert.equal(res.ok === false && res.code, 'PROTOCOL', String(name));
+      }
+      assert.equal(await exists(namePath(store, NAMED)), false);
+    });
+  });
+
+  it('name_session rejects an invalid name with INVALID_NAME', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const res = await call(nameSession(NAMED, 'two\nlines'));
+      assert.equal(res.ok === false && res.code, 'INVALID_NAME');
+      assert.equal(await exists(namePath(store, NAMED)), false);
+    });
+  });
+
+  it('name_session on an unknown or deleted session is SESSION_NOT_FOUND', async () => {
+    await withDaemon(async ({ store, call }) => {
+      const missing = await call(nameSession(ABSENT_ID, 'App picked'));
+      assert.equal(missing.ok === false && missing.code, 'SESSION_NOT_FOUND');
+      await seedSession(store, NAMED, HEX_LIVE);
+      assert.equal((await call({ verb: 'delete_session', session_id: NAMED })).ok, true);
+      const deleted = await call(nameSession(NAMED, 'App picked'));
+      assert.equal(deleted.ok === false && deleted.code, 'SESSION_NOT_FOUND');
+      assert.match(deleted.ok === false ? deleted.message : '', /deleted/);
+      assert.equal(await exists(namePath(store, NAMED)), false);
+    });
+  });
+
+  it('name_session on an unreadable name.json is STORAGE_UNAVAILABLE', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      await mkdir(namePath(store, NAMED));
+      const res = await call(nameSession(NAMED, 'App picked'));
+      assert.equal(res.ok === false && res.code, 'STORAGE_UNAVAILABLE', JSON.stringify(res));
+    });
+  });
+
+  it('name_session works on a stopped (archived) session', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = await attachWatchOnly(call, worktree);
+      assert.equal((await call({ verb: 'detach', target: worktree })).ok, true);
+      assert.deepEqual(await call(nameSession(id, 'Archived work')), { v: 1, ok: true, changed: true });
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: 'Archived work', user_name: null });
+    });
+  });
+
+  it('interleaved name_session and rename_session keep both fields', async () => {
+    await withDaemon(async ({ store, call }) => {
+      await seedSession(store, NAMED, HEX_LIVE);
+      const naming = call(nameSession(NAMED, 'App picked'));
+      const renaming = call({ verb: 'rename_session', session_id: NAMED, name: 'Mine' });
+      assert.deepEqual([(await naming).ok, (await renaming).ok], [true, true]);
+      assert.deepEqual(await readName(store, NAMED), { version: 1, agent_name: 'App picked', user_name: 'Mine' });
+    });
+  });
+
+  it('interleaved name_session and name_workspace keep the first agent name', async () => {
+    await withDaemon(async ({ store, worktree, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id!;
+      const replies = await Promise.all([call(nameSession(id, 'App picked')), call(nameOf(worktree, 'Agent picked'))]);
+      const changed = replies.map((r) => r.ok && r.changed);
+      assert.equal(changed.filter(Boolean).length, 1, JSON.stringify(replies));
+      const winner = changed[0] ? 'App picked' : 'Agent picked';
+      assert.deepEqual(await readName(store, id), { version: 1, agent_name: winner, user_name: null });
+    });
+  });
 });
