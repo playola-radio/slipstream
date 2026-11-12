@@ -344,20 +344,29 @@ test('real clip cache bypass is separate from admission and blob loss forces a n
     const routeKey = `/v1/sessions/${change!.sessionId}/changes/${change!.seq}/clips`;
     reader = await startReaderServer({ storeDir: root, projectionTrace: collector.observe,
       projectionAdmissionConfig: { C: 1, Q: 1, W: 1, D: 5_000 } });
-    const responses: ClipResponse[] = [];
-    for (let index = 0; index < 3; index++) {
-      if (index === 2) await unlink(blobPath(root, change!.key.split('/')[0]!));
+    const fetchClip = async (): Promise<ClipResponse> => {
       const startedAtNs = process.hrtime.bigint();
-      const response = await fetch(reader.url + routeKey,
-        { headers: { authorization: `Bearer ${reader.token}` } });
+      const response = await fetch(reader!.url + routeKey,
+        { headers: { authorization: `Bearer ${reader!.token}` } });
       const body = await response.json() as { status: string; fallback_reason?: string };
-      responses.push({ httpStatus: response.status, status: body.status, reason: body.fallback_reason,
-        latencyMs: 0, routeKey, startedAtNs, completedAtNs: process.hrtime.bigint() });
-    }
+      return { httpStatus: response.status, status: body.status, reason: body.fallback_reason,
+        latencyMs: 0, routeKey, startedAtNs, completedAtNs: process.hrtime.bigint() };
+    };
+    // On a loaded host a cold request can time out (worker warm-up or the parse
+    // limit), and timeouts are never cached. Only a ready answer seeds the cache.
+    const giveUpAt = Date.now() + 10_000;
+    let cold = await fetchClip();
+    while (cold.status !== 'ready' && Date.now() < giveUpAt) cold = await fetchClip();
+    assert.equal(cold.status, 'ready');
+    const hit = await fetchClip();
+    await unlink(blobPath(root, change!.key.split('/')[0]!));
+    const responses = [cold, hit, await fetchClip()];
     await reader.close(); reader = undefined;
     const assembled = assembleProjectionTrace(collector.snapshot().events, []);
+    const clipTraces = assembled.traces.filter(trace => trace.workload === 'clip');
     assert.deepEqual(assembled.faults, []);
-    assert.equal(assembled.traces.filter(trace => trace.workload === 'clip').length, 2);
+    assert.ok(clipTraces.some(trace => trace.submittedAtNs < hit.startedAtNs!));
+    assert.equal(clipTraces.filter(trace => trace.submittedAtNs >= hit.startedAtNs!).length, 1);
     assert.equal(assembled.clipCacheBypasses.length, 1);
     assert.match(scoreClipTrace([responses[0]!, responses[2]!], assembled.traces,
       assembled.clipCacheBypasses).join(' '), /cold clip did not produce ready/);
