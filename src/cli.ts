@@ -785,7 +785,8 @@ async function runConductor(action: ConductorAction, store: string): Promise<num
   }
   if (action === 'archive') {
     await runWithdrawal(store, (deps) => runConductorArchive({ env: process.env, err,
-      withdraw: (target) => runWithdraw({ target, reason: 'archived', missingOk: true }, deps) }), 'detach');
+      withdraw: (target) => runWithdraw(
+        { target, reason: 'archived', missingOk: true, origin: 'cli:conductor-archive' }, deps) }), 'detach');
     return Number(process.exitCode ?? 0);
   }
   let inventory;
@@ -815,7 +816,8 @@ async function runWorkspace(action: WorkspaceAction, dir: string, store: string)
     prepare: async () => await daemonReady(store) ? 0 : 1,
     record: (path) => runWatchOnly(path, store, true),
     withdraw: async (path) => {
-      await runWithdrawal(store, (w) => runWithdraw({ target: path, reason: 'archived', missingOk: true }, w), 'detach');
+      await runWithdrawal(store, (w) => runWithdraw(
+        { target: path, reason: 'archived', missingOk: true, origin: 'cli:workspace-archive' }, w), 'detach');
       return Number(process.exitCode ?? 0);
     },
     scripts: sharedScripts,
@@ -962,7 +964,7 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'detach') {
-    await runWithdrawal(args.store, (deps) => runWithdraw({ target: args.target, reason: 'detached' }, deps), 'detach');
+    await runWithdrawal(args.store, (deps) => runWithdraw({ target: args.target, reason: 'detached', origin: 'cli:detach' }, deps), 'detach');
     return;
   }
 

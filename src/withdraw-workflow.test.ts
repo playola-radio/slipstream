@@ -36,15 +36,25 @@ describe('withdrawing a capture', () => {
   it('reports the daemon\'s answer when it is running', async () => {
     const { store } = await seeded();
     const d = deps(store, async () => ({ v: 1, ok: true, session_id: ID, state: 'stopped', reason: 'detached' }));
-    assert.equal(await runWithdraw({ target: ID, reason: 'detached' }, d), 0);
+    assert.equal(await runWithdraw({ target: ID, reason: 'detached', origin: 'cli:detach' }, d), 0);
     assert.deepEqual(d.printed, ['session_id: ' + ID, 'state: stopped', 'reason: detached']);
     assert.equal((await loadIntent(store)).captures[0]?.intent, 'running');
+  });
+
+  it('tells the daemon which command asked, so its log names the origin', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const d = deps('/unused-store', async (request) => {
+      sent.push(request);
+      return { v: 1, ok: true, session_id: ID, state: 'stopped', reason: 'detached' };
+    });
+    await runWithdraw({ target: ID, reason: 'detached', origin: 'cli:detach' }, d);
+    assert.deepEqual(sent, [{ verb: 'detach', target: ID, origin: 'cli:detach' }]);
   });
 
   it('records the withdrawal itself while no daemon runs, and says the stop is unconfirmed', async () => {
     const { store, root } = await seeded();
     const d = deps(store, async () => DOWN);
-    assert.equal(await runWithdraw({ target: root, reason: 'archived' }, d), 0);
+    assert.equal(await runWithdraw({ target: root, reason: 'archived', origin: 'cli:detach' }, d), 0);
     const after = await loadIntent(store);
     assert.equal(after.captures[0]?.intent, 'withdrawn');
     assert.equal(after.captures[0]?.withdrawn_reason, 'archived');
@@ -57,27 +67,27 @@ describe('withdrawing a capture', () => {
     const { store, root } = await seeded();
     const link = join(await mkdtemp(join(tmpdir(), 'slip-withdraw-ln-')), 'ws');
     await symlink(root, link);
-    assert.equal(await runWithdraw({ target: link, reason: 'detached' }, deps(store, async () => DOWN)), 0);
+    assert.equal(await runWithdraw({ target: link, reason: 'detached', origin: 'cli:detach' }, deps(store, async () => DOWN)), 0);
     assert.equal((await loadIntent(store)).captures[0]?.intent, 'withdrawn');
   });
 
   it('refuses a target nothing is recorded for', async () => {
     const { store } = await seeded();
     const d = deps(store, async () => DOWN);
-    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'detached' }, d), 1);
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'detached', origin: 'cli:detach' }, d), 1);
     assert.match(d.warned.join('\n'), /no capture is recorded for \/nowhere/);
   });
 
   it('counts a target with no capture as done when asked to, with or without a daemon', async () => {
     const { store } = await seeded();
     const offline = deps(store, async () => DOWN);
-    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, offline), 0);
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true, origin: 'cli:detach' }, offline), 0);
     assert.deepEqual(offline.printed, ['slipstream: no capture is recorded for /nowhere; nothing to withdraw.']);
     const live = deps(store, async () => ({ v: 1, ok: false, code: 'TARGET_NOT_FOUND', message: 'no capture of /nowhere' }));
-    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, live), 0);
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true, origin: 'cli:detach' }, live), 0);
     assert.deepEqual(live.printed, ['slipstream: no capture of /nowhere; nothing to withdraw.']);
     const other = deps(store, async () => ({ v: 1, ok: false, code: 'STORAGE_UNAVAILABLE', message: 'disk' }));
-    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true }, other), 1);
+    assert.equal(await runWithdraw({ target: '/nowhere', reason: 'archived', missingOk: true, origin: 'cli:detach' }, other), 1);
   });
 
   it('retries over the socket when a daemon holds the store lock while it starts', async () => {
@@ -90,7 +100,7 @@ describe('withdrawing a capture', () => {
       await lock.release();
       return { v: 1, ok: true, session_id: ID, state: 'stopped', reason: 'detached' };
     });
-    assert.equal(await runWithdraw({ target: ID, reason: 'detached' }, d), 0);
+    assert.equal(await runWithdraw({ target: ID, reason: 'detached', origin: 'cli:detach' }, d), 0);
     assert.equal(calls, 3);
     assert.equal((await loadIntent(store)).captures[0]?.intent, 'running');
   });
@@ -100,7 +110,7 @@ describe('withdrawing a capture', () => {
     const lock = await acquireSessionLock(store);
     try {
       const d = deps(store, async () => DOWN);
-      assert.equal(await runWithdraw({ target: ID, reason: 'detached' }, d), 1);
+      assert.equal(await runWithdraw({ target: ID, reason: 'detached', origin: 'cli:detach' }, d), 1);
       assert.match(d.warned.join('\n'), /is locked by another process, but no daemon answers/);
     } finally {
       await lock.release();
