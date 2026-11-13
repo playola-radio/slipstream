@@ -233,16 +233,32 @@ describe('http-reader events (finite)', () => {
     await writeFile(join(d, 'sessions', UUID, 'events.jsonl'), lines.join('\n') + '\n', 'utf8');
     const s = await startReaderServer({ storeDir: d });
     const errors = mock.method(console, 'error', () => {});
+    const original = ServerResponse.prototype.write;
+    let resolveBlockedWrite!: () => void;
+    const blockedWrite = new Promise<void>((resolve) => { resolveBlockedWrite = resolve; });
+    const patched = mock.method(ServerResponse.prototype, 'write', function (this: ServerResponse, chunk: string) {
+      original.call(this, chunk, 'utf8');
+      resolveBlockedWrite();
+      return false;
+    });
+    let closed = false;
     try {
       const res = await GET(s, `/v1/sessions/${UUID}/events?after=0`);
       assert.equal(res.status, 200);
       const reader = res.body!.getReader();
       await reader.read();
+      await blockedWrite;
       await reader.cancel();
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await s.close();
+      closed = true;
       const failures = errors.mock.calls.map((c) => String(c.arguments[0])).filter((m) => m.includes('request failed'));
       assert.deepEqual(failures, []);
-    } finally { errors.mock.restore(); await s.close(); await rm(d, { recursive: true, force: true }); }
+    } finally {
+      patched.mock.restore();
+      errors.mock.restore();
+      if (!closed) await s.close();
+      await rm(d, { recursive: true, force: true });
+    }
   });
 
   it('400 on an invalid cursor', async () => {
