@@ -507,20 +507,21 @@ describe('daemon control verbs', () => {
       const line = logged.find((l) => l.includes('detach_requested'))!;
       assert.match(line, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z slipstream daemon: detach_requested \{/);
       assert.deepEqual(JSON.parse(line.slice(line.indexOf('{'))), {
-        origin: 'app:pause', target: worktree, session_id: id, binding_generation: generation, reason: 'detached', withdrawn: true,
+        origin: 'app:pause', target: worktree, session_id: id, binding_generation: generation, reason: 'detached', already_withdrawn: false,
       });
     });
   });
 
-  it('logs a detach with no origin as unknown, and one of an already paused capture as not withdrawn', async (t) => {
+  it('logs a missing origin as unknown, cuts a long one short, and marks an already paused capture', async (t) => {
     const logged: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
     await withDaemon(async ({ worktree, call }) => {
       await attachWatchOnly(call, worktree);
       await call({ verb: 'detach', target: worktree });
-      await call({ verb: 'detach', target: worktree });
+      await call({ verb: 'detach', target: worktree, origin: 'x'.repeat(100) });
       const fields = logged.filter((l) => l.includes('detach_requested')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
-      assert.deepEqual(fields.map((f) => [f.origin, f.binding_generation, f.withdrawn]), [['unknown', null, true], ['unknown', null, false]]);
+      assert.deepEqual(fields.map((f) => [f.origin, f.binding_generation, f.already_withdrawn]),
+        [['unknown', null, false], ['x'.repeat(64), null, true]]);
     });
   });
 

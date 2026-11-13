@@ -1477,10 +1477,11 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       const entry = findCapture(intent, t.id);
       return entry !== undefined && entry.intent !== 'withdrawn';
     });
+    const origin = nonEmptyString(req.origin) ? req.origin.slice(0, 64) : 'unknown';
     for (const t of targets) {
       console.error(`${new Date().toISOString()} slipstream daemon: detach_requested ${JSON.stringify({
-        origin: nonEmptyString(req.origin) ? req.origin : 'unknown', target: req.target, session_id: t.id,
-        binding_generation: t.binding?.generation ?? null, reason: why, withdrawn: pending.includes(t) })}`);
+        origin, target: req.target, session_id: t.id, binding_generation: t.binding?.generation ?? null, reason: why,
+        already_withdrawn: !pending.includes(t) })}`);
     }
     if (pending.length > 0) {
       const refused = intentRefusal();
