@@ -41,6 +41,17 @@ describe('withdrawing a capture', () => {
     assert.equal((await loadIntent(store)).captures[0]?.intent, 'running');
   });
 
+  it('tells the daemon which command asked, so its log names the origin', async () => {
+    const { store } = await seeded();
+    const sent: Array<Record<string, unknown>> = [];
+    const d = deps(store, async (request) => {
+      sent.push(request);
+      return { v: 1, ok: true, session_id: ID, state: 'stopped', reason: 'detached' };
+    });
+    await runWithdraw({ target: ID, reason: 'detached', origin: 'cli:detach' }, d);
+    assert.deepEqual(sent, [{ verb: 'detach', target: ID, origin: 'cli:detach' }]);
+  });
+
   it('records the withdrawal itself while no daemon runs, and says the stop is unconfirmed', async () => {
     const { store, root } = await seeded();
     const d = deps(store, async () => DOWN);

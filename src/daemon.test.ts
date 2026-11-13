@@ -497,6 +497,33 @@ describe('daemon control verbs', () => {
     });
   });
 
+  it('logs who asked for a detach, with the session, its linked chat and the reason', async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    await withDaemon(async ({ worktree, store, call }) => {
+      const id = rec(await attachConnected(call, worktree, store)).session_id;
+      const generation = (await bindingOf(call, id!))?.binding_generation;
+      assert.equal((await call({ verb: 'detach', target: worktree, origin: 'app:pause' })).ok, true);
+      const line = logged.find((l) => l.includes('detach_requested'))!;
+      assert.match(line, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z slipstream daemon: detach_requested \{/);
+      assert.deepEqual(JSON.parse(line.slice(line.indexOf('{'))), {
+        origin: 'app:pause', target: worktree, session_id: id, binding_generation: generation, reason: 'detached', withdrawn: true,
+      });
+    });
+  });
+
+  it('logs a detach with no origin as unknown, and one of an already paused capture as not withdrawn', async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    await withDaemon(async ({ worktree, call }) => {
+      await attachWatchOnly(call, worktree);
+      await call({ verb: 'detach', target: worktree });
+      await call({ verb: 'detach', target: worktree });
+      const fields = logged.filter((l) => l.includes('detach_requested')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+      assert.deepEqual(fields.map((f) => [f.origin, f.binding_generation, f.withdrawn]), [['unknown', null, true], ['unknown', null, false]]);
+    });
+  });
+
   it('fails attachment closed when the identity is incomplete', async () => {
     await withDaemon(async ({ worktree, call }) => {
       for (const partial of [

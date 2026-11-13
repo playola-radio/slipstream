@@ -26,9 +26,11 @@ const LOCKED_POLL_MS = 250;
 
 /** `missingOk` makes a target with no capture a success: an archive script must
  * not fail for a workspace Slipstream never captured. */
-export async function runWithdraw(opts: { target: string; reason: 'detached' | 'archived'; missingOk?: boolean },
+export async function runWithdraw(
+  opts: { target: string; reason: 'detached' | 'archived'; missingOk?: boolean; origin?: string },
   deps: WithdrawDeps): Promise<number> {
-  const request = { verb: 'detach', target: opts.target, ...(opts.reason === 'archived' ? { reason: 'archived' } : {}) };
+  const request = { verb: 'detach', target: opts.target, ...(opts.reason === 'archived' ? { reason: 'archived' } : {}),
+    ...(opts.origin ? { origin: opts.origin } : {}) };
   const nothing = (message: string) => deps.out(`slipstream: ${message}; nothing to withdraw.`);
   const missing = opts.missingOk ? (res: ResponseEnvelope) => !res.ok && res.code === 'TARGET_NOT_FOUND' : () => false;
   return untilUnlocked(deps, request, async () => {
