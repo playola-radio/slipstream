@@ -495,6 +495,10 @@ export async function startReaderServer(opts: ReaderServerOptions): Promise<Read
           seq = batch[batch.length - 1]!.seq;
         }
         res.end();
+      } catch (err) {
+        // A client that hung up is not a failed request; corruption still is.
+        if (ac.signal.aborted && !(err instanceof LogCorruptError)) return;
+        throw err;
       } finally {
         await cursor?.close();
         followers.delete(ac);
