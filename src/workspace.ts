@@ -12,8 +12,9 @@ export interface WorkspaceDeps {
   /** Makes sure a daemon of this build is running, starting one if needed; non-zero,
    * with the reason reported, when there is none to record with. */
   prepare: () => Promise<number>;
-  /** Watch-only attach with --wait. */
-  record: (dir: string) => Promise<number>;
+  /** Watch-only attach with --wait; calls `admitted` once the daemon has taken the
+   * capture, before waiting for it to record. */
+  record: (dir: string, admitted: () => void) => Promise<number>;
   /** Stop recording with reason `archived`; an unrecorded folder is not an error. */
   withdraw: (dir: string) => Promise<number>;
   scripts: (dir: string) => Promise<Scripts>;
@@ -29,6 +30,7 @@ export function workspacesRoot(home: string): string {
 }
 
 const BRANCH_PREFIX = 'slipstream/';
+const FETCH = ['fetch', '--prune', 'origin'];
 const REV_PARSE = ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'];
 
 export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Promise<number> {
@@ -46,12 +48,18 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
   }
   // Before anything changes, so a daemon that can't record leaves no unrecorded worktree.
   if (await deps.prepare() !== 0) return 1;
-  const fetch = await deps.git(['fetch', '--prune', 'origin'], root);
-  if (fetch.code !== 0) {
-    deps.err(`slipstream: git fetch origin failed:\n${fetch.output.trim()}`);
-    return 1;
+  // Branching from what is already fetched keeps the network off the critical path;
+  // only a repo with no base branch yet has to wait for the fetch.
+  let base = await baseBranch(root, deps, false);
+  const fetchFirst = base === null;
+  if (fetchFirst) {
+    const fetch = await deps.git(FETCH, root);
+    if (fetch.code !== 0) {
+      deps.err(`slipstream: git fetch origin failed:\n${fetch.output.trim()}`);
+      return 1;
+    }
+    base = await baseBranch(root, deps, true);
   }
-  const base = await baseBranch(root, deps);
   if (!base) {
     deps.err(`slipstream: ${root} has neither origin/develop nor a default origin branch to start from.`);
     return 1;
@@ -67,17 +75,31 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
     return 1;
   }
   const path = await deps.realpath(join(parent, `workspace-${n}`));
-  deps.out(`created ${path} on ${branch} from ${base}`);
-  const recorded = await deps.record(path).catch((err: unknown) => {
+  const from = await deps.git(['log', '-1', '--format=%h %s', 'HEAD'], path);
+  deps.out(`created ${path} on ${branch} from ${base}${from.code === 0 ? ` at ${from.output.trim()}` : ''}`);
+  // Started only now: a fetch racing `worktree add` can collide on packed-refs.lock.
+  const refresh = fetchFirst ? null : deps.git(FETCH, root);
+  const printPath = () => {
+    deps.out('');
+    deps.out(`workspace_path: ${path}`);
+  };
+  let printed = false;
+  const recorded = await deps.record(path, () => {
+    printed = true;
+    printPath();
+  }).catch((err: unknown) => {
     deps.err(`slipstream: couldn't record ${path}: ${errorMessage(err)}`);
     return 1;
   });
-  deps.out('');
-  deps.out(`workspace_path: ${path}`);
+  if (!printed) printPath();
+  // Setup waits for recording so the baseline is the fresh checkout and setup's own changes are captured.
   const setUp = await runRepoScript('setup', root, path, deps);
+  const refreshed = await refresh;
+  if (refreshed && refreshed.code !== 0) {
+    deps.err(`slipstream: warning: background git fetch origin failed; ${path} branched from the ${base} already fetched:\n${refreshed.output.trim()}`);
+  }
   // Ends any unterminated line the setup script left, so the path stays on a line of its own.
-  deps.out('');
-  deps.out(`workspace_path: ${path}`);
+  printPath();
   return recorded === 0 && setUp ? 0 : 1;
 }
 
@@ -121,10 +143,12 @@ export async function runWorkspaceArchive(dir: string, deps: WorkspaceDeps): Pro
   return 0;
 }
 
-async function baseBranch(root: string, deps: WorkspaceDeps): Promise<string | null> {
+/** origin/develop, else origin's default branch; `askRemote` refreshes that default from the remote first. */
+async function baseBranch(root: string, deps: WorkspaceDeps, askRemote: boolean): Promise<string | null> {
   if ((await deps.git(['show-ref', '--verify', '--quiet', 'refs/remotes/origin/develop'], root)).code === 0) return 'origin/develop';
-  if ((await deps.git(['remote', 'set-head', 'origin', '--auto'], root)).code !== 0) return null;
-  const head = await deps.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], root);
+  if (askRemote && (await deps.git(['remote', 'set-head', 'origin', '--auto'], root)).code !== 0) return null;
+  // Fails on a missing or dangling origin/HEAD, which can't be branched from.
+  const head = await deps.git(['rev-parse', '--verify', '--quiet', '--abbrev-ref', 'refs/remotes/origin/HEAD'], root);
   return head.code === 0 && head.output.trim() !== '' ? head.output.trim() : null;
 }
 

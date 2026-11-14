@@ -236,8 +236,12 @@ made 14 tool calls before it ended. Slipstream runs first in setup, but whether
 recording is ready before the agent's first edit was not measured. If the agent
 edits first, the first recorded state is whatever was there when recording
 started, and those earlier edits are not shown as changes. This is a known gap, accepted as is: Slipstream does not add a hook, a second capture source, or a wait to close it.
-`slipstream workspace create` (below) does not have this gap: it waits for setup to
-finish, and no agent exists in the workspace yet.
+`slipstream workspace create` (below) has a narrower form of this gap. It prints
+the folder as soon as the daemon has taken the capture, before its first
+baseline finishes, so an agent started in that folder straight away could edit
+before recording starts. Its setup script waits for the recording attempt to
+finish, whether recording starts, is refused, or times out; the script still
+runs when recording cannot start, so its changes may not be captured.
 
 Conductor removes an archived workspace's folder. Archive scripts were seen to
 run while the folder was still there (they could still use files in it), but
@@ -282,14 +286,20 @@ slipstream workspace archive ~/slipstream/workspaces/myrepo/workspace-1
 
 `create` makes a git worktree at `~/slipstream/workspaces/<repo>/workspace-N` on
 a new branch `slipstream/workspace-N`, using the smallest N that is free. It
-fetches `origin` and starts from `origin/develop`, or from origin's default
-branch when there is no `develop`. A repo with no `origin` is refused. Then it
-starts the daemon if needed, starts recording the workspace, and runs the repo's
-committed setup script (`.conductor/settings.toml` or `conductor.json`, the same
-files Conductor reads). It waits for setup to finish. Whenever the folder was
-made, even if recording or setup then failed, it prints `workspace_path: <folder>`
-twice: once before setup runs, and again as its last line. A failed setup leaves
-the workspace in place.
+starts from `origin/develop`, or from origin's default branch when there is no
+`develop`, as already fetched, and prints the commit it started from. It
+refreshes `origin` in the background once the folder exists; a failed refresh
+is a warning, not a failure. Only a repo with neither branch fetched yet waits
+to fetch first. A repo with no `origin` is refused. It starts the daemon if
+needed before making anything, then starts recording the workspace, waits for
+the recording attempt to finish, and runs the repo's committed setup script
+(`.conductor/settings.toml` or `conductor.json`, the same files Conductor
+reads). Setup runs whether recording starts, is refused, or times out, so setup
+changes may not be captured when recording cannot start. It waits for setup to
+finish. Whenever the folder was made, even if recording or setup then failed,
+it prints `workspace_path: <folder>` twice: once as soon as the daemon has taken
+the capture (before recording starts), and again as its last line. A failed
+setup leaves the workspace in place.
 
 `archive` only works on a folder directly under `~/slipstream/workspaces/<repo>/`.
 It refuses a workspace with uncommitted or untracked changes (ignored files are

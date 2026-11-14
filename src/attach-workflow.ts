@@ -140,11 +140,13 @@ async function linkWhenRecording(request: Record<string, unknown> & { verb: stri
 }
 
 /** `slipstream attach --watch-only`: record a workspace with no chat linked. */
-export async function runWatchOnlyAttach(opts: { dir: string; wait: boolean }, deps: WaitDeps): Promise<number> {
+export async function runWatchOnlyAttach(opts: { dir: string; wait: boolean; onAdmitted?: () => void },
+  deps: WaitDeps): Promise<number> {
   try {
     const res = await deps.control({ verb: 'attach', mode: 'watch-only', worktree: opts.dir });
     if (!res.ok) throw new Refusal(`${res.code}: ${res.message}`);
     const id = String(res.session_id);
+    opts.onAdmitted?.();
     let state = String(res.state);
     if (state === 'queued' || state === 'baselining') {
       if (!opts.wait) {

@@ -759,6 +759,31 @@ describe('slipstream attach --watch-only', () => {
     assert.match(r.err, /still pending, outcome unknown/);
   });
 
+  it('with --wait, reports the admitted capture before polling for recording', async () => {
+    const seen: string[] = [];
+    const code = await runWatchOnlyAttach({ dir: '/w', wait: true, onAdmitted: () => seen.push('admitted') }, {
+      out: () => {}, err: () => {},
+      control: async (req) => {
+        seen.push(String(req.verb));
+        return (req.verb === 'attach'
+          ? { v: 1, ok: true, session_id: 's1', state: 'queued', reason: null, created: true }
+          : { v: 1, ok: true, capture: { session_id: 's1', state: 'recording' } }) as ResponseEnvelope;
+      },
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(seen, ['attach', 'admitted', 'status']);
+  });
+
+  it('does not report a refused capture as admitted', async () => {
+    let admitted = false;
+    const code = await runWatchOnlyAttach({ dir: '/w', wait: true, onAdmitted: () => { admitted = true; } }, {
+      out: () => {}, err: () => {},
+      control: async () => ({ v: 1, ok: false, code: 'CAPTURE_LIMIT_REACHED', message: 'full' }) as ResponseEnvelope,
+    });
+    assert.equal(code, 1);
+    assert.equal(admitted, false);
+  });
+
   it('exits non-zero with the exact capture-limit text when every slot is used', async () => {
     const text = '32/32 capture slots in use. This workspace is NOT recording. Pause one first.';
     const r = await run([{ ok: false, code: 'CAPTURE_LIMIT_REACHED', message: text }], true);

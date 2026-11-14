@@ -629,10 +629,10 @@ export function formatStatus(res: Record<string, unknown>, own: Build, mismatch:
 }
 
 /** `slipstream attach --watch-only` records a workspace without linking a chat. */
-async function runWatchOnly(dir: string, store: string, wait: boolean): Promise<number> {
+async function runWatchOnly(dir: string, store: string, wait: boolean, onAdmitted?: () => void): Promise<number> {
   const send = await daemonSend(store);
   try {
-    return await runWatchOnlyAttach({ dir, wait }, {
+    return await runWatchOnlyAttach({ dir, wait, ...(onAdmitted ? { onAdmitted } : {}) }, {
       out: (line) => console.log(line),
       err: (line) => console.error(line),
       control: (request) => send({ v: 1, ...request }),
@@ -813,7 +813,7 @@ async function runWorkspace(action: WorkspaceAction, dir: string, store: string)
       });
     }),
     prepare: async () => await daemonReady(store) ? 0 : 1,
-    record: (path) => runWatchOnly(path, store, true),
+    record: (path, admitted) => runWatchOnly(path, store, true, admitted),
     withdraw: async (path) => {
       await runWithdrawal(store, (w) => runWithdraw({ target: path, reason: 'archived', missingOk: true }, w), 'detach');
       return Number(process.exitCode ?? 0);
