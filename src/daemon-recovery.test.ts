@@ -143,18 +143,28 @@ describe('daemon restart recovery', () => {
     });
   });
 
-  it('honors an archive recorded while no daemon ran: not resumed, and the stop is not backfilled', async () => {
+  it('closes out an archive recorded while no daemon ran: not resumed, and the stop written now behind a restart gap', async () => {
     await withRestartableStore(async ({ store, roots, start, stop }) => {
       const [a] = await roots(1);
       let { call } = await start();
       const id = await attachRecording(call, a!);
       await stop();
       await withdrawOffline(store, { root: a! }, 'archived');
+      await rm(a!, { recursive: true });
       const before = await readFile(sessionLogPath(store, id), 'utf8');
-      ({ call } = await start());
-      const row = await captureRow(call, id);
-      assert.deepEqual([row.state, row.reason], ['not_recording', 'stop-unconfirmed']);
-      assert.equal(await readFile(sessionLogPath(store, id), 'utf8'), before);
+      const restarted = await start();
+      call = restarted.call;
+      const row = await waitForRow(call, id, (r) => r.state !== 'not_recording', 'a closed-out stop');
+      assert.deepEqual([row.state, row.reason], ['stopped', 'archived']);
+      const after = await readFile(sessionLogPath(store, id), 'utf8');
+      assert.ok(after.startsWith(before), 'the history before the restart is kept as it was');
+      const added = (await readLog(store, id)).slice(before.trim().split('\n').length);
+      assert.deepEqual(added.map((e) => [e.type, e.data.reason ?? e.data.capture_mode]), [
+        ['slipstream.session.resumed.v1', 'watch-only'],
+        ['slipstream.capture.gap.v1', 'restart'],
+        ['slipstream.capture.stopped.v1', 'archived'],
+      ]);
+      assert.equal(await sessionsSeq(restarted.daemon, id), BigInt(added.at(-1)!.seq), 'the reader publishes the close-out');
     });
   });
 
@@ -775,6 +785,30 @@ describe('a capture whose root or watcher goes away', () => {
       const entries = (await loadIntent(store)).captures;
       assert.deepEqual(entries.map((c) => [c.session_id, c.intent, c.withdrawn_reason]).sort(),
         [[old, 'withdrawn', 'archived'], [fresh, 'withdrawn', 'archived']].sort());
+    });
+  });
+
+  it('archives a path whose older capture never recorded its stop: every capture there ends stopped', async () => {
+    await withRestartableStore(async ({ store, roots, start, stop }) => {
+      const [a] = await roots(1);
+      let { call } = await start();
+      const old = await attachRecording(call, a!);
+      await stop();
+      await withdrawOffline(store, { root: a! }, 'detached');
+      await replaceRoot(a!);
+      // The stop cannot be written when the daemon starts.
+      const log = sessionLogPath(store, old);
+      await chmod(log, 0o400);
+      ({ call } = await start());
+      const fresh = await attachRecording(call, a!);
+      assert.equal((await call({ verb: 'detach', target: a, reason: 'archived' })).ok, true);
+      assert.equal((await captureRow(call, old)).reason, 'stop-unconfirmed');
+      await chmod(log, 0o600);
+      const res = await call({ verb: 'detach', target: a, reason: 'archived' });
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const rows = await Promise.all([old, fresh].map((id) => captureRow(call, id)));
+      assert.deepEqual(rows.map((r) => [r.state, r.reason]), [['stopped', 'detached'], ['stopped', 'archived']]);
+      assert.equal((await readLog(store, old)).at(-1)!.data.reason, 'detached');
     });
   });
 

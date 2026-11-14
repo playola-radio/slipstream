@@ -2,8 +2,8 @@
  * `slipstream detach`, `slipstream unlink` and `slipstream conductor archive`.
  * Each goes through the daemon when one runs. With no daemon, the CLI records the
  * withdrawal in the intent record itself, under the store lock (contracts.md §8),
- * so a later daemon never resumes it. Nothing is written to the session's log:
- * no capture ran, so no stop is claimed and the state is `stop-unconfirmed`.
+ * so a later daemon never resumes it. Nothing is written to the session's log
+ * here, so the state is `stop-unconfirmed` until the next daemon records the stop.
  */
 import { realpath } from 'node:fs/promises';
 import type { ResponseEnvelope } from './control-protocol.ts';
@@ -45,7 +45,7 @@ export async function runWithdraw(opts: { target: string; reason: 'detached' | '
       deps.out('reason: stop-unconfirmed');
     }
     deps.out('slipstream: no daemon is running; the withdrawal is recorded and will not be resumed. '
-      + 'No stop was written to the session, because none was observed.');
+      + 'Until the next daemon to start records the stop, it is not shown as stopped.');
   }, missing, nothing);
 }
 

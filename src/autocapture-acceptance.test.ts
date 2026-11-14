@@ -636,9 +636,12 @@ describe('auto-capture acceptance: races and recovery', () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
       assert.equal(attempts, tries, 'an archived capture is not retried');
       const row = await captureRow(call, id);
-      assert.deepEqual(stateOf(row), ['not_recording', 'stop-unconfirmed', 'unlinked'],
-        'the stop was never recorded in the log, so it is not shown as cleanly stopped');
-      assert.equal(await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8'), before, 'nothing resumed after the archive');
+      assert.deepEqual(stateOf(row), ['stopped', 'archived', 'unlinked']);
+      const after = await readFile(join(store, 'sessions', id, 'events.jsonl'), 'utf8');
+      assert.ok(after.startsWith(before));
+      assert.deepEqual(after.slice(before.length).trim().split('\n').map((l) => (JSON.parse(l) as { type: string }).type), [
+        'slipstream.session.resumed.v1', 'slipstream.capture.gap.v1', 'slipstream.capture.stopped.v1',
+      ], 'nothing resumed after the archive: its stop is recorded now, behind a restart gap');
       const { projection, fold } = await bothReaders(store, restarted.daemon.readerUrl, restarted.daemon.readerToken);
       assert.deepEqual(fold, projection);
       assert.deepEqual(projection.binding_slots, { used: 0, limit: 10 });
