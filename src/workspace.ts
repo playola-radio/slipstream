@@ -75,7 +75,7 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
     return 1;
   }
   const path = await deps.realpath(join(parent, `workspace-${n}`));
-  const from = await deps.git(['log', '-1', '--format=%h %s', base], root);
+  const from = await deps.git(['log', '-1', '--format=%h %s', 'HEAD'], path);
   deps.out(`created ${path} on ${branch} from ${base}${from.code === 0 ? ` at ${from.output.trim()}` : ''}`);
   // Started only now: a fetch racing `worktree add` can collide on packed-refs.lock.
   const refresh = fetchFirst ? null : deps.git(FETCH, root);
@@ -92,7 +92,7 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
     return 1;
   });
   if (!printed) printPath();
-  // Setup starts only once the baseline is done, so its output is never recorded as agent changes.
+  // Setup waits for recording so the baseline is the fresh checkout and setup's own changes are captured.
   const setUp = await runRepoScript('setup', root, path, deps);
   const refreshed = await refresh;
   if (refreshed && refreshed.code !== 0) {

@@ -72,8 +72,7 @@ function createGit(extra: Record<string, Reply | Promise<Reply>> = {}): Record<s
     'show-ref --verify --quiet refs/heads/slipstream/workspace-1': NO_BRANCH,
     'show-ref --verify --quiet refs/heads/slipstream/workspace-2': NO_BRANCH,
     'show-ref --verify --quiet refs/heads/slipstream/workspace-3': NO_BRANCH,
-    [`${FROM} origin/develop`]: { code: 0, output: 'abc1234 Merge pull request #9\n' },
-    [`${FROM} origin/main`]: { code: 0, output: 'def5678 Initial commit\n' },
+    [`${FROM} HEAD`]: { code: 0, output: 'abc1234 Merge pull request #9\n' },
     ...extra,
   };
 }
@@ -94,7 +93,7 @@ describe('runWorkspaceCreate', () => {
       `git ${DEVELOP} @${ROOT}`,
       `git show-ref --verify --quiet refs/heads/slipstream/workspace-1 @${ROOT}`,
       `git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`,
-      `git ${FROM} origin/develop @${ROOT}`,
+      `git ${FROM} HEAD @${WS}`,
       `git ${FETCH} @${ROOT}`,
       `record ${WS}`,
       `recording ${WS}`,
@@ -153,10 +152,7 @@ describe('runWorkspaceCreate', () => {
   });
 
   it('fetches first, and only once, when no base branch exists locally', async () => {
-    const f = fake({ git: createGit({
-      [DEVELOP]: NO_BRANCH,
-      'remote set-head origin --auto': { code: 0, output: '' },
-    }) });
+    const f = fake();
     f.deps.git = async (args, cwd) => {
       const key = args.join(' ');
       f.calls.push(`git ${key} @${cwd}`);
