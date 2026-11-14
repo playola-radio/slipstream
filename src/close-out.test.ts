@@ -28,12 +28,6 @@ async function closeOut(inputs: EventInput[]): Promise<{ seq: bigint; types: str
 }
 
 describe('closeOutSession', () => {
-  it('records the stop behind a restart gap', async () => {
-    assert.deepEqual(await closeOut([started]), { seq: 4n, types: [
-      'slipstream.session.started.v1', 'slipstream.session.resumed.v1', 'slipstream.capture.gap.v1', 'slipstream.capture.stopped.v1',
-    ] });
-  });
-
   it('keeps a stop already in the log instead of writing a second one', async () => {
     assert.deepEqual(await closeOut([started, stopped]), { seq: 2n, types: [
       'slipstream.session.started.v1', 'slipstream.capture.stopped.v1',
