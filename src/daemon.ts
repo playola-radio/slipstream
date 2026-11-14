@@ -1497,7 +1497,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const already = !pending.includes(c) && findCapture(intent, c.id)?.intent === 'withdrawn' && c.lifecycle === 'stopped';
     // An earlier withdrawal whose stop is still unrecorded gets another try.
     for (const t of targets) {
-      if (!pending.includes(t) && t.lifecycle === 'failed' && !t.session && !t.closing && !t.closeError) setClosing(t, settleWithdrawn(t));
+      if (!pending.includes(t) && t.lifecycle === 'failed' && !t.session && !t.closing && deleting !== t.id) setClosing(t, settleWithdrawn(t));
     }
     await Promise.all(targets.map((t) => t.closing));
     const undurable = targets.find((t) => t.withdrawalError);
@@ -1558,7 +1558,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       c.lifecycle = 'failed';
       return;
     }
-    if (!last || last.type === 'slipstream.capture.stopped.v1') {
+    // A record past the reader's pin reached the log without a confirmed fsync
+    // (a stop or close-out that failed); only recovery can confirm it.
+    const pinned = registry.get(c.id)?.boundary.current();
+    if (!last || (last.type === 'slipstream.capture.stopped.v1' && (pinned === undefined || pinned >= last.seq))) {
       c.lifecycle = 'stopped';
       return;
     }
@@ -1567,13 +1570,14 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       return;
     }
     // Pin the reader at the durable high-water before the log grows.
-    registry.freeze(c.id, last.seq);
+    registry.freeze(c.id, pinned ?? last.seq);
     try {
       cas ??= await createCas(join(storeDir, 'blobs'));
       const seq = await closeOutSession({ logPath, sessionId: c.id, cas, assertOwnership: assertStoreOwned,
         reason: findCapture(intent, c.id)?.withdrawn_reason ?? 'detached' });
       registry.freeze(c.id, seq);
       c.lifecycle = 'stopped';
+      c.closeError = undefined;
     } catch (err) {
       console.error(`slipstream daemon: could not record the stop of withdrawn capture ${c.id}:`, err);
       c.lifecycle = 'failed';

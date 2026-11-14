@@ -2235,7 +2235,10 @@ describe('daemon capture table', () => {
       assert.deepEqual([row.state, row.reason], ['not_recording', 'stop-unconfirmed']);
       assert.ok(!(await readLog(store, id)).some((e) => e.type === 'slipstream.capture.stopped.v1'));
       disk.full = false;
-    }, { createLog: disk.createLog }, /stop could not be recorded/);
+      const retried = rec(await call({ verb: 'detach', target: id }));
+      assert.deepEqual([retried.state, retried.reason], ['stopped', 'detached'], 'a later detach records the stop once storage is back');
+      assert.equal((await readLog(store, id)).at(-1)!.type, 'slipstream.capture.stopped.v1');
+    }, { createLog: disk.createLog });
   });
 
   it('lets independent readers follow each capture and lists every capture', async () => {

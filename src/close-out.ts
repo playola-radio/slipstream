@@ -3,6 +3,7 @@ import type { Cas } from './cas.ts';
 import { acquireSessionLock } from './lock.ts';
 import { createLog } from './log.ts';
 import { recoverSession } from './recovery.ts';
+import { finalRecord } from './store-reader.ts';
 
 export interface CloseOutOptions {
   logPath: string;
@@ -18,7 +19,9 @@ export interface CloseOutOptions {
  * (a daemon shutdown or crash; contracts.md §6). Nothing has written to the log
  * since, and the session lock proves nothing is writing now, so the stop is
  * appended at the current time, never backdated, behind a `capture.gap{restart}`
- * that discloses the unobserved time in between. Returns the final durable seq.
+ * that discloses the unobserved time in between. A stop already in the log, once
+ * recovery has made it durable, is kept rather than written twice. Returns the
+ * final durable seq.
  */
 export async function closeOutSession(opts: CloseOutOptions): Promise<bigint> {
   const { logPath, sessionId } = opts;
@@ -33,6 +36,8 @@ export async function closeOutSession(opts: CloseOutOptions): Promise<bigint> {
   try {
     const recovered = await recoverSession(logPath, sessionId, opts.cas);
     if (recovered.root === undefined) throw new Error(`session ${sessionId} has no session.started record`);
+    // Recovery made the log durable, so an earlier attempt's stop now counts.
+    if ((await finalRecord(logPath))?.type === 'slipstream.capture.stopped.v1') return recovered.recoveredThroughSeq;
     const log = await createLog({ filePath: logPath, sessionId, startSeq: recovered.recoveredThroughSeq });
     try {
       owned();
