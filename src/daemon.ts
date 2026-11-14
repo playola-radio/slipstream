@@ -19,6 +19,7 @@ import {
   isValidSessionId, listSessions, findWorkspaceSession, finalRecord, readTombstone, sessionLogPath, WorkspaceLookupError,
 } from './store-reader.ts';
 import { CorruptLogError } from './recovery.ts';
+import { closeOutSession } from './close-out.ts';
 import { LogCorruptError } from './log-reader.ts';
 import {
   publishTombstone,
@@ -782,7 +783,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
         inflight: new Set(), attempts: 0 };
       captures.set(id, c);
       if (entry.intent === 'withdrawn') {
-        // `stopped` only when the last activation's stop is durable (§6).
+        // `stopped` only when the last activation's stop is durable (§6); one
+        // without is closed out once the daemon is ready.
         c.lifecycle = c.resume && last?.type !== 'slipstream.capture.stopped.v1' ? 'failed' : 'stopped';
         continue;
       }
@@ -1493,6 +1495,10 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
       }
     }
     const already = !pending.includes(c) && findCapture(intent, c.id)?.intent === 'withdrawn' && c.lifecycle === 'stopped';
+    // An earlier withdrawal whose stop is still unrecorded gets another try.
+    for (const t of targets) {
+      if (!pending.includes(t) && t.lifecycle === 'failed' && !t.session && !t.closing && deleting !== t.id) setClosing(t, settleWithdrawn(t));
+    }
     await Promise.all(targets.map((t) => t.closing));
     const undurable = targets.find((t) => t.withdrawalError);
     if (undurable) return errFields('STORAGE_UNAVAILABLE', `the withdrawal was not saved: ${(undurable.withdrawalError as Error).message}`);
@@ -1507,13 +1513,8 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   async function closeCapture(c: Capture, prior: Promise<void> | undefined, why: 'detached' | 'archived'): Promise<void> {
     clearTimeout(c.retryTimer);
     const from = c.lifecycle;
-    if (from === 'queued') {
-      // Not activated: the start job sees the withdrawal and starts nothing. It is
-      // `stopped` only if its last activation, if any, ended in a durable stop (§6).
-      const last = c.resume ? await finalRecord(sessionLogPath(storeDir, c.id)).catch(() => undefined) : undefined;
-      c.lifecycle = !c.resume || last?.type === 'slipstream.capture.stopped.v1' ? 'stopped' : 'failed';
-      return;
-    }
+    // Not activated: the start job sees the withdrawal and starts nothing.
+    if (from === 'queued') return settleWithdrawn(c);
     c.lifecycle = 'stopping';
     if (from === 'baselining') await c.starting;
     await prior;
@@ -1528,12 +1529,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     if (registry.get(c.id)) registry.setAgentConnection(c.id, 'none');
     const session = c.session;
-    if (!session) {
-      // Its activation already ended in a durable stop, or its storage failed
-      // earlier and it was halted without one.
-      c.lifecycle = c.ended || !c.activation ? 'stopped' : 'failed';
-      return;
-    }
+    if (!session) return settleWithdrawn(c);
     c.session = undefined;
     try {
       // A link the log never named (a crash before its `agent.binding`) has no
@@ -1548,6 +1544,45 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     }
     // Pin the reader at the final durable seq (honest even if stop() failed).
     registry.freeze(c.id, BigInt(session.health.snapshot().durable_seq));
+  }
+
+  /** End a withdrawn capture that has no session: `stopped` once its last
+   * activation, if any, ends in a durable stop (§6), recording that stop now if
+   * the activation ended without one. */
+  async function settleWithdrawn(c: Capture): Promise<void> {
+    c.lifecycle = 'stopping';
+    const logPath = sessionLogPath(storeDir, c.id);
+    let last;
+    try { last = await finalRecord(logPath); } catch (err) {
+      console.error(`slipstream daemon: could not read the log of withdrawn capture ${c.id}:`, err);
+      c.lifecycle = 'failed';
+      return;
+    }
+    // A record past the reader's pin reached the log without a confirmed fsync
+    // (a stop or close-out that failed); only recovery can confirm it.
+    const pinned = registry.get(c.id)?.boundary.current();
+    if (!last || (last.type === 'slipstream.capture.stopped.v1' && (pinned === undefined || pinned >= last.seq))) {
+      c.lifecycle = 'stopped';
+      c.closeError = undefined;
+      return;
+    }
+    if (torn || compromised) {
+      c.lifecycle = 'failed';
+      return;
+    }
+    // Pin the reader at the durable high-water before the log grows.
+    registry.freeze(c.id, pinned ?? last.seq);
+    try {
+      cas ??= await createCas(join(storeDir, 'blobs'));
+      const seq = await closeOutSession({ logPath, sessionId: c.id, cas, assertOwnership: assertStoreOwned,
+        reason: findCapture(intent, c.id)?.withdrawn_reason ?? 'detached' });
+      registry.freeze(c.id, seq);
+      c.lifecycle = 'stopped';
+      c.closeError = undefined;
+    } catch (err) {
+      console.error(`slipstream daemon: could not record the stop of withdrawn capture ${c.id}:`, err);
+      c.lifecycle = 'failed';
+    }
   }
 
   /** Revoke a capture's chat link; the capture keeps recording. */
@@ -2278,6 +2313,9 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
   // Only now let the connection handler dispatch verbs (see the `ready` gate).
   ready = true;
   for (const c of restored) enqueueStart(c);
+  for (const c of captures.values()) {
+    if (c.lifecycle === 'failed') setClosing(c, settleWithdrawn(c));
+  }
 
   return {
     socketPath,

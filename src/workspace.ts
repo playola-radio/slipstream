@@ -105,9 +105,15 @@ export async function runWorkspaceCreate(repo: string, deps: WorkspaceDeps): Pro
 
 export async function runWorkspaceArchive(dir: string, deps: WorkspaceDeps): Promise<number> {
   const managed = await deps.realpath(workspacesRoot(deps.home)).catch(() => null);
-  const path = await deps.realpath(dir).catch(() => null);
-  const parts = managed !== null && path !== null ? relative(managed, path).split(sep) : [];
-  if (path === null || parts.length !== 2 || parts.includes('..') || parts.includes('')) {
+  let path: string;
+  try { path = await deps.realpath(dir); } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    deps.err(code === 'ENOENT' || code === 'ENOTDIR' ? `slipstream: ${dir} no longer exists (already archived?).`
+      : `slipstream: couldn't read ${dir}: ${errorMessage(err)}`);
+    return 1;
+  }
+  const parts = managed !== null ? relative(managed, path).split(sep) : [];
+  if (parts.length !== 2 || parts.includes('..') || parts.includes('')) {
     deps.err(`slipstream: workspace archive only archives folders under ${workspacesRoot(deps.home)}/<repo>/<name>.`);
     return 1;
   }

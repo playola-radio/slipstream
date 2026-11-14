@@ -2160,15 +2160,17 @@ describe('daemon capture table', () => {
     }, { createLog: holdTasks });
   });
 
-  it('does not report a failed baseline as cleanly stopped after detach', async () => {
+  it('records the stop of a capture whose baseline failed when it is detached', async () => {
     await withCaptures(async ({ store, call, roots }) => {
       const [a] = await roots(1);
       const admitted = await call({ verb: 'attach', mode: 'watch-only', worktree: a! });
       const id = rec(admitted).session_id!;
       await waitForRow(call, id, r => r.reason === 'baseline-failed');
       const detached = rec(await call({ verb: 'detach', target: id }));
-      assert.deepEqual([detached.state, detached.reason], ['not_recording', 'stop-unconfirmed']);
-      assert.equal((await readLog(store, id)).some(e => e.type === 'slipstream.capture.stopped.v1'), false);
+      assert.deepEqual([detached.state, detached.reason], ['stopped', 'detached']);
+      assert.deepEqual((await readLog(store, id)).slice(-3).map(e => e.type), [
+        'slipstream.session.resumed.v1', 'slipstream.capture.gap.v1', 'slipstream.capture.stopped.v1',
+      ]);
     }, { enumerate: async () => { throw new Error('baseline failed'); } });
   });
 
@@ -2233,7 +2235,37 @@ describe('daemon capture table', () => {
       assert.deepEqual([row.state, row.reason], ['not_recording', 'stop-unconfirmed']);
       assert.ok(!(await readLog(store, id)).some((e) => e.type === 'slipstream.capture.stopped.v1'));
       disk.full = false;
-    }, { createLog: disk.createLog }, /stop could not be recorded/);
+      const retried = rec(await call({ verb: 'detach', target: id }));
+      assert.deepEqual([retried.state, retried.reason], ['stopped', 'detached'], 'a later detach records the stop once storage is back');
+      assert.equal((await readLog(store, id)).at(-1)!.type, 'slipstream.capture.stopped.v1');
+    }, { createLog: disk.createLog });
+  });
+
+  it('acknowledges a retry after a durable stop when later log cleanup failed', async () => {
+    let failClose = true;
+    const closeAfterStopping: typeof createLog = async (options) => {
+      const log = await createLog(options);
+      return {
+        ...log,
+        close: async () => {
+          await log.close();
+          if (failClose) {
+            failClose = false;
+            throw new Error('log close failed');
+          }
+        },
+      };
+    };
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      const failed = await call({ verb: 'detach', target: id });
+      assert.equal(failed.ok, false);
+      assert.equal((await readLog(store, id)).at(-1)!.type, 'slipstream.capture.stopped.v1');
+
+      const retried = await call({ verb: 'detach', target: id });
+      assert.deepEqual([retried.ok, rec(retried).state], [true, 'stopped']);
+    }, { createLog: closeAfterStopping });
   });
 
   it('lets independent readers follow each capture and lists every capture', async () => {

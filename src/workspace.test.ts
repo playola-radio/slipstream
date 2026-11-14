@@ -13,6 +13,7 @@ type Reply = { code: number | null; output: string };
 function fake(opts: {
   git?: Record<string, Reply | Promise<Reply>>;
   existing?: string[];
+  missing?: string[];
   scripts?: Scripts;
   prepare?: number;
   record?: number;
@@ -49,7 +50,10 @@ function fake(opts: {
     },
     runScript: async (script, cwd, env) => { calls.push(`run ${script} @${cwd} ${JSON.stringify(env)}`); return opts.script ?? 0; },
     exists: async (path) => (opts.existing ?? []).includes(path),
-    realpath: async (path) => path,
+    realpath: async (path) => {
+      if ((opts.missing ?? []).includes(path)) throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+      return path;
+    },
     out: (line) => { out.push(line); calls.push(`out ${line}`); },
     err: (line) => err.push(line),
   };
@@ -331,6 +335,13 @@ describe('runWorkspaceArchive', () => {
     const f = fake({ git: archiveGit() });
     assert.equal(await runWorkspaceArchive(outside, f.deps), 1);
     assert.match(f.err.join('\n'), /only archives folders under \/h\/slipstream\/workspaces/);
+    assert.deepEqual(f.calls, []);
+  });
+
+  it('says a folder that no longer exists is gone, not outside the managed root', async () => {
+    const f = fake({ git: archiveGit(), missing: [WS] });
+    assert.equal(await runWorkspaceArchive(WS, f.deps), 1);
+    assert.deepEqual(f.err, [`slipstream: ${WS} no longer exists (already archived?).`]);
     assert.deepEqual(f.calls, []);
   });
 
