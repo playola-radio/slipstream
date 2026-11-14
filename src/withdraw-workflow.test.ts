@@ -51,6 +51,7 @@ describe('withdrawing a capture', () => {
     assert.equal(after.bindings[0]?.intent, 'revoked');
     assert.deepEqual(d.printed.slice(0, 3), ['session_id: ' + ID, 'state: not_recording', 'reason: stop-unconfirmed']);
     assert.match(d.printed.join('\n'), /no daemon is running; the withdrawal is recorded and will not be resumed/);
+    assert.match(d.printed.join('\n'), /the next daemon to start records the stop/);
   });
 
   it('resolves a symlinked workspace path to its recorded root offline', async () => {

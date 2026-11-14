@@ -2160,15 +2160,17 @@ describe('daemon capture table', () => {
     }, { createLog: holdTasks });
   });
 
-  it('does not report a failed baseline as cleanly stopped after detach', async () => {
+  it('records the stop of a capture whose baseline failed when it is detached', async () => {
     await withCaptures(async ({ store, call, roots }) => {
       const [a] = await roots(1);
       const admitted = await call({ verb: 'attach', mode: 'watch-only', worktree: a! });
       const id = rec(admitted).session_id!;
       await waitForRow(call, id, r => r.reason === 'baseline-failed');
       const detached = rec(await call({ verb: 'detach', target: id }));
-      assert.deepEqual([detached.state, detached.reason], ['not_recording', 'stop-unconfirmed']);
-      assert.equal((await readLog(store, id)).some(e => e.type === 'slipstream.capture.stopped.v1'), false);
+      assert.deepEqual([detached.state, detached.reason], ['stopped', 'detached']);
+      assert.deepEqual((await readLog(store, id)).slice(-3).map(e => e.type), [
+        'slipstream.session.resumed.v1', 'slipstream.capture.gap.v1', 'slipstream.capture.stopped.v1',
+      ]);
     }, { enumerate: async () => { throw new Error('baseline failed'); } });
   });
 

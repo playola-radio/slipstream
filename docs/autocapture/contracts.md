@@ -323,7 +323,9 @@ session ownership heartbeats (7), in this precedence:
      `capture.stopped` to write and none is claimed (Brian, 2026-10-18).
    - Otherwise: `not_recording{stop-unconfirmed}`. This covers any capture that
      activated but has no durable `capture.stopped`, and the offline CLI, which
-     cannot tell whether an activation began. Never `recording`.
+     cannot tell whether an activation began. Never `recording`. It does not
+     last: a daemon records the missing stop (see Crash points), and rule 1
+     applies from then on.
 3. Intent `running` whose last activation ends in `capture.stopped`: `stopped`
    with that event's reason. `maintenance` additionally carries the running
    intent, so it resumes later; `watcher-failed` does too when recovery is
@@ -360,7 +362,7 @@ current activation yet.
 |---|---|---|
 | admission intent written, first append | `not_recording{daemon-unavailable}` then `queued` once a daemon is live | Starts the capture under the persisted `session_id`. |
 | `session.started`/`resumed`, `capture.ready` | `not_recording{daemon-unavailable}` while no daemon; `queued` once a daemon is live; `baselining` once resumed | Resumes; `capture.gap{restart}` discloses the hole. |
-| withdrawal written, `capture.stopped` (the capture had activated) | `not_recording{stop-unconfirmed}` | Does not resume a withdrawn capture. Does **not** backfill `capture.stopped` as if it happened at the original time. |
+| withdrawal written, `capture.stopped` (the capture had activated) | `not_recording{stop-unconfirmed}` until a daemon records the stop, then `stopped` with the withdrawal reason | Does not resume a withdrawn capture. Holding the store lock and the session's lock, so nothing else is writing, it appends `session.resumed`, `capture.gap{restart}` and `capture.stopped` with the withdrawal reason, all stamped at the current time. The stop is never backdated to the withdrawal; the gap discloses the time nothing observed (Brian, 2026-11-14). It does this at daemon start, when the withdrawal reaches a capture with no running session, and on the next detach or archive of that path if an earlier attempt failed. |
 | withdrawal written, first append (never activated) | `stopped` with the withdrawal reason (fold rule 2) | Starts nothing; there is no stop to write. |
 | binding intent written, `agent.binding` | binding `setup_pending` from intent (no event yet) | Appends `agent.binding` and `setup_pending` at the stored generation on resume, then publishes. |
 | revoke written, `agent.unlinked` | binding `unlinked` (intent wins) | Does not restore the binding; does not backfill `agent.unlinked`. The next activation's `capture.gap{restart}` discloses the hole. |
