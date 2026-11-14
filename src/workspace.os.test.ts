@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { probeSocket } from './daemon.ts';
@@ -16,7 +16,7 @@ function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEn
 }
 
 describe('slipstream workspace against real git and a disposable daemon', () => {
-  it('creates a workspace, runs setup, records it, then archives it and keeps the branch', async () => {
+  it('creates a workspace, runs setup, records it, archives it keeping the branch, and creates offline', async () => {
     const dir = await realpath(await mkdtemp(join(tmpdir(), 'slip-workspace-os-')));
     const store = join(dir, 'store');
     const env: NodeJS.ProcessEnv = {
@@ -47,7 +47,8 @@ describe('slipstream workspace against real git and a disposable daemon', () => 
 
       const created = await slipstream('workspace', 'create', repo);
       assert.equal(created.code, 0, created.stderr);
-      assert.match(created.stdout, /SETUP-DONE/);
+      assert.match(created.stdout, new RegExp(`created ${workspace} on slipstream/workspace-1 from origin/develop at [0-9a-f]+ seed\\n`));
+      assert.ok(created.stdout.indexOf(`workspace_path: ${workspace}`) < created.stdout.indexOf('SETUP-DONE'), created.stdout);
       assert.equal(created.stdout.trim().split('\n').at(-1), `workspace_path: ${workspace}`);
       await access(join(workspace, 'setup-ran.txt'));
       const recording = await slipstream('status');
@@ -60,6 +61,12 @@ describe('slipstream workspace against real git and a disposable daemon', () => 
       assert.notEqual((await git(['branch', '--list', 'slipstream/workspace-1'], repo)).trim(), '');
       const stopped = await slipstream('status');
       assert.match(stopped.stdout, new RegExp(`${workspace}\\n  session_id: \\S+\\n  state: stopped \\(archived\\)`));
+
+      await rename(join(dir, 'origin.git'), join(dir, 'origin-gone.git'));
+      const offline = await slipstream('workspace', 'create', repo);
+      assert.equal(offline.code, 0, offline.stderr);
+      assert.match(offline.stderr, /warning: background git fetch origin failed/);
+      assert.equal(offline.stdout.trim().split('\n').at(-1), `workspace_path: ${join(dir, 'slipstream', 'workspaces', 'myrepo', 'workspace-2')}`);
     } finally {
       const lock = await readFile(join(store, 'owner.lock'), 'utf8').catch(() => null);
       if (lock) {

@@ -11,11 +11,13 @@ const SETUP_ENV = { CONDUCTOR_ROOT_PATH: ROOT, CONDUCTOR_WORKSPACE_PATH: WS };
 type Reply = { code: number | null; output: string };
 
 function fake(opts: {
-  git?: Record<string, Reply>;
+  git?: Record<string, Reply | Promise<Reply>>;
   existing?: string[];
   scripts?: Scripts;
   prepare?: number;
   record?: number;
+  /** Whether the daemon admits the capture before `record` returns; default true. */
+  admitted?: boolean;
   withdraw?: number;
   script?: number;
   recordError?: Error;
@@ -32,9 +34,11 @@ function fake(opts: {
       return opts.git?.[key] ?? { code: 0, output: '' };
     },
     prepare: async () => { calls.push('prepare'); return opts.prepare ?? 0; },
-    record: async (dir) => {
+    record: async (dir, admitted) => {
       calls.push(`record ${dir}`);
       if (opts.recordError) throw opts.recordError;
+      if (opts.admitted !== false) admitted();
+      calls.push(`recording ${dir}`);
       return opts.record ?? 0;
     },
     withdraw: async (dir) => { calls.push(`withdraw ${dir}`); return opts.withdraw ?? 0; },
@@ -54,44 +58,73 @@ function fake(opts: {
 
 const NO_BRANCH: Reply = { code: 1, output: '' };
 const REV_PARSE = 'rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir';
+const DEVELOP = 'show-ref --verify --quiet refs/remotes/origin/develop';
+const ORIGIN_HEAD = 'rev-parse --verify --quiet --abbrev-ref refs/remotes/origin/HEAD';
+const FETCH = 'fetch --prune origin';
+const FROM = 'log -1 --format=%h %s';
 
-function createGit(extra: Record<string, Reply> = {}): Record<string, Reply> {
+function createGit(extra: Record<string, Reply | Promise<Reply>> = {}): Record<string, Reply | Promise<Reply>> {
   return {
     [REV_PARSE]: { code: 0, output: `${ROOT}\n${ROOT}/.git\n${ROOT}/.git\n` },
     'remote get-url origin': { code: 0, output: 'git@github.com:o/repo.git\n' },
-    'show-ref --verify --quiet refs/remotes/origin/develop': { code: 0, output: '' },
+    [DEVELOP]: { code: 0, output: '' },
+    [ORIGIN_HEAD]: NO_BRANCH,
     'show-ref --verify --quiet refs/heads/slipstream/workspace-1': NO_BRANCH,
     'show-ref --verify --quiet refs/heads/slipstream/workspace-2': NO_BRANCH,
     'show-ref --verify --quiet refs/heads/slipstream/workspace-3': NO_BRANCH,
+    [`${FROM} origin/develop`]: { code: 0, output: 'abc1234 Merge pull request #9\n' },
+    [`${FROM} origin/main`]: { code: 0, output: 'def5678 Initial commit\n' },
     ...extra,
   };
 }
 
+/** Everything but output, with each git call reduced to its arguments. */
+function steps(calls: string[]): string[] {
+  return calls.filter((c) => !c.startsWith('out ')).map((c) => c.split(' @')[0]!);
+}
+
 describe('runWorkspaceCreate', () => {
-  it('creates workspace-1 from origin/develop, records it, then runs setup', async () => {
+  it('branches from a local origin/develop, refreshes origin after the worktree exists, records, then runs setup', async () => {
     const f = fake({ git: createGit() });
     assert.equal(await runWorkspaceCreate('/src/repo', f.deps), 0);
     assert.deepEqual(f.calls.filter((c) => !c.startsWith('out ')), [
       `git ${REV_PARSE} @/src/repo`,
       `git remote get-url origin @${ROOT}`,
       'prepare',
-      `git fetch --prune origin @${ROOT}`,
-      `git show-ref --verify --quiet refs/remotes/origin/develop @${ROOT}`,
+      `git ${DEVELOP} @${ROOT}`,
       `git show-ref --verify --quiet refs/heads/slipstream/workspace-1 @${ROOT}`,
       `git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/develop @${ROOT}`,
+      `git ${FROM} origin/develop @${ROOT}`,
+      `git ${FETCH} @${ROOT}`,
       `record ${WS}`,
+      `recording ${WS}`,
       `scripts ${WS}`,
       `run make setup @${WS} ${JSON.stringify(SETUP_ENV)}`,
     ]);
     assert.deepEqual(f.out.slice(-2), ['', `workspace_path: ${WS}`]);
   });
 
-  it('prints the path after recording and before the setup script', async () => {
+  it('prints the branch point so a stale base is visible', async () => {
     const f = fake({ git: createGit() });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
-    const order = f.calls.filter((c) => c.startsWith('out ') || c.startsWith('record ') || c.startsWith('run '));
-    assert.deepEqual(order.slice(-6).map((c) => c.split(' @')[0]), [
-      `record ${WS}`, 'out ', `out workspace_path: ${WS}`, 'run make setup', 'out ', `out workspace_path: ${WS}`,
+    assert.ok(f.out.includes(`created ${WS} on slipstream/workspace-1 from origin/develop at abc1234 Merge pull request #9`), f.out.join('\n'));
+  });
+
+  it('prints the path once the capture is admitted, then waits for recording before setup', async () => {
+    const f = fake({ git: createGit() });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
+    const order = f.calls.filter((c) => /^(out|record|recording|run) /.test(c));
+    assert.deepEqual(order.slice(-7).map((c) => c.split(' @')[0]), [
+      `record ${WS}`, 'out ', `out workspace_path: ${WS}`, `recording ${WS}`, 'run make setup', 'out ', `out workspace_path: ${WS}`,
+    ]);
+  });
+
+  it('prints the path after the attach returns when the daemon never admits the capture', async () => {
+    const f = fake({ git: createGit(), admitted: false, record: 1 });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    const order = f.calls.filter((c) => /^(out workspace_path:|recording |run )/.test(c));
+    assert.deepEqual(order.map((c) => c.split(' @')[0]), [
+      `recording ${WS}`, `out workspace_path: ${WS}`, 'run make setup', `out workspace_path: ${WS}`,
     ]);
   });
 
@@ -108,29 +141,74 @@ describe('runWorkspaceCreate', () => {
     assert.equal(f.out.filter((l) => l === `workspace_path: ${WS}`).length, 2);
   });
 
-  it('falls back to origin/HEAD when there is no origin/develop', async () => {
+  it('branches from a local origin/HEAD without asking the remote when there is no origin/develop', async () => {
     const f = fake({ git: createGit({
-      'show-ref --verify --quiet refs/remotes/origin/develop': NO_BRANCH,
-      'remote set-head origin --auto': { code: 0, output: '' },
-      'symbolic-ref --short refs/remotes/origin/HEAD': { code: 0, output: 'origin/main\n' },
+      [DEVELOP]: NO_BRANCH,
+      [ORIGIN_HEAD]: { code: 0, output: 'origin/main\n' },
     }) });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
-    assert.ok(f.calls.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/main @${ROOT}`), f.calls.join('\n'));
+    const s = steps(f.calls);
+    assert.ok(s.indexOf(`git ${FETCH}`) > s.indexOf(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/main`), s.join('\n'));
+    assert.ok(!s.includes('git remote set-head origin --auto'), s.join('\n'));
   });
 
-  it('prunes stale remote branches before selecting origin/develop', async () => {
+  it('fetches first, and only once, when no base branch exists locally', async () => {
     const f = fake({ git: createGit({
-      'fetch --prune origin': { code: 0, output: '' },
+      [DEVELOP]: NO_BRANCH,
+      'remote set-head origin --auto': { code: 0, output: '' },
     }) });
+    f.deps.git = async (args, cwd) => {
+      const key = args.join(' ');
+      f.calls.push(`git ${key} @${cwd}`);
+      if (key === ORIGIN_HEAD) {
+        const fetched = f.calls.includes(`git ${FETCH} @${ROOT}`);
+        return fetched ? { code: 0, output: 'origin/main\n' } : NO_BRANCH;
+      }
+      return createGit({ [DEVELOP]: NO_BRANCH })[key] ?? { code: 0, output: '' };
+    };
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
-    assert.ok(f.calls.includes(`git fetch --prune origin @${ROOT}`), f.calls.join('\n'));
+    const s = steps(f.calls);
+    assert.deepEqual(s.filter((c) => c === `git ${FETCH}`), [`git ${FETCH}`]);
+    assert.ok(s.indexOf(`git ${FETCH}`) < s.indexOf('git remote set-head origin --auto'), s.join('\n'));
+    assert.ok(s.includes(`git worktree add --no-track -b slipstream/workspace-1 ${WS} origin/main`), s.join('\n'));
+  });
+
+  it('creates nothing when the up-front fetch fails', async () => {
+    const f = fake({ git: createGit({
+      [DEVELOP]: NO_BRANCH,
+      [FETCH]: { code: 128, output: 'fatal: unable to access remote\n' },
+    }) });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
+    assert.match(f.err.join('\n'), /git fetch origin failed:\nfatal: unable to access remote/);
+    assert.ok(!f.calls.some((c) => c.startsWith('git worktree add')));
+  });
+
+  it('a failed background fetch is a warning, not a failure', async () => {
+    const f = fake({ git: createGit({ [FETCH]: { code: 128, output: 'fatal: unable to access remote\n' } }) });
+    assert.equal(await runWorkspaceCreate(ROOT, f.deps), 0);
+    assert.match(f.err.join('\n'), /warning: .*git fetch origin failed.*\nfatal: unable to access remote/s);
+    assert.ok(f.calls.some((c) => c.startsWith('run make setup')));
+    assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
+  });
+
+  it('records and runs setup while the background fetch runs, and exits only after it ends', async () => {
+    let finishFetch!: (reply: Reply) => void;
+    const fetching = new Promise<Reply>((resolve) => { finishFetch = resolve; });
+    const f = fake({ git: createGit({ [FETCH]: fetching }) });
+    let exited = false;
+    const created = runWorkspaceCreate(ROOT, f.deps).then((code) => { exited = true; return code; });
+    while (!f.calls.some((c) => c.startsWith('run make setup'))) await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(exited, false);
+    finishFetch({ code: 0, output: '' });
+    assert.equal(await created, 0);
+    assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
   });
 
   it('creates nothing when refreshing the remote default branch fails', async () => {
     const f = fake({ git: createGit({
-      'show-ref --verify --quiet refs/remotes/origin/develop': NO_BRANCH,
+      [DEVELOP]: NO_BRANCH,
       'remote set-head origin --auto': { code: 1, output: 'error: cannot determine remote HEAD\n' },
-      'symbolic-ref --short refs/remotes/origin/HEAD': { code: 0, output: 'origin/main\n' },
     }) });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
     assert.ok(!f.calls.some((c) => c.startsWith('git worktree add')));
@@ -145,10 +223,7 @@ describe('runWorkspaceCreate', () => {
   });
 
   it('creates nothing when origin has neither develop nor a default branch', async () => {
-    const f = fake({ git: createGit({
-      'show-ref --verify --quiet refs/remotes/origin/develop': NO_BRANCH,
-      'symbolic-ref --short refs/remotes/origin/HEAD': { code: 128, output: 'fatal: ref refs/remotes/origin/HEAD is not a symbolic ref\n' },
-    }) });
+    const f = fake({ git: createGit({ [DEVELOP]: NO_BRANCH }) });
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
     assert.match(f.err.join('\n'), /origin\/develop/);
     assert.ok(!f.calls.some((c) => c.startsWith('git worktree add')));
@@ -193,6 +268,7 @@ describe('runWorkspaceCreate', () => {
     assert.equal(await runWorkspaceCreate(ROOT, f.deps), 1);
     assert.match(f.err.join('\n'), /control socket closed/);
     assert.ok(f.calls.some((c) => c.startsWith('run make setup')));
+    assert.equal(f.out.filter((l) => l === `workspace_path: ${WS}`).length, 2);
     assert.equal(f.out.at(-1), `workspace_path: ${WS}`);
   });
 
