@@ -239,7 +239,9 @@ started, and those earlier edits are not shown as changes. This is a known gap, 
 `slipstream workspace create` (below) has a narrower form of this gap. It prints
 the folder as soon as the daemon has taken the capture, before its first
 baseline finishes, so an agent started in that folder straight away could edit
-before recording starts. Its setup script always waits for recording.
+before recording starts. Its setup script waits for the recording attempt to
+finish, whether recording starts, is refused, or times out; the script still
+runs when recording cannot start, so its changes may not be captured.
 
 Conductor removes an archived workspace's folder. Archive scripts were seen to
 run while the folder was still there (they could still use files in it), but
@@ -290,12 +292,14 @@ refreshes `origin` in the background once the folder exists; a failed refresh
 is a warning, not a failure. Only a repo with neither branch fetched yet waits
 to fetch first. A repo with no `origin` is refused. It starts the daemon if
 needed before making anything, then starts recording the workspace, waits for
-recording, and runs the repo's committed setup script (`.conductor/settings.toml`
-or `conductor.json`, the same files Conductor reads). It waits for setup to
-finish. Whenever the folder was made, even if recording or setup then failed, it
-prints `workspace_path: <folder>` twice: once as soon as the daemon has taken the
-capture (before recording starts), and again as its last line. A failed setup
-leaves the workspace in place.
+the recording attempt to finish, and runs the repo's committed setup script
+(`.conductor/settings.toml` or `conductor.json`, the same files Conductor
+reads). Setup runs whether recording starts, is refused, or times out, so setup
+changes may not be captured when recording cannot start. It waits for setup to
+finish. Whenever the folder was made, even if recording or setup then failed,
+it prints `workspace_path: <folder>` twice: once as soon as the daemon has taken
+the capture (before recording starts), and again as its last line. A failed
+setup leaves the workspace in place.
 
 `archive` only works on a folder directly under `~/slipstream/workspaces/<repo>/`.
 It refuses a workspace with uncommitted or untracked changes (ignored files are
