@@ -2241,6 +2241,33 @@ describe('daemon capture table', () => {
     }, { createLog: disk.createLog });
   });
 
+  it('acknowledges a retry after a durable stop when later log cleanup failed', async () => {
+    let failClose = true;
+    const closeAfterStopping: typeof createLog = async (options) => {
+      const log = await createLog(options);
+      return {
+        ...log,
+        close: async () => {
+          await log.close();
+          if (failClose) {
+            failClose = false;
+            throw new Error('log close failed');
+          }
+        },
+      };
+    };
+    await withCaptures(async ({ store, call, roots }) => {
+      const [a] = await roots(1);
+      const id = await attachWatchOnly(call, a!);
+      const failed = await call({ verb: 'detach', target: id });
+      assert.equal(failed.ok, false);
+      assert.equal((await readLog(store, id)).at(-1)!.type, 'slipstream.capture.stopped.v1');
+
+      const retried = await call({ verb: 'detach', target: id });
+      assert.deepEqual([retried.ok, rec(retried).state], [true, 'stopped']);
+    }, { createLog: closeAfterStopping });
+  });
+
   it('lets independent readers follow each capture and lists every capture', async () => {
     await withCaptures(async ({ store, daemon, call, roots, fake }) => {
       const [a, b] = await roots(2);

@@ -1563,6 +1563,7 @@ export async function startDaemon(opts: DaemonOptions): Promise<Daemon> {
     const pinned = registry.get(c.id)?.boundary.current();
     if (!last || (last.type === 'slipstream.capture.stopped.v1' && (pinned === undefined || pinned >= last.seq))) {
       c.lifecycle = 'stopped';
+      c.closeError = undefined;
       return;
     }
     if (torn || compromised) {
